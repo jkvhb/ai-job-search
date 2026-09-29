@@ -140,8 +140,11 @@ def _count_files(directory, exts):
     return len([f for f in names if f.lower().endswith(exts)])
 
 
-def build_log_bundle():
-    """日志 + 环境信息（不含 key）打包成 zip，方便反馈给 AI 做优化"""
+def build_log_bundle(port=8000):
+    """日志 + 环境信息（不含 key）打包成 zip，方便反馈给 AI 做优化
+
+    port 由调用方传入（app.py 传它实际监听的端口），不要写死。
+    """
     log_dir = os.path.dirname(LOG_FILE)
     os.makedirs(log_dir, exist_ok=True)
     name = "反馈日志包_%s.zip" % datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -153,7 +156,7 @@ def build_log_bundle():
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "python": sys.version,
         "platform": sys.platform,
-        "port": 8000,
+        "port": port,
         "models": {
             "text": {"base_url": cfg["text_model"]["base_url"], "model": cfg["text_model"]["model"],
                      "temperature": cfg["text_model"].get("temperature"),

@@ -64,7 +64,8 @@ def set_current_profile(key=None):
 
 
 def p_path(*parts, **kw):
-    return os.path.join(profile_dir(kw.get("key")), *parts)
+    """解析到指定 key 的 profile；未指定则用「当前 profile」（多用户隔离的关键）"""
+    return os.path.join(profile_dir(kw.get("key") or current_profile()), *parts)
 
 
 # ---------- 读写 ----------

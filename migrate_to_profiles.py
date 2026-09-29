@@ -31,6 +31,11 @@ def copy_dir(src, dst):
     if not os.path.isdir(src):
         return "跳过(不存在)"
     if os.path.isdir(dst) and os.listdir(dst):
+        # 目录非空：核对文件数，避免"上次半途中断 + 本次跳过"掩盖缺文件
+        src_n = sum(len(fs) for _, _, fs in os.walk(src))
+        dst_n = sum(len(fs) for _, _, fs in os.walk(dst))
+        if src_n != dst_n:
+            return "⚠ 跳过(目标非空但疑似不完整: %d/%d 文件)" % (dst_n, src_n)
         return "跳过(目标非空)"
     shutil.copytree(src, dst, dirs_exist_ok=True)
     return "已复制"

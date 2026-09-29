@@ -46,6 +46,11 @@ class StorePathTest(unittest.TestCase):
     def test_read_json_returns_default_on_missing(self):
         self.assertEqual(store.read_json(os.path.join(self.tmp, "nope.json"), {"d": 1}), {"d": 1})
 
+    def test_p_path_follows_current_profile(self):
+        store.set_current_profile("erin")
+        self.assertTrue(store.p_path("jobs.json").endswith(
+            os.path.join("profiles", "erin", "jobs.json")))
+
     def test_safe_name_blocks_traversal(self):
         self.assertEqual(store.safe_name("../../etc/passwd"), "passwd")
         self.assertEqual(store.safe_name(".."), "")
