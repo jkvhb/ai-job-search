@@ -97,7 +97,9 @@ def write_json(path, obj):
 
 
 def safe_name(name):
-    return os.path.basename(str(name or "").strip())
+    """只取文件名；拒绝 . / .. 这类可越级的名字（返回空串）"""
+    n = os.path.basename(str(name or "").strip())
+    return "" if n in (".", "..") else n
 
 
 def slug(text, limit=28):
