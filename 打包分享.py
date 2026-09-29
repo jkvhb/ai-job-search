@@ -227,9 +227,29 @@ def collect():
     return items
 
 
+def leak_keywords():
+    """从 .leak-keywords.txt 读取要拦截的个人信息关键词。
+
+    该文件**不入库**（见 .gitignore）——避免为了"检测个人信息"而把个人信息写进源码。
+    每行一个关键词，# 开头为注释。文件不存在时只检查 API Key。
+    """
+    p = os.path.join(ROOT, ".leak-keywords.txt")
+    kws = []
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#"):
+                    kws.append(line)
+    except Exception:
+        pass
+    return kws
+
+
 def verify(zpath):
     """反向扫描 zip，确认没有泄漏"""
     issues = []
+    kws = leak_keywords()
     with zipfile.ZipFile(zpath) as z:
         for n in z.namelist():
             info = z.getinfo(n)
@@ -242,7 +262,7 @@ def verify(zpath):
                     continue
                 if re.search(r"sk-[A-Za-z0-9_\-]{20,}", txt):
                     issues.append("疑似明文 API Key：%s" % n)
-                for kw in ("周汉钦", "15822092270", "Zhouhanqin0818"):
+                for kw in kws:
                     if kw in txt:
                         issues.append("个人信息 '%s' 出现在：%s" % (kw, n))
     return issues
