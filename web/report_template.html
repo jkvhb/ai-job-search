@@ -1,0 +1,415 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>__TITLE__</title>
+<style>
+  :root{
+    --bg:#f4f6fb; --card:#fff; --line:#e5e9f2; --ink:#1a2233; --sub:#6b7488; --muted:#9aa3b5;
+    --accent:#2563eb; --accent-soft:#eef3ff; --green:#16a34a; --green-soft:#e9f9ef;
+    --amber:#d97706; --amber-soft:#fdf3e3; --red:#dc2626; --red-soft:#fdeaea;
+    --radius:14px; --shadow:0 1px 3px rgba(16,24,40,.06),0 8px 24px rgba(16,24,40,.05);
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html{scroll-behavior:smooth}
+  body{background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;line-height:1.65;padding:26px 16px;-webkit-font-smoothing:antialiased}
+  .wrap{max-width:880px;margin:0 auto}
+  /* 工具栏 */
+  .toolbar{display:flex;align-items:center;gap:10px;margin-bottom:14px;flex-wrap:wrap}
+  .toolbar button{background:var(--card);color:var(--ink);border:1px solid var(--line);border-radius:9px;padding:8px 14px;font-size:13.5px;cursor:pointer;font-weight:600;box-shadow:0 1px 2px rgba(16,24,40,.04);transition:.15s}
+  .toolbar button:hover{border-color:var(--accent);color:var(--accent)}
+  .toolbar .hint{font-size:12px;color:var(--muted);margin-left:auto}
+  /* 目录 */
+  .toc{position:sticky;top:8px;z-index:50;display:flex;gap:6px;flex-wrap:wrap;background:linear-gradient(135deg,#f0fdfa,#effcfb);backdrop-filter:blur(10px);border:1px solid #c9ece6;border-radius:12px;padding:9px 11px;margin-bottom:16px;box-shadow:0 2px 10px rgba(13,148,136,.10)}
+  .toc a{font-size:12.6px;color:#0f766e;text-decoration:none;padding:5px 11px;border-radius:8px;font-weight:600;white-space:nowrap;transition:.15s;cursor:pointer}
+  .toc a:hover{background:#ccfbf1;color:#0f766e}
+  .toc a.active{background:#0d9488;color:#fff;box-shadow:0 2px 6px rgba(13,148,136,.28)}
+  .toc .top{margin-left:auto;color:#4ba69d;font-weight:600}
+  /* 页头 */
+  .hero{background:linear-gradient(135deg,#2563eb 0%,#4f46e5 100%);color:#fff;border-radius:var(--radius);padding:30px 34px;box-shadow:var(--shadow);margin-bottom:18px}
+  .hero .kicker{font-size:12.5px;letter-spacing:.5px;opacity:.85;margin-bottom:9px}
+  .hero h1{font-size:29px;font-weight:700;margin-bottom:10px}
+  .hero .tags{display:flex;flex-wrap:wrap;gap:8px;margin-top:6px}
+  .hero .tags span{background:rgba(255,255,255,.16);border:1px solid rgba(255,255,255,.22);padding:3px 12px;border-radius:999px;font-size:12.5px}
+  .hero .score-row{display:flex;align-items:center;gap:16px;margin-top:20px;flex-wrap:wrap}
+  .hero .score{font-size:44px;font-weight:800;line-height:1}
+  .hero .score small{font-size:17px;font-weight:500;opacity:.85}
+  .hero .verdict{font-size:15.5px;font-weight:600;background:rgba(255,255,255,.18);padding:7px 16px;border-radius:999px}
+  .hero .meta-line{margin-top:14px;font-size:12.5px;opacity:.82}
+  /* 卡片 */
+  .card{background:var(--card);border-radius:var(--radius);box-shadow:var(--shadow);padding:24px 26px;margin-bottom:16px;border:1px solid var(--line);border-top:3px solid var(--c,var(--line));scroll-margin-top:74px}
+  .card h2{font-size:17.5px;font-weight:700;margin-bottom:15px;display:flex;align-items:center;gap:10px;padding-bottom:10px;border-bottom:1px solid var(--line)}
+  .card h2 .num{display:inline-flex;align-items:center;justify-content:center;width:26px;height:26px;background:var(--cbg,var(--accent-soft));color:var(--c,var(--accent));border-radius:8px;font-size:12.5px;font-weight:700;flex:none}
+  /* 模块配色（浅色系） */
+  .m-gates{--c:#3b82f6;--cbg:#eff6ff}
+  .m-scores{--c:#8b5cf6;--cbg:#f5f3ff}
+  .m-breakdown{--c:#06b6d4;--cbg:#ecfeff}
+  .m-outline{--c:#10b981;--cbg:#ecfdf5}
+  .m-optimization{--c:#f59e0b;--cbg:#fffbeb}
+  .m-interview{--c:#ec4899;--cbg:#fdf2f8}
+  .m-apply{--c:#64748b;--cbg:#f1f5f9}
+  .card h3{font-size:14.5px;font-weight:700;margin:17px 0 9px}
+  .card p{color:var(--sub);font-size:13.8px;margin-bottom:7px}
+  /* 表格 */
+  table{width:100%;border-collapse:collapse;font-size:13.2px;margin:9px 0}
+  th,td{border:1px solid var(--line);padding:8px 11px;text-align:left;vertical-align:top}
+  th{background:#f8fafd;color:var(--sub);font-weight:600;white-space:nowrap}
+  /* 标签 */
+  .pill{display:inline-block;padding:2px 10px;border-radius:999px;font-size:11.8px;font-weight:600;white-space:nowrap}
+  .ok{background:var(--green-soft);color:var(--green)} .warn{background:var(--amber-soft);color:var(--amber)}
+  .bad{background:var(--red-soft);color:var(--red)} .info{background:var(--accent-soft);color:var(--accent)}
+  /* 勾选行 */
+  label.chk{display:flex;align-items:flex-start;gap:9px;font-size:13.5px;color:var(--sub);cursor:pointer;padding:5px 0}
+  label.chk input{margin-top:3px;width:15px;height:15px;accent-color:var(--accent);flex:none;cursor:pointer}
+  label.chk input:checked + span{color:var(--muted);text-decoration:line-through}
+  /* 打分滑块 */
+  .srow{display:flex;align-items:center;gap:12px;margin:9px 0}
+  .srow .sname{width:170px;font-size:13px;color:var(--sub);flex:none}
+  .srow .sname small{color:var(--muted);margin-left:5px}
+  .srow input[type=range]{flex:1;accent-color:var(--c,var(--accent));cursor:pointer}
+  .srow .sval{width:42px;text-align:right;font-size:13.5px;font-weight:700;color:var(--c,var(--accent));flex:none}
+  .total-box{display:flex;align-items:center;justify-content:space-between;background:var(--cbg,var(--accent-soft));border-radius:10px;padding:1px 18px;margin-top:14px}
+  .total-box .lbl{font-size:13.5px;color:var(--sub);font-weight:600}
+  .total-box .val{font-size:28px;font-weight:800;color:var(--c,var(--accent))}
+  /* 折叠 */
+  details{border:1px solid var(--line);border-radius:10px;margin:8px 0;background:#fcfdff;overflow:hidden}
+  details summary{padding:11px 14px;cursor:pointer;font-size:13.8px;font-weight:600;display:flex;align-items:center;gap:9px;list-style:none}
+  details summary::-webkit-details-marker{display:none}
+  details summary::before{content:"▸";color:var(--c,var(--accent));font-size:12px;transition:.2s}
+  details[open] summary::before{transform:rotate(90deg)}
+  details .ans{padding:0 15px 13px 36px;font-size:13.5px;color:var(--sub);border-top:1px dashed var(--line);padding-top:11px;margin-top:2px}
+  details .intent{font-size:12px;color:var(--muted);font-weight:400;margin-left:auto;flex:none}
+  /* 引用 */
+  .quote{background:var(--cbg,var(--accent-soft));border-left:4px solid var(--c,var(--accent));padding:12px 16px;border-radius:8px;font-size:14px;margin:10px 0}
+  .note{background:#fffaf0;border:1px solid #f3e3bb;color:#8a6d1a;border-radius:8px;padding:10px 14px;font-size:12.8px;margin:11px 0}
+  /* 投递状态 */
+  .app-row{display:flex;gap:14px;flex-wrap:wrap;align-items:center}
+  .app-row label{font-size:13px;color:var(--sub);font-weight:600;display:flex;align-items:center;gap:7px}
+  .app-row select,.app-row input[type=date],.app-row input[type=text]{border:1px solid var(--line);border-radius:8px;padding:6px 10px;font-size:13px;font-family:inherit;color:var(--ink);background:#fff}
+  .kwmap td:first-child{color:var(--accent);font-weight:600}
+  /* 岗位信息与联系方式 */
+  .meta-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:9px 18px}
+  .meta-grid .mi{display:flex;flex-direction:column;gap:1px}
+  .meta-grid .mk{font-size:11.6px;color:var(--muted);font-weight:600}
+  .meta-grid .mv{color:var(--ink);font-weight:700;font-size:14px;word-break:break-all}
+  .lnkrow{margin-top:13px;display:flex;gap:8px;flex-wrap:wrap}
+  .lnk{font-size:12.8px;font-weight:600;color:var(--c,var(--accent));background:var(--cbg,var(--accent-soft));border:1px solid var(--line);border-radius:8px;padding:6px 13px;text-decoration:none;cursor:pointer;font-family:inherit}
+  .lnk:hover{border-color:var(--c,var(--accent))}
+  ul,ol{margin:5px 0 5px 2px;padding-left:20px}
+  li{font-size:13.6px;color:var(--sub);margin-bottom:5px}
+  li b{color:var(--ink)}
+  footer{text-align:center;color:var(--muted);font-size:12px;padding:12px 0 28px}
+  @media print{
+    body{background:#fff;padding:0}
+    .toolbar{display:none}
+    .toc{display:none}
+    .card,.hero{box-shadow:none;border:1px solid #ddd;break-inside:avoid}
+    details{border-color:#ddd} details[open] .ans{display:block}
+    details:not([open]) .ans{display:none}
+  }
+  @media (max-width:640px){.srow .sname{width:110px}.hero h1{font-size:23px}.toc .top{display:none}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="toolbar">
+    <button onclick="window.print()">📤 导出 PDF</button>
+    <button onclick="toggleAll(true)">展开全部答案</button>
+    <button onclick="toggleAll(false)">收起全部</button>
+    <button onclick="resetState()">↺ 重置我的勾选</button>
+    <span class="hint" id="hint">你的勾选/打分/投递状态会保存在本机浏览器</span>
+  </div>
+  <header class="hero" id="hero"></header>
+  <nav class="toc" id="toc"></nav>
+  <main id="main"></main>
+  <footer id="foot"></footer>
+</div>
+<script>
+const REPORT_DATA = __REPORT_DATA__;
+const RID = (REPORT_DATA && REPORT_DATA.report_id) || 'default';
+const SKEY = 'report_state:' + RID;
+let state;
+try { state = JSON.parse(localStorage.getItem(SKEY)) || {}; } catch(e){ state = {}; }
+if (!state.checks) state.checks = {};
+if (!state.scores) state.scores = {};
+if (!state.app) state.app = {};
+
+function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function save(){ try { localStorage.setItem(SKEY, JSON.stringify(state)); } catch(e){} }
+function flash(msg){ const h=document.getElementById('hint'); if(!h)return; h.textContent = msg||'已保存 ✓'; h.style.color='var(--green)'; clearTimeout(window.__ft); window.__ft=setTimeout(()=>{h.textContent='你的勾选/打分/投递状态会保存在本机浏览器';h.style.color='';},1200); }
+function toggleAll(open){ document.querySelectorAll('#main details').forEach(d => d.open = open); }
+function resetState(){ if(!confirm('确定清空本报告的勾选、打分和投递状态吗？')) return; state={checks:{},scores:{},app:{}}; save(); location.reload(); }
+function fmt(n){ return (Math.round(Number(n)*10)/10).toFixed(1).replace(/\.0$/,''); }
+function verdictText(lvl, fallback){
+  if (lvl==='green') return '✅ '+(fallback||'建议投递');
+  if (lvl==='amber') return '⚠️ '+(fallback||'概率偏低');
+  if (lvl==='red') return '❌ '+(fallback||'不建议');
+  return fallback||'';
+}
+function pillFor(level){ const m={ok:'ok',warn:'warn',bad:'bad',info:'info'}; return m[level]||'info'; }
+function verdictPill(v){
+  const t = String(v||'');
+  if (t.indexOf('具备')>=0 || t.indexOf('✅')>=0 || t.indexOf('通过')>=0) return 'ok';
+  if (t.indexOf('部分')>=0 || t.indexOf('⚠')>=0 || t.indexOf('待')>=0) return 'warn';
+  if (t.indexOf('缺失')>=0 || t.indexOf('❌')>=0 || t.indexOf('不')===0) return 'bad';
+  return 'info';
+}
+function card(num,title,body,anchor){
+  const label = esc(num+' '+title);
+  return '<section class="card m-'+anchor+'" id="sec-'+anchor+'" data-label="'+label+'"><h2><span class="num">'+num+'</span>'+esc(title)+'</h2>'+body+'</section>';
+}
+
+/* ---------- 页头 ---------- */
+function renderHero(){
+  const d = REPORT_DATA;
+  const lvl = d.verdict_level || (d.score>=60?'green':(d.score>=45?'amber':'red'));
+  const tags = [
+    d.location && ('📍 '+d.location),
+    d.salary && ('💰 '+d.salary),
+    d.education && ('🎓 '+d.education),
+    d.experience && ('⏳ '+d.experience),
+    d.work_type && ('🏢 '+d.work_type)
+  ].filter(Boolean).map(t=>'<span>'+esc(t)+'</span>').join('');
+  document.getElementById('hero').innerHTML =
+    '<div class="kicker">AI 求职 SOP · 岗位匹配分析报告</div>'+
+    '<h1>'+esc(d.job_title||'岗位分析')+'</h1>'+
+    (d.company? '<div style="opacity:.9;font-size:13.5px;margin-top:2px">'+esc(d.company)+'</div>':'')+
+    '<div class="tags">'+tags+'</div>'+
+    '<div class="score-row"><div class="score" id="heroScore">'+fmt(d.score)+'<small>分</small></div>'+
+    '<div class="verdict" id="heroVerdict">'+esc(verdictText(lvl, d.verdict))+'</div></div>'+
+    '<div class="meta-line">候选人：'+esc(d.candidate||'—')+' ｜ 生成日期：'+esc(d.date||'')+(d.source?' ｜ 来源：'+esc(d.source):'')+'</div>';
+}
+
+/* ---------- ★ 岗位信息与联系方式 ---------- */
+function renderContact(){
+  const d = REPORT_DATA;
+  const items = [
+    ['🏢 招聘公司', d.company],
+    ['👤 HR 姓名', d.hr_name],
+    ['📞 电话 / 微信', d.phone],
+    ['📍 工作地址', d.address],
+    ['🗂 岗位分类', d.job_category],
+    ['🎯 岗位名称', d.job_title]
+  ].filter(x=>x[1]);
+  const links = [];
+  if(d.source_link) links.push('<a class="lnk" href="'+esc(d.source_link)+'" target="_blank">🔗 打开原岗位链接</a>');
+  if(d.jd_image) links.push('<a class="lnk" href="/jd/'+encodeURIComponent(d.jd_image)+'" target="_blank">🖼 查看原始 JD 截图</a>');
+  if(d.phone) links.push('<button class="lnk" data-copy="'+esc(d.phone)+'">📞 复制电话</button>');
+  if(!items.length && !links.length) return '';
+  let h = '';
+  if(items.length){
+    h += '<div class="meta-grid">'+items.map(x=>'<div class="mi"><span class="mk">'+x[0]+'</span><span class="mv">'+esc(x[1])+'</span></div>').join('')+'</div>';
+  } else {
+    h += '<p style="color:var(--muted);font-size:13px">JD 原文里没有提取到公司 / HR / 电话等信息。可以在工具「岗位台账」里手动补填，补完这里也会显示。</p>';
+  }
+  if(links.length) h += '<div class="lnkrow">'+links.join('')+'</div>';
+  return card('★','岗位信息与联系方式（联系 HR 用）', h, 'contact');
+}
+
+/* ---------- 01 硬门槛 ---------- */
+function renderGates(){
+  const d = REPORT_DATA; if(!d.hard_gates||!d.hard_gates.length) return '';
+  const rows = d.hard_gates.map((g,i)=>{
+    const key='gate:'+i, on = state.checks[key]?'checked':'';
+    return '<tr><td><label class="chk"><input type="checkbox" data-key="'+key+'" '+on+'><span>'+esc(g.name)+'</span></label></td>'+
+      '<td>'+esc(g.jd)+'</td><td>'+esc(g.me)+'</td>'+
+      '<td><span class="pill '+pillFor(g.level||verdictPill(g.result))+'">'+esc(g.result)+'</span></td></tr>';
+  }).join('');
+  const risks = (d.risks&&d.risks.length)? '<div class="note">⚠️ '+d.risks.map(esc).join('<br>⚠️ ')+'</div>' : '';
+  return card('01','硬门槛判定','<table><tr><th></th><th>JD 要求</th><th>我的情况</th><th>结论</th></tr>'+rows+'</table>'+risks+
+    '<p style="font-size:12.3px;color:var(--muted)">勾选 = 投递前已逐项确认过</p>','gates');
+}
+
+/* ---------- 02 匹配打分 ---------- */
+function renderScores(){
+  const d = REPORT_DATA; if(!d.scores||!d.scores.length) return '';
+  const rows = d.scores.map((s,i)=>{
+    const val = (state.scores[i]!=null)? state.scores[i] : s.score;
+    return '<div class="srow"><div class="sname">'+esc(s.dimension)+'<small>'+esc(s.weight)+'%</small></div>'+
+      '<input type="range" min="0" max="10" step="0.5" value="'+val+'" data-score="'+i+'">'+
+      '<div class="sval" id="sv'+i+'">'+fmt(val)+'</div></div>';
+  }).join('');
+  const note = d.score_note? '<div class="note">'+esc(d.score_note)+'</div>' : '';
+  return card('02','匹配打分（可拖动修正）', rows +
+    '<div class="total-box"><span class="lbl">加权总分</span><span class="val" id="totalVal">'+fmt(d.score)+'</span></div>'+note+
+    '<p style="font-size:12.3px;color:var(--muted)">拖动滑块可主观修正 AI 打分，总分实时重算并自动保存</p>','scores');
+}
+
+/* ---------- 03 JD 拆解 ---------- */
+function renderBreakdown(){
+  const d = REPORT_DATA; let h='';
+  if(d.job_profile) h += '<h3>岗位画像</h3><p>'+esc(d.job_profile)+'</p>';
+  if(d.pain_points&&d.pain_points.length){
+    h += '<h3>职责 → 业务痛点反推</h3><table><tr><th>职责原文</th><th>背后痛点</th><th>你的证据</th></tr>'+
+      d.pain_points.map(p=>'<tr><td>'+esc(p.duty)+'</td><td>'+esc(p.pain)+'</td><td>'+esc(p.evidence||'—')+'</td></tr>').join('')+'</table>';
+  }
+  if(d.gaps&&d.gaps.length){
+    h += '<h3>能力缺口（skill gap）</h3><table><tr><th>能力要求</th><th>你的现状</th><th>判定</th></tr>'+
+      d.gaps.map(g=>'<tr><td>'+esc(g.skill)+'</td><td>'+esc(g.current)+'</td><td><span class="pill '+verdictPill(g.verdict)+'">'+esc(g.verdict)+'</span></td></tr>').join('')+'</table>';
+  }
+  if(d.keywords&&d.keywords.length){
+    h += '<h3>JD 关键词 / 术语（简历与话术需保留原词过 ATS）</h3><p>'+
+      d.keywords.map(k=>'<span class="pill info" style="margin:2px 4px 2px 0">'+esc(k)+'</span>').join('')+'</p>';
+  }
+  return h? card('03','JD 拆解 · 能力缺口', h, 'breakdown') : '';
+}
+
+/* ---------- 04 简历大纲 ---------- */
+function renderOutline(){
+  const d = REPORT_DATA, o = d.resume_outline; if(!o) return '';
+  let h='';
+  if(o.highlights&&o.highlights.length){
+    h += '<h3>重点体现清单（按 JD 权重排序）</h3><ol>'+o.highlights.map(x=>'<li>'+esc(x)+'</li>').join('')+'</ol>';
+  }
+  if(o.reorder&&o.reorder.length){
+    h += '<h3>经历重排建议</h3><ol>'+o.reorder.map(x=>'<li>'+esc(x)+'</li>').join('')+'</ol>';
+  }
+  if(o.greeting){
+    h += '<h3>BOSS 打招呼话术</h3><div class="quote">'+esc(o.greeting)+'</div>';
+  }
+  return h? card('04','简历大纲', h, 'outline') : '';
+}
+
+/* ---------- 05 简历优化方向 ---------- */
+function renderOptimization(){
+  const d = REPORT_DATA, o = d.resume_optimization; if(!o) return '';
+  const list=(title,arr)=> (arr&&arr.length)? '<h3>'+title+'</h3><ul>'+arr.map(x=>'<li>'+esc(x)+'</li>').join('')+'</ul>' : '';
+  let h = list('➕ 增：建议补写的内容', o.add) +
+          list('➖ 删：建议删/缩的内容', o.remove) +
+          list('✏️ 改：表述改写方向', o.rewrite) +
+          list('📊 量化补强：缺数字的地方怎么补', o.quantify);
+  if(o.keyword_map&&o.keyword_map.length){
+    h += '<h3>关键词对齐表（JD 词 → 你简历里的写法）</h3><table class="kwmap"><tr><th>JD 关键词</th><th>建议在简历里写成</th></tr>'+
+      o.keyword_map.map(k=>'<tr><td>'+esc(k.jd)+'</td><td>'+esc(k.resume)+'</td></tr>').join('')+'</table>';
+  }
+  if(o.section_notes&&o.section_notes.length){
+    h += '<h3>逐段改写要点</h3><table><tr><th>简历段落</th><th>改写建议</th></tr>'+
+      o.section_notes.map(s=>'<tr><td>'+esc(s.section)+'</td><td>'+esc(s.advice)+'</td></tr>').join('')+'</table>';
+  }
+  return h? card('05','简历优化方向', h, 'optimization') : '';
+}
+
+/* ---------- 06 面试准备 ---------- */
+function renderInterview(){
+  const d = REPORT_DATA, it = d.interview; if(!it) return '';
+  let h='';
+  if(it.questions&&it.questions.length){
+    h += '<h3>预测面试题（点开看答案骨架；勾选=已准备）</h3>';
+    h += it.questions.map((q,i)=>{
+      const key='iq:'+i, on = state.checks[key]?'checked':'';
+      return '<details><summary>'+
+        '<input type="checkbox" data-key="'+key+'" '+on+' onclick="event.stopPropagation()" style="width:15px;height:15px;accent-color:var(--accent);cursor:pointer;flex:none">'+
+        '<span>'+esc(q.q)+'</span>'+(q.intent?'<span class="intent">'+esc(q.intent)+'</span>':'')+
+        '</summary><div class="ans">'+esc(q.skeleton)+'</div></details>';
+    }).join('');
+  }
+  if(it.asks&&it.asks.length){
+    h += '<h3>反问问题</h3><ol>'+it.asks.map(x=>'<li>'+esc(x)+'</li>').join('')+'</ol>';
+  }
+  return h? card('06','面试准备', h, 'interview') : '';
+}
+
+/* ---------- 投递 checklist + 状态 ---------- */
+function renderApplication(){
+  const d = REPORT_DATA; let h='';
+  if(d.checklist&&d.checklist.length){
+    h += '<h3>投递前 Checklist</h3>' + d.checklist.map((c,i)=>{
+      const key='cl:'+i, on = state.checks[key]?'checked':'';
+      return '<label class="chk"><input type="checkbox" data-key="'+key+'" '+on+'><span>'+esc(c)+'</span></label>';
+    }).join('');
+  }
+  const a = state.app;
+  const status = a.status!=null?a.status:((d.application&&d.application.status)||'未投递');
+  const next = a.next!=null?a.next:((d.application&&d.application.next_followup)||'');
+  const notes = a.notes!=null?a.notes:((d.application&&d.application.notes)||'');
+  const opts = ['未投递','已投','待回复','面试中','已拒','Offer','放弃'];
+  h += '<h3>投递状态（可直接编辑）</h3><div class="app-row">'+
+    '<label>状态 <select data-app="status">'+opts.map(o=>'<option '+(o===status?'selected':'')+'>'+esc(o)+'</option>').join('')+'</select></label>'+
+    '<label>下一跟进 <input type="date" data-app="next" value="'+esc(next)+'"></label>'+
+    '<label style="flex:1;min-width:220px">备注 <input type="text" data-app="notes" style="flex:1;width:100%" value="'+esc(notes)+'" placeholder="面试反馈 / 联系人 / 薪资谈判要点"></label>'+
+    '</div>';
+  return card('✓','投递执行', h, 'apply');
+}
+
+/* ---------- 目录：可点击跳转 + 滚动高亮 ---------- */
+function buildToc(){
+  const secs = Array.prototype.slice.call(document.querySelectorAll('#main .card[id]'));
+  const toc = document.getElementById('toc');
+  if(!secs.length){ toc.style.display='none'; return; }
+  toc.innerHTML = secs.map(s=>'<a href="#'+s.id+'" data-target="'+s.id+'">'+esc(s.dataset.label)+'</a>').join('') +
+                  '<a class="top" href="#hero">↑ 顶部</a>';
+  initSpy();
+}
+function initSpy(){
+  const links = Array.prototype.slice.call(document.querySelectorAll('#toc a[data-target]'));
+  const secs = links.map(a=>document.getElementById(a.dataset.target));
+  function onScroll(){
+    const y = window.scrollY + 96;
+    let idx = 0;
+    secs.forEach((s,i)=>{ if(s && s.offsetTop <= y) idx = i; });
+    links.forEach((a,i)=>a.classList.toggle('active', i===idx && window.scrollY > 60));
+  }
+  window.addEventListener('scroll', onScroll, {passive:true});
+  onScroll();
+}
+
+/* ---------- 总分实时重算 ---------- */
+function recalc(){
+  const d = REPORT_DATA; if(!d.scores) return;
+  let sum=0;
+  d.scores.forEach((s,i)=>{
+    const v = (state.scores[i]!=null)? Number(state.scores[i]) : Number(s.score);
+    sum += v * Number(s.weight);
+  });
+  const total = sum/10;
+  const el = document.getElementById('totalVal'); if(el) el.textContent = fmt(total);
+  const hs = document.getElementById('heroScore'); if(hs) hs.innerHTML = fmt(total)+'<small>分</small>';
+  const hv = document.getElementById('heroVerdict');
+  if(hv){
+    const lvl = total>=60?'green':(total>=45?'amber':'red');
+    hv.textContent = verdictText(lvl, null);
+    hv.style.opacity = (lvl!==(d.verdict_level||'green')) ? '.75' : '1';
+  }
+}
+
+/* ---------- 事件绑定 ---------- */
+function bind(){
+  document.querySelectorAll('#main input[type=checkbox][data-key]').forEach(cb=>{
+    cb.addEventListener('change', ()=>{ state.checks[cb.dataset.key] = cb.checked; save(); flash(); });
+  });
+  document.querySelectorAll('#main input[type=range][data-score]').forEach(r=>{
+    const i = r.dataset.score;
+    r.addEventListener('input', ()=>{
+      state.scores[i] = Number(r.value);
+      const sv = document.getElementById('sv'+i); if(sv) sv.textContent = fmt(r.value);
+      recalc();
+    });
+    r.addEventListener('change', ()=>{ save(); flash(); });
+  });
+  document.querySelectorAll('#main [data-app]').forEach(el=>{
+    el.addEventListener('change', ()=>{ state.app[el.dataset.app] = el.value; save(); flash(); });
+  });
+  document.querySelectorAll('#main [data-copy]').forEach(b=>{
+    b.addEventListener('click', ()=>{
+      const t = b.dataset.copy;
+      if(navigator.clipboard) navigator.clipboard.writeText(t).then(()=>flash('已复制：'+t)).catch(()=>flash('请手动复制：'+t));
+      else flash('请手动复制：'+t);
+    });
+  });
+}
+
+/* ---------- 启动 ---------- */
+function render(){
+  renderHero();
+  document.getElementById('main').innerHTML =
+    renderContact()+renderGates()+renderScores()+renderBreakdown()+renderOutline()+renderOptimization()+renderInterview()+renderApplication();
+  document.getElementById('foot').textContent = '由 AI 求职 SOP 生成 · 文件：'+RID+'.html · 勾选与打分保存在本机浏览器';
+  bind();
+  recalc();
+  buildToc();
+}
+render();
+</script>
+</body>
+</html>
