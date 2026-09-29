@@ -1,16 +1,20 @@
+# Python
 __pycache__/
 *.pyc
+
+# 构建产物 / 临时
 dist/
 _mockups/
-data/profiles/*/logs/
-data/profiles/*/reports/
-data/profiles/*/jd/
-data/profiles/*/resumes/
-data/profiles/*/config.json
-data/profiles/*/jobs.json
-data/profiles/*/knowledge.json
-data/current_profile.txt
-config.json
 _backup_before_migrate.zip
+
+# 个人数据（绝不入库）
+config.json
+data/
+reports/
+resumes/
+资产库/
+学习材料/
+
+# 反馈包
 报告*.zip
 反馈日志包_*.zip
