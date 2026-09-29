@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+dist/
+_mockups/
+data/profiles/*/logs/
+data/profiles/*/reports/
+data/profiles/*/jd/
+data/profiles/*/resumes/
+data/profiles/*/config.json
+data/profiles/*/jobs.json
+data/profiles/*/knowledge.json
+data/current_profile.txt
+config.json
+_backup_before_migrate.zip
+报告*.zip
+反馈日志包_*.zip
