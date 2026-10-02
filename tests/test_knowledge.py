@@ -69,5 +69,22 @@ class SourceMergeTest(_Isolated):
         self.assertEqual({s["url"] for s in out}, {"https://x", "https://y"})
 
 
+class BrainstormTest(_Isolated):
+    def test_brainstorm_adds_layer1_nodes(self):
+        chat = fake_chat_factory(['{"related":[{"id":"sft","term":"SFT","definition":"d",'
+                                  '"plain_explanation":"p","relation":"前置"}]}'])
+        core = [knowledge.normalize_node({"id": "rlhf", "term": "RLHF", "definition": "d",
+                                          "plain_explanation": "p"}, 0)]
+        nodes = knowledge.brainstorm(core, {"text_model": {"base_url": "u", "api_key": "k",
+                                                           "model": "m"}}, chat=chat)
+        self.assertEqual(len(nodes), 1)
+        self.assertEqual(nodes[0]["layer"], 1)
+        self.assertEqual(core[0]["related"][0]["id"], "sft")
+
+    def test_brainstorm_skips_when_empty(self):
+        self.assertEqual(knowledge.brainstorm([], {"text_model": {"base_url": "u", "api_key": "k",
+                                                                 "model": "m"}}), [])
+
+
 if __name__ == "__main__":
     unittest.main()

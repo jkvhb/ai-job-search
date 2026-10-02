@@ -71,3 +71,43 @@ def merge_sources(a, b):
             seen.add(u)
             out.append(s)
     return out
+
+
+BRAIN_SYSTEM = """你是知识网络构建专家。给定一个核心概念，列出候选人还需要了解的 2~3 个**关联知识点**。
+
+只输出 JSON：{"related":[{"id":"英文短标识","term":"术语","definition":"专业定义(50字内)",
+"plain_explanation":"通俗解释+例子","relation":"前置|对比|属于|应用"}]}
+
+硬性要求：
+- 2~3 个，必须与给定概念直接相关，不要凑数
+- 字符串内部禁止英文双引号，禁止裸换行
+- 全部中文"""
+
+
+def brainstorm(core_nodes, cfg, chat=None):
+    """第 ② 步：为每个核心知识点扩出第 1 层关联（并回填 core.related）"""
+    if not core_nodes:
+        return []
+    chat = chat or llm.call_openai_compatible
+    new_nodes, seen = [], {n["id"] for n in core_nodes}
+    for node in core_nodes:
+        try:
+            reply = _call(chat, cfg, [
+                {"role": "system", "content": BRAIN_SYSTEM},
+                {"role": "user", "content": "核心概念：%s\n专业定义：%s\n\n请列出 2~3 个关联知识点。"
+                                            % (node["term"], node["definition"])},
+            ])
+            data = llm.parse_json_reply(reply)
+        except Exception as e:
+            log.log_exc("knowledge.brainstorm_error", e, term=node.get("term"))
+            continue
+        for r in (data.get("related") or [])[:MAX_RELATED_PER_NODE]:
+            if not (r or {}).get("term"):
+                continue
+            child = normalize_node(r, 1)
+            node["related"].append({"id": child["id"], "relation": (r.get("relation") or "相关").strip()})
+            if child["id"] not in seen:
+                seen.add(child["id"])
+                new_nodes.append(child)
+    log.log_event("knowledge.brainstorm_done", core=len(core_nodes), expanded=len(new_nodes))
+    return new_nodes
