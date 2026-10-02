@@ -210,6 +210,15 @@
       <label class="fld">API Key</label><input type="password" id="vKey" placeholder="sk-...">
     </div>
     <div class="card">
+      <h2>搜索源（可选，用于给知识点附真实来源）</h2>
+      <div id="spList"></div>
+      <div class="row" style="margin-top:10px">
+        <button class="btn ghost" id="spAddBtn">＋ 添加搜索源</button>
+      </div>
+      <div class="hintline">按顺序尝试，失败自动换下一个。支持 <code>tavily</code> / <code>bocha</code>。
+        不配也能用，只是知识点的来源会标成「AI 整理待查证」。</div>
+    </div>
+    <div class="card">
       <button class="btn" id="saveCfgBtn">💾 保存设置</button>
       <div class="status" id="cfgSt"></div>
       <div class="hintline">Key 只存在本机 <code>config.json</code>，不会上传到任何第三方</div>
@@ -420,15 +429,41 @@ $('#saveResumeBtn').addEventListener('click', async ()=>{
 });
 $('#clearResumeBtn').addEventListener('click', ()=>{ $('#resumeContent').value=''; $('#editingName').textContent='未选择'; delete $('#editingName').dataset.name; });
 
+/* ---------------- 搜索源 ---------------- */
+let SP = [];
+function renderSP(){
+  const box = $('#spList');
+  box.innerHTML = SP.length ? SP.map((p,i)=>
+    '<div class="row" style="margin-bottom:8px;align-items:center">'+
+      '<input type="text" data-sp="'+i+'" data-f="name" placeholder="tavily / bocha" value="'+esc(p.name||'')+'" style="max-width:130px">'+
+      '<input type="text" class="grow" data-sp="'+i+'" data-f="base_url" placeholder="https://api.tavily.com" value="'+esc(p.base_url||'')+'">'+
+      '<input type="password" class="grow" data-sp="'+i+'" data-f="api_key" placeholder="API Key" value="'+esc(p.api_key||'')+'">'+
+      '<button class="btn danger sm" data-spdel="'+i+'">删除</button>'+
+    '</div>').join('') : '<div class="empty">还没有搜索源</div>';
+  $$('#spList [data-sp]').forEach(el=>el.addEventListener('input',()=>{
+    SP[+el.dataset.sp][el.dataset.f] = el.value;
+  }));
+  $$('#spList [data-spdel]').forEach(b=>b.addEventListener('click',()=>{
+    SP.splice(+b.dataset.spdel,1); renderSP();
+  }));
+}
+$('#spAddBtn').addEventListener('click', ()=>{
+  SP.push({name:'tavily', base_url:'https://api.tavily.com', api_key:''});
+  renderSP();
+});
+
 /* ---------------- 配置 ---------------- */
 async function loadConfig(){
   const c = await fetch('/api/config').then(x=>x.json());
   $('#tBase').value=c.text_model.base_url; $('#tModel').value=c.text_model.model; $('#tKey').value=c.text_model.api_key||'';
   $('#vBase').value=c.vision_model.base_url; $('#vModel').value=c.vision_model.model; $('#vKey').value=c.vision_model.api_key||'';
+  SP = Array.isArray(c.search_providers) ? c.search_providers : [];
+  renderSP();
 }
 $('#saveCfgBtn').addEventListener('click', async ()=>{
   const body = {text_model:{label:'DeepSeek（文本分析 / 跑 SOP）',base_url:$('#tBase').value.trim(),model:$('#tModel').value.trim(),api_key:$('#tKey').value.trim()},
-                vision_model:{label:'Kimi（识图 OCR / 读 JD 截图）',base_url:$('#vBase').value.trim(),model:$('#vModel').value.trim(),api_key:$('#vKey').value.trim()}};
+                vision_model:{label:'Kimi（识图 OCR / 读 JD 截图）',base_url:$('#vBase').value.trim(),model:$('#vModel').value.trim(),api_key:$('#vKey').value.trim()},
+                search_providers: SP};
   const r = await fetch('/api/config', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)}).then(x=>x.json());
   show($('#cfgSt'), r.ok?'ok':'err', r.ok?'设置已保存 ✓':'保存失败');
 });

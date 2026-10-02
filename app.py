@@ -533,11 +533,15 @@ class Handler(BaseHTTPRequestHandler):
                         if cfg[k].get(kk) != vv:
                             changed.append("%s.%s" % (k, kk))
                     cfg[k].update(body[k])
+            if isinstance(body.get("search_providers"), list):
+                cfg["search_providers"] = body["search_providers"]
+                changed.append("search_providers")
             store.save_config(cfg)
             log.log_event("config.save", changed=changed, text_model=cfg["text_model"]["model"],
-                      vision_model=cfg["vision_model"]["model"],
-                      text_key_set=bool(cfg["text_model"]["api_key"]),
-                      vision_key_set=bool(cfg["vision_model"]["api_key"]))
+                          vision_model=cfg["vision_model"]["model"],
+                          text_key_set=bool(cfg["text_model"]["api_key"]),
+                          vision_key_set=bool(cfg["vision_model"]["api_key"]),
+                          search_count=len(cfg.get("search_providers") or []))
             return self._send(200, {"ok": True})
 
         if p == "/api/resumes":
