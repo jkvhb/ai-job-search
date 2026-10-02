@@ -241,7 +241,12 @@ let kStack = [];           // 卡片栈：当前钻取路径的节点 id
 function kNode(id){ return KNOW.find(n => n.id === id); }
 
 function renderKnowledge(){
-  if(!KNOW.length) return '';
+  const err = (REPORT_DATA && REPORT_DATA.knowledge_error) || '';
+  if(!KNOW.length){
+    if(!err) return '';
+    return card('📚','知识学习地图',
+                '<div class="note">⚠️ 知识地图生成失败：'+esc(err)+'</div>', 'knowledge');
+  }
   if(!kStack.length) kStack = [KNOW[0].id];
   return card('📚','知识学习地图（点关联概念可继续钻取）',
               '<div id="knowBox">'+knowInner()+'</div>', 'knowledge');

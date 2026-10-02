@@ -19,6 +19,7 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, unquote, quote
 
+import knowledge
 import llm
 import log
 import search as search_mod
@@ -261,6 +262,19 @@ def do_analyze(jd_text, image_data_url, resume_name, link=""):
         if data is None:
             raise RuntimeError("模型返回的 JSON 无法解析，自动修复也未成功：%s" % last_err)
         d = normalize(data, resume_name, " + ".join(source_bits) or "文本输入")
+
+        # ---- 知识学习地图（阶段 1）----
+        know_nodes = []
+        try:
+            _t = time.time()
+            know_nodes = knowledge.build_for_jd(jd_text, cfg)
+            log.log_event("analyze.knowledge_done", ms=int((time.time() - _t) * 1000),
+                          nodes=len(know_nodes))
+        except Exception as e:
+            # 明确区分「管线失败」与「真的没有知识点」，避免静默变成空模块
+            log.log_exc("analyze.knowledge_error", e)
+            d["knowledge_error"] = str(e)
+        d["knowledge"] = know_nodes
 
         fname = render_report(d)
         job_id = fname[:-5]
