@@ -29,14 +29,17 @@ PKG = "AI求职助手-分享版-%s" % STAMP
 
 # ---- 要打包的源码与文档 ----
 FILES = [
-    "app.py", "启动.bat", "创建桌面快捷方式.bat", "分享说明.md", "README.md", "EXAMPLES.md",
+    "app.py", "store.py", "log.py", "llm.py", "search.py", "knowledge.py", "migrate_to_profiles.py",
+    "启动.bat", "创建桌面快捷方式.bat", "分享说明.md", "README.md", "EXAMPLES.md",
     "00-求职SOP总纲.md", "01-资产库构建.md", "02-预筛与打分.md",
     "03-JD拆解.md", "04-简历大纲.md", "05-面试准备.md", "06-投递追踪.md",
 ]
 DIRS = ["web", "assets", "templates"]
 
 # ---- 绝不打包（个人数据 / 密钥）----
-BLOCK_FILES = {"config.json", "jobs.json", "events.jsonl"}
+# 注意：从重构后 app.py 只读 data/profiles/<key>/，jobs.json / events.jsonl 等散落
+# 旧路径一并拦住；.leak-keywords.txt 里是真实姓名/手机号，绝不允许进包。
+BLOCK_FILES = {"config.json", "jobs.json", "events.jsonl", ".leak-keywords.txt"}
 BLOCK_DIRS = {"data", "reports", "resumes", "dist", "__pycache__", "docs", ".git"}
 
 NEW_CONFIG = {
@@ -46,6 +49,8 @@ NEW_CONFIG = {
     "vision_model": {"label": "Kimi（识图 OCR / 读 JD 截图）",
                      "base_url": "https://api.moonshot.cn/v1",
                      "model": "kimi-k2.6", "temperature": 1, "api_key": ""},
+    # 搜索源留空：不配也能用，只是知识点来源会全部标「AI 整理待查证」
+    "search_providers": [],
 }
 
 STARTER_RESUME = """# 我的简历（把这里换成你自己的内容）
@@ -107,6 +112,8 @@ SHARE_NOTE = """# AI 求职助手 · 测试版
 3. **简历大纲 + 简历优化方向**（增删改、量化补强、关键词对齐、逐段改写）
 4. **面试准备**（预测题 + 答案骨架 + 反问）
 5. **岗位台账**（自动抽取公司 / HR / 电话 / 地址，可搜索筛选，随时找回要联系的岗位）
+6. **知识学习地图**（JD → 12~15 个核心知识点：专业定义 + 通俗解释 + 前世今生时间线 +
+   关联知识 + 面试会怎么问；配了搜索源还会附**真实来源链接**，可点开原文）
 
 产物是一份**可交互的 HTML 报告**（带目录跳转、勾选清单、打分滑块、导出 PDF）。
 
@@ -129,6 +136,8 @@ SHARE_NOTE = """# AI 求职助手 · 测试版
 3. 进「⚙️ 设置」填两个 API Key，中文名照抄：
    - 文本分析（DeepSeek）：模型名填 `deepseek-flash`
    - 识图（Kimi / Moonshot）：模型名填 `kimi-k2.6`
+   - （可选）「搜索源」：填 `tavily` 或 `bocha` 的 Key，知识点才会带真实来源；
+     不填也能用，只是来源统一标「AI 整理待查证」（不编造链接）
    保存后回到「① 分析岗位」就能用了
 
 > 还没申请 Key？先点「**看看示例效果（免 API Key）**」感受一下界面和报告长什么样。
@@ -157,12 +166,13 @@ Key 申请地址：
 
 | 内容 | 位置 |
 |---|---|
-| API Key | `config.json`（**千万别把这个文件发给别人**） |
-| 简历 | `resumes/` |
-| 分析报告 | `reports/` |
-| 岗位台账 | `data/jobs.json` |
-| 上传的 JD 截图 / 原文 | `data/jd/` |
-| 运行日志 | `data/logs/events.jsonl` |
+| API Key | `data/profiles/<当前用户>/config.json`（**千万别把这个文件发给别人**） |
+| 简历 | `data/profiles/<当前用户>/resumes/` |
+| 分析报告 | `data/profiles/<当前用户>/reports/` |
+| 岗位台账 | `data/profiles/<当前用户>/jobs.json` |
+| 知识库 | `data/profiles/<当前用户>/knowledge.json` |
+| 上传的 JD 截图 / 原文 | `data/profiles/<当前用户>/jd/` |
+| 运行日志 | `data/profiles/<当前用户>/logs/events.jsonl` |
 
 全部只在你本机，不上传任何服务器。
 
@@ -207,6 +217,10 @@ def collect():
     """收集要打包的文件（相对路径 -> 绝对路径）"""
     items = []
     for f in FILES:
+        # 二次保险：万一以后有人往 FILES 里加了个人数据文件，也进不了包
+        if os.path.basename(f) in BLOCK_FILES or f.replace("\\", "/").split("/")[0] in BLOCK_DIRS:
+            print("  跳过（禁止打包）:", f)
+            continue
         p = os.path.join(ROOT, f)
         if os.path.exists(p):
             items.append((f, p))
@@ -284,10 +298,10 @@ def main():
         # 干净的配置（key 留空）
         z.writestr(PKG + "/config.json", json.dumps(NEW_CONFIG, ensure_ascii=False, indent=2))
         # 空目录占位 + 起步简历模板
+        # data/profiles/<key>/{resumes,reports,jd,logs} 由 store.ensure_profile() 按需创建，
+        # 不再逐个写 .gitkeep；data/.gitkeep 只保证包内有一个干净的 data/ 目录。
         z.writestr(PKG + "/resumes/我的简历.md", STARTER_RESUME)
-        z.writestr(PKG + "/reports/.gitkeep", "")
-        z.writestr(PKG + "/data/jd/.gitkeep", "")
-        z.writestr(PKG + "/data/logs/.gitkeep", "")
+        z.writestr(PKG + "/data/.gitkeep", "")
         z.writestr(PKG + "/创建桌面快捷方式.bat", SHORTCUT_BAT)
         z.writestr(PKG + "/分享说明.md", SHARE_NOTE)
 
