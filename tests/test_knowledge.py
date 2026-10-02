@@ -119,5 +119,51 @@ class SourceAndTimelineTest(_Isolated):
         self.assertEqual(out[0]["timeline"][0]["year"], "2022")
 
 
+class ResilienceTest(_Isolated):
+    def test_brainstorm_survives_non_list_related(self):
+        # 合法 JSON 但 related 不是数组 → 不能抛，其他核心点要照常处理
+        chat = fake_chat_factory(['{"related":"hello"}',
+                                  '{"related":[{"id":"b1","term":"B1","definition":"d",'
+                                  '"plain_explanation":"p","relation":"前置"}]}'])
+        core = [knowledge.normalize_node({"id": "a", "term": "A", "definition": "d",
+                                          "plain_explanation": "p"}, 0),
+                knowledge.normalize_node({"id": "b", "term": "B", "definition": "d",
+                                          "plain_explanation": "p"}, 0)]
+        out = knowledge.brainstorm(core, {"text_model": {"base_url": "u", "api_key": "k",
+                                                         "model": "m"}}, chat=chat)
+        self.assertEqual([n["id"] for n in out], ["b1"])
+
+    def test_extract_returns_empty_on_unparseable(self):
+        chat = fake_chat_factory(["完全不是 JSON"])
+        self.assertEqual(knowledge.extract_nodes("JD", {"text_model": {"base_url": "u",
+                                                                       "api_key": "k", "model": "m"}},
+                                                 chat=chat), [])
+
+    def test_extract_returns_empty_on_non_list_nodes(self):
+        chat = fake_chat_factory(['{"nodes":"oops"}'])
+        self.assertEqual(knowledge.extract_nodes("JD", {"text_model": {"base_url": "u",
+                                                                       "api_key": "k", "model": "m"}},
+                                                 chat=chat), [])
+
+    def test_attach_timeline_survives_bad_snippet_type(self):
+        chat = fake_chat_factory(['{"timeline":[{"year":"2022","text":"X"}]}'])
+        nodes = [{"id": "a", "term": "A", "definition": "d", "plain_explanation": "p",
+                  "sources": [{"title": "T", "url": "https://x", "snippet": {"unexpected": "shape"}}],
+                  "confidence": "verified", "timeline": [], "related": [], "layer": 0}]
+        out = knowledge.attach_timeline(nodes, {"text_model": {"base_url": "u", "api_key": "k",
+                                                               "model": "m"}}, chat=chat)
+        self.assertEqual(out[0]["timeline"][0]["year"], "2022")
+
+    def test_attach_timeline_skips_sourceless_without_calling_chat(self):
+        def must_not_call(*a, **kw):
+            raise AssertionError("对没有来源的节点绝不该调用模型")
+
+        nodes = [{"id": "a", "term": "A", "definition": "d", "plain_explanation": "p",
+                  "sources": [], "confidence": "ai-generated", "timeline": [], "related": [], "layer": 0}]
+        out = knowledge.attach_timeline(nodes, {"text_model": {"base_url": "u", "api_key": "k",
+                                                               "model": "m"}}, chat=must_not_call)
+        self.assertEqual(out[0]["timeline"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -50,14 +50,22 @@ def normalize_node(n, layer=0):
 
 
 def extract_nodes(jd_text, cfg, chat=None):
-    """第 ① 步：从 JD 抽出核心知识点"""
+    """第 ① 步：从 JD 抽出核心知识点（失败时记日志并返回空列表，不抛）"""
     chat = chat or llm.call_openai_compatible
-    reply = _call(chat, cfg, [
-        {"role": "system", "content": EXTRACT_SYSTEM},
-        {"role": "user", "content": "岗位 JD：\n%s\n\n请拆出 12~15 个核心知识点，输出 JSON。" % jd_text},
-    ])
-    data = llm.parse_json_reply(reply)
-    nodes = [normalize_node(n, 0) for n in (data.get("nodes") or []) if (n or {}).get("term")]
+    try:
+        reply = _call(chat, cfg, [
+            {"role": "system", "content": EXTRACT_SYSTEM},
+            {"role": "user", "content": "岗位 JD：\n%s\n\n请拆出 12~15 个核心知识点，输出 JSON。" % jd_text},
+        ])
+        data = llm.parse_json_reply(reply)
+    except Exception as e:
+        log.log_exc("knowledge.extract_error", e)
+        return []
+    raw = data.get("nodes")
+    if not isinstance(raw, list):
+        log.log_event("knowledge.extract_bad_shape", level="warn", got=type(raw).__name__)
+        return []
+    nodes = [normalize_node(n, 0) for n in raw if isinstance(n, dict) and n.get("term")]
     log.log_event("knowledge.extract_done", count=len(nodes))
     return nodes[:MAX_CORE]
 
@@ -95,20 +103,26 @@ def brainstorm(core_nodes, cfg, chat=None):
             reply = _call(chat, cfg, [
                 {"role": "system", "content": BRAIN_SYSTEM},
                 {"role": "user", "content": "核心概念：%s\n专业定义：%s\n\n请列出 2~3 个关联知识点。"
-                                            % (node["term"], node["definition"])},
+                                            % (node.get("term", ""), node.get("definition", ""))},
             ])
             data = llm.parse_json_reply(reply)
+            related = data.get("related")
+            if not isinstance(related, list):
+                log.log_event("knowledge.brainstorm_bad_shape", level="warn",
+                              term=node.get("term"), got=type(related).__name__)
+                continue
+            for r in related[:MAX_RELATED_PER_NODE]:
+                if not isinstance(r, dict) or not r.get("term"):
+                    continue
+                child = normalize_node(r, 1)
+                node.setdefault("related", []).append(
+                    {"id": child["id"], "relation": (r.get("relation") or "相关").strip()})
+                if child["id"] not in seen:
+                    seen.add(child["id"])
+                    new_nodes.append(child)
         except Exception as e:
             log.log_exc("knowledge.brainstorm_error", e, term=node.get("term"))
             continue
-        for r in (data.get("related") or [])[:MAX_RELATED_PER_NODE]:
-            if not (r or {}).get("term"):
-                continue
-            child = normalize_node(r, 1)
-            node["related"].append({"id": child["id"], "relation": (r.get("relation") or "相关").strip()})
-            if child["id"] not in seen:
-                seen.add(child["id"])
-                new_nodes.append(child)
     log.log_event("knowledge.brainstorm_done", core=len(core_nodes), expanded=len(new_nodes))
     return new_nodes
 
@@ -133,7 +147,7 @@ def attach_sources(nodes, providers, search=None, max_results=3):
         except Exception as e:
             log.log_exc("knowledge.search_error", e, term=n.get("term"))
             res = []
-        n["sources"] = res
+        n["sources"] = res if isinstance(res, list) else []
         n["confidence"] = "verified" if res else "ai-generated"
     log.log_event("knowledge.sources_done",
                   verified=sum(1 for n in nodes if n["confidence"] == "verified"), total=len(nodes))
@@ -146,17 +160,24 @@ def attach_timeline(nodes, cfg, chat=None):
     for n in nodes:
         if not n.get("sources"):
             continue
-        refs = "\n".join("- %s | %s | %s" % (s.get("title", ""), s.get("snippet", "")[:200], s.get("url", ""))
-                         for s in n["sources"][:5])
         try:
+            refs = "\n".join(
+                "- %s | %s | %s" % (str(s.get("title") or ""),
+                                    str(s.get("snippet") or "")[:200],
+                                    str(s.get("url") or ""))
+                for s in n["sources"][:5] if isinstance(s, dict))
             reply = _call(chat, cfg, [
                 {"role": "system", "content": TIMELINE_SYSTEM},
                 {"role": "user", "content": "概念：%s\n\n参考资料：\n%s\n\n请输出时间线 JSON。"
-                                            % (n["term"], refs)},
+                                            % (n.get("term", ""), refs)},
             ])
             data = llm.parse_json_reply(reply)
+            tl = data.get("timeline")
+            if not isinstance(tl, list):
+                n["timeline"] = []
+                continue
             n["timeline"] = [{"year": str(t.get("year", "")).strip(), "text": (t.get("text") or "").strip()}
-                             for t in (data.get("timeline") or []) if (t or {}).get("text")]
+                             for t in tl if isinstance(t, dict) and (t.get("text") or "").strip()]
         except Exception as e:
             log.log_exc("knowledge.timeline_error", e, term=n.get("term"))
             n["timeline"] = []
