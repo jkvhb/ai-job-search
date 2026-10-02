@@ -86,5 +86,38 @@ class BrainstormTest(_Isolated):
                                                                  "model": "m"}}), [])
 
 
+class SourceAndTimelineTest(_Isolated):
+    def test_attach_sources_marks_verified(self):
+        def fake_search(query, providers=None, **kw):
+            return [{"title": "T", "url": "https://x", "snippet": "s", "date": "2022"}]
+
+        nodes = [knowledge.normalize_node({"id": "a", "term": "A", "definition": "d",
+                                           "plain_explanation": "p"})]
+        out = knowledge.attach_sources(nodes, [{"name": "t", "base_url": "u", "api_key": "k"}],
+                                       search=fake_search)
+        self.assertEqual(out[0]["confidence"], "verified")
+        self.assertEqual(out[0]["sources"][0]["url"], "https://x")
+
+    def test_attach_sources_marks_ai_when_no_result(self):
+        def empty_search(query, providers=None, **kw):
+            return []
+
+        nodes = [knowledge.normalize_node({"id": "a", "term": "A", "definition": "d",
+                                           "plain_explanation": "p"})]
+        out = knowledge.attach_sources(nodes, [{"name": "t", "base_url": "u", "api_key": "k"}],
+                                       search=empty_search)
+        self.assertEqual(out[0]["confidence"], "ai-generated")
+        self.assertEqual(out[0]["sources"], [])
+
+    def test_attach_timeline_when_verified(self):
+        chat = fake_chat_factory(['{"timeline":[{"year":"2022","text":"ChatGPT 发布"}]}'])
+        nodes = [{"id": "a", "term": "A", "definition": "d", "plain_explanation": "p",
+                  "sources": [{"title": "T", "url": "https://x", "snippet": "s", "date": ""}],
+                  "confidence": "verified", "timeline": [], "related": [], "layer": 0}]
+        out = knowledge.attach_timeline(nodes, {"text_model": {"base_url": "u", "api_key": "k",
+                                                               "model": "m"}}, chat=chat)
+        self.assertEqual(out[0]["timeline"][0]["year"], "2022")
+
+
 if __name__ == "__main__":
     unittest.main()

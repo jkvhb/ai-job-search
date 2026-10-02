@@ -111,3 +111,66 @@ def brainstorm(core_nodes, cfg, chat=None):
                 new_nodes.append(child)
     log.log_event("knowledge.brainstorm_done", core=len(core_nodes), expanded=len(new_nodes))
     return new_nodes
+
+
+TIMELINE_SYSTEM = """你是技术史专家。基于给出的**参考资料**，为该概念梳理「前世今生」时间线。
+
+只输出 JSON：{"timeline":[{"year":"年份或年月","text":"发生了什么(30字内)"}]}
+
+硬性要求：
+- 4~6 条，按时间正序
+- **只写参考资料里能支撑的事实**；资料不足就少写几条，绝不编造
+- 字符串内部禁止英文双引号，禁止裸换行
+- 全部中文"""
+
+
+def attach_sources(nodes, providers, search=None, max_results=3):
+    """第 ③ 步：为每个知识点查真实来源；查不到标 ai-generated"""
+    search = search or search_mod.search
+    for n in nodes:
+        try:
+            res = search(n["term"] + " 是什么", providers=providers, max_results=max_results)
+        except Exception as e:
+            log.log_exc("knowledge.search_error", e, term=n.get("term"))
+            res = []
+        n["sources"] = res
+        n["confidence"] = "verified" if res else "ai-generated"
+    log.log_event("knowledge.sources_done",
+                  verified=sum(1 for n in nodes if n["confidence"] == "verified"), total=len(nodes))
+    return nodes
+
+
+def attach_timeline(nodes, cfg, chat=None):
+    """第 ④ 步：基于来源写「前世今生」时间线（无来源的跳过，不编造）"""
+    chat = chat or llm.call_openai_compatible
+    for n in nodes:
+        if not n.get("sources"):
+            continue
+        refs = "\n".join("- %s | %s | %s" % (s.get("title", ""), s.get("snippet", "")[:200], s.get("url", ""))
+                         for s in n["sources"][:5])
+        try:
+            reply = _call(chat, cfg, [
+                {"role": "system", "content": TIMELINE_SYSTEM},
+                {"role": "user", "content": "概念：%s\n\n参考资料：\n%s\n\n请输出时间线 JSON。"
+                                            % (n["term"], refs)},
+            ])
+            data = llm.parse_json_reply(reply)
+            n["timeline"] = [{"year": str(t.get("year", "")).strip(), "text": (t.get("text") or "").strip()}
+                             for t in (data.get("timeline") or []) if (t or {}).get("text")]
+        except Exception as e:
+            log.log_exc("knowledge.timeline_error", e, term=n.get("term"))
+            n["timeline"] = []
+    log.log_event("knowledge.timeline_done", with_timeline=sum(1 for n in nodes if n["timeline"]))
+    return nodes
+
+
+def build_for_jd(jd_text, cfg, core_limit=MAX_CORE):
+    """编排：① 拆解 → ② 头脑风暴 → ③ 搜索 → ④ 时间线"""
+    core = extract_nodes(jd_text, cfg)[:core_limit]
+    expanded = brainstorm(core, cfg)
+    all_nodes = core + expanded
+    attach_sources(all_nodes, cfg.get("search_providers") or [])
+    attach_timeline(all_nodes, cfg)
+    log.log_event("knowledge.build_done", core=len(core), expanded=len(expanded),
+                  verified=sum(1 for n in all_nodes if n["confidence"] == "verified"))
+    return all_nodes
