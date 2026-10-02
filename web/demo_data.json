@@ -132,5 +132,21 @@
     "按本报告的优化方向改一版简历再投",
     "打招呼话术复制到 BOSS 聊天框"
   ],
-  "application": {"status": "未投递", "next_followup": "", "notes": ""}
+  "application": {"status": "未投递", "next_followup": "", "notes": ""},
+  "knowledge": [
+    {"id":"rlhf","term":"RLHF（基于人类反馈的强化学习）","definition":"先让人对模型回答打分排序训练奖励模型，再用强化学习让模型朝高分方向优化。","plain_explanation":"就像老师先给一摞作文打分排序，让模型学会『什么样的回答更好』，然后照着这个标准反复练。","category":"核心概念","layer":0,"confidence":"verified",
+     "timeline":[{"year":"2017","text":"Christiano 等提出从人类偏好做强化学习"},{"year":"2022.03","text":"InstructGPT 论文，证明 RLHF 让模型更听指令"},{"year":"2022.11","text":"ChatGPT 发布，RLHF 走向大众"},{"year":"2023+","text":"DPO 等免奖励模型方法出现，与 RLHF 并行"}],
+     "related":[{"id":"sft","relation":"前置"},{"id":"mt","relation":"应用"}],
+     "sources":[{"title":"OpenAI · Training language models to follow instructions","url":"https://arxiv.org/abs/2203.02155","date":"2022-03","accessed":"2026-09-30"},{"title":"HuggingFace · Illustrating RLHF","url":"https://huggingface.co/blog/rlhf","date":"2023-02","accessed":"2026-09-30"}],
+     "interview_questions":["RLHF 和 SFT 有什么区别？","你标注的偏好数据是怎么采集和质检的？"],
+     "state":"待学习","last_outcome":"未面试"},
+    {"id":"sft","term":"SFT（监督微调）","definition":"用『输入-理想输出』成对数据在预训练模型上继续训练。","plain_explanation":"拿标准答案喂给模型做练习，让它学会特定格式和任务。","category":"前置知识","layer":1,"confidence":"verified",
+     "timeline":[{"year":"2020","text":"GPT-3 后微调成为落地标配"}],
+     "related":[{"id":"rlhf","relation":"对比"}],
+     "sources":[{"title":"HuggingFace · Supervised Fine-tuning","url":"https://huggingface.co/docs/transformers/training","date":"2023","accessed":"2026-09-30"}],
+     "interview_questions":["SFT 数据量要多少？"],"state":"待学习","last_outcome":"未面试"},
+    {"id":"mt","term":"多轮对话（Multi-turn）","definition":"包含多轮上下文、指代消解、话题切换与打断的对话形态。","plain_explanation":"不是一问一答，而是像打电话那样能记住前面说了什么、能被打断、能接着聊。","category":"核心概念","layer":0,"confidence":"ai-generated",
+     "timeline":[],"related":[{"id":"rlhf","relation":"属于"}],
+     "sources":[],"interview_questions":["多轮对话数据怎么质检？"],"state":"待学习","last_outcome":"未面试"}
+  ]
 }

@@ -100,6 +100,33 @@
   li{font-size:13.6px;color:var(--sub);margin-bottom:5px}
   li b{color:var(--ink)}
   footer{text-align:center;color:var(--muted);font-size:12px;padding:12px 0 28px}
+  /* 知识学习地图 */
+  .kc{border:1px solid var(--line);border-radius:12px;padding:14px 16px;margin-bottom:11px;background:#fcfdff}
+  .kc .kh{display:flex;align-items:center;gap:9px;flex-wrap:wrap;cursor:pointer}
+  .kc .kt{font-size:15.5px;font-weight:700}
+  .kc .kbadge{font-size:11px;font-weight:600;padding:1px 9px;border-radius:99px}
+  .kbadge.core{background:#eef3ff;color:#2563eb}
+  .kbadge.ext{background:#f1f5f9;color:#64748b}
+  .kbadge.hot{background:#fdf3e3;color:#d97706}
+  .kbadge.ai{background:#fdeaea;color:#dc2626}
+  .kbadge.ver{background:#e9f9ef;color:#16a34a}
+  .kc .kchk{margin-left:auto;display:flex;align-items:center;gap:5px;font-size:12.5px;color:var(--sub)}
+  .kc .kplain{background:#eef3ff;border-left:3px solid #2563eb;padding:9px 12px;border-radius:7px;font-size:13.5px;margin-top:9px}
+  .kc .kdef{font-size:13.2px;color:var(--sub);margin-top:8px}
+  .kc .kbody{display:none;margin-top:12px;padding-top:12px;border-top:1px dashed var(--line)}
+  .kc.open .kbody{display:block}
+  .kc h4{font-size:13.5px;font-weight:700;margin:13px 0 8px}
+  .kc .ktl{position:relative;margin-left:6px;padding-left:18px;border-left:2px solid #dbe3f5}
+  .kc .ktl .it{position:relative;margin-bottom:9px}
+  .kc .ktl .it::before{content:"";position:absolute;left:-24px;top:5px;width:9px;height:9px;border-radius:50%;background:#2563eb;border:2px solid #fff;box-shadow:0 0 0 2px #dbe3f5}
+  .kc .kyr{font-size:12px;font-weight:700;color:#2563eb}
+  .kc .ktx{font-size:13px;color:var(--sub)}
+  .kchip{font-size:12px;background:#f1f4fa;color:#4a5568;padding:3px 10px;border-radius:99px;border:1px solid var(--line);cursor:pointer;display:inline-block;margin:2px 4px 2px 0}
+  .kchip:hover{background:#eef3ff;color:#2563eb;border-color:#c7d7fb}
+  .ksrc{font-size:12px;color:var(--muted);margin-top:9px;word-break:break-all}
+  .ksrc a{color:#2563eb}
+  .kcrumb{font-size:12.5px;color:var(--muted);margin-bottom:9px}
+  .kcrumb span{cursor:pointer;color:#2563eb}
   @media print{
     body{background:#fff;padding:0}
     .toolbar{display:none}
@@ -205,6 +232,112 @@ function renderContact(){
   }
   if(links.length) h += '<div class="lnkrow">'+links.join('')+'</div>';
   return card('★','岗位信息与联系方式（联系 HR 用）', h, 'contact');
+}
+
+/* ---------- 📚 知识学习地图 ---------- */
+const KNOW = (REPORT_DATA && REPORT_DATA.knowledge) || [];
+let kStack = [];           // 卡片栈：当前钻取路径的节点 id
+
+function kNode(id){ return KNOW.find(n => n.id === id); }
+
+function renderKnowledge(){
+  if(!KNOW.length) return '';
+  if(!kStack.length) kStack = [KNOW[0].id];
+  return card('📚','知识学习地图（点关联概念可继续钻取）',
+              '<div id="knowBox">'+knowInner()+'</div>', 'knowledge');
+}
+
+function knowInner(){
+  const cur = kNode(kStack[kStack.length-1]);
+  if(!cur) return '';
+  const crumb = '<div class="kcrumb">' + kStack.map((id,i)=>{
+    const n = kNode(id);
+    const t = n ? esc(n.term) : esc(id);
+    return (i ? ' › ' : '') + (i === kStack.length-1 ? '<b>'+t+'</b>' : '<span data-kgo="'+i+'">'+t+'</span>');
+  }).join('') + '</div>';
+  return crumb + kCard(cur, true);
+}
+
+function kCard(n, expanded){
+  const badges =
+    '<span class="kbadge '+(n.layer===0?'core':'ext')+'">'+(n.layer===0?'核心概念':'扩展知识')+'</span>' +
+    (n.confidence==='verified' ? '<span class="kbadge ver">有来源</span>'
+                               : '<span class="kbadge ai">AI整理待查证</span>');
+
+  const plain = n.plain_explanation ? '<div class="kplain">💡 '+esc(n.plain_explanation)+'</div>' : '';
+  const def = n.definition ? '<div class="kdef">'+esc(n.definition)+'</div>' : '';
+
+  const tl = (n.timeline && n.timeline.length)
+    ? '<h4>🕐 前世今生</h4><div class="ktl">' + n.timeline.map(t=>
+        '<div class="it"><div class="kyr">'+esc(t.year)+'</div><div class="ktx">'+esc(t.text)+'</div></div>'
+      ).join('') + '</div>'
+    : '<h4>🕐 前世今生</h4><div class="ktx">暂无可靠来源，未生成时间线（避免编造）。</div>';
+
+  const rel = (n.related && n.related.length)
+    ? '<h4>🔗 相关知识（点开继续钻取）</h4><div>' + n.related.map(r=>{
+        const t = kNode(r.id);
+        const label = (t ? t.term : r.id) + (r.relation ? '·'+r.relation : '');
+        return '<span class="kchip" data-kopen="'+esc(r.id)+'">'+esc(label)+'</span>';
+      }).join('') + '</div>'
+    : '';
+
+  const iq = (n.interview_questions && n.interview_questions.length)
+    ? '<h4>💬 面试会怎么问</h4><div class="ktx">'+n.interview_questions.map(esc).join('<br>')+'</div>' : '';
+
+  const src = (n.sources && n.sources.length)
+    ? '<div class="ksrc">📎 来源：' + n.sources.map(s=>
+        '<a href="'+esc(s.url)+'" target="_blank" rel="noopener">'+esc(s.title || s.url)+'</a>'
+      ).join(' ｜ ') + '</div>'
+    : '<div class="ksrc">📎 未找到可靠来源，以上内容为 AI 整理，请自行查证。</div>';
+
+  const checked = state.checks['know:'+n.id] ? 'checked' : '';
+  return '<div class="kc'+(expanded?' open':'')+'" id="kc-'+esc(n.id)+'">'+
+    '<div class="kh" data-ktoggle="'+esc(n.id)+'">'+
+      '<span class="kt">'+esc(n.term)+'</span>'+badges+
+      '<label class="kchk"><input type="checkbox" data-key="know:'+esc(n.id)+'" '+checked+
+        ' onclick="event.stopPropagation()">已掌握</label>'+
+    '</div>'+ plain + def +
+    '<div class="kbody">'+ tl + rel + iq + src +'</div>'+
+  '</div>';
+}
+
+/* 卡片栈交互：只重绘 #knowBox，不影响报告其它模块的事件绑定 */
+function bindKnow(){
+  const root = document.getElementById('knowBox');
+  if(!root) return;
+  /* #knowBox 每次钻取都会重建卡片，「已掌握」也是新元素；bind() 的通用 checkbox
+     处理器只在启动时跑一次，覆盖不到重建出来的勾选框。这里用事件委托补齐
+     （#knowBox 根节点本身不会被替换）：首屏那张卡已被 bind() 接管，标记后跳过，避免重复保存。 */
+  if(!root.__knowChkBound){
+    root.__knowChkBound = true;
+    root.querySelectorAll('input[type=checkbox][data-key]').forEach(cb=>{ cb.__knowWired = true; });
+    root.addEventListener('change', e=>{
+      const cb = e.target;
+      if(!cb || cb.__knowWired || !cb.dataset || !cb.dataset.key) return;
+      state.checks[cb.dataset.key] = cb.checked; save(); flash();
+    });
+  }
+  root.querySelectorAll('[data-ktoggle]').forEach(el=>{
+    el.addEventListener('click', ()=>{
+      const b = document.getElementById('kc-'+el.dataset.ktoggle);
+      if(b) b.classList.toggle('open');
+    });
+  });
+  root.querySelectorAll('[data-kopen]').forEach(el=>{
+    el.addEventListener('click', ()=>{
+      kStack.push(el.dataset.kopen);
+      root.innerHTML = knowInner();
+      bindKnow();
+      flash('已钻取到新概念');
+    });
+  });
+  root.querySelectorAll('[data-kgo]').forEach(el=>{
+    el.addEventListener('click', ()=>{
+      kStack = kStack.slice(0, +el.dataset.kgo + 1);
+      root.innerHTML = knowInner();
+      bindKnow();
+    });
+  });
 }
 
 /* ---------- 01 硬门槛 ---------- */
@@ -397,13 +530,15 @@ function bind(){
       else flash('请手动复制：'+t);
     });
   });
+  bindKnow();
 }
 
 /* ---------- 启动 ---------- */
 function render(){
   renderHero();
   document.getElementById('main').innerHTML =
-    renderContact()+renderGates()+renderScores()+renderBreakdown()+renderOutline()+renderOptimization()+renderInterview()+renderApplication();
+    renderContact()+renderGates()+renderScores()+renderBreakdown()+renderOutline()
+    +renderOptimization()+renderKnowledge()+renderInterview()+renderApplication();
   document.getElementById('foot').textContent = '由 AI 求职 SOP 生成 · 文件：'+RID+'.html · 勾选与打分保存在本机浏览器';
   bind();
   recalc();
