@@ -97,7 +97,7 @@ def brainstorm(core_nodes, cfg, chat=None):
     if not core_nodes:
         return []
     chat = chat or llm.call_openai_compatible
-    new_nodes, seen = [], {n["id"] for n in core_nodes}
+    new_nodes, seen = [], {n.get("id") for n in core_nodes if n.get("id")}
     for node in core_nodes:
         try:
             reply = _call(chat, cfg, [
@@ -148,7 +148,7 @@ def attach_sources(nodes, providers, search=None, max_results=3):
             log.log_exc("knowledge.search_error", e, term=n.get("term"))
             res = []
         n["sources"] = res if isinstance(res, list) else []
-        n["confidence"] = "verified" if res else "ai-generated"
+        n["confidence"] = "verified" if isinstance(res, list) and res else "ai-generated"
     log.log_event("knowledge.sources_done",
                   verified=sum(1 for n in nodes if n["confidence"] == "verified"), total=len(nodes))
     return nodes
