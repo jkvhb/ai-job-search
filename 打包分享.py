@@ -295,13 +295,14 @@ def main():
     with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as z:
         for rel, full in items:
             z.write(full, PKG + "/" + rel)
-        # 干净的配置（key 留空）
-        z.writestr(PKG + "/config.json", json.dumps(NEW_CONFIG, ensure_ascii=False, indent=2))
-        # 空目录占位 + 起步简历模板
-        # data/profiles/<key>/{resumes,reports,jd,logs} 由 store.ensure_profile() 按需创建，
-        # 不再逐个写 .gitkeep；data/.gitkeep 只保证包内有一个干净的 data/ 目录。
-        z.writestr(PKG + "/resumes/我的简历.md", STARTER_RESUME)
-        z.writestr(PKG + "/data/.gitkeep", "")
+        # 重构后 app 只读 data/profiles/<key>/ 下的数据（store.p_path），
+        # 所以配置与起步简历**必须写进 profile 目录**，否则：
+        #   - 测试者打开「简历」下拉框是空的（根目录的 resumes/ 不会被读取）
+        #   - 改根目录的 config.json 不生效
+        # data/profiles/default/{reports,jd,logs} 由 store.ensure_profile() 按需创建。
+        z.writestr(PKG + "/data/profiles/default/config.json",
+                   json.dumps(NEW_CONFIG, ensure_ascii=False, indent=2))
+        z.writestr(PKG + "/data/profiles/default/resumes/我的简历.md", STARTER_RESUME)
         z.writestr(PKG + "/创建桌面快捷方式.bat", SHORTCUT_BAT)
         z.writestr(PKG + "/分享说明.md", SHARE_NOTE)
 
