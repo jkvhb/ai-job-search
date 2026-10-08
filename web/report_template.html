@@ -461,15 +461,82 @@ function kRun(){
 
 function kWake(){ if (kG && !kG.raf) kG.raf = requestAnimationFrame(kRun); }
 
-function initGraph(){
+/* 事件坐标 → 图谱世界坐标。用 kG.canvas（每次进图谱态都刷新）而不是闭包里捕获的元素，
+   否则 window 上只注册一次的 mousemove/mouseup 会一直拿着第一次那张已废弃的 canvas。 */
+function kToWorld(ev){
+  const c = (kG && kG.canvas) || null;
+  if (!c) return { x: 0, y: 0 };
+  const r = c.getBoundingClientRect();
+  return { x: (ev.clientX - r.left - kG.ox) / kG.scale,
+           y: (ev.clientY - r.top  - kG.oy) / kG.scale };
+}
+function kHit(p){
+  if (!kG) return null;
+  return kG.nodes.find(nd => Math.hypot(nd.x-p.x, nd.y-p.y) <= nd.r + 4) || null;
+}
+
+function initGraph(root){
   const c = document.getElementById('kgCanvas');
   if (!c) { kG = null; return; }
   const W = c.clientWidth || 700, H = c.clientHeight || 420;
   const data = kGraphData();
-  kG = { nodes: data.nodes, edges: data.edges, idx: data.idx,
-         raf: null, scale: 1, ox: 0, oy: 0, drag: null, pan: null, hover: null, settled: false };
+  kG = { nodes: data.nodes, edges: data.edges, idx: data.idx, canvas: c,
+         raf: null, scale: 1, ox: 0, oy: 0, drag: null, pan: null, hover: null,
+         moved: false, settled: false };
   kSeed(kG, W, H);
   kRun();
+
+  c.addEventListener('mousedown', ev => {
+    kG.moved = false;
+    const p = kToWorld(ev), nd = kHit(p);
+    if (nd) kG.drag = { nd, dx: p.x-nd.x, dy: p.y-nd.y };
+    else kG.pan = { x: ev.clientX - kG.ox, y: ev.clientY - kG.oy };
+    c.classList.add('dragging');
+  });
+  /* window 上的两个监听只注册一次（window.__kgBound 守卫），避免每次进图谱态泄漏一对；
+     监听体统一通过 kToWorld/kHit 取当前 canvas，因此重绘后依然有效。 */
+  if (!window.__kgBound){
+    window.__kgBound = true;
+    window.addEventListener('mousemove', ev => {
+      if (!kG) return;
+      if (kG.drag){ const p = kToWorld(ev); kG.drag.nd.x = p.x - kG.drag.dx; kG.drag.nd.y = p.y - kG.drag.dy;
+                    kG.drag.nd.vx = kG.drag.nd.vy = 0; kG.moved = true; kDraw(); return; }
+      if (kG.pan){ kG.ox = ev.clientX - kG.pan.x; kG.oy = ev.clientY - kG.pan.y; kG.moved = true; kDraw(); return; }
+      const p = kToWorld(ev), nd = kHit(p);
+      const h = nd ? nd.id : null;
+      if (h !== kG.hover){ kG.hover = h; kDraw(); }
+    });
+    window.addEventListener('mouseup', () => {
+      if (!kG) return;
+      const moved = kG.moved;                   // 只有真的拖动过才唤醒模拟，单纯点一下不必重启布局
+      kG.drag = null; kG.pan = null;
+      if (kG.canvas) kG.canvas.classList.remove('dragging');
+      if (moved) kWake();                       // 松手后让布局重新收敛
+    });
+  }
+  c.addEventListener('wheel', ev => {
+    ev.preventDefault();
+    const r = c.getBoundingClientRect();
+    const mx = ev.clientX - r.left, my = ev.clientY - r.top;
+    const f = ev.deltaY > 0 ? 0.9 : 1.1;
+    const ns = Math.min(2.5, Math.max(0.4, kG.scale * f));
+    kG.ox = mx - (mx - kG.ox) * (ns / kG.scale);
+    kG.oy = my - (my - kG.oy) * (ns / kG.scale);
+    kG.scale = ns;
+    kDraw();
+  }, { passive: false });
+  c.addEventListener('click', ev => {
+    /* 拖拽（节点或背景）后浏览器仍会补一个 click，这里按“是否真的拖动过”过滤，
+       否则一拖节点就跳走、拖拽等于不可用。 */
+    if (kG.moved){ kG.moved = false; return; }
+    const p = kToWorld(ev), nd = kHit(p);
+    if (!nd) return;
+    kView = 'card';
+    kStack = [nd.id];                          // 跳回卡片：直接定位到该节点
+    root.innerHTML = knowInner();
+    bindKnow();
+    flash('已跳回「' + nd.label + '」的卡片');
+  });
 }
 
 /* 卡片栈交互：只重绘 #knowBox，不影响报告其它模块的事件绑定 */
@@ -517,7 +584,7 @@ function bindKnow(){
       bindKnow();
     });
   });
-  if (kView === 'graph') initGraph();
+  if (kView === 'graph') initGraph(root);
 }
 
 /* ---------- 01 硬门槛 ---------- */
