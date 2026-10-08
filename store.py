@@ -17,6 +17,7 @@ DEFAULT_CONFIG = {
                      "base_url": "https://api.moonshot.cn/v1",
                      "model": "kimi-k2.6", "temperature": 1, "api_key": ""},
     "search_providers": [],
+    "max_searches": 40,   # 每次知识分析最多搜多少次（核心概念优先），控制搜索额度消耗
 }
 
 CATEGORIES = ["数据标注/质检", "AI数据运营", "标注管理", "AI产品经理", "AI训练师", "其他"]
@@ -123,6 +124,10 @@ def load_config(key=None):
                 cfg[k].update({kk: vv for kk, vv in data[k].items() if vv is not None})
         if isinstance(data.get("search_providers"), list):
             cfg["search_providers"] = data["search_providers"]
+        # 可调项：用户可在 config.json 里改搜索次数上限（bool 是 int 子类，要排除）
+        ms = data.get("max_searches")
+        if isinstance(ms, int) and not isinstance(ms, bool) and ms >= 0:
+            cfg["max_searches"] = ms
     return cfg
 
 

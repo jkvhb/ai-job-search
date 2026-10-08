@@ -149,6 +149,8 @@
   .kli .kln{font-weight:600;color:var(--ink)}
   .kli.sub .kln{font-weight:500;color:var(--sub)}
   .kli .kla{margin-left:auto;font-size:12px;color:var(--accent);white-space:nowrap}
+  .kli.last{background:#fff7e6;box-shadow:inset 3px 0 0 #f59e0b}
+  .kli.last:hover{background:#fdf3e3}
   .kbadge.done{background:#e9f9ef;color:#16a34a}
   @media print{
     body{background:#fff;padding:0}
@@ -184,6 +186,8 @@ try { state = JSON.parse(localStorage.getItem(SKEY)) || {}; } catch(e){ state = 
 if (!state.checks) state.checks = {};
 if (!state.scores) state.scores = {};
 if (!state.app) state.app = {};
+if (typeof state.listScroll !== 'number') state.listScroll = 0;   // 列表视图滚动位置（跨卡片往返保持）
+if (!state.lastKnow) state.lastKnow = '';                          // 上次打开的知识点 id（用于高亮）
 
 function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function save(){ try { localStorage.setItem(SKEY, JSON.stringify(state)); } catch(e){} }
@@ -260,7 +264,7 @@ function renderContact(){
 /* ---------- 📚 知识学习地图 ---------- */
 const KNOW = (REPORT_DATA && REPORT_DATA.knowledge) || [];
 let kStack = [];           // 卡片栈：当前钻取路径的节点 id
-let kView = 'card';        // 'card' | 'graph'
+let kView = 'card';        // 'card' | 'list' | 'graph'
 
 function kNode(id){ return KNOW.find(n => n.id === id); }
 
@@ -333,7 +337,8 @@ function kListData(){
 function kListItem(n, sub){
   const ver = n.confidence === 'verified';
   const done = state.checks['know:'+n.id];
-  return '<div class="kli'+(sub?' sub':'')+'" data-kopen2="'+esc(n.id)+'">'+
+  const last = (state.lastKnow === n.id) ? ' last' : '';   // 上次打开的那一条：琥珀色高亮
+  return '<div class="kli'+(sub?' sub':'')+last+'" data-kopen2="'+esc(n.id)+'">'+
     '<span class="kln">'+esc(n.term || n.id)+'</span>'+
     (ver ? '<span class="kbadge ver">有来源</span>' : '<span class="kbadge ai">待查证</span>')+
     (done ? '<span class="kbadge done">已掌握</span>' : '')+
@@ -643,6 +648,8 @@ function bindKnow(){
   // 视图切换
   root.querySelectorAll('[data-kview]').forEach(el=>{
     el.addEventListener('click', ()=>{
+      const b = root.querySelector('.klist');       // 切走之前先把列表位置落盘
+      if (b){ state.listScroll = b.scrollTop; save(); }
       kView = el.dataset.kview;
       root.innerHTML = knowInner();
       bindKnow();
@@ -657,9 +664,13 @@ function bindKnow(){
       kDraw();
     });
   });
-  // 列表条目 → 打开对应卡片
+  // 列表条目 → 打开对应卡片（先记住位置再切视图：切完 .klist 就不存在了）
   root.querySelectorAll('[data-kopen2]').forEach(el=>{
     el.addEventListener('click', ()=>{
+      const box = root.querySelector('.klist');
+      state.listScroll = box ? box.scrollTop : 0;
+      state.lastKnow = el.dataset.kopen2;
+      save();
       kView = 'card';
       kStack = [el.dataset.kopen2];
       root.innerHTML = knowInner();
@@ -700,6 +711,32 @@ function bindKnow(){
       bindKnow();
     });
   });
+  /* 列表视图：恢复上次的滚动位置，并持续记录新位置。
+     #knowBox 每次切换视图都会重建，所以监听器必须靠 box.__bound 守卫，
+     否则同一位置会被叠加绑定、越绑越多。 */
+  if (kView === 'list'){
+    const box = root.querySelector('.klist');
+    if (box){
+      if (typeof state.listScroll === 'number') box.scrollTop = state.listScroll;
+      if (!box.__bound){
+        box.__bound = true;
+        let st = null;
+        box.addEventListener('scroll', ()=>{
+          state.listScroll = box.scrollTop;      // 内存里立即更新，落盘做节流
+          clearTimeout(st);
+          st = setTimeout(save, 250);
+        }, {passive:true});
+      }
+      // 没有历史位置（或位置为 0）时，把上次打开的那一条滚进视野，免得从顶部重翻
+      if (state.lastKnow && !state.listScroll){
+        let lastEl = null;
+        box.querySelectorAll('[data-kopen2]').forEach(el=>{
+          if (el.dataset.kopen2 === state.lastKnow) lastEl = el;
+        });
+        if (lastEl) lastEl.scrollIntoView({block:'center'});
+      }
+    }
+  }
   if (kView === 'graph') initGraph(root);
 }
 
