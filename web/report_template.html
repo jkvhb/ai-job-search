@@ -138,6 +138,18 @@
   .klegend span{display:flex;align-items:center;gap:5px}
   .klegend i{width:11px;height:11px;border-radius:50%;display:inline-block}
   .klegend i.ring{background:#fff;border:3px solid var(--line);width:13px;height:13px}
+  .klmeta{font-size:12.5px;color:var(--muted);margin-bottom:10px}
+  .klist{display:flex;flex-direction:column;gap:10px;max-height:520px;overflow:auto;padding-right:4px}
+  .klgrp{border:1px solid var(--line);border-radius:10px;padding:10px 12px;background:#fcfdff}
+  .klgh{font-size:11.5px;font-weight:700;color:var(--muted);letter-spacing:.5px;margin-bottom:6px}
+  .klgh.sub{margin-top:8px}
+  .klkids{border-left:2px solid #e5e9f2;margin-left:5px;padding-left:9px}
+  .kli{display:flex;align-items:center;gap:8px;padding:6px 8px;border-radius:8px;cursor:pointer;font-size:13.5px}
+  .kli:hover{background:#eef3ff}
+  .kli .kln{font-weight:600;color:var(--ink)}
+  .kli.sub .kln{font-weight:500;color:var(--sub)}
+  .kli .kla{margin-left:auto;font-size:12px;color:var(--accent);white-space:nowrap}
+  .kbadge.done{background:#e9f9ef;color:#16a34a}
   @media print{
     body{background:#fff;padding:0}
     .toolbar{display:none}
@@ -269,12 +281,15 @@ function knowInner(){
   if(!cur) return '';
   const toggle = '<div class="kgbar">'+
     '<button class="kgbtn'+(kView==='card'?' on':'')+'" data-kview="card">📚 卡片视图</button>'+
+    '<button class="kgbtn'+(kView==='list'?' on':'')+'" data-kview="list">📋 列表视图</button>'+
     '<button class="kgbtn'+(kView==='graph'?' on':'')+'" data-kview="graph">🗺 关系总览</button>'+
+    (kView==='graph' ? '<button class="kgbtn" data-kfit="1">⤢ 适应窗口</button>' : '')+
     '<span class="kghint">'+(kView==='graph'
       ? '拖拽节点 · 滚轮缩放 · 拖背景平移 · <b>点节点回到卡片</b>'
-      : '点关联概念可继续钻取')+'</span>'+
+      : (kView==='list' ? '点任意条目打开对应卡片' : '点关联概念可继续钻取'))+'</span>'+
   '</div>';
   if(kView === 'graph') return toggle + '<canvas id="kgCanvas"></canvas>' + kLegend();
+  if(kView === 'list')  return toggle + kListView();
   const crumb = '<div class="kcrumb">' + kStack.map((id,i)=>{
     const n = kNode(id);
     const t = n ? esc(n.term) : esc(id);
@@ -291,6 +306,61 @@ function kLegend(){
     '<span><i class="ring" style="border-color:#d97706"></i>AI 整理待查证</span>'+
     '<span><i class="ring" style="border-color:#f59e0b"></i>当前卡片</span>'+
   '</div>';
+}
+
+/* ---------- 📋 列表视图：一级（核心概念）/ 二级（扩展知识） ---------- */
+function kListData(){
+  const known = {};
+  KNOW.forEach(n => { known[n.id] = n; });
+  const cores = KNOW.filter(n => (n.layer || 0) === 0);
+  const listed = {};
+  const groups = cores.map(c => {
+    listed[c.id] = true;
+    const kids = [];
+    (c.related || []).forEach(r => {
+      const k = r && known[r.id];
+      if (k && k.id !== c.id && !kids.some(x => x.id === k.id)){   // 跳过悬空与自引用
+        kids.push(k);
+        listed[k.id] = true;
+      }
+    });
+    return { core: c, kids: kids };
+  });
+  const orphans = KNOW.filter(n => !listed[n.id]);   // 未被任何一级引用的扩展节点
+  return { groups: groups, orphans: orphans };
+}
+
+function kListItem(n, sub){
+  const ver = n.confidence === 'verified';
+  const done = state.checks['know:'+n.id];
+  return '<div class="kli'+(sub?' sub':'')+'" data-kopen2="'+esc(n.id)+'">'+
+    '<span class="kln">'+esc(n.term || n.id)+'</span>'+
+    (ver ? '<span class="kbadge ver">有来源</span>' : '<span class="kbadge ai">待查证</span>')+
+    (done ? '<span class="kbadge done">已掌握</span>' : '')+
+    '<span class="kla">打开卡片 ›</span>'+
+  '</div>';
+}
+
+function kListView(){
+  const d = kListData();
+  let h = '<div class="klmeta">共 '+KNOW.length+' 个知识点：一级 '+d.groups.length+
+          ' 个核心概念，二级 '+d.groups.reduce((a,g)=>a+g.kids.length,0)+' 个扩展知识</div>';
+  h += '<div class="klist">';
+  d.groups.forEach(g => {
+    h += '<div class="klgrp">'+
+      '<div class="klgh">一级 · 核心概念</div>'+
+      kListItem(g.core, false)+
+      (g.kids.length ? '<div class="klkids">'+
+          '<div class="klgh sub">二级 · 扩展知识</div>'+
+          g.kids.map(k => kListItem(k, true)).join('')+
+        '</div>' : '')+
+    '</div>';
+  });
+  if (d.orphans.length){
+    h += '<div class="klgrp"><div class="klgh">未归类的知识点</div>'+
+         d.orphans.map(n => kListItem(n, false)).join('')+'</div>';
+  }
+  return h + '</div>';
 }
 
 function kCard(n, expanded){
@@ -392,11 +462,11 @@ function kStep(g, W, H){
   });
   let energy = 0;
   N.forEach(nd => {
-    nd.vx += (W/2 - nd.x) * 0.0022;
-    nd.vy += (H/2 - nd.y) * 0.0022;
+    nd.vx += (W/2 - nd.x) * 0.0016;
+    nd.vy += (H/2 - nd.y) * 0.0016;
     nd.vx *= 0.86; nd.vy *= 0.86;
-    nd.x = Math.max(nd.r+6, Math.min(W-nd.r-6, nd.x + nd.vx));
-    nd.y = Math.max(nd.r+6, Math.min(H-nd.r-6, nd.y + nd.vy));
+    nd.x += nd.vx;
+    nd.y += nd.vy;
     energy += nd.vx*nd.vx + nd.vy*nd.vy;
   });
   return energy;
@@ -447,6 +517,29 @@ function kDraw(){
   ctx.restore();
 }
 
+/* 首帧前把布局跑到收敛，这样用户看到的是「已经摆好」的图，不会看见乱跳 */
+function kSettle(g, W, H, iters){
+  let e = 1;
+  for (let i = 0; i < iters && e > 0.05; i++) e = kStep(g, W, H);
+  return e;
+}
+
+/* 一次性把视口对准整张图（只是移动镜头，不改变布局，也不限制图的大小） */
+function kFit(g, W, H){
+  if (!g.nodes.length) return;
+  let a = Infinity, b = Infinity, c = -Infinity, d = -Infinity;
+  g.nodes.forEach(nd => {
+    a = Math.min(a, nd.x - nd.r); c = Math.max(c, nd.x + nd.r);
+    b = Math.min(b, nd.y - nd.r); d = Math.max(d, nd.y + nd.r);
+  });
+  const gw = Math.max(c - a, 1), gh = Math.max(d - b, 1);
+  const pad = 26;
+  const s = Math.min((W - pad*2) / gw, (H - pad*2) / gh);
+  g.scale = Math.max(0.25, Math.min(1.6, s));
+  g.ox = W/2 - ((a + c)/2) * g.scale;
+  g.oy = H/2 - ((b + d)/2) * g.scale;
+}
+
 function kRun(){
   const c = document.getElementById('kgCanvas');
   if (!c || !kG) return;
@@ -484,7 +577,11 @@ function initGraph(root){
          raf: null, scale: 1, ox: 0, oy: 0, drag: null, pan: null, hover: null,
          moved: false, settled: false };
   kSeed(kG, W, H);
-  kRun();
+  kSettle(kG, W, H, 500);      // 同步跑到收敛（约 30–80ms）
+  kFit(kG, W, H);              // 一次性对准
+  kDraw();                     // 画一帧即可，此后无自动动画
+  kG.settled = true;
+  kG.raf = null;
 
   c.addEventListener('mousedown', ev => {
     kG.moved = false;
@@ -549,6 +646,25 @@ function bindKnow(){
       kView = el.dataset.kview;
       root.innerHTML = knowInner();
       bindKnow();
+    });
+  });
+  // 图谱：镜头一次性复位到整张图（不改变布局）
+  root.querySelectorAll('[data-kfit]').forEach(el=>{
+    el.addEventListener('click', ()=>{
+      const c = document.getElementById('kgCanvas');
+      if (!kG || !c) return;
+      kFit(kG, c.clientWidth || 700, c.clientHeight || 420);
+      kDraw();
+    });
+  });
+  // 列表条目 → 打开对应卡片
+  root.querySelectorAll('[data-kopen2]').forEach(el=>{
+    el.addEventListener('click', ()=>{
+      kView = 'card';
+      kStack = [el.dataset.kopen2];
+      root.innerHTML = knowInner();
+      bindKnow();
+      flash('已打开该知识点的卡片');
     });
   });
   /* #knowBox 每次钻取都会重建卡片，「已掌握」也是新元素；bind() 的通用 checkbox
