@@ -127,6 +127,17 @@
   .ksrc a{color:#2563eb}
   .kcrumb{font-size:12.5px;color:var(--muted);margin-bottom:9px}
   .kcrumb span{cursor:pointer;color:#2563eb}
+  .kgbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:10px}
+  .kgbtn{font-size:12.5px;font-weight:600;color:var(--sub);background:#fff;border:1px solid var(--line);border-radius:8px;padding:5px 12px;cursor:pointer;font-family:inherit}
+  .kgbtn:hover{border-color:var(--accent);color:var(--accent)}
+  .kgbtn.on{background:var(--accent);color:#fff;border-color:var(--accent)}
+  .kghint{font-size:12px;color:var(--muted)}
+  #kgCanvas{width:100%;height:420px;display:block;border:1px solid var(--line);border-radius:10px;background:#fff;cursor:grab}
+  #kgCanvas.dragging{cursor:grabbing}
+  .klegend{display:flex;gap:14px;flex-wrap:wrap;font-size:12px;color:var(--sub);margin-top:10px}
+  .klegend span{display:flex;align-items:center;gap:5px}
+  .klegend i{width:11px;height:11px;border-radius:50%;display:inline-block}
+  .klegend i.ring{background:#fff;border:3px solid var(--line);width:13px;height:13px}
   @media print{
     body{background:#fff;padding:0}
     .toolbar{display:none}
@@ -237,6 +248,7 @@ function renderContact(){
 /* ---------- 📚 知识学习地图 ---------- */
 const KNOW = (REPORT_DATA && REPORT_DATA.knowledge) || [];
 let kStack = [];           // 卡片栈：当前钻取路径的节点 id
+let kView = 'card';        // 'card' | 'graph'
 
 function kNode(id){ return KNOW.find(n => n.id === id); }
 
@@ -248,19 +260,37 @@ function renderKnowledge(){
                 '<div class="note">⚠️ 知识地图生成失败：'+esc(err)+'</div>', 'knowledge');
   }
   if(!kStack.length) kStack = [KNOW[0].id];
-  return card('📚','知识学习地图（点关联概念可继续钻取）',
+  return card('📚','知识学习地图',
               '<div id="knowBox">'+knowInner()+'</div>', 'knowledge');
 }
 
 function knowInner(){
   const cur = kNode(kStack[kStack.length-1]);
   if(!cur) return '';
+  const toggle = '<div class="kgbar">'+
+    '<button class="kgbtn'+(kView==='card'?' on':'')+'" data-kview="card">📚 卡片视图</button>'+
+    '<button class="kgbtn'+(kView==='graph'?' on':'')+'" data-kview="graph">🗺 关系总览</button>'+
+    '<span class="kghint">'+(kView==='graph'
+      ? '拖拽节点 · 滚轮缩放 · 拖背景平移 · <b>点节点回到卡片</b>'
+      : '点关联概念可继续钻取')+'</span>'+
+  '</div>';
+  if(kView === 'graph') return toggle + '<canvas id="kgCanvas"></canvas>' + kLegend();
   const crumb = '<div class="kcrumb">' + kStack.map((id,i)=>{
     const n = kNode(id);
     const t = n ? esc(n.term) : esc(id);
     return (i ? ' › ' : '') + (i === kStack.length-1 ? '<b>'+t+'</b>' : '<span data-kgo="'+i+'">'+t+'</span>');
   }).join('') + '</div>';
-  return crumb + kCard(cur, true);
+  return toggle + crumb + kCard(cur, true);
+}
+
+function kLegend(){
+  return '<div class="klegend">'+
+    '<span><i style="background:#2563eb"></i>核心概念</span>'+
+    '<span><i style="background:#94a3b8"></i>扩展知识</span>'+
+    '<span><i class="ring" style="border-color:#16a34a"></i>有真实来源</span>'+
+    '<span><i class="ring" style="border-color:#d97706"></i>AI 整理待查证</span>'+
+    '<span><i class="ring" style="border-color:#f59e0b"></i>当前卡片</span>'+
+  '</div>';
 }
 
 function kCard(n, expanded){
@@ -306,10 +336,154 @@ function kCard(n, expanded){
   '</div>';
 }
 
+/* ---------- 🗺 力导向图谱（零依赖 canvas） ---------- */
+let kG = null;   // { nodes, edges, idx, canvas, raf, scale, ox, oy, drag, pan, hover, settled }
+
+function kGraphData(){
+  const known = {};
+  KNOW.forEach(n => { known[n.id] = n; });
+  const nodes = KNOW.map(n => ({
+    id: n.id, label: n.term || n.id, layer: n.layer || 0,
+    verified: n.confidence === 'verified',
+    r: (n.layer === 0 ? 22 : 14), x: 0, y: 0, vx: 0, vy: 0
+  }));
+  const edges = [];
+  KNOW.forEach(n => (n.related || []).forEach(r => {
+    if (r && known[r.id]) edges.push({ a: n.id, b: r.id });   // 跳过悬空引用
+  }));
+  const idx = {};
+  nodes.forEach(n => { idx[n.id] = n; });
+  return { nodes, edges, idx };
+}
+
+function kSeed(g, W, H){
+  const n = g.nodes.length || 1;
+  g.nodes.forEach((nd, i) => {
+    const ang = (i / n) * Math.PI * 2;
+    const rad = (nd.layer === 0 ? 0.22 : 0.38) * Math.min(W, H);
+    nd.x = W/2 + Math.cos(ang)*rad + (Math.random()-0.5)*16;
+    nd.y = H/2 + Math.sin(ang)*rad + (Math.random()-0.5)*16;
+    nd.vx = nd.vy = 0;
+  });
+}
+
+function kStep(g, W, H){
+  const N = g.nodes;
+  for (let i = 0; i < N.length; i++){
+    for (let j = i+1; j < N.length; j++){
+      const a = N[i], b = N[j];
+      let dx = a.x-b.x, dy = a.y-b.y, d2 = dx*dx+dy*dy;
+      if (d2 < 1){ dx = Math.random()-0.5; dy = Math.random()-0.5; d2 = 1; }
+      const d = Math.sqrt(d2), gap = a.r + b.r + 26;
+      const f = (gap*gap)/d2 * 0.85;
+      const fx = dx/d*f, fy = dy/d*f;
+      a.vx += fx; a.vy += fy; b.vx -= fx; b.vy -= fy;
+    }
+  }
+  const L = 96;
+  g.edges.forEach(e => {
+    const a = g.idx[e.a], b = g.idx[e.b];
+    if (!a || !b) return;
+    const dx = b.x-a.x, dy = b.y-a.y;
+    const d = Math.max(Math.sqrt(dx*dx+dy*dy), 1);
+    const f = (d - L) * 0.012;
+    const fx = dx/d*f, fy = dy/d*f;
+    a.vx += fx; a.vy += fy; b.vx -= fx; b.vy -= fy;
+  });
+  let energy = 0;
+  N.forEach(nd => {
+    nd.vx += (W/2 - nd.x) * 0.0022;
+    nd.vy += (H/2 - nd.y) * 0.0022;
+    nd.vx *= 0.86; nd.vy *= 0.86;
+    nd.x = Math.max(nd.r+6, Math.min(W-nd.r-6, nd.x + nd.vx));
+    nd.y = Math.max(nd.r+6, Math.min(H-nd.r-6, nd.y + nd.vy));
+    energy += nd.vx*nd.vx + nd.vy*nd.vy;
+  });
+  return energy;
+}
+
+function kDraw(){
+  const c = document.getElementById('kgCanvas');
+  if (!c || !kG) return;
+  const dpr = window.devicePixelRatio || 1;
+  const W = c.clientWidth || 700, H = c.clientHeight || 420;
+  if (c.width !== Math.round(W*dpr)) { c.width = Math.round(W*dpr); c.height = Math.round(H*dpr); }
+  const ctx = c.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, W, H);
+  ctx.save();
+  ctx.translate(kG.ox, kG.oy);
+  ctx.scale(kG.scale, kG.scale);
+
+  ctx.lineWidth = 1;
+  kG.edges.forEach(e => {
+    const a = kG.idx[e.a], b = kG.idx[e.b];
+    if (!a || !b) return;
+    const hot = (kG.hover === e.a || kG.hover === e.b);
+    ctx.strokeStyle = hot ? 'rgba(37,99,235,.55)' : 'rgba(148,163,184,.42)';
+    ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+  });
+
+  const curId = kStack[kStack.length-1];
+  kG.nodes.forEach(nd => {
+    ctx.beginPath(); ctx.arc(nd.x, nd.y, nd.r, 0, Math.PI*2);
+    ctx.fillStyle = nd.layer === 0 ? '#2563eb' : '#94a3b8';
+    ctx.globalAlpha = (kG.hover && kG.hover !== nd.id) ? 0.75 : 1;
+    ctx.fill();
+    ctx.globalAlpha = 1;
+    ctx.lineWidth = 2.5;
+    ctx.strokeStyle = nd.verified ? '#16a34a' : '#d97706';
+    ctx.stroke();
+    if (nd.id === curId){
+      ctx.beginPath(); ctx.arc(nd.x, nd.y, nd.r+6, 0, Math.PI*2);
+      ctx.strokeStyle = '#f59e0b'; ctx.lineWidth = 2; ctx.stroke();
+    }
+    ctx.font = (nd.layer === 0 ? 'bold 11px ' : '10px ') + '-apple-system,"Microsoft YaHei",sans-serif';
+    ctx.fillStyle = nd.layer === 0 ? '#1a2233' : '#6b7488';
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    const lb = nd.label.length > 10 ? nd.label.slice(0,10)+'…' : nd.label;
+    ctx.fillText(lb, nd.x, nd.y + nd.r + 10);
+  });
+  ctx.restore();
+}
+
+function kRun(){
+  const c = document.getElementById('kgCanvas');
+  if (!c || !kG) return;
+  const W = c.clientWidth || 700, H = c.clientHeight || 420;
+  let e = 1;
+  for (let i = 0; i < 12 && e > 0.35; i++) e = kStep(kG, W, H);
+  kDraw();
+  kG.settled = (e <= 0.35);
+  if (kG.settled){ kG.raf = null; return; }          // 收敛后停 rAF，省 CPU
+  kG.raf = requestAnimationFrame(kRun);
+}
+
+function kWake(){ if (kG && !kG.raf) kG.raf = requestAnimationFrame(kRun); }
+
+function initGraph(){
+  const c = document.getElementById('kgCanvas');
+  if (!c) { kG = null; return; }
+  const W = c.clientWidth || 700, H = c.clientHeight || 420;
+  const data = kGraphData();
+  kG = { nodes: data.nodes, edges: data.edges, idx: data.idx,
+         raf: null, scale: 1, ox: 0, oy: 0, drag: null, pan: null, hover: null, settled: false };
+  kSeed(kG, W, H);
+  kRun();
+}
+
 /* 卡片栈交互：只重绘 #knowBox，不影响报告其它模块的事件绑定 */
 function bindKnow(){
   const root = document.getElementById('knowBox');
   if(!root) return;
+  // 视图切换
+  root.querySelectorAll('[data-kview]').forEach(el=>{
+    el.addEventListener('click', ()=>{
+      kView = el.dataset.kview;
+      root.innerHTML = knowInner();
+      bindKnow();
+    });
+  });
   /* #knowBox 每次钻取都会重建卡片，「已掌握」也是新元素；bind() 的通用 checkbox
      处理器只在启动时跑一次，覆盖不到重建出来的勾选框。这里用事件委托补齐
      （#knowBox 根节点本身不会被替换）：首屏那张卡已被 bind() 接管，标记后跳过，避免重复保存。 */
@@ -343,6 +517,7 @@ function bindKnow(){
       bindKnow();
     });
   });
+  if (kView === 'graph') initGraph();
 }
 
 /* ---------- 01 硬门槛 ---------- */
