@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """知识管线：① 拆解 ② 头脑风暴 ③ 搜索 ④ 校验生成"""
 import json
+from concurrent.futures import ThreadPoolExecutor
 
 import llm
 import log
@@ -9,6 +10,21 @@ import store
 
 MAX_CORE = 15
 MAX_RELATED_PER_NODE = 3
+MAX_TIMELINES = 30   # 时间线最贵（每节点一次模型调用），设上限兜底
+
+
+def _map_nodes(nodes, worker, max_workers=1):
+    """对每个节点执行 worker(node)。max_workers>1 时并发——
+    每个节点是独立网络 I/O，串行会把总耗时乘以节点数。
+    默认 1（串行）：保证注入假实现的测试结果确定、可复现。
+    """
+    if max_workers and max_workers > 1 and len(nodes) > 1:
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            list(ex.map(worker, nodes))
+    else:
+        for n in nodes:
+            worker(n)
+
 
 EXTRACT_SYSTEM = """你是资深 AI 领域技术面试官 + 知识拆解专家。
 从岗位 JD 中抽出候选人**必须掌握**的核心知识点，供其学习备考。
@@ -138,10 +154,11 @@ TIMELINE_SYSTEM = """你是技术史专家。基于给出的**参考资料**，�
 - 全部中文"""
 
 
-def attach_sources(nodes, providers, search=None, max_results=3):
+def attach_sources(nodes, providers, search=None, max_results=3, max_workers=1):
     """第 ③ 步：为每个知识点查真实来源；查不到标 ai-generated"""
     search = search or search_mod.search
-    for n in nodes:
+
+    def one(n):
         try:
             res = search(n["term"] + " 是什么", providers=providers, max_results=max_results)
         except Exception as e:
@@ -149,17 +166,28 @@ def attach_sources(nodes, providers, search=None, max_results=3):
             res = []
         n["sources"] = res if isinstance(res, list) else []
         n["confidence"] = "verified" if isinstance(res, list) and res else "ai-generated"
+
+    _map_nodes(nodes, one, max_workers)
     log.log_event("knowledge.sources_done",
                   verified=sum(1 for n in nodes if n["confidence"] == "verified"), total=len(nodes))
     return nodes
 
 
-def attach_timeline(nodes, cfg, chat=None):
-    """第 ④ 步：基于来源写「前世今生」时间线（无来源的跳过，不编造）"""
+def attach_timeline(nodes, cfg, chat=None, max_workers=1, max_timelines=MAX_TIMELINES):
+    """第 ④ 步：基于来源写「前世今生」时间线（无来源的跳过，不编造）
+
+    超出 max_timelines 的有来源节点不再调用模型：它们保留 sources / verified，
+    只是 timeline 为空（不伪造），并在日志里以 capped 计数。
+    """
     chat = chat or llm.call_openai_compatible
-    for n in nodes:
+    sourced = [n for n in nodes if n.get("sources")]
+    # sorted 稳定：同层内保持原顺序，而核心节点（layer 0）本就在列表前面
+    selected = sorted(sourced, key=lambda n: n.get("layer") or 0)[:max_timelines]
+    capped = len(sourced) - len(selected)
+
+    def one(n):
         if not n.get("sources"):
-            continue
+            return
         try:
             refs = "\n".join(
                 "- %s | %s | %s" % (str(s.get("title") or ""),
@@ -175,13 +203,16 @@ def attach_timeline(nodes, cfg, chat=None):
             tl = data.get("timeline")
             if not isinstance(tl, list):
                 n["timeline"] = []
-                continue
+                return
             n["timeline"] = [{"year": str(t.get("year", "")).strip(), "text": (t.get("text") or "").strip()}
                              for t in tl if isinstance(t, dict) and (t.get("text") or "").strip()]
         except Exception as e:
             log.log_exc("knowledge.timeline_error", e, term=n.get("term"))
             n["timeline"] = []
-    log.log_event("knowledge.timeline_done", with_timeline=sum(1 for n in nodes if n["timeline"]))
+
+    _map_nodes(selected, one, max_workers)
+    log.log_event("knowledge.timeline_done", with_timeline=sum(1 for n in nodes if n["timeline"]),
+                  capped=capped)
     return nodes
 
 
@@ -190,8 +221,8 @@ def build_for_jd(jd_text, cfg, core_limit=MAX_CORE):
     core = extract_nodes(jd_text, cfg)[:core_limit]
     expanded = brainstorm(core, cfg)
     all_nodes = core + expanded
-    attach_sources(all_nodes, cfg.get("search_providers") or [])
-    attach_timeline(all_nodes, cfg)
+    attach_sources(all_nodes, cfg.get("search_providers") or [], max_workers=6)
+    attach_timeline(all_nodes, cfg, max_workers=6)
     log.log_event("knowledge.build_done", core=len(core), expanded=len(expanded),
                   verified=sum(1 for n in all_nodes if n["confidence"] == "verified"))
     return all_nodes

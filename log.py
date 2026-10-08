@@ -4,6 +4,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 import traceback
 import uuid
@@ -17,6 +18,9 @@ SESSION_ID = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
 
 KEY_PAT = re.compile(r"(sk-[A-Za-z0-9_\-]{4})[A-Za-z0-9_\-]{4,}")
 SENSITIVE_KEYS = ("api_key", "apikey", "key", "authorization", "token", "password", "secret")
+
+# 追加写不是原子的：并发（如 knowledge 的并行搜索/时间线）会交错写坏 JSONL 行
+_LOG_LOCK = threading.Lock()
 
 
 def log_file_path():
@@ -61,8 +65,10 @@ def log_event(event, level="info", data=None, **kw):
            "level": level, "session": SESSION_ID, "event": event, "data": redact(d)}
     try:
         os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
-        with open(LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        line = json.dumps(rec, ensure_ascii=False) + "\n"
+        with _LOG_LOCK:
+            with open(LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(line)
     except Exception:
         pass
     if level in ("error", "warn"):

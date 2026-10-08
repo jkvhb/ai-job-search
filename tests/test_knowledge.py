@@ -164,6 +164,40 @@ class ResilienceTest(_Isolated):
                                                                "model": "m"}}, chat=must_not_call)
         self.assertEqual(out[0]["timeline"], [])
 
+    def test_attach_timeline_parallel_matches_sequential(self):
+        import threading as _threading
+        lock = _threading.Lock()
+
+        def fake_chat(base_url, api_key, model, messages, **kw):
+            with lock:
+                return '{"timeline":[{"year":"2022","text":"X"}]}'
+
+        nodes = [{"id": "n%d" % i, "term": "N%d" % i, "definition": "d", "plain_explanation": "p",
+                  "sources": [{"title": "T", "url": "https://x%d" % i, "snippet": "s"}],
+                  "confidence": "verified", "timeline": [], "related": [], "layer": 0}
+                 for i in range(8)]
+        out = knowledge.attach_timeline(nodes, {"text_model": {"base_url": "u", "api_key": "k",
+                                                               "model": "m"}},
+                                        chat=fake_chat, max_workers=4)
+        self.assertEqual(len(out), 8)
+        self.assertTrue(all(n["timeline"] for n in out))
+
+    def test_attach_timeline_cap(self):
+        def fake_chat(base_url, api_key, model, messages, **kw):
+            return '{"timeline":[{"year":"2022","text":"X"}]}'
+
+        nodes = [{"id": "n%d" % i, "term": "N%d" % i, "definition": "d", "plain_explanation": "p",
+                  "sources": [{"title": "T", "url": "https://x%d" % i, "snippet": "s"}],
+                  "confidence": "verified", "timeline": [], "related": [], "layer": 1 if i >= 3 else 0}
+                 for i in range(6)]
+        out = knowledge.attach_timeline(nodes, {"text_model": {"base_url": "u", "api_key": "k",
+                                                               "model": "m"}},
+                                        chat=fake_chat, max_timelines=3)
+        with_tl = [n for n in out if n["timeline"]]
+        self.assertEqual(len(with_tl), 3)
+        # 核心节点优先（layer 0 先于 layer 1）
+        self.assertTrue(all(n["layer"] == 0 for n in with_tl))
+
 
 if __name__ == "__main__":
     unittest.main()
