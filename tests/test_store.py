@@ -88,5 +88,34 @@ class ReportStateTest(IsolatedCase):
         self.assertEqual(store.load_report_state("r1")["checks"], {"a": True, "b": False})
 
 
+class InterviewStoreTest(IsolatedCase):
+    def test_path_traversal_is_neutralised(self):
+        self.assertEqual(store.interview_dir(""), "")
+        self.assertEqual(store.interview_dir(".."), "")
+        p = store.interview_dir("../../etc")
+        if p:
+            self.assertTrue(p.startswith(store.interviews_dir()))
+
+    def test_save_stream_writes_and_returns_size(self):
+        import io
+        n = store.save_stream("iv1", "audio.wav", io.BytesIO(b"x" * 5000), max_bytes=10 * 1024)
+        self.assertEqual(n, 5000)
+        self.assertEqual(os.path.getsize(store.interview_file("iv1", "audio.wav")), 5000)
+
+    def test_save_stream_rejects_oversize_and_cleans_partial_file(self):
+        import io
+        with self.assertRaises(ValueError):
+            store.save_stream("iv1", "audio.wav", io.BytesIO(b"x" * 5000), max_bytes=1000)
+        self.assertFalse(os.path.exists(store.interview_file("iv1", "audio.wav")))
+
+    def test_read_write_json_roundtrip_in_interview_dir(self):
+        self.assertTrue(store.save_interview_json("iv1", "status.json", {"state": "queued"}))
+        self.assertEqual(store.load_interview_json("iv1", "status.json")["state"], "queued")
+
+    def test_missing_interview_json_returns_default(self):
+        self.assertEqual(store.load_interview_json("nope", "status.json", {"state": "?"}),
+                         {"state": "?"})
+
+
 if __name__ == "__main__":
     unittest.main()

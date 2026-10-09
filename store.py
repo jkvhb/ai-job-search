@@ -273,3 +273,61 @@ def save_report_state(report_id, checks, key=None):
     write_json(path, {"version": 1, "report_id": safe_name(report_id),
                       "checks": _clean_checks(checks)})
     return True
+
+
+# ---------- interviews（面试记录，阶段 3.4）----------
+def interviews_dir(key=None):
+    return p_path("interviews", key=key)
+
+
+def interview_dir(interview_id, key=None):
+    name = safe_name(interview_id)
+    return os.path.join(interviews_dir(key), name) if name else ""
+
+
+def interview_file(interview_id, filename, key=None):
+    d, n = interview_dir(interview_id, key), safe_name(filename)
+    return os.path.join(d, n) if d and n else ""
+
+
+def save_stream(interview_id, filename, src, max_bytes):
+    """把可读对象分块写到面试目录。超限或出错时删掉半截文件并抛异常。返回写入字节数。
+
+    分块（256KB）是为了几十 MB 的录音不吃内存；
+    写失败必须清理，否则目录里留下半截文件、下次还会被当成有效录音。
+    """
+    path = interview_file(interview_id, filename)
+    if not path:
+        raise ValueError("非法的面试 id 或文件名")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    total = 0
+    try:
+        with open(path, "wb") as f:
+            while True:
+                chunk = src.read(256 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > max_bytes:
+                    raise ValueError("文件超过上限 %d MB" % (max_bytes // 1024 // 1024))
+                f.write(chunk)
+    except Exception:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        raise
+    return total
+
+
+def save_interview_json(interview_id, filename, obj, key=None):
+    path = interview_file(interview_id, filename, key)
+    if not path:
+        return False
+    write_json(path, obj)
+    return True
+
+
+def load_interview_json(interview_id, filename, default=None, key=None):
+    path = interview_file(interview_id, filename, key)
+    return read_json(path, default) if path else default
