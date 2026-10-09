@@ -553,12 +553,19 @@ def render_report(out, jd_id, interview_id):
     模板细节在 Task 6；这里只负责把数据交给 app.render_report，并把 report_id 钉在面试记录
     id 上（复盘报告按面试记录定位，不像岗位报告那样按「日期_岗位_分数」每次生成新文件）。
 
+    **转写正文在这里就放进 payload**：只靠 /reports/* 动态注入的话，磁盘上那份 iv_*.html
+    的「原始转写全文」永远是空的（用户右键保存 / 双击打开就是残的）。
+
     **延迟 import app** —— app.py 会 import interview，模块顶部互相 import 会循环导入。
     """
     import app
     out = dict(out or {})
     out.setdefault("job_title", (out.get("meta") or {}).get("job_title") or "")
     out.setdefault("score", 0)
+    tr = store.load_interview_json(interview_id, "transcript.json", {})
+    text = tr.get("text") if isinstance(tr, dict) else ""
+    if isinstance(text, str) and text.strip():
+        out.setdefault("transcript_text", text)
     return app.render_report(out, fixed_id="iv_" + str(interview_id))
 
 

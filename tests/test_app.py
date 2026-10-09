@@ -615,23 +615,88 @@ class TemplateKindTest(IsolatedCase):
         self.assertIn(INTERVIEW_TEMPLATE_MARKER, body)          # 访谈模板独有的字符串
         self.assertNotIn(JD_TEMPLATE_MARKER, body)
 
-    def test_report_written_by_the_real_pipeline_uses_the_interview_template(self):
-        """真实现写出来的复盘报告（<title> 里带「· 岗位匹配分析 ·」）也必须走访谈模板。
+    def test_each_template_contains_the_report_marker_exactly_once(self):
+        """`kb.read_report_data` 从**第一次**出现的位置开始解析：模板里多一处（哪怕写在注释里）
+        就会让所有报告的快照都读不出来 —— 整批报告静默退化成「原样发送旧文件」。
 
-        这条是防假绿的：上面那份是手写的 <title>T</title>，而真报告的标题由
-        app.render_report 生成、**确实含「岗位匹配分析」**（复盘复用了 JD 的标题格式）。
-        真人拿到的就是这里的文件，所以必须按真文件断言一次。
+        这不是假想：访谈模板的头部注释里抄了一遍那行赋值，本文件另一条用例当场抓到。
+        """
+        for path in (app.TEMPLATE_PATH, app.INTERVIEW_TEMPLATE_PATH):
+            text = store.read_text(path)
+            self.assertEqual(text.count(kb.REPORT_MARK), 1,
+                             "%s 里 %r 出现了 %d 次"
+                             % (os.path.basename(path), kb.REPORT_MARK, text.count(kb.REPORT_MARK)))
+
+    def test_written_interview_report_data_is_readable(self):
+        """真写出来的复盘报告，其 REPORT_DATA 必须能被 `kb.read_report_data` 读出来 ——
+        读不出来 = 报告列表回填 / 知识库体检 / 我的动态渲染全都看不到这场面试的数据。"""
+        interview.render_report({"kind": "interview", "summary": "独有总评"}, "j1", "iv1")
+        path = os.path.join(store.p_path("reports"), "iv_iv1.html")
+        data = kb.read_report_data(path)
+        self.assertIsInstance(data, dict)
+        self.assertEqual(data.get("kind"), "interview")
+        self.assertEqual(data.get("summary"), "独有总评")
+
+    def test_report_written_by_the_real_pipeline_uses_the_interview_template(self):
+        """真实现写出来的复盘报告也必须走访谈模板（不管是磁盘上那份还是 serve 出来的）。
+
+        这条是防假绿的：上面那份是手写的 <title>T</title>，而真报告的 <title> 由
+        app.render_report 生成 —— 必须按真文件断言一次，否则「写盘用 JD、serve 用访谈」
+        这种割裂会静默通过。
         """
         interview.render_report({"kind": "interview", "summary": "s", "meta": {"interview_id": "iv1"}},
                                 "j1", "iv1")
         path = os.path.join(store.p_path("reports"), "iv_iv1.html")
         self.assertTrue(os.path.exists(path))
-        self.assertIn("岗位匹配分析", store.read_text(path))      # 反证：真标题里确实有这段
         code, body = self._get("/reports/iv_iv1.html")
         self.assertEqual(code, 200)
         self.assertIn(INTERVIEW_TEMPLATE_MARKER, body)
         self.assertNotIn(JD_TEMPLATE_MARKER, body)
         self.assertNotIn("__REPORT_DATA__", body)
+
+    def test_report_on_disk_uses_the_interview_template_without_any_route(self):
+        """**磁盘上那份文件本身**就必须是复盘版式 —— 直接读文件（= file:// 语义），不经过 HTTP。
+
+        用户会右键保存 / 双击打开 / 发给别人；如果只有 serve 时才换模板，那份文件永远是
+        「JD 骨架 + 访谈数据」（而且没有转写正文）。
+        """
+        store.save_interview_json("iv1", "transcript.json",
+                                  {"text": "面试官：讲讲 RLHF 的独有一句。", "language": "zh"})
+        interview.render_report({"kind": "interview", "job_title": "AI 产品经理", "date": "2026-10-09",
+                                 "summary": "s", "meta": {"interview_id": "iv1"}}, "j1", "iv1")
+        path = os.path.join(store.p_path("reports"), "iv_iv1.html")
+        on_disk = store.read_text(path)
+        self.assertIn(INTERVIEW_TEMPLATE_MARKER, on_disk)
+        self.assertNotIn(JD_TEMPLATE_MARKER, on_disk)
+        self.assertNotIn("__REPORT_DATA__", on_disk)
+        self.assertNotIn("__TITLE__", on_disk)
+        # 转写正文写进 payload → 不经过任何路由也能看见（这是 file:// 打开时的唯一来源）
+        self.assertIn("讲讲 RLHF 的独有一句", on_disk)
+        # 标题也不能还是「岗位匹配分析」（那是 JD 报告的说法，出现在标签页/打印页眉上）
+        self.assertIn("面试复盘", on_disk)
+        self.assertNotIn("岗位匹配分析", on_disk)
+
+    def test_write_and_serve_share_one_template_rule(self):
+        """写盘与 serve 必须共用同一份 kind 判定 —— 两处各写一套迟早分叉。"""
+        self.assertEqual(app.report_template_for({"kind": "interview"}), app.INTERVIEW_TEMPLATE_PATH)
+        self.assertEqual(app.report_template_for({"kind": "jd"}), app.TEMPLATE_PATH)
+        self.assertEqual(app.report_template_for({}), app.TEMPLATE_PATH)
+        self.assertEqual(app.report_template_for(None), app.TEMPLATE_PATH)
+        # 同一份数据：写盘产出的页面与 serve 出来的页面必须都是访谈版式
+        interview.render_report({"kind": "interview", "summary": "s", "meta": {"interview_id": "iv1"}},
+                                "j1", "iv1")
+        path = os.path.join(store.p_path("reports"), "iv_iv1.html")
+        served = app._render_report_page(path)
+        self.assertIn(INTERVIEW_TEMPLATE_MARKER, store.read_text(path))
+        self.assertIn(INTERVIEW_TEMPLATE_MARKER, served)
+        self.assertNotIn(JD_TEMPLATE_MARKER, served)
+
+    def test_old_interview_report_without_transcript_gets_it_at_serve_time(self):
+        """旧报告的兜底：payload 里没有 transcript_text（历史文件），serve 时从 transcript.json 补。"""
+        store.save_interview_json("iv9", "transcript.json", {"text": "旧报告的转写正文"})
+        self._write_report("iv_9.html", {"kind": "interview", "summary": "s",
+                                         "meta": {"interview_id": "iv9"}})
+        self.assertIn("旧报告的转写正文", self._get("/reports/iv_9.html")[1])
 
     def test_jd_report_still_uses_jd_template(self):
         self._write_report("x_岗位.html", {"job_title": "岗"})

@@ -149,16 +149,28 @@ def _report_title(path):
     return m.group(1) if m else os.path.basename(path)
 
 
+def report_template_for(data):
+    """报告数据 → 用哪个模板文件。**这是唯一判定点**。
+
+    写盘（`render_report`）与 serve（`_render_report_page`）必须走同一份规则：两处各写一套
+    就是「老报告用不上新前端」那类不一致的复发 —— 更糟的是会出现「磁盘上是 JD 骨架、
+    服务里打开是复盘版式」的割裂（双击打开的那份永远是错的）。
+
+    缺省必须是 JD 模板：`kind` 是后加的字段，**所有老 JD 报告都没有它**。
+    """
+    kind = data.get("kind") if isinstance(data, dict) else None
+    return INTERVIEW_TEMPLATE_PATH if kind == "interview" else TEMPLATE_PATH
+
+
 def _attach_transcript(data):
     """把这场面试的原始转写塞进报告数据 —— 复盘报告的「原始转写全文」段要它。
 
-    为什么不指望生成时写进去：`interview.render_report` 交给 `app.render_report` 的 out 里只有
-    7 段分析 + meta（duration/language/chars/interview_id），**没有转写正文**；正文躺在
-    `interviews/<id>/transcript.json` 里。而 /reports/* 本来就是「动态拼装、老报告吃最新模板」，
-    顺手读一次即可 —— 比把几十万字复制进每一份报告的 REPORT_DATA 更省。
-
-    取不到（旧报告 / 记录被删 / 文件损坏 / 没有 meta）一律静默跳过：绝不能让报告因此打不开。
+    **写盘时已经带上了**（`interview.render_report` 会把 transcript_text 放进 payload），
+    这里是给**旧报告**兜底：之前生成的 iv_*.html 里没有正文，动态重渲染时顺手补一次。
+    取不到（记录被删 / 文件损坏 / 没有 meta）一律静默跳过：绝不能让报告因此打不开。
     """
+    if isinstance(data.get("transcript_text"), str) and data["transcript_text"].strip():
+        return                                   # payload 里已经有了，不重复读盘
     meta = data.get("meta") if isinstance(data.get("meta"), dict) else {}
     iid = str(meta.get("interview_id") or "")
     if not iid:
@@ -173,11 +185,9 @@ def _attach_transcript(data):
 
 
 def _render_report_page(path):
-    """用**当前模板** + 报告里的 REPORT_DATA 渲染。kind 决定用哪个模板。
+    """用**当前模板** + 报告里的 REPORT_DATA 渲染。kind 决定用哪个模板（report_template_for）。
 
     kind="interview" → interview_template.html；其它/缺失 → report_template.html。
-    缺省必须是 JD 模板：`kind` 是这一轮才加进报告数据的字段，**所有老 JD 报告都没有它** ——
-    缺省一旦反过来，上线当天全部老报告都会变成复盘版式。
 
     读不出 REPORT_DATA（旧格式 / 文件被改坏）、模板缺失、或拼装时出任何意外时返回 None，
     由调用方退回 _send_file 原样发送 —— 报告绝不能因此打不开。
@@ -185,11 +195,11 @@ def _render_report_page(path):
     data = kb.read_report_data(path)
     if not isinstance(data, dict):
         return None
-    is_interview = data.get("kind") == "interview"
-    tpl = store.read_text(INTERVIEW_TEMPLATE_PATH if is_interview else TEMPLATE_PATH)
+    tpl_path = report_template_for(data)
+    tpl = store.read_text(tpl_path)
     if not tpl:
         return None
-    if is_interview:
+    if tpl_path == INTERVIEW_TEMPLATE_PATH:
         _attach_transcript(data)
     title = _report_title(path) or os.path.basename(path)
     # 拼装方式必须与 render_report() 完全一致，否则同一份数据会渲染出两种页面
@@ -198,9 +208,11 @@ def _render_report_page(path):
 
 
 def render_report(d, fixed_id=None):
-    tpl = store.read_text(TEMPLATE_PATH)
+    # 写盘与 serve 共用同一份 kind 判定：否则磁盘上那份会是与用户看到的不同的骨架
+    tpl_path = report_template_for(d)
+    tpl = store.read_text(tpl_path)
     if not tpl:
-        raise RuntimeError("缺少报告模板 web/report_template.html")
+        raise RuntimeError("缺少报告模板：%s" % os.path.basename(tpl_path))
     job = store.slug(d.get("job_title") or "岗位")
     score_disp = "%g" % d["score"]
     if fixed_id:
@@ -215,7 +227,11 @@ def render_report(d, fixed_id=None):
             fname = "%s(%d).html" % (base, n)
             n += 1
     d["report_id"] = fname[:-5]
-    title = "%s · 岗位匹配分析 · %s分 · %s" % (d.get("job_title") or "岗位", score_disp, d.get("verdict") or "")
+    if tpl_path == INTERVIEW_TEMPLATE_PATH:
+        # 复盘报告不能顶着「岗位匹配分析 · 0分」的标题出现在浏览器标签页 / 打印页眉上
+        title = ("%s · 面试复盘 · %s" % (d.get("job_title") or "面试", d.get("date") or "")).rstrip(" ·")
+    else:
+        title = "%s · 岗位匹配分析 · %s分 · %s" % (d.get("job_title") or "岗位", score_disp, d.get("verdict") or "")
     payload = json.dumps(d, ensure_ascii=False).replace("</", "<\\/")
     html = tpl.replace("__TITLE__", title).replace("__REPORT_DATA__", payload)
     store.write_text(os.path.join(store.p_path("reports"), fname), html)

@@ -133,9 +133,13 @@
 </div>
 <script>
 /* 面试复盘报告。数据由 app._render_report_page 注入（与 JD 报告同一套约定：
-   __TITLE__ / const REPORT_DATA = …），模板自包含、零外部资源。
+   __TITLE__ 占位 + 下面那行 REPORT_DATA 赋值），模板自包含、零外部资源。
    报告有两种打开方式：工具里（http://127.0.0.1…，能打 API）与直接双击（file://）。
-   后者点「加入知识库」不可能成功 —— 必须**明说并禁用**，绝不假装加成功。 */
+   后者点「加入知识库」不可能成功 —— 必须**明说并禁用**，绝不假装加成功。
+
+   ⚠️ 别在任何注释/文案里再抄一遍那行赋值的前缀（把它当普通文字写出来也不行）：
+   kb.read_report_data 取的是**第一次**出现的位置，多一处就会让所有报告的快照都读不出来，
+   整批报告会静默退化成「原样发送旧文件」。 */
 const REPORT_DATA = __REPORT_DATA__;
 const KB_API = '/api/knowledge/add';
 const OFFLINE_KB_MSG = '未连接到工具，无法入库';
