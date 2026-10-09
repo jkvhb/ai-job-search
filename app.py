@@ -488,6 +488,29 @@ class Handler(BaseHTTPRequestHandler):
                 log.log_exc("kb.api_error", e)
                 return self._send(500, {"ok": False, "error": "知识库读取失败：%s" % e})
 
+        if p == "/api/knowledge/review":
+            try:
+                try:
+                    limit = int(q.get("limit", ["20"])[0])
+                except Exception:
+                    limit = 20
+                limit = max(1, min(limit, 200))
+                data = store.load_knowledge()
+                queue = kb.review_queue(data, limit=limit)
+                today = datetime.now().strftime("%Y-%m-%d")
+                nodes = kb.ensure_kb(data)["nodes"]
+                return self._send(200, {
+                    "ok": True, "queue": queue,
+                    "stats": {"due": len(queue),
+                              "mastered": sum(1 for n in nodes if n.get("state") == "已掌握"),
+                              "reviewed_today": sum(1 for n in nodes
+                                                    if n.get("last_reviewed_at") == today)},
+                })
+            except Exception as e:
+                # do_GET 没有外层 try（见上面 /api/knowledge 的注释）：不兜底就会裸断连接
+                log.log_exc("kb.review_api_error", e)
+                return self._send(500, {"ok": False, "error": "复习队列读取失败：%s" % e})
+
         if p == "/api/jd_text":
             job = store.find_job(store.safe_name(q.get("id", [""])[0]))
             if not job or not job.get("jd_text_file"):
@@ -628,6 +651,56 @@ class Handler(BaseHTTPRequestHandler):
         if p == "/api/knowledge/state":
             ok, msg = kb.set_state(str(body.get("id") or ""), str(body.get("state") or ""))
             return self._send(200 if ok else 400, {"ok": ok, "error": msg})
+
+        if p == "/api/knowledge/review":
+            ok, node = kb.record_review(str(body.get("id") or ""), str(body.get("result") or ""))
+            if not ok:
+                return self._send(400, {"ok": False, "error": "记录失败：知识点或结果不合法"})
+            return self._send(200, {"ok": True, "node": node})
+
+        if p == "/api/report_state/read":
+            rid = store.safe_name(body.get("report_id"))
+            if not rid:
+                return self._send(400, {"ok": False, "error": "报告 id 不合法"})
+            terms = body.get("terms") if isinstance(body.get("terms"), list) else []
+            index = {n.get("id"): n for n in kb.ensure_kb(store.load_knowledge())["nodes"] if n.get("id")}
+            know = {}
+            for t in terms:
+                # 归一化只有 kb.normalize_id 一份实现：路由里再写一套迟早会和知识库分叉
+                nid = kb.normalize_id(t)
+                if not nid:
+                    continue
+                card = index.get(nid)
+                know[str(t)] = str(card.get("state")) if card else kb.DEFAULT_STATE
+            return self._send(200, {"ok": True,
+                                    "checks": store.load_report_state(rid)["checks"],
+                                    "know": know})
+
+        if p == "/api/report_state/write":
+            rid = store.safe_name(body.get("report_id"))
+            if not rid:
+                return self._send(400, {"ok": False, "error": "报告 id 不合法"})
+            checks = body.get("checks") if isinstance(body.get("checks"), dict) else {}
+            know = body.get("know") if isinstance(body.get("know"), dict) else {}
+            saved = created = 0
+            for k, v in checks.items():
+                st = store.load_report_state(rid)
+                st["checks"][str(k)] = bool(v)
+                if store.save_report_state(rid, st["checks"]):
+                    saved += 1
+            for term, val in know.items():
+                if isinstance(val, dict):
+                    state = str(val.get("state") or "")
+                    meta = val
+                else:
+                    state = str(val or "")
+                    meta = None
+                ok, was_created, _ = kb.upsert_check(term, state, meta)
+                if ok:
+                    saved += 1
+                    created += 1 if was_created else 0
+            log.log_event("report_state.write", report=rid, saved=saved, created=created)
+            return self._send(200, {"ok": True, "saved": saved, "created": created})
 
         if p == "/api/knowledge/merge":
             ok, msg = kb.merge_nodes(str(body.get("keep_id") or ""), str(body.get("drop_id") or ""))

@@ -1578,3 +1578,124 @@ class UpsertCheckTest(IsolatedCase):
         ok, _, card = kb.upsert_check("甲", "待学习")
         self.assertTrue(ok)
         self.assertEqual(card["state"], "待学习")
+
+
+class ReportStateRouteTest(IsolatedCase):
+    """打钩持久化的两条 HTTP 路由（POST /api/report_state/read | write）。
+
+    用已有的沙箱化 handler（不接套接字）直接调 do_POST；DATA_ROOT/LOG_FILE 已在 IsolatedCase 里隔离。
+    走路由而不是直调 store：路由层的 report_id 校验（400）与 know 映射只有在这一层才测得到。
+    """
+
+    def _post(self, path, body):
+        return _post(path, body)[1]
+
+    def _post_raw(self, path, body):
+        return _post(path, body)
+
+    def test_read_returns_checks_and_know_states(self):
+        kb.absorb([_node(term="省略恢复")], {"id": "j1"})
+        kb.set_state("省略恢复", "已掌握")
+        store.save_report_state("r1", {"gate:0": True})
+        body = self._post("/api/report_state/read", {"report_id": "r1", "terms": ["省略恢复", "没见过"]})
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["checks"], {"gate:0": True})
+        self.assertEqual(body["know"]["省略恢复"], "已掌握")
+        self.assertEqual(body["know"]["没见过"], "待学习")
+
+    def test_write_saves_both_kinds_and_upserts(self):
+        body = self._post("/api/report_state/write", {
+            "report_id": "r1",
+            "checks": {"gate:1": True},
+            "know": {"新概念": {"state": "已掌握", "definition": "定义"}}})
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["created"], 1)
+        self.assertEqual(store.load_report_state("r1")["checks"], {"gate:1": True})
+        self.assertEqual(store.load_knowledge()["nodes"][0]["state"], "已掌握")
+
+    def test_bad_report_id_is_rejected(self):
+        # 判据与 store.report_state_path 一致：safe_name 为空 → 400（'' / '.' / '..'）
+        for bad in ("", "..", "."):
+            code, body = self._post_raw("/api/report_state/write", {"report_id": bad, "checks": {"a": True}})
+            self.assertEqual(code, 400, "report_id=%r 应被拒" % bad)
+            self.assertFalse(body["ok"])
+        d = store.report_state_dir()
+        self.assertEqual(os.listdir(d) if os.path.isdir(d) else [], [])   # 拒了就不该落盘
+
+    def test_traversal_shaped_report_id_is_sanitised_not_escaped(self):
+        # '../evil' 形态：store.safe_name 取 basename 削成 'evil'（与 tests/test_store.py 同一口径），
+        # 所以路由放行 —— 但落盘路径必须仍在 report_state 目录内，绝不越级。
+        code, body = self._post_raw("/api/report_state/write", {"report_id": "../evil", "checks": {"a": True}})
+        self.assertEqual(code, 200)
+        self.assertTrue(body["ok"])
+        self.assertEqual(os.listdir(store.report_state_dir()), ["evil.json"])
+        self.assertEqual(store.load_report_state("../evil")["checks"], {"a": True})
+
+    def test_read_with_bad_report_id_is_rejected(self):
+        code, _ = self._post_raw("/api/report_state/read", {"report_id": ""})
+        self.assertEqual(code, 400)
+
+    def test_write_rejects_bad_know_state(self):
+        # 前端把状态拼错时不能静默吞掉：400 且不建卡
+        code, body = self._post_raw("/api/report_state/write",
+                                    {"report_id": "r1", "know": {"新概念": {"state": "已精通"}}})
+        self.assertEqual(code, 200, "整条写请求本身成功，只是这一项没写进去")
+        self.assertEqual(body["ok"], True)
+        self.assertEqual(body["saved"], 0)                # checks 为空、know 的 state 非法 → 一个都没存
+        self.assertEqual(store.load_knowledge()["nodes"], [])
+
+
+class ReviewRouteTest(IsolatedCase):
+    """自测队列的两条 HTTP 路由（GET / 记录 POST /api/knowledge/review）。"""
+
+    def _get(self, path):
+        return _get(path)[1]
+
+    def _post(self, path, body):
+        return _post(path, body)[1]
+
+    def _post_raw(self, path, body):
+        return _post(path, body)
+
+    def _get_raw(self, path):
+        return _get(path)
+
+    def test_queue_returns_score_and_reason(self):
+        kb.absorb([_node(term="甲")], {"id": "j1"})
+        body = self._get("/api/knowledge/review?limit=5")
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["queue"][0]["term"], "甲")
+        self.assertIn("reason", body["queue"][0])
+        self.assertIn("stats", body)
+
+    def test_queue_honours_limit_and_default(self):
+        kb.absorb([_node(term="概念%02d" % i) for i in range(30)], {"id": "j1"})
+        self.assertEqual(len(self._get("/api/knowledge/review")["queue"]), 20)      # 默认 20，不是全量
+        self.assertEqual(len(self._get("/api/knowledge/review?limit=50")["queue"]), 30)
+
+    def test_queue_survives_unexpected_error(self):
+        # /api/knowledge/review 是 do_GET 里第二处可能抛的读取路径，而 do_GET 没有外层 try：
+        # 不兜底就会裸断连接（客户端只看到 RemoteDisconnected，连 500 都没有）。
+        kb.absorb([_node(term="甲")], {"id": "j1"})
+        with mock.patch.object(kb, "review_queue", side_effect=RuntimeError("boom")):
+            code, body = self._get_raw("/api/knowledge/review")
+        self.assertEqual(code, 500)
+        self.assertFalse(body["ok"])
+        self.assertIn("复习队列读取失败", body["error"])
+        self.assertTrue(_log_events("kb.review_api_error"))
+
+    def test_record_advances_state(self):
+        kb.absorb([_node(term="甲")], {"id": "j1"})
+        body = self._post("/api/knowledge/review", {"id": "甲", "result": "答上了"})
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["node"]["state"], "已掌握")
+
+    def test_record_rejects_bad_result(self):
+        kb.absorb([_node(term="甲")], {"id": "j1"})
+        code, _ = self._post_raw("/api/knowledge/review", {"id": "甲", "result": "瞎写"})
+        self.assertEqual(code, 400)
+
+    def test_record_rejects_unknown_node(self):
+        kb.absorb([_node(term="甲")], {"id": "j1"})
+        code, _ = self._post_raw("/api/knowledge/review", {"id": "不存在的卡", "result": "答上了"})
+        self.assertEqual(code, 400)
