@@ -31,6 +31,9 @@ STATE_VALUES = ("待学习", "学习中", "已掌握")
 DEFAULT_STATE = "待学习"
 DEFAULT_OUTCOME = "未面试"
 
+# 掌握度排序：手动合并两张「用户卡」时用 max 取更靠后的那个状态（见 merge_nodes）
+_STATE_RANK = {s: i for i, s in enumerate(STATE_VALUES)}
+
 # 去掉这些后缀后若完全相同，则两个术语疑似同一概念（仅提示，绝不自动合并）
 _TAIL_WORDS = ("体系", "机制", "方法", "流程", "策略", "规范", "标准", "系统")
 
@@ -38,6 +41,9 @@ _TAIL_WORDS = ("体系", "机制", "方法", "流程", "策略", "规范", "标�
 _PUNCT = re.compile(r"[\s\u3000·・、,，.。;；:：!！?？\"'“”‘’()（）\[\]【】<>《》/\\|_\-—－+*#~`]+")
 
 REPORT_MARK = "const REPORT_DATA = "
+
+# 隔离备份名的自增序号：只到秒会互相覆盖，加 pid 也挡不住「同一进程同一秒内两次隔离」
+_QUARANTINE_SEQ = 0
 
 
 def normalize_id(term):
@@ -235,24 +241,32 @@ def _merge_into(card, node):
 
 
 def _quarantine_corrupt_kb():
-    """损坏的 knowledge.json 先改名备份，绝不当空库静默覆盖。
+    """损坏的 knowledge.json 先改名备份，绝不当空库静默覆盖。返回 True = 可以继续写盘。
 
     store.read_json 把「解析失败」和「文件为空」都归成 None，而 absorb 末尾会把内存里的库写回
     文件 —— 一次坏读就等于清空用户全部积累。判据必须是「文件有内容 **且** 解析失败」：
     正常的空库 {"nodes": []} 解析成功，绝不会被误备份走。
+
+    改名失败时返回 False（调用方 absorb 会放弃这次写盘）：宁可这次不沉淀，
+    也绝不能让坏文件被内存里的空库顶掉。
     """
     path = store.knowledge_path()
     if store.read_json(path, None) is not None:
-        return
+        return True
     if not store.read_text(path, "").strip():
-        return                       # 文件不存在或为空：没有可丢的数据
-    backup = "%s.corrupt-%s" % (path, datetime.now().strftime("%Y%m%d%H%M%S"))
+        return True                  # 文件不存在或为空：没有可丢的数据
+    # 文件名带自增序号：同秒内两次隔离（或两个进程）绝不能互相覆盖备份
+    global _QUARANTINE_SEQ
+    _QUARANTINE_SEQ += 1
+    backup = "%s.corrupt-%s-%d-%04d" % (path, datetime.now().strftime("%Y%m%d%H%M%S"),
+                                       os.getpid(), _QUARANTINE_SEQ)
     try:
         os.replace(path, backup)
     except OSError as e:
         log.log_event("kb.corrupt_backup_failed", level="warn", error=str(e))
-        return
+        return False
     log.log_event("kb.corrupt_backup", level="warn", backup=os.path.basename(backup))
+    return True
 
 
 def absorb(nodes, jd=None, kb=None):
@@ -261,9 +275,10 @@ def absorb(nodes, jd=None, kb=None):
     幂等：同一个 jd['id'] 重复吸收不会重复计数 from_jds，来源也不会翻倍。
 
     写盘之前先保住「读不出来」的旧文件（见 _quarantine_corrupt_kb）—— 本函数末尾一定会
-    save_knowledge，不先备份的话坏文件会被内存里的空库永久顶掉。
+    save_knowledge，不先备份的话坏文件会被内存里的空库永久顶掉。备份都失败时直接放弃本次吸收。
     """
-    _quarantine_corrupt_kb()
+    if not _quarantine_corrupt_kb():
+        return 0, 0
     kb = ensure_kb(kb if kb is not None else store.load_knowledge())
     index = {n.get("id"): n for n in kb["nodes"] if n.get("id")}
     added = merged = 0
@@ -325,7 +340,14 @@ def _is_subsequence(short, long_):
 
 
 def _dup_reason(a, b):
-    """两个身份键疑似同一概念的原因；不是则 None。"""
+    """两个身份键疑似同一概念的原因；不是则 None。
+
+    先做类型防御：knowledge.json 是用户可手改的，`"id": 5` 这类非字符串键会让
+    `5 in "abc"` 直接抛 TypeError —— 那会顺着 find_duplicates 冒到 /api/knowledge 变成 500，
+    违反 ensure_kb 一族「绝不抛异常」的契约。
+    """
+    if not isinstance(a, str) or not isinstance(b, str):
+        return None
     if not a or not b or a == b:
         return None
     if a in b or b in a:
@@ -352,8 +374,13 @@ def _dup_reason(a, b):
 
 
 def find_duplicates(kb, limit=20):
-    """启发式找出可能指同一概念的术语对。**只提示，绝不自动合并**（错并难发现）。"""
-    ids = [n.get("id") for n in ensure_kb(kb)["nodes"] if n.get("id")]
+    """启发式找出可能指同一概念的术语对。**只提示，绝不自动合并**（错并难发现）。
+
+    只取字符串 id：知识库可被用户手改出 `"id": 5`，非字符串既无法比较大小写与包含关系，
+    也会在 `5 in "abc"` 处抛 TypeError。
+    """
+    ids = [n.get("id") for n in ensure_kb(kb)["nodes"]
+           if isinstance(n.get("id"), str) and n.get("id")]
     out = []
     for i in range(len(ids)):
         for j in range(i + 1, len(ids)):
@@ -370,7 +397,9 @@ def merge_nodes(keep_id, drop_id, kb=None):
 
     参数可以是**身份键**也可以是**原始术语**（内部先 normalize_id，对已归一化的 id 是 no-op）。
 
-    keep 的学习进度保持不变（合并方向永远是「你的进度 → 保留」，不用 drop 覆盖）。
+    学习进度**取并集**（见下方注释）：手动合并的是两张「用户卡」，两张卡的进度都是用户的真实
+    作答结果，选错方向（把已掌握的并进待学习的）不该静默丢掉复习进度。这与 _merge_into 的
+    「只保 keep 进度」并不矛盾 —— 那条铁律守的是「AI 新节点不许覆盖你的进度」，这里两边都是你。
     """
     keep_id, drop_id = normalize_id(keep_id), normalize_id(drop_id)
     if not keep_id or not drop_id:
@@ -383,7 +412,27 @@ def merge_nodes(keep_id, drop_id, kb=None):
     if keep is None or drop is None:
         return False, "找不到要合并的知识点"
 
+    # 进度并集必须在 _merge_into **之前**取快照：_merge_into 会就地改 keep/drop 两个 dict
+    # （index 与 kb["nodes"] 是同一批对象），它会把 drop 的 last_outcome 补成默认值，
+    # 之后再去读 drop 就已经把用户真实的「已面试」读丢了。
+    union = {
+        "state": drop.get("state"),
+        "last_outcome": drop.get("last_outcome"),
+        "asked_count": _as_int(drop.get("asked_count")),
+        "first_seen": str(drop.get("first_seen") or ""),
+    }
+
     _merge_into(keep, drop)
+
+    # 手动合并两张「用户卡」时进度要取并集：否则误选合并方向就会静默丢掉复习进度
+    keep["asked_count"] = max(_as_int(keep.get("asked_count")), union["asked_count"])
+    if _STATE_RANK.get(str(union["state"]), 0) > _STATE_RANK.get(str(keep.get("state")), 0):
+        keep["state"] = union["state"]
+    if str(union["last_outcome"] or "") not in ("", DEFAULT_OUTCOME):
+        keep["last_outcome"] = union["last_outcome"]
+    fs = union["first_seen"]
+    if fs and (not keep.get("first_seen") or fs < str(keep["first_seen"])):
+        keep["first_seen"] = fs
 
     aliases = _as_list(keep.get("aliases"))
     for a in [drop.get("term")] + _as_list(drop.get("aliases")):
@@ -414,9 +463,13 @@ def stats(kb):
 
 
 def list_nodes(kb, q="", state="", category="", jd_id="", sort="mentions"):
-    """查询知识库。默认按「被多少个岗位提到过」降序 —— 提到越多越是岗位刚需。"""
+    """查询知识库。默认按「被多少个岗位提到过」降序 —— 提到越多越是岗位刚需。
+
+    q 先 str() 强制转换：查询串直接来自 URL 参数，`q=123` 这类输入不能把 AttributeError
+    冒到 /api/knowledge 上。
+    """
     nodes = list(ensure_kb(kb)["nodes"])
-    q = (q or "").strip().lower()
+    q = str(q or "").strip().lower()
     if q:
         nodes = [n for n in nodes
                  if q in str(n.get("term") or "").lower()
@@ -487,24 +540,33 @@ def absorb_reports():
     """回填：把所有已有报告的知识吸进知识库。纯本地、零 API 额度、幂等。
 
     返回 (处理成功的报告数, 新增卡片数, 合并次数)。
+
+    每份报告独立 try：一份写盘失败只跳过它，不能中断整轮回填（与 knowledge.py 的
+    「每项独立 try」风格一致）。
     """
     folder = store.p_path("reports")
     files = sorted(glob.glob(os.path.join(folder, "*.html"))) if os.path.isdir(folder) else []
     done = added = merged = 0
     for path in files:
         name = os.path.basename(path)
-        data = read_report_data(path)
-        if not data:
-            log.log_event("kb.import_skip", level="warn", file=name)
+        try:
+            data = read_report_data(path)
+            if not data:
+                # 旧格式报告（早期版本没有 REPORT_DATA）是可预期情况，不是异常
+                log.log_event("kb.import_skip", level="info", file=name, reason="读不出 REPORT_DATA")
+                continue
+            nodes = data.get("knowledge")
+            if isinstance(nodes, dict):
+                nodes = nodes.get("nodes")
+            if not isinstance(nodes, list) or not nodes:
+                log.log_event("kb.import_skip", level="info", file=name, reason="报告没有知识点")
+                continue
+            a, m = absorb(nodes, _report_jd(data, name))
+            added += a
+            merged += m
+            done += 1
+        except Exception as e:
+            log.log_exc("kb.import_report_error", e, file=name)
             continue
-        nodes = data.get("knowledge")
-        if isinstance(nodes, dict):
-            nodes = nodes.get("nodes")
-        if not isinstance(nodes, list) or not nodes:
-            continue
-        a, m = absorb(nodes, _report_jd(data, name))
-        added += a
-        merged += m
-        done += 1
     log.log_event("kb.import_done", files=done, added=added, merged=merged)
     return done, added, merged

@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import glob
 import json
+import log
 import os
 import unittest
 
@@ -48,7 +49,9 @@ class EnsureKbTest(unittest.TestCase):
 
 
 def _node(**kw):
-    n = {"id": "x", "term": "省略恢复", "definition": "把省略的成分补全",
+    # 默认 definition 刻意不含任何被测术语的字（曾用「把省略的成分补全」，含「省略」，
+    # 把 Task 7 的 q="省略" 计数断言污染成假绿；默认值必须与所有术语无关）
+    n = {"id": "x", "term": "省略恢复", "definition": "默认定义",
          "plain_explanation": "一句话说不完整，靠上下文补齐", "category": "NLP",
          "layer": 0, "sources": [], "timeline": [], "related": [],
          "interview_questions": [], "confidence": "ai-generated"}
@@ -58,6 +61,15 @@ def _node(**kw):
 
 def _src(url, title="t", snippet="s", date="2024"):
     return {"title": title, "url": url, "snippet": snippet, "date": date, "accessed": "2026-10-08"}
+
+
+def _log_events(name):
+    """读出隔离目录里的事件日志（IsolatedCase 已把 log.LOG_FILE 指到临时目录）"""
+    path = log.LOG_FILE
+    if not os.path.exists(path):
+        return []
+    return [e for e in (json.loads(l) for l in store.read_text(path).splitlines() if l.strip())
+            if e.get("event") == name]
 
 
 class AbsorbTest(IsolatedCase):
@@ -325,6 +337,58 @@ class ResilienceTest(IsolatedCase):
         kb.absorb([_node(layer="1")], {"id": "j1"})
         self.assertEqual(store.load_knowledge()["nodes"][0]["layer"], 1)
 
+    def test_corrupt_file_survives_when_backup_rename_fails(self):
+        # 改名失败还照写，等于把用户的积累用空库顶掉 —— 宁可这次不沉淀
+        store.ensure_profile()
+        path = store.knowledge_path()
+        store.write_text(path, "{ this is not json")
+        real_replace = kb.os.replace
+        kb.os.replace = lambda *a, **kw: (_ for _ in ()).throw(OSError("rename failed"))
+        try:
+            added, merged = kb.absorb([_node()], {"id": "j1"})
+        finally:
+            kb.os.replace = real_replace
+        self.assertEqual((added, merged), (0, 0))
+        self.assertEqual(store.read_text(path), "{ this is not json")   # 坏文件原样保留
+        self.assertEqual(glob.glob(path + ".corrupt-*"), [])            # 没有半成品备份
+        self.assertTrue(_log_events("kb.corrupt_backup_failed"))
+
+    def test_two_quarantines_in_the_same_second_do_not_overwrite_each_other(self):
+        # 备份名原先只到秒：同秒两次隔离会互相覆盖，只留下一个备份
+        store.ensure_profile()
+        path = store.knowledge_path()
+        for i in (1, 2):
+            store.write_text(path, "{ 坏文件 %d" % i)
+            kb.absorb([_node()], {"id": "j%d" % i})
+        backups = glob.glob(path + ".corrupt-*")
+        self.assertEqual(len(backups), 2)
+        self.assertEqual(sorted(store.read_text(x) for x in backups),
+                         ["{ 坏文件 1", "{ 坏文件 2"])
+
+    def test_absorb_does_not_wipe_an_existing_live_kb(self):
+        # 反向确认：正常库（能解析）绝不被隔离，absorb 之后内容只增不减
+        kb.absorb([_node(term="A词")], {"id": "j1"})
+        self.assertEqual(glob.glob(store.knowledge_path() + ".corrupt-*"), [])
+        kb.absorb([_node(term="B词")], {"id": "j2"})
+        self.assertEqual(sorted(n["term"] for n in store.load_knowledge()["nodes"]),
+                         ["A词", "B词"])
+    def test_jd_without_id_is_not_recorded(self):
+        # _add_jd 只过滤非 dict 时，「没有 id 的 dict」会被记进 from_jds：
+        # stats()["multi_jd"] 数它、all_jds() 又跳过它 —— 统计口径打架
+        kb.absorb([_node()], {"job_title": "没有 id 的岗位"})
+        card = store.load_knowledge()["nodes"][0]
+        self.assertEqual(card["from_jds"], [])
+        self.assertEqual(kb.stats(store.load_knowledge())["multi_jd"], 0)
+        self.assertEqual(kb.all_jds(store.load_knowledge()), [])
+
+    def test_id_less_jd_does_not_inflate_multi_jd(self):
+        kb.absorb([_node()], {"id": "j1"})
+        kb.absorb([_node()], {"job_title": "没有 id"})
+        kb.absorb([_node()], {"company": "没有 id 的公司"})
+        d = store.load_knowledge()
+        self.assertEqual(len(d["nodes"][0]["from_jds"]), 1)
+        self.assertEqual(kb.stats(d)["multi_jd"], 0)
+
 
 class DuplicateTest(IsolatedCase):
     def _seed(self, terms):
@@ -341,9 +405,67 @@ class DuplicateTest(IsolatedCase):
         self.assertTrue(kb.find_duplicates(store.load_knowledge()))
 
     def test_does_not_pair_unrelated_terms(self):
+        # 原来只否定 4 个术语里的一对，负例强度太弱（另外 5 对悄悄配上了也照样绿）
+        # → 断言这 4 个术语两两都不成对
         self._seed(["Transformer 架构", "抽样检验", "幻觉", "标注规范"])
-        for d in kb.find_duplicates(store.load_knowledge()):
-            self.assertNotEqual({d["a"], d["b"]}, {"transformer架构", "抽样检验"})
+        self.assertEqual(kb.find_duplicates(store.load_knowledge()), [])
+
+    def test_non_string_ids_do_not_raise(self):
+        # knowledge.json 是用户可手改的：`"id": 5` 曾让 `5 in "abc"` 抛 TypeError，
+        # 顺着 /api/knowledge 变成 500
+        kb_data = {"nodes": [{"id": 5, "term": "手改的坏卡"}, {"id": None},
+                             {"id": {}}, {"id": []}, {"id": "abc", "term": "正常卡"}]}
+        self.assertIsInstance(kb.find_duplicates(kb_data), list)
+        self.assertIsInstance(kb.find_duplicates({"nodes": [{"id": 1}, {"id": 2}]}), list)
+        self.assertEqual(kb.find_duplicates({"nodes": [{"id": 5}, {"id": "abc"}]}), [])
+
+    def test_non_string_ids_are_ignored_but_string_ones_still_compared(self):
+        kb_data = {"nodes": [{"id": 5}, {"id": "省略恢复"}, {"id": "省略识别及恢复"}]}
+        dups = kb.find_duplicates(kb_data)
+        self.assertEqual(len(dups), 1)
+        self.assertEqual({dups[0]["a"], dups[0]["b"]}, {"省略恢复", "省略识别及恢复"})
+
+    def test_dup_reason_type_guard(self):
+        # 双保险：即使有人绕过 find_duplicates 直接调 _dup_reason，也不能抛
+        self.assertIsNone(kb._dup_reason(5, "abc"))
+        self.assertIsNone(kb._dup_reason("abc", 5))
+        self.assertIsNone(kb._dup_reason(None, None))
+
+    def test_synonym_suffix_rule_pairs_same_stem_after_stripping_tail_word(self):
+        # 「训练体系 / 训练机制」：去掉后缀词后词干同为「训练」，且互相不包含
+        # （所以走的是「同义后缀」分支，不是「包含」分支）
+        self._seed(["训练体系", "训练机制"])
+        dups = kb.find_duplicates(store.load_knowledge())
+        self.assertEqual(len(dups), 1)
+        self.assertEqual(dups[0]["reason"], "同义后缀")
+
+    def test_synonym_suffix_rule_needs_same_stem(self):
+        # 同一条规则的负例：后缀词相同、去掉之后词干不同 → 不成对
+        self._seed(["训练体系", "评估体系"])
+        self.assertEqual(kb.find_duplicates(store.load_knowledge()), [])
+
+    def test_prefix_and_suffix_similarity_rule(self):
+        # 「首尾相近」在真实语料从未触发过 —— 这条规则此前完全没有测试。
+        # 这两个术语前 4 字与后 2 字都相同、互相不包含，只能由「首尾相近」命中
+        self._seed(["数据标注处理流程", "数据标注审核流程"])
+        dups = kb.find_duplicates(store.load_knowledge())
+        self.assertEqual(len(dups), 1)
+        self.assertEqual(dups[0]["reason"], "首尾相近")
+
+    def test_short_terms_are_excluded_from_prefix_similarity(self):
+        # 门槛是「两个都 ≥6 字」：4 字词首尾同字极易互相配对，必须被挡住
+        self._seed(["机器学习", "机器算法"])
+        self.assertEqual(kb.find_duplicates(store.load_knowledge()), [])
+
+    def test_prefix_similarity_needs_both_prefix_and_suffix(self):
+        # 前缀 4 字相同但尾字不同，且互相不包含 → 不成对（门槛是 p>=4 且 s>=2）
+        self._seed(["模型微调策略", "模型微调方案"])
+        self.assertEqual(kb.find_duplicates(store.load_knowledge()), [])
+
+    def test_containment_length_gap_over_four_is_not_a_pair(self):
+        # 「包含」分支的长度差门槛 ≤4：差了 5 个字就不是同一概念的写法差异
+        self._seed(["机器学习", "机器学习算法与模型"])
+        self.assertEqual(kb.find_duplicates(store.load_knowledge()), [])
 
     def test_short_terms_do_not_generate_prefix_noise(self):
         self._seed(["抽样", "抽取", "抽检"])
@@ -385,7 +507,10 @@ class ManualMergeTest(IsolatedCase):
         kb.absorb([_node(term="B词", sources=[_src("https://b")])], {"id": "j2"})
         kb.set_state("A词", "已掌握")
         kb.set_state("B词", "待学习")
-        kb.merge_nodes("A词", "B词")
+        ok, msg = kb.merge_nodes("A词", "B词")
+        # 先钉住「合并真的发生了」：只断 state 的话，一个完全不合并的 no-op 实现也能通过
+        self.assertTrue(ok, msg)
+        self.assertEqual(len(store.load_knowledge()["nodes"]), 1)
         self.assertEqual(store.load_knowledge()["nodes"][0]["state"], "已掌握")
 
     def test_merge_rejects_same_id(self):
@@ -393,19 +518,31 @@ class ManualMergeTest(IsolatedCase):
         ok, msg = kb.merge_nodes("A词", "A词")
         self.assertFalse(ok)
         self.assertIn("自己", msg)
+        self.assertEqual(len(store.load_knowledge()["nodes"]), 1)
 
     def test_merge_rejects_unknown_id(self):
         kb.absorb([_node(term="A词")], {"id": "j1"})
+        # 先确认 keep 侧确实存在且能命中：否则「找不到 keep」与「找不到 drop」分不开，
+        # 一个把 keep 也查丢的 no-op 实现照样能让本用例通过
+        self.assertTrue(kb.set_state("A词", "学习中")[0])
         ok, msg = kb.merge_nodes("A词", "不存在的词")
         self.assertFalse(ok)
-        self.assertEqual(len(store.load_knowledge()["nodes"]), 1)
+        # 拒绝必须是「什么都没发生」：合并照做但返回失败同样是错的
+        cards = store.load_knowledge()["nodes"]
+        self.assertEqual(len(cards), 1)
+        self.assertEqual(cards[0]["term"], "A词")
+        self.assertEqual(cards[0]["aliases"], [])
 
     def test_merge_is_idempotent_when_target_gone(self):
         kb.absorb([_node(term="A词")], {"id": "j1"})
         kb.absorb([_node(term="B词")], {"id": "j2"})
-        kb.merge_nodes("A词", "B词")
+        ok, msg = kb.merge_nodes("A词", "B词")
+        self.assertTrue(ok, msg)          # 第一次必须真的合并掉（否则第二次的 False 是假象）
+        # 钉住「第一次真的动过库」：只断第二次返回 False 的话，一个什么都不做的 no-op 也照样绿
+        self.assertEqual([n["term"] for n in store.load_knowledge()["nodes"]], ["A词"])
         ok, _ = kb.merge_nodes("A词", "B词")
         self.assertFalse(ok)
+        self.assertEqual(len(store.load_knowledge()["nodes"]), 1)
 
     def test_entry_points_accept_raw_terms_and_ids_alike(self):
         kb.absorb([_node(term="Transformer 架构")], {"id": "j1"})
@@ -418,6 +555,72 @@ class ManualMergeTest(IsolatedCase):
         kb.absorb([_node(term="省略识别及恢复")], {"id": "j2"})
         ok, msg = kb.merge_nodes("Transformer 架构", "省略识别及恢复")
         self.assertTrue(ok, msg)
+
+
+class ProgressUnionTest(IsolatedCase):
+    """手动合并两张「用户卡」时，学习进度取并集而不是只保 keep 的（否则误选方向即静默丢进度）。
+
+    注意：这不是放松「用户进度神圣」—— _merge_into（AI 节点并入你的卡）里 keep 的进度仍然
+    绝不被覆盖，铁律 1 只针对「库 → 覆盖你」，这里是两张你自己的卡。
+    """
+
+    def _seed(self, term, jd_id, state=None, asked=None, outcome=None, first_seen=None):
+        kb.absorb([_node(term=term)], {"id": jd_id})
+        d = store.load_knowledge()
+        card = [n for n in d["nodes"] if n["id"] == kb.normalize_id(term)][0]
+        if state is not None:
+            card["state"] = state
+        if asked is not None:
+            card["asked_count"] = asked
+        if outcome is not None:
+            card["last_outcome"] = outcome
+        if first_seen is not None:
+            card["first_seen"] = first_seen
+        store.save_knowledge(d)
+
+    def test_merge_unions_progress_so_drop_progress_is_not_lost(self):
+        # 审查实测的原始故障：keep「待学习/未面试/0」+ drop「已掌握/已面试/5」→ 合并后全丢
+        self._seed("A词", "j1")
+        self._seed("B词", "j2", state="已掌握", asked=5, outcome="已面试")
+        ok, msg = kb.merge_nodes("A词", "B词")
+        self.assertTrue(ok, msg)
+        card = store.load_knowledge()["nodes"][0]
+        self.assertEqual(card["state"], "已掌握")
+        self.assertEqual(card["last_outcome"], "已面试")
+        self.assertEqual(card["asked_count"], 5)
+
+    def test_merge_does_not_reset_keep_progress_when_drop_is_blank(self):
+        # 只补不回退：drop 的进度是空值时，绝不能把 keep 已有的真实结果冲成默认值
+        self._seed("A词", "j1", state="已掌握", asked=3, outcome="已面试")
+        self._seed("B词", "j2")
+        self.assertTrue(kb.merge_nodes("A词", "B词")[0])
+        card = store.load_knowledge()["nodes"][0]
+        self.assertEqual(card["state"], "已掌握")
+        self.assertEqual(card["last_outcome"], "已面试")
+        self.assertEqual(card["asked_count"], 3)
+
+    def test_merge_takes_earliest_first_seen(self):
+        # first_seen = 「这个概念最早什么时候出现」，并集口径下应取更早的一侧
+        self._seed("A词", "j1", first_seen="2026-10-08")
+        self._seed("B词", "j2", first_seen="2026-01-01")
+        self.assertTrue(kb.merge_nodes("A词", "B词")[0])
+        self.assertEqual(store.load_knowledge()["nodes"][0]["first_seen"], "2026-01-01")
+
+    def test_merge_takes_earliest_first_seen_the_other_way_round(self):
+        self._seed("A词", "j1", first_seen="2026-01-01")
+        self._seed("B词", "j2", first_seen="2026-10-08")
+        self.assertTrue(kb.merge_nodes("A词", "B词")[0])
+        self.assertEqual(store.load_knowledge()["nodes"][0]["first_seen"], "2026-01-01")
+
+    def test_merge_still_accumulates_aliases_and_from_jds(self):
+        # 进度并集只补不回退：来源/别名等仍按原语义累加
+        self._seed("A词", "j1", state="已掌握", asked=5, outcome="已面试")
+        self._seed("B词", "j2")
+        self.assertTrue(kb.merge_nodes("A词", "B词")[0])
+        card = store.load_knowledge()["nodes"][0]
+        self.assertEqual(card["term"], "A词")
+        self.assertIn("B词", card["aliases"])
+        self.assertEqual(sorted(j["id"] for j in card["from_jds"]), ["j1", "j2"])
 
 
 class QueryTest(IsolatedCase):
@@ -448,9 +651,18 @@ class QueryTest(IsolatedCase):
         self.assertEqual(s["by_state"], {"待学习": 0, "学习中": 0, "已掌握": 0})
 
     def test_search_matches_term_and_definition(self):
-        self.assertEqual(len(kb.list_nodes(store.load_knowledge(), q="省略")), 1)
+        # 断言返回的术语集合，不断言条数：条数会被「别的卡恰好也命中」污染（默认 definition 就害过一次）
+        self.assertEqual({n["term"] for n in kb.list_nodes(store.load_knowledge(), q="省略")},
+                         {"省略恢复"})
         self.assertEqual(len(kb.list_nodes(store.load_knowledge(), q="统计抽样")), 1)
         self.assertEqual(len(kb.list_nodes(store.load_knowledge(), q="不存在的词")), 0)
+
+    def test_search_tolerates_non_string_q(self):
+        # q 直接来自 URL 参数：123 / bytes 不能让 AttributeError / TypeError 冒成 500
+        kb_data = store.load_knowledge()
+        for bad in (123, b"x", None, [], object()):
+            self.assertIsInstance(kb.list_nodes(kb_data, q=bad), list)
+        self.assertEqual({n["term"] for n in kb.list_nodes(kb_data, q=123)}, set())
 
     def test_filter_by_state_and_category(self):
         kb.set_state("省略恢复", "已掌握")
@@ -546,3 +758,47 @@ class ImportReportsTest(IsolatedCase):
     def test_empty_folder_is_fine(self):
         store.ensure_profile()
         self.assertEqual(kb.absorb_reports(), (0, 0, 0))
+
+    def test_one_bad_report_does_not_abort_the_whole_backfill(self):
+        # 循环内没有 per-report try 时，一份报告写盘失败会让后面所有报告都吸不进来
+        self._write_report("20260901_岗C_60分.html", {
+            "report_id": "20260901_岗C_60分", "job_title": "岗C",
+            "knowledge": [_node(term="坏报告里的词")]})
+        self._write_report("20260902_岗D_70分.html", {
+            "report_id": "20260902_岗D_70分", "job_title": "岗D",
+            "knowledge": [_node(term="好报告里的词")]})
+        real_absorb = kb.absorb
+
+        def boom(nodes, jd=None, kb_=None):
+            if jd and jd.get("id") == "20260901_岗C_60分":
+                raise OSError("disk full")
+            return real_absorb(nodes, jd, kb_)
+
+        kb.absorb = boom
+        try:
+            files, added, merged = kb.absorb_reports()
+        finally:
+            kb.absorb = real_absorb
+        self.assertEqual((files, added, merged), (1, 1, 0))
+        self.assertEqual([n["term"] for n in store.load_knowledge()["nodes"]],
+                         ["好报告里的词"])
+        self.assertTrue(_log_events("kb.import_report_error"))
+
+    def test_skipped_old_format_reports_are_logged_at_info_level(self):
+        # 旧格式报告是可预期情况：不能打 warn（用户在日志页看到的「异常」里混着正常跳过）
+        self._write_report("20260901_岗C_60分.html", {"report_id": "20260901_岗C_60分"})
+        files, added, _ = kb.absorb_reports()
+        self.assertEqual((files, added), (0, 0))
+        res = _log_events("kb.import_skip")
+        self.assertEqual(len(res), 1)
+        self.assertEqual(res[0]["level"], "info")
+        self.assertEqual(res[0]["data"]["file"], "20260901_岗C_60分.html")
+
+    def test_skipped_old_format_report_without_data_marker_is_info_too(self):
+        store.ensure_profile()
+        store.write_text(os.path.join(store.p_path("reports"), "旧报告.html"), "<html>no data")
+        self.assertEqual(kb.absorb_reports()[0], 0)
+        res = _log_events("kb.import_skip")
+        self.assertTrue(res)
+        self.assertTrue(all(e["level"] == "info" for e in res))
+        self.assertFalse(_log_events("kb.import_report_error"))
