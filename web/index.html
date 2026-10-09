@@ -124,6 +124,23 @@
   .kbstates{display:flex;gap:6px;margin-top:10px}
   .kbstates button{font-size:12.5px;padding:5px 12px}
   .kbstates button.on{background:var(--accent);color:#fff;border-color:var(--accent)}
+  /* 翻卡自测（阶段 3.2） */
+  /* 注意：.kbsplit{display:flex} 这类作者样式会盖掉 UA 的 [hidden]{display:none}，
+     隐藏必须靠 !important，否则 hidden 形同虚设（自测面板会和列表同时出现）。 */
+  [hidden]{display:none !important}
+  .kbreview{border:1px solid var(--line);border-radius:10px;padding:18px;background:#fcfdff}
+  .kbrvtop{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:12px}
+  .kbrvtop .n{font-weight:700;font-size:14px}
+  .kbrvtop .sc{font-size:12.5px;color:var(--sub)}
+  .kbrvtop .why{font-size:12px;color:var(--muted)}
+  .kbrvbar{height:7px;border-radius:999px;background:#eef1f7;overflow:hidden;margin-bottom:16px}
+  .kbrvbar i{display:block;height:100%;background:linear-gradient(90deg,#2563eb,#4f46e5);transition:width .25s}
+  .kbrvcard{border:1px solid var(--line);border-radius:12px;background:#fff;padding:22px;text-align:center}
+  .kbrvterm{font-size:22px;font-weight:800;letter-spacing:.5px;line-height:1.4}
+  .kbrvhint{font-size:12.5px;color:var(--muted);margin-top:8px}
+  .kbrvans{text-align:left;margin-top:16px;border-top:1px dashed var(--line);padding-top:14px}
+  .kbrvbtns{display:flex;gap:10px;justify-content:center;flex-wrap:wrap;margin-top:18px}
+  .kbrvsum .big{font-size:30px;font-weight:800;color:var(--accent)}
 </style>
 </head>
 <body>
@@ -223,9 +240,11 @@
           <option value="recent">按最近出现</option>
           <option value="term">按术语</option>
         </select>
+        <button id="kbReview" class="btn">🎯 开始自测</button>
         <button id="kbImport" class="ghost">从已有报告导入</button>
       </div>
-      <div class="kbsplit">
+      <div id="kbReviewBox" class="kbreview" hidden></div>
+      <div class="kbsplit" id="kbSplit">
         <div class="kblist" id="kbList"></div>
         <div class="kbdetail" id="kbDetail"><div class="kbdempty">← 左侧选一个知识点</div></div>
       </div>
@@ -692,6 +711,145 @@ async function kbImport(){
   finally { btn.disabled = false; btn.textContent = '从已有报告导入'; }
 }
 
+/* ---------- 🎯 翻卡自测（阶段 3.2） ----------
+   队列来自 GET /api/knowledge/review（后端按状态权重 × 被提到次数 × 久未复习排好序），
+   答题结果 POST /api/knowledge/review {id, result} —— id 必须是节点的**身份键**，
+   不是术语（术语会经过 kb.normalize_id 归一化，可能撞到另一张卡）。 */
+let KB_RV = null;   // {queue, i, up, down, shown, busy}
+
+async function kbReviewStart(){
+  const btn = $('#kbReview');
+  if(btn) btn.disabled = true;
+  let d;
+  try{
+    d = await (await fetch('/api/knowledge/review?limit=20')).json();
+  }catch(e){
+    toast('复习队列读取失败：'+e.message);
+    logUI('kb.review_load_failed', {error:e.message}, 'error');
+    if(btn) btn.disabled = false;
+    return;
+  }
+  if(btn) btn.disabled = false;
+  // 和 kbLoad 同样的纪律：HTTP 500 也能 json() 出 {ok:false}，不判 ok 就会把错误对象当数据用
+  if(!d || d.ok === false){
+    const msg = (d && d.error) || '复习队列读取失败（服务无响应）';
+    toast(msg); logUI('kb.review_load_failed', {error:msg}, 'error'); return;
+  }
+  const q = d.queue || [];
+  if(!q.length){ toast('暂时没有要复习的知识点（知识库为空，或都刚复习过）'); return; }
+  KB_RV = {queue:q, i:0, up:0, down:0, shown:false, busy:false};
+  kbReviewRender();
+  logUI('kb.review_start', {n:q.length});
+}
+
+function kbReviewAnswerHTML(n){
+  let h = '<div class="kbrvans">';
+  h += n.definition
+    ? '<div class="kbsec"><h4>专业定义</h4><div class="kbq">'+esc(n.definition)+'</div></div>'
+    : '<div class="kbsec"><h4>专业定义</h4><div class="kbdempty">这张卡还没有定义</div></div>';
+  if(n.plain_explanation) h += '<div class="kbsec"><h4>通俗解释</h4><div class="kbq">'+esc(n.plain_explanation)+'</div></div>';
+  const ss = n.sources || [];
+  if(ss.length) h += '<div class="kbsec"><h4>来源（可点开原文）</h4><ul class="kbdlist">'
+    + ss.map(s=>{
+        const label = esc(s.title || s.url);
+        const url = kbSafeUrl(s.url);           // 非 http(s) 不渲染成链接（见 kbSafeUrl 注释）
+        return url ? '<li><a href="'+esc(url)+'" target="_blank" rel="noopener">'+label+'</a></li>'
+                   : '<li>'+label+'</li>';
+      }).join('') + '</ul></div>';
+  const jd = (n.from_jds || []).filter(j=>j && j.id);
+  if(jd.length) h += '<div class="kbsec"><h4>来源岗位</h4><ul class="kbdlist">'
+    + jd.map(j=>'<li>'+esc(j.job_title || j.id)+(j.company ? ' · '+esc(j.company) : '')+'</li>').join('')+'</ul></div>';
+  return h + '</div>';
+}
+
+function kbReviewPanel(){
+  const R = KB_RV, M = R.queue.length;
+  const done = R.i >= M;
+  const n = done ? null : R.queue[R.i];
+  const pct = M ? Math.round(Math.min(R.i, M) * 100 / M) : 100;
+  let h = '<div class="kbrvtop">'
+    + '<span class="n">'+(done ? '本轮完成' : '第 '+(R.i+1)+' / '+M+' 张')+'</span>'
+    + '<span class="sc">答上 <b>'+R.up+'</b> · 没答上 <b>'+R.down+'</b></span>'
+    + (n && n.reason ? '<span class="why">为什么这张排前面：'+esc(n.reason)+'</span>' : '')
+    + '<button class="btn gray sm" id="kbRvExit" style="margin-left:auto">← 退出自测</button>'
+    + '</div>'
+    + '<div class="kbrvbar"><i style="width:'+pct+'%"></i></div>';
+  if(done){
+    h += '<div class="kbrvcard kbrvsum"><div class="big">'+R.up+' / '+M+'</div>'
+      + '<div class="kbrvhint">本轮小结：答上 '+R.up+' · 没答上 '+R.down+'</div>'
+      + '<div class="kbrvbtns">'
+      + '<button class="btn" id="kbRvAgain">🔁 再来一轮</button>'
+      + '<button class="btn gray" id="kbRvExit2">返回知识库</button></div></div>';
+    return h;
+  }
+  // 正面只有术语：答案要先经过「看答案」这一步，别让人一眼看到定义
+  h += '<div class="kbrvcard"><div class="kbrvterm">'+esc(n.term || n.id)+'</div>'
+    + '<div class="kbrvhint">先自己回想一遍，再点「看答案」核对</div>';
+  if(R.shown) h += kbReviewAnswerHTML(n);
+  h += '<div class="kbrvbtns">' + (R.shown
+      ? '<button class="btn" data-rv="答上了">✅ 答上了</button>'
+        + '<button class="btn gray" data-rv="没答上">❌ 没答上</button>'
+      : '<button class="btn" id="kbRvShow">👀 看答案</button>')
+    + '</div></div>';
+  return h;
+}
+
+function kbReviewRender(){
+  const box = $('#kbReviewBox'); if(!box) return;
+  if(!KB_RV){ box.hidden = true; box.innerHTML = ''; return; }
+  const split = $('#kbSplit'); if(split) split.hidden = true;    // 自测面板替换掉列表区域
+  const dup = $('#kbDup'); if(dup) dup.hidden = true;
+  const rv = $('#kbReview'); if(rv) rv.hidden = true;
+  box.hidden = false;
+  box.innerHTML = kbReviewPanel();
+  /* 面板每次重建都换新节点，但监听器只绑在容器上（一次），靠 id / data-rv 分发：
+     反复进面板、反复答题都不会叠加绑定（点一次只发一次请求）。 */
+  if(!box.__rvBound){
+    box.__rvBound = true;
+    box.addEventListener('click', e=>{
+      const t = e.target; if(!t || !t.dataset) return;
+      if(t.dataset.rv){ kbReviewAnswer(t.dataset.rv); return; }
+      if(t.id === 'kbRvShow'){ if(KB_RV){ KB_RV.shown = true; kbReviewRender(); } return; }
+      if(t.id === 'kbRvExit' || t.id === 'kbRvExit2'){ kbReviewExit(); return; }
+      if(t.id === 'kbRvAgain'){ KB_RV = null; kbReviewStart(); }
+    });
+  }
+}
+
+function kbReviewExit(){
+  KB_RV = null;
+  const box = $('#kbReviewBox'); if(box){ box.hidden = true; box.innerHTML = ''; }
+  const split = $('#kbSplit'); if(split) split.hidden = false;
+  const dup = $('#kbDup'); if(dup) dup.hidden = false;
+  const rv = $('#kbReview'); if(rv) rv.hidden = false;
+  kbLoad();     // 状态被自测改过了：回列表必须重新拉，不能拿旧数据糊弄
+  toast('已退出自测');
+}
+
+async function kbReviewAnswer(result){
+  const R = KB_RV;
+  if(!R || R.busy) return;
+  if(result !== '答上了' && result !== '没答上') return;   // result 只有两个合法值（后端也这么判）
+  const n = R.queue[R.i]; if(!n) return;
+  R.busy = true;
+  let d;
+  try{
+    d = await (await fetch('/api/knowledge/review', {method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({id:n.id, result:result})})).json();
+  }catch(e){
+    R.busy = false; toast('未记录，请重试');               // 失败：停在当前卡，绝不推进
+    logUI('kb.review_failed', {error:e.message}, 'error'); return;
+  }
+  if(!d || d.ok === false){
+    R.busy = false; toast('未记录，请重试');
+    logUI('kb.review_failed', {error:(d && d.error) || ''}, 'error'); return;
+  }
+  if(result === '答上了') R.up++; else R.down++;
+  R.i++; R.shown = false; R.busy = false;                  // 成功才推进
+  kbReviewRender();
+}
+
 function initKnowTab(){
   // 只绑一次：每次点 tab 都会调用本函数，重复绑定会让一次输入触发多次请求
   if(!initKnowTab.done){
@@ -699,6 +857,7 @@ function initKnowTab(){
     $('#kbQ').addEventListener('input', ()=>{ clearTimeout(kbT); kbT = setTimeout(kbLoad, 250); });
     ['kbState','kbCat','kbJd','kbSort'].forEach(id=>$('#'+id).addEventListener('change', kbLoad));
     $('#kbImport').addEventListener('click', kbImport);
+    $('#kbReview').addEventListener('click', kbReviewStart);
   }
   kbLoad();
 }
