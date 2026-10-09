@@ -21,6 +21,7 @@ from urllib.parse import urlparse, parse_qs, unquote, quote
 
 import kb
 import knowledge
+import interview
 import llm
 import log
 import search as search_mod
@@ -35,6 +36,7 @@ except Exception:
 ROOT = store.ROOT
 WEB = os.path.join(ROOT, "web")
 TEMPLATE_PATH = os.path.join(WEB, "report_template.html")
+INTERVIEW_TEMPLATE_PATH = os.path.join(WEB, "interview_template.html")   # 面试复盘报告版式
 DEMO_PATH = os.path.join(WEB, "demo_data.json")
 DEMO_ID = "示例_语音文本评测_80分"   # 示例报告固定文件名，避免重复点击产生 (2)(3) 副本
 SOP_FILES = ["00-求职SOP总纲.md", "02-预筛与打分.md", "03-JD拆解.md", "04-简历大纲.md", "05-面试准备.md"]
@@ -147,27 +149,52 @@ def _report_title(path):
     return m.group(1) if m else os.path.basename(path)
 
 
+def _attach_transcript(data):
+    """把这场面试的原始转写塞进报告数据 —— 复盘报告的「原始转写全文」段要它。
+
+    为什么不指望生成时写进去：`interview.render_report` 交给 `app.render_report` 的 out 里只有
+    7 段分析 + meta（duration/language/chars/interview_id），**没有转写正文**；正文躺在
+    `interviews/<id>/transcript.json` 里。而 /reports/* 本来就是「动态拼装、老报告吃最新模板」，
+    顺手读一次即可 —— 比把几十万字复制进每一份报告的 REPORT_DATA 更省。
+
+    取不到（旧报告 / 记录被删 / 文件损坏 / 没有 meta）一律静默跳过：绝不能让报告因此打不开。
+    """
+    meta = data.get("meta") if isinstance(data.get("meta"), dict) else {}
+    iid = str(meta.get("interview_id") or "")
+    if not iid:
+        rid = str(data.get("report_id") or "")
+        iid = rid[3:] if rid.startswith("iv_") else ""      # 报告文件名就是 iv_<面试id>
+    if not iid:
+        return
+    tr = store.load_interview_json(iid, "transcript.json", {})
+    text = tr.get("text") if isinstance(tr, dict) else ""
+    if isinstance(text, str) and text.strip():
+        data["transcript_text"] = text
+
+
 def _render_report_page(path):
-    """用**当前模板**重渲染一份已存在的报告；做不到时返回 None。
+    """用**当前模板** + 报告里的 REPORT_DATA 渲染。kind 决定用哪个模板。
 
-    为什么必须这样：报告的前端 JS 是内嵌在每份 HTML 里的，改模板只影响之后新生成的报告 ——
-    老报告的逻辑永远停在「生成那一天」的版本（「列表视图位置记忆」和「打钩存服务端」
-    已经两次踩到同一个坑）。所以 /reports/* 一律动态拼装：
-      - 分析数据：仍然取该报告文件里的 REPORT_DATA 快照，一个字都不改
-      - 页面骨架 / 前端逻辑：用当前 web/report_template.html
+    kind="interview" → interview_template.html；其它/缺失 → report_template.html。
+    缺省必须是 JD 模板：`kind` 是这一轮才加进报告数据的字段，**所有老 JD 报告都没有它** ——
+    缺省一旦反过来，上线当天全部老报告都会变成复盘版式。
 
-    读不出 REPORT_DATA（旧格式 / 文件被改坏）或模板缺失时返回 None，
+    读不出 REPORT_DATA（旧格式 / 文件被改坏）、模板缺失、或拼装时出任何意外时返回 None，
     由调用方退回 _send_file 原样发送 —— 报告绝不能因此打不开。
     """
     data = kb.read_report_data(path)
-    if not data:
+    if not isinstance(data, dict):
         return None
-    tpl = store.read_text(TEMPLATE_PATH)
+    is_interview = data.get("kind") == "interview"
+    tpl = store.read_text(INTERVIEW_TEMPLATE_PATH if is_interview else TEMPLATE_PATH)
     if not tpl:
         return None
+    if is_interview:
+        _attach_transcript(data)
+    title = _report_title(path) or os.path.basename(path)
     # 拼装方式必须与 render_report() 完全一致，否则同一份数据会渲染出两种页面
     payload = json.dumps(data, ensure_ascii=False).replace("</", "<\\/")
-    return tpl.replace("__TITLE__", _report_title(path)).replace("__REPORT_DATA__", payload)
+    return tpl.replace("__TITLE__", title).replace("__REPORT_DATA__", payload)
 
 
 def render_report(d, fixed_id=None):
@@ -387,6 +414,104 @@ def do_demo():
     return fname
 
 
+# ---------------------------------------------------------------- 面试上传
+# 服务端自己生成落盘文件名：客户端文件名只进 status.json 当元数据，**绝不参与拼路径**
+UPLOAD_AUDIO_EXTS = (".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".opus",
+                     ".mp4", ".mov", ".mkv", ".webm", ".avi")
+UPLOAD_TEXT_EXTS = (".txt", ".md")
+UPLOAD_FALLBACK_EXT = ".wav"     # 认不出的扩展名：扩展名只是给 _find_audio 认的，格式由 ffmpeg 按内容探
+
+
+class ContentLengthReader:
+    """只让读 n 个字节的读取器 —— 喂给 store.save_stream 的那个「分块读」。
+
+    为什么必须有它：`BaseHTTPRequestHandler.rfile` 是**套接字上的 BufferedReader**，它的
+    `read(k)` 会一直阻塞到凑满 k 字节或对端关闭连接。save_stream 每次要 256KB，而
+    Content-Length 只有几十 MB（或者一个小文字稿）时，客户端正等着响应、不会关连接 ——
+    于是服务端死等，上传永远卡住（本地 BytesIO 的测试**根本发现不了**：它到末尾就返回短数据）。
+    按 Content-Length 精确截断，读到 n 字节即 EOF，才谈得上「分块写盘」。
+
+    chunked 请求拿不到 Content-Length，本工具不支持（前端用 File 当 body，浏览器一定会带）。
+    """
+
+    def __init__(self, src, length):
+        self.src = src
+        self.left = max(0, int(length or 0))
+
+    def read(self, size=-1):
+        if self.left <= 0:
+            return b""
+        want = self.left if (size is None or size < 0) else min(int(size), self.left)
+        chunk = self.src.read(want) or b""
+        if len(chunk) > want:            # 防呆：不守规矩的 reader 也休想让我们写超过声明的字节数
+            chunk = chunk[:want]
+        self.left -= len(chunk)
+        return chunk
+
+
+def new_interview_id(job_id):
+    """`<YYYYMMDD_HHMM>_<岗位slug>`（规格 §3）；同一分钟里连传两次时加序号。
+
+    不用 uuid / 自增计数：id 要能被人一眼看懂是哪场面试（也是报告的文件名 iv_<id>.html）。
+    """
+    base = "%s_%s" % (datetime.now().strftime("%Y%m%d_%H%M"), store.slug(job_id))
+    iid, n = base, 2
+    while os.path.isdir(store.interview_dir(iid)):
+        iid = "%s-%d" % (base, n)
+        n += 1
+    return iid
+
+
+def upload_kind_of(header_kind, ext):
+    """这次上传是音频还是文字稿：X-Kind（audio/text）优先，auto/缺省时按扩展名。"""
+    k = str(header_kind or "").strip().lower()
+    if k in ("audio", "text"):
+        return k
+    return "text" if ext in UPLOAD_TEXT_EXTS else "audio"
+
+
+def upload_filename(kind, original):
+    """服务端生成的目标文件名。
+
+    文字稿必须叫 source.txt：`interview.run_pipeline` 对 kind="text" 读的就是这个固定名字
+    （改成 source.md 会让文字稿永远分析出空文本，而音频那条路又找不到录音）。
+    """
+    if kind == "text":
+        return "source.txt"
+    ext = os.path.splitext(str(original or ""))[1].lower()
+    return "audio" + (ext if ext in UPLOAD_AUDIO_EXTS else UPLOAD_FALLBACK_EXT)
+
+
+def interview_kind_of(st, interview_id):
+    """这份记录该跑音频还是文字稿流水线。
+
+    status.json 里的 kind 是上传时写下的真值；**老记录没有这个字段**，只能按目录内容推：
+    有 source.txt 就按文字稿 —— 否则默认 audio 会去找音频、报「找不到录音文件，请重新上传」。
+    """
+    k = str((st or {}).get("kind") or "").strip().lower()
+    if k in ("audio", "text"):
+        return k
+    src = store.interview_file(interview_id, "source.txt")
+    return "text" if src and os.path.isfile(src) else "audio"
+
+
+def cleanup_failed_upload(interview_id, filename=""):
+    """上传失败后的清理：删掉这次自己刚写的（半截/空）文件，再删掉空目录。
+
+    只动**这次上传刚创建**的那个文件和目录，绝不碰别的面试记录 —— 用户真实录音在成功路径上
+    一律保留（规格 §10：失败保留音频，只清理检测到是半截的上传文件）。
+    """
+    try:
+        f = store.interview_file(interview_id, filename)
+        if f and os.path.isfile(f):
+            os.remove(f)
+        d = store.interview_dir(interview_id)
+        if d and os.path.isdir(d) and not os.listdir(d):
+            os.rmdir(d)
+    except OSError:
+        pass
+
+
 # ---------------------------------------------------------------- HTTP
 class Handler(BaseHTTPRequestHandler):
     server_version = "AIJobSearch/2.0"
@@ -554,6 +679,36 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(404, {"error": "没有保存 JD 原文"})
             return self._send(200, {"text": store.read_text(os.path.join(store.p_path("jd"), job["jd_text_file"]))})
 
+        if p == "/api/interview/status":
+            iid = store.safe_name(q.get("id", [""])[0])
+            if not iid:
+                return self._send(400, {"ok": False, "error": "缺少面试记录 id"})
+            try:
+                st = interview.status(iid)
+                if not st:
+                    return self._send(404, {"ok": False, "error": "找不到该面试记录"})
+                return self._send(200, dict(st, ok=True, id=iid,
+                                            running=interview.is_running(iid)))
+            except Exception as e:
+                # do_GET **没有外层 try**（见 /api/knowledge 的注释）：不兜底的话服务器直接关连接，
+                # 前端只看到 RemoteDisconnected —— 连 500 都拿不到，只能永远转圈。
+                log.log_exc("interview.status_error", e, interview=iid)
+                return self._send(500, {"ok": False, "error": "面试状态读取失败：%s" % e})
+
+        if p == "/api/interview/list":
+            job = store.safe_name(q.get("job", [""])[0])
+            try:
+                rows = []
+                for iid in interview.list_interviews(job):
+                    st = interview.status(iid)
+                    if st:
+                        rows.append(dict(st, id=iid, running=interview.is_running(iid)))
+                return self._send(200, {"ok": True, "job": job, "interviews": rows})
+            except Exception as e:
+                # 同上：do_GET 必须自己兜底，否则连接裸断
+                log.log_exc("interview.list_error", e, job=job)
+                return self._send(500, {"ok": False, "error": "面试记录列表读取失败：%s" % e})
+
         if p == "/api/logs":
             try:
                 n = int(q.get("limit", ["150"])[0])
@@ -609,10 +764,100 @@ class Handler(BaseHTTPRequestHandler):
         self._t0 = time.time()
         p = urlparse(self.path).path
         try:
+            # 上传必须**先于 _json_body()** 分流：那个函数按 Content-Length 把整个 body 读进
+            # 内存（上限 500MB），先读就等于既没有「超限不读 body」也没有「分块写盘」。
+            if p == "/api/interview/upload":
+                return self._interview_upload()
             return self._handle_post(p)
         except Exception as e:
             log.log_exc("http.post_unhandled_error", e, path=p)
             return self._send(500, {"ok": False, "error": "服务器内部错误：%s" % e})
+
+    def _interview_upload(self):
+        """POST /api/interview/upload：`application/octet-stream` + X-Job-Id / X-File-Name。
+
+        顺序是有讲究的：
+        ① **先看 Content-Length**：超限立刻 413，**一个字节都不读**（否则 500MB 先灌进内存）；
+        ② 岗位 id 必填 —— 不知道挂给谁就没法在台账里找到它、也没法反哺知识库；
+        ③ 再分块写盘（store.save_stream，256KB/块），文件名由服务端生成；
+        ④ 写 status.json 元数据 → `interview.start()` 起后台线程 → **立刻返回**。
+           转写是 0.9× 音频时长的事，同步等只会让浏览器超时。
+
+        客户端文件名既是**不可信输入**（绝不拿它拼路径）又必须 `unquote`（HTTP 头放不下中文，
+        前端按 encodeURIComponent 发的），还原后只当元数据存进 status.json。
+        """
+        raw_length = self.headers.get("Content-Length")
+        has_length = raw_length is not None and str(raw_length).strip() != ""
+        try:
+            length = int(raw_length) if has_length else 0
+        except (TypeError, ValueError):
+            length = 0
+        if length > interview.MAX_UPLOAD_BYTES:
+            log.log_event("interview.upload_rejected", level="warn", bytes=length, reason="超限")
+            return self._send(413, {"ok": False, "error": "文件超过上限 %d MB"
+                                    % (interview.MAX_UPLOAD_BYTES // 1024 // 1024)})
+        if not has_length or length < 0:
+            # 拿不到长度 = 分块传输（或头部被改坏）。分块不支持，直接说清，别当成空文件
+            return self._send(400, {"ok": False,
+                                    "error": "缺少（或非法）Content-Length，无法确定要收多少字节"})
+        job_id = store.safe_name(unquote(str(self.headers.get("X-Job-Id") or "")))
+        if not job_id:
+            return self._send(400, {"ok": False,
+                                    "error": "缺少 X-Job-Id：不知道这场面试属于哪个岗位"})
+        original = unquote(str(self.headers.get("X-File-Name") or "")).strip()
+        ext = os.path.splitext(original)[1].lower()
+        kind = upload_kind_of(self.headers.get("X-Kind"), ext)
+        fname = upload_filename(kind, original)
+        iid = new_interview_id(job_id)
+        try:
+            # 必须按 Content-Length 截断后再交给 save_stream：直接喂 self.rfile 的话
+            # 套接字上的 read(256KB) 会死等（详见 ContentLengthReader 的注释）
+            written = store.save_stream(iid, fname, ContentLengthReader(self.rfile, length),
+                                       interview.MAX_UPLOAD_BYTES)
+        except ValueError as e:
+            # store.save_stream 抛错时已经删掉半截文件，这里只补目录清理与明确的错误码
+            cleanup_failed_upload(iid, fname)
+            over = "超过上限" in str(e)          # Content-Length 撒谎时（分块传输）的兜底
+            log.log_event("interview.upload_rejected", level="warn", job=job_id, reason=str(e))
+            return self._send(413 if over else 400, {"ok": False, "error": str(e)})
+        except Exception as e:
+            # 客户端中途断开也走这里：半截文件必须清掉，否则下次会被当成有效录音
+            cleanup_failed_upload(iid, fname)
+            log.log_exc("interview.upload_error", e, job=job_id)
+            return self._send(500, {"ok": False, "error": "上传失败：%s" % e})
+        if written != length:
+            # 客户端中途断了：ContentLengthReader 一旦拿不到声明的字节数就返回 EOF，
+            # save_stream 只当正常结束。不比对的话会留下**一份被截断的录音**并报告上传成功，
+            # 用户等到最后只看到「转写失败 / 转出来是乱码」。
+            cleanup_failed_upload(iid, fname)
+            log.log_event("interview.upload_truncated", level="warn", job=job_id,
+                          got=written, want=length)
+            return self._send(400, {"ok": False, "error": "上传中断：只收到 %d/%d 字节，请重新上传"
+                                    % (written, length)})
+        if written <= 0:
+            # 空文件转写出来必然是空文本：当场说清，别让用户等半小时拿到一份空报告
+            cleanup_failed_upload(iid, fname)
+            return self._send(400, {"ok": False, "error": "上传的文件是空的（0 字节）"})
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        meta = {"state": "queued", "job_id": job_id, "kind": kind, "original_name": original,
+                "stored_name": fname, "audio_bytes": written, "started_at": now,
+                "updated_at": now, "elapsed": 0.0, "error": ""}
+        store.save_interview_json(iid, "status.json", meta)
+        log.log_event("interview.upload", interview=iid, job=job_id, kind=kind,
+                      bytes=written, name=original)
+        try:
+            # 必须走模块属性（interview.start）而不是 from … import start：测试要能替换它
+            interview.start(job_id, iid, store.load_config(), kind=kind)
+        except Exception as e:
+            # 线程都起不来（极罕见）：状态改成 error，但**录进去的字节一律保留**，可以 retry
+            log.log_exc("interview.start_error", e, interview=iid)
+            store.save_interview_json(iid, "status.json",
+                                      dict(meta, state="error",
+                                           error="无法启动后台任务：%s" % e))
+            return self._send(500, {"ok": False, "interview_id": iid,
+                                    "error": "无法启动后台任务：%s" % e})
+        return self._send(200, {"ok": True, "interview_id": iid, "kind": kind,
+                                "bytes": written, "state": "queued"})
 
     def _handle_post(self, p):
         body = self._json_body()
@@ -751,6 +996,47 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 log.log_exc("kb.import_error", e)
                 return self._send(200, {"ok": False, "error": str(e)})
+
+        if p == "/api/interview/retry":
+            iid = store.safe_name(body.get("id"))
+            if not iid:
+                return self._send(400, {"ok": False, "error": "缺少面试记录 id"})
+            st = interview.status(iid)
+            if not st:
+                return self._send(404, {"ok": False, "error": "找不到该面试记录"})
+            # 「从失败的那一步开始」不用在这里判断：run_pipeline 见到 transcript.json 就跳过转写。
+            kind = interview_kind_of(st, iid)
+            job_id = str(st.get("job_id") or "")
+            running = interview.is_running(iid)
+            try:
+                # 已在跑时 interview.start 会复用那条线程（单飞），不会重复烧机器
+                interview.start(job_id, iid, store.load_config(), kind=kind)
+            except Exception as e:
+                log.log_exc("interview.retry_error", e, interview=iid)
+                return self._send(500, {"ok": False, "error": "重试失败：%s" % e})
+            log.log_event("interview.retry", interview=iid, job=job_id, kind=kind,
+                          already_running=running)
+            return self._send(200, {"ok": True, "id": iid, "kind": kind, "reused": running,
+                                    "state": "running" if running else "queued"})
+
+        if p == "/api/knowledge/add":
+            term = str(body.get("term") or "").strip()
+            if not kb.normalize_id(term):
+                return self._send(400, {"ok": False, "error": "术语不能为空（只有标点也算空）"})
+            meta = {"definition": str(body.get("definition") or "").strip(),
+                    "category": str(body.get("category") or "").strip()}
+            try:
+                # 手动入库 = 用户已经做出的判断：直接进复习队列（「待学习」），
+                # 且**绝不**用报告里的短解释覆盖卡上更全的内容（upsert_check 内已保证）
+                ok, created, card = kb.upsert_check(term, kb.DEFAULT_STATE, meta)
+            except Exception as e:
+                log.log_exc("kb.add_error", e)
+                return self._send(500, {"ok": False, "error": "入库失败：%s" % e})
+            if not ok or not isinstance(card, dict):
+                return self._send(400, {"ok": False, "error": "术语不能为空（只有标点也算空）"})
+            log.log_event("kb.add_manual", id=card.get("id"), term=term, created=created)
+            return self._send(200, {"ok": True, "created": created,
+                                    "id": card.get("id"), "node": card})
 
         if p == "/api/analyze":
             try:
