@@ -141,6 +141,23 @@
   .kbrvans{text-align:left;margin-top:16px;border-top:1px dashed var(--line);padding-top:14px}
   .kbrvbtns{display:flex;gap:10px;justify-content:center;flex-wrap:wrap;margin-top:18px}
   .kbrvsum .big{font-size:30px;font-weight:800;color:var(--accent)}
+  /* 🎤 面试复盘（上传面板） */
+  /* :empty → 没有面试记录的岗位连这个 span 都不占位（否则每一行的按钮都会被推开一点） */
+  .ivstat{font-size:12.5px;color:var(--sub);margin-right:10px}
+  .ivstat:empty{display:none}
+  .ivmodal{position:fixed;inset:0;z-index:120;background:rgba(20,26,38,.44);overflow:auto;padding:34px 16px;
+    display:flex;align-items:flex-start;justify-content:center}
+  .ivbox{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow);
+    width:100%;max-width:660px;padding:20px 22px}
+  .ivhd{display:flex;align-items:flex-start;gap:10px;margin-bottom:12px}
+  .ivhd .t{flex:1;min-width:0;font-size:15.5px;font-weight:700}
+  .ivprog{height:8px;border-radius:999px;background:#eef1f7;overflow:hidden;margin:10px 0 6px}
+  .ivprog i{display:block;height:100%;background:linear-gradient(90deg,#2563eb,#4f46e5);transition:width .2s}
+  .ivrec{border:1px solid var(--line);border-radius:10px;padding:11px 13px;margin-bottom:9px;background:#fcfdff}
+  .ivrec .n{font-size:13.5px;font-weight:600;word-break:break-all}
+  .ivrec .m{font-size:12.3px;color:var(--sub);margin-top:3px;word-break:break-all}
+  .ivrec .m.err{color:var(--red)}
+  .ivrec input[type=file]{margin-top:9px;font-size:13px;width:100%}
 </style>
 </head>
 <body>
@@ -306,6 +323,17 @@
 </div>
 <div class="toast" id="toast"></div>
 
+<!-- 🎤 面试复盘：上传面板（覆盖层）。内容全部由 JS 渲染，见下方 iv* 函数 -->
+<div class="ivmodal" id="ivModal" hidden>
+  <div class="ivbox">
+    <div class="ivhd">
+      <div class="t" id="ivTitle">🎤 面试复盘</div>
+      <button class="btn gray sm" id="ivClose">✕ 关闭</button>
+    </div>
+    <div id="ivBody"></div>
+  </div>
+</div>
+
 <script>
 const $ = s => document.querySelector(s);
 const $$ = s => document.querySelectorAll(s);
@@ -340,6 +368,8 @@ $$('nav button').forEach(b=>b.addEventListener('click',()=>{
   if(b.dataset.tab==='resumes') loadResumes();
   if(b.dataset.tab==='logs') loadLogs();
   if(b.dataset.tab==='know') initKnowTab();
+  // 切走 tab 就把面试面板收掉：否则它会在后台一直轮询（面板本身的轮询只该在看得见时跑）
+  if($('#ivModal') && !$('#ivModal').hidden) ivClose('tab');
   logUI('tab.switch', {tab: b.dataset.tab});
 }));
 
@@ -356,6 +386,7 @@ $('#img').addEventListener('change', e=>{
 async function loadJobs(){
   const r = await fetch('/api/jobs').then(x=>x.json());
   JOBS = r.jobs || []; CATS = r.categories || []; STATS = r.statuses || [];
+  ivCacheClear();                       // 台账重载 = 面试记录也可能变了，缓存作废重取
   $('#jobCount').textContent = JOBS.length;
   const fc = $('#fCat'), fs = $('#fStatus');
   if(fc.options.length<=1) CATS.forEach(c=>fc.add(new Option(c,c)));
@@ -394,6 +425,10 @@ function renderJobs(){
     if(j.jd_image) links.push('<a class="btn gray sm" href="/jd/'+encodeURIComponent(j.jd_image)+'" target="_blank">🖼 原截图</a>');
     if(j.jd_text_file) links.push('<button class="btn gray sm" data-jdtext="'+esc(j.id)+'">📄 JD原文</button>');
     if(phone) links.push('<button class="btn ghost sm" data-copy="'+esc(phone)+'">📞 复制电话</button>');
+    // 🎤 面试复盘入口：先放一个占位按钮，等 /api/interview/list 回来再由 ivPaintStats() 换成
+    // 「📊 打开最近复盘 ↗」真链接（有记录且已完成时）——报告必须走 HTTP 地址，不能用 file://
+    const ivSlot = '<span id="ivbox-'+esc(j.id)+'"><button class="btn gray sm" data-iv="'+esc(j.id)+'">🎤 面试复盘</button></span>';
+    links.push(ivSlot);
     links.push('<button class="btn gray sm" data-edit="'+esc(j.id)+'">✏️ 编辑</button>');
     links.push('<button class="btn danger sm" data-del="'+esc(j.id)+'">🗑 删除</button>');
 
@@ -414,7 +449,7 @@ function renderJobs(){
         '<div><span class="k">🗂 来源</span><b>'+esc(j.source_type||'—')+'</b></div>'+
         (j.notes? '<div style="grid-column:1/-1"><span class="k">📝 备注</span><b>'+esc(j.notes)+'</b></div>':'')+
       '</div>'+
-      '<div class="acts">'+links.join(' ')+'</div>'+
+      '<div class="acts"><span class="ivstat" id="ivstat-'+esc(j.id)+'"></span>'+links.join(' ')+'</div>'+
       '<div class="editbox" id="edit-'+esc(j.id)+'">'+
         '<div class="egrid">'+
           '<div><label>公司</label><input data-f="company" value="'+esc(j.company||'')+'"></div>'+
@@ -446,6 +481,9 @@ function renderJobs(){
   box.querySelectorAll('[data-del]').forEach(b=>b.addEventListener('click',()=>delJob(b.dataset.del)));
   box.querySelectorAll('[data-copy]').forEach(b=>b.addEventListener('click',()=>copyText(b.dataset.copy)));
   box.querySelectorAll('[data-jdtext]').forEach(b=>b.addEventListener('click',()=>showJdText(b.dataset.jdtext)));
+  box.querySelectorAll('[data-iv]').forEach(b=>b.addEventListener('click',()=>ivOpen(b.dataset.iv)));
+  ivPaintStats();       // 先用缓存里的面试统计把行内文字填上（没缓存就等 ivLoadStats 回来再填）
+  ivLoadStats();        // 每个岗位问一次 /api/interview/list（没有「列出全部面试」的接口）
 }
 async function saveJob(id){
   const box = document.getElementById('edit-'+id);
@@ -471,7 +509,516 @@ async function showJdText(id){
   el.addEventListener(s==='#q'?'input':'change', renderJobs);
 });
 
+/* ---------------- 🎤 面试复盘（上传 / 轮询 / 打开报告） ----------------
+   这个面板存在的全部意义是两句「不骗人」：
+
+   1. **进度**：上传阶段用 XHR 的 upload.onprogress 显示真百分比（浏览器实测的字节数）；
+      转写/分析阶段**绝不给百分比** —— 后端不报转写进度，编一个就是骗人。
+      那一刻能说的只有「已运行 N 分钟」，且**只有**后端真给了 estimate_hint（上传时 ffprobe
+      真探到了音频时长）才加「预计 ≈ …」；拿不到就一个字都不提预计。
+   2. **失败**：error / interrupted / 读状态失败 一律显示错误 + 「重试」，
+      **没有 done 就绝不渲染「打开报告」**（把失败画成完成是这一块最不能犯的错）。
+
+   状态数据全来自后端（/api/interview/status 的 state/elapsed/estimate_hint/error），前端不推算任何数字。
+*/
+const IV_EXTS = ['.wav','.mp3','.m4a','.aac','.flac','.ogg','.opus',
+                 '.mp4','.mov','.mkv','.webm','.avi','.txt','.md'];
+const IV_ACCEPT = IV_EXTS.join(',') + ',audio/*,video/*';
+const IV_STATE_TEXT = {queued:'排队中', transcribing:'转写中', analyzing:'分析中',
+                       done:'已完成', error:'失败', interrupted:'上次被中断'};
+const IV_POLL_MS = 4000;          // 转写几十分钟起步：4 秒问一次足够，也不至于把服务打满
+
+let IV = {seq:0, job:null, iid:'', timer:null, xhr:null, live:null, recs:[]};
+let IV_CACHE = {};                // jobId -> {rows:[该岗位的面试记录]}（/api/interview/list 的原样数据）
+let IV_FAILED = {};               // jobId -> 1：这一轮读失败过，不再反复重试（重载台账时清空）
+let IV_WEAK = null;               // jobId -> 「没答上」卡数；null = 没拿到，一个都不显示（绝不当成 0）
+let ivSeq = 0;                    // 台账统计的请求代次：只认最新一次（与 kbSeq 同款竞态守卫）
+
+function ivCacheClear(){ ivSeq++; IV_CACHE = {}; IV_FAILED = {}; IV_WEAK = null; }
+
+/* ---- 纯文案函数：探针直接调它们，DOM 无关 ---- */
+function ivReportUrl(iid){ return '/reports/' + encodeURIComponent('iv_' + iid + '.html'); }
+function ivStateText(s){ return IV_STATE_TEXT[s] || ('未知状态（' + String(s == null ? '' : s) + '）'); }
+function ivElapsedText(sec){
+  const s = Number(sec);
+  if(!isFinite(s) || s <= 0) return '已运行 0 秒';
+  return s < 60 ? ('已运行 ' + Math.round(s) + ' 秒') : ('已运行 ' + Math.floor(s / 60) + ' 分钟');
+}
+// 预计：**只在轮询中（没跑完）且后端真给了 estimate_hint 时**才有；done/error/interrupted 一律空。
+// （后端在 state=done 时也照带 estimate_hint —— 完成态再显示「预计 9 分钟」就是胡说。）
+function ivEstimateText(d){
+  if(!d || !d.estimate_hint) return '';
+  const st = String(d.state || '');
+  if(st === 'done' || st === 'error' || st === 'interrupted') return '';
+  const t = d.estimate_hint.text;
+  return (typeof t === 'string' && t.trim()) ? t.trim() : '';
+}
+// 「转写中 · 已运行 12 分钟 · 预计 ≈ 36 分钟（音频时长 × 0.9）」
+function ivStatusLine(d){
+  d = d || {};
+  const st = ivStateText(d.state);
+  if(d.state === 'done' || d.state === 'error') return st;      // 这两态不掺时长/预计
+  const parts = [st];
+  if(d.elapsed != null) parts.push(ivElapsedText(d.elapsed));
+  const est = ivEstimateText(d);
+  if(est) parts.push(est);
+  return parts.join(' · ');
+}
+function ivStatLine(n, weak){
+  let s = '面试 ' + n + ' 次';
+  if(weak > 0) s += ' · 没答上 ' + weak + ' 个';
+  return s;
+}
+function ivDurText(sec){
+  const s = Number(sec) || 0;
+  if(s < 60) return Math.round(s) + ' 秒';
+  if(s < 3600) return Math.round(s / 60) + ' 分钟';
+  return (Math.floor(s / 3600)) + ' 小时 ' + Math.round((s % 3600) / 60) + ' 分钟';
+}
+function ivSizeText(bytes){
+  const b = Number(bytes) || 0;
+  if(b < 1024) return b + ' B';
+  if(b < 1024 * 1024) return (b / 1024).toFixed(1) + ' KB';
+  return (b / 1024 / 1024).toFixed(1) + ' MB';
+}
+// accept= 只是提示（用户还能选「所有文件」），这里再挡一道：非音视频、非 .txt/.md 不上传
+function ivKindAllowed(file){
+  const name = String((file && file.name) || '').toLowerCase();
+  const i = name.lastIndexOf('.');
+  if(i >= 0 && IV_EXTS.indexOf(name.slice(i)) >= 0) return true;
+  return /^(audio|video)\//i.test(String((file && file.type) || ''));
+}
+function ivRecMeta(d){
+  d = d || {};
+  const k = String(d.kind || '');
+  const parts = [k === 'text' ? '文字稿' : (k === 'audio' ? '录音/视频' : '记录')];
+  if(d.started_at) parts.push(String(d.started_at));
+  const dur = Number(d.audio_duration) || 0;
+  if(dur > 0) parts.push('音频 ' + ivDurText(dur));
+  parts.push(ivStatusLine(d));
+  return parts.join(' · ');
+}
+
+/* ---- 台账行内统计 + 行内入口 ---- */
+// M（没答上几个）的唯一真数据源：knowledge.json 里 last_outcome="没答上"、且 last_interview_jd=该岗位的卡数。
+// 为什么能用它：last_outcome **只有**面试反馈会写（自测写的是 last_result），record_interview 又会把
+// last_interview_jd 记成那场面试的岗位 —— 两个字段对得上才是真数据。
+// 为什么不用 analysis.json：后端没有任何路由能读它（/api/interview/list 只回 status.json 的字段），
+// 拿不到就一个都不显示，绝不按「面试 N 次」去编一个 M。
+async function ivWeakCounts(){
+  try{
+    const d = await (await fetch('/api/knowledge')).json();
+    if(!d || d.ok === false || !Array.isArray(d.nodes)) throw new Error((d && d.error) || 'nodes 缺失');
+    const out = {};
+    d.nodes.forEach(n=>{
+      if(!n || String(n.last_outcome || '') !== '没答上') return;
+      const jid = String(n.last_interview_jd || '');
+      if(jid) out[jid] = (out[jid] || 0) + 1;
+    });
+    return out;
+  }catch(e){
+    logUI('iv.weak_count_failed', {error: e.message}, 'error');
+    return null;                        // 拿不到 → 台账只显示「面试 N 次」
+  }
+}
+
+async function ivLoadStats(){
+  // IV_FAILED：读失败的岗位这一轮不再重试 —— 否则每敲一个搜索字就重发一轮请求 + 弹一次 toast
+  const miss = JOBS.filter(j=>!IV_CACHE[j.id] && !IV_FAILED[j.id]);
+  if(!miss.length){ ivPaintStats(); return; }
+  const seq = ++ivSeq;
+  const res = await Promise.all(miss.map(async j=>{
+    try{
+      const d = await (await fetch('/api/interview/list?job=' + encodeURIComponent(j.id))).json();
+      if(!d || d.ok === false) throw new Error((d && d.error) || '服务无响应');
+      return [j.id, Array.isArray(d.interviews) ? d.interviews : [], ''];
+    }catch(e){
+      return [j.id, null, e.message];
+    }
+  }));
+  if(seq !== ivSeq) return;             // 旧的响应后到 → 丢弃，绝不覆盖新结果
+  let failed = 0;
+  res.forEach(([id, rows, err])=>{
+    if(rows) IV_CACHE[id] = {rows: rows};
+    else { IV_FAILED[id] = 1; failed++; logUI('iv.list_failed', {job: id, error: err}, 'error'); }
+  });
+  if(failed) toast('有 ' + failed + ' 个岗位的面试记录没读出来（详见日志）');
+  // 一条面试记录都没有时不必去读知识库：M 只在「面试 N 次」有数时才可能显示
+  const anyRecs = Object.keys(IV_CACHE).some(k=>IV_CACHE[k].rows.length > 0);
+  if(anyRecs && IV_WEAK === null) IV_WEAK = await ivWeakCounts();
+  if(seq !== ivSeq) return;
+  ivPaintStats();
+}
+
+function ivPaintStats(){
+  JOBS.forEach(j=>{
+    const c = IV_CACHE[j.id];
+    if(!c) return;                                  // 没取到：保持原样（占位按钮仍在），不编数字
+    const stat = document.getElementById('ivstat-' + j.id);
+    if(stat){
+      const m = IV_WEAK ? (IV_WEAK[j.id] || 0) : 0;
+      stat.textContent = c.rows.length ? ivStatLine(c.rows.length, m) : '';
+      if(m > 0){
+        stat.title = '「没答上 ' + m + ' 个」来自知识库：被这个岗位的面试判定为「没答上」、'
+                   + '之后还没在别的面试里答回来的知识点卡数（' + m + ' 张）';
+      }
+    }
+    const box = document.getElementById('ivbox-' + j.id);
+    if(!box) return;
+    const latest = c.rows[0];                       // 后端按 mtime 倒序 → 第一条就是最近一份
+    const done = latest && latest.state === 'done';
+    let h = done
+      ? '<a class="btn gray sm" href="' + esc(ivReportUrl(latest.id)) + '" target="_blank" rel="noopener">📊 打开最近复盘 ↗</a>'
+      : '<button class="btn gray sm" data-iv="' + esc(j.id) + '">🎤 面试复盘</button>';
+    if(c.rows.length) h += ' <button class="btn gray sm" data-iv="' + esc(j.id) + '">📋 面试记录 ' + c.rows.length + '</button>';
+    if(box.dataset.ivHtml === h) return;            // 内容没变就不重建：搜索框每敲一下都会走到这里
+    box.dataset.ivHtml = h;
+    box.innerHTML = h;
+    box.querySelectorAll('[data-iv]').forEach(b=>b.addEventListener('click',()=>ivOpen(b.dataset.iv)));
+  });
+}
+
+/* ---- 面板 ---- */
+function ivInit(){
+  // 只绑一次：initKnowTab 同款守卫（点 tab 会反复触发，重复绑定会让一次点击关两次/重试两次）
+  if(ivInit.done) return;
+  ivInit.done = true;
+  $('#ivClose').addEventListener('click', ()=>ivClose('button'));
+  $('#ivModal').addEventListener('click', e=>{ if(e.target === $('#ivModal')) ivClose('backdrop'); });
+  document.addEventListener('keydown', e=>{
+    if(e.key === 'Escape' && !$('#ivModal').hidden) ivClose('esc');
+  });
+}
+
+function ivOpen(jobId){
+  ivInit();
+  const job = JOBS.filter(j=>j.id === jobId)[0] || {id: jobId, job_title: ''};
+  IV.seq++;                                   // 新代次：上一个面板的所有回调/定时器当场作废
+  const seq = IV.seq;
+  ivStopTimers();
+  IV.job = job; IV.iid = ''; IV.recs = []; IV.live = null;
+  $('#ivTitle').innerHTML = '🎤 面试复盘 · ' + esc(job.job_title || job.id || '未命名岗位');
+  $('#ivBody').innerHTML = '<div id="ivLive"></div><div id="ivRecs"></div><div id="ivUp"></div>';
+  $('#ivModal').hidden = false;
+  logUI('iv.open', {job: jobId});
+  ivLoadList(seq);
+}
+
+// 关面板/切 tab/换岗位时唯一该做的事：**把定时器与在途请求停掉**（否则关了还一直轮询）
+function ivStopTimers(){
+  if(IV.timer){ clearTimeout(IV.timer); IV.timer = null; }
+  if(IV.xhr){
+    const x = IV.xhr; IV.xhr = null;
+    // 上传传到一半被关掉：abort 让服务端看到连接断开 → 它会把半截文件清掉，不留垃圾
+    try{ x.abort(); }catch(e){}
+  }
+}
+
+function ivClose(reason){
+  IV.seq++;                                   // 代次前进一步：在途的 fetch 回调全部失效
+  ivStopTimers();
+  IV.iid = ''; IV.recs = []; IV.live = null;
+  const m = $('#ivModal'); if(m) m.hidden = true;
+  const b = $('#ivBody'); if(b) b.innerHTML = '';
+  logUI('iv.close', {reason: reason || ''});
+}
+
+async function ivLoadList(seq){
+  let d;
+  try{
+    d = await (await fetch('/api/interview/list?job=' + encodeURIComponent(IV.job.id))).json();
+  }catch(e){
+    if(seq !== IV.seq) return;
+    ivPanelError('面试记录读取失败：' + e.message);
+    logUI('iv.list_failed', {job: IV.job.id, error: e.message}, 'error');
+    return;
+  }
+  if(seq !== IV.seq) return;
+  if(!d || d.ok === false){ ivPanelError((d && d.error) || '面试记录读取失败（服务无响应）'); return; }
+  IV.recs = Array.isArray(d.interviews) ? d.interviews : [];
+  IV_CACHE[IV.job.id] = {rows: IV.recs};
+  ivRenderAll();
+  ivPaintStats();
+  // 已经跑完的记录，其面试反馈会改写知识库（weak_concepts → last_outcome=没答上），
+  // 而台账行里的「没答上 M 个」是知识库的投影 —— 打开这个面板时重取一次，
+  // 否则用户刚看完复盘、回到台账，那个数字还是上一轮加载时的旧值（少一个）。
+  if(IV.recs.some(r=>String(r && r.state) === 'done')) ivRefreshStats();
+  // 最近一份还在跑 → 自动跟一下进度（转写要几十分钟，用户一进来就该看到「已运行 N 分钟」）。
+  // done / error / interrupted **绝不自动跟进**：一个已经跑完，一个要用户自己决定要不要重试。
+  const latest = IV.recs[0];
+  if(latest && ['queued','transcribing','analyzing'].indexOf(String(latest.state)) >= 0){
+    ivTrack(latest.id, false);
+  }
+}
+
+function ivPanelError(msg){
+  const el = $('#ivRecs');
+  if(el) el.innerHTML = '<div class="status on err">' + esc(msg) + '</div>';
+  toast(msg);
+}
+
+function ivRenderAll(){ ivRenderLive(); ivRenderRecs(); ivRenderUpload(); }
+
+function ivRenderLive(){
+  const el = $('#ivLive'); if(!el) return;
+  const L = IV.live;
+  if(!L){ el.innerHTML = ''; return; }
+  let h = '';
+  if(L.phase === 'upload'){
+    const pct = Math.max(0, Math.min(100, Number(L.pct) || 0));
+    h = '<div class="status on info" id="ivLiveMsg">正在上传：' + pct + '%</div>'
+      + '<div class="ivprog"><i id="ivLivePct" style="width:' + pct + '%"></i></div>'
+      + '<div class="hintline">' + esc(L.name || '') + '（' + ivSizeText(L.total) + '）'
+      + ' —— 传的是本机服务，不上传任何第三方；传完自动开始转写。</div>';
+  } else if(L.phase === 'poll'){
+    const d = L.data || {};
+    h = '<div class="status on info" id="ivLiveMsg">' + esc(ivStatusLine(d)) + '</div>'
+      + '<div class="hintline">转写约「音频时长 × 0.9」，几十分钟很正常。'
+      + '<b>可以关掉这个面板</b>，后台继续跑，跑完在台账里点「📊 打开最近复盘」。</div>'
+      + (L.note ? '<div class="hintline">' + esc(L.note) + '</div>' : '');
+  } else if(L.phase === 'done'){
+    h = '<div class="status on ok" id="ivLiveMsg">✅ 转写与分析完成</div>'
+      + '<div class="row" style="margin-top:6px">'
+      + '<a class="btn" id="ivOpenReport" href="' + esc(ivReportUrl(IV.iid)) + '" target="_blank" rel="noopener">📊 打开面试复盘报告 ↗</a>'
+      + '</div>';
+  } else {                                   // error / interrupted：**绝不显示成完成**
+    h = '<div class="status on err" id="ivLiveMsg">' + esc(L.err || '失败') + '</div>';
+    if(L.retry && L.retry !== 'none'){
+      h += '<div class="row" style="margin-top:6px"><button class="btn sm" id="ivRetry">🔁 重试</button>'
+        + (L.retry === 'record'
+            ? '<span class="hintline">已有转写会跳过，不会重复花时间。</span>'
+            : '<span class="hintline">文件还在输入框里，直接重传。</span>')
+        + '</div>';
+    }
+    if(L.auto) h += '<div class="hintline">会自动重试读取状态；一直失败就检查服务是否还在跑。</div>';
+  }
+  el.innerHTML = h;
+  const rb = $('#ivRetry'); if(rb) rb.addEventListener('click', ivRetry);
+}
+
+function ivRenderRecs(){
+  const el = $('#ivRecs'); if(!el) return;
+  el.innerHTML = (IV.recs || []).map(d=>{
+    const st = String((d && d.state) || '');
+    const acts = [];
+    if(st === 'done') acts.push('<a class="btn gray sm" href="' + esc(ivReportUrl(d.id)) + '" target="_blank" rel="noopener">📊 打开复盘报告 ↗</a>');
+    if(st === 'error' || st === 'interrupted') acts.push('<button class="btn gray sm" data-ivretry-rec="' + esc(d.id) + '">🔁 重试</button>');
+    if(st === 'queued' || st === 'transcribing' || st === 'analyzing') acts.push('<button class="btn gray sm" data-ivtrack="' + esc(d.id) + '">🔄 看进度</button>');
+    if(IV.iid === d.id) acts.push('<span class="pill">当前</span>');
+    return '<div class="ivrec" data-ivrec="' + esc(d.id) + '">'
+      + '<div class="n">📄 ' + esc(d.original_name || d.id) + '</div>'
+      + '<div class="m">' + esc(ivRecMeta(d)) + '</div>'
+      + (st === 'error' && d.error ? '<div class="m err">' + esc(String(d.error)) + '</div>' : '')
+      + (acts.length ? '<div class="row" style="margin-top:6px">' + acts.join(' ') + '</div>' : '')
+      + '</div>';
+  }).join('');
+  el.querySelectorAll('[data-ivretry-rec]').forEach(b=>b.addEventListener('click', ()=>ivTrack(b.dataset.ivretryRec, true)));
+  el.querySelectorAll('[data-ivtrack]').forEach(b=>b.addEventListener('click', ()=>ivTrack(b.dataset.ivtrack, false)));
+}
+
+function ivRenderUpload(){
+  const el = $('#ivUp'); if(!el) return;
+  // 正在上传时不给再选：两个 XHR 同时写同一个岗位只会让人看不懂哪个进度是哪个
+  if(IV.live && IV.live.phase === 'upload'){ el.innerHTML = ''; return; }
+  el.innerHTML = '<div class="ivrec">'
+    + '<div class="n">＋ 上传一场新的面试</div>'
+    + '<div class="m">支持录音 / 视频（.m4a .mp3 .wav .mp4 .mov …）与文字稿（.txt .md）。'
+    + '转写在<b>后端</b>跑，关掉这个面板也会继续。</div>'
+    + '<input type="file" id="ivFile" accept="' + esc(IV_ACCEPT) + '">'
+    + '<div class="m" id="ivPickName"></div>'
+    + '<div class="row" style="margin-top:9px"><button class="btn sm" id="ivUploadBtn">⬆ 上传并开始转写</button></div>'
+    + '</div>';
+  $('#ivFile').addEventListener('change', ivFileChanged);
+  $('#ivUploadBtn').addEventListener('click', ivPickFile);
+}
+
+function ivFileChanged(){
+  const inp = $('#ivFile'), f = inp && inp.files && inp.files[0];
+  if(!f) return;
+  if(!ivKindAllowed(f)){                       // accept 拦不住手选「所有文件」，这里明确拒绝
+    inp.value = '';
+    toast('不支持这种文件：' + f.name + '（支持录音/视频与 .txt / .md）');
+    logUI('iv.upload_rejected_client', {name: f.name}, 'warn');
+    return;
+  }
+  const meta = document.getElementById('ivPickName');
+  if(meta) meta.textContent = '已选择：' + f.name + '（' + ivSizeText(f.size) + '）';
+}
+
+function ivPickFile(){
+  const inp = $('#ivFile'), f = inp && inp.files && inp.files[0];
+  if(!f){ toast('请先选择一个录音 / 视频 / 文字稿文件'); return; }
+  if(!ivKindAllowed(f)){ toast('不支持这种文件：' + f.name); return; }
+  if(IV.xhr){ toast('上一份还在上传，等它传完再传下一份'); return; }   // 连点两下不能开两个 XHR
+  const seq = IV.seq;
+  IV.iid = '';
+  IV.live = {phase:'upload', pct:0, total:f.size, name:f.name};
+  ivRenderAll();
+  ivUpload(f, seq);
+}
+
+function ivUpload(file, seq){
+  const xhr = new XMLHttpRequest();
+  IV.xhr = xhr;
+  xhr.open('POST', '/api/interview/upload');
+  xhr.timeout = 30 * 60 * 1000;      // 500MB 上限：给足 30 分钟，但不能无限挂着（挂了就说清楚 + 可重试）
+  xhr.setRequestHeader('X-Job-Id', IV.job.id);
+  // 头里放不下中文：必须 encodeURIComponent（服务端 unquote 后只当元数据，不拼路径）。
+  // body 直接给 File：浏览器自己带 Content-Type 与 Content-Length（服务端要 Content-Length）。
+  xhr.setRequestHeader('X-File-Name', encodeURIComponent(file.name));
+  xhr.upload.onprogress = e=>{
+    if(seq !== IV.seq || !IV.live || IV.live.phase !== 'upload') return;
+    if(e.lengthComputable && e.total > 0){
+      IV.live.total = e.total;
+      IV.live.pct = Math.round(e.loaded * 100 / e.total);
+    }
+    ivRenderLive();
+  };
+  xhr.onload = ()=>{
+    if(seq !== IV.seq) return;
+    IV.xhr = null;
+    let d = null;
+    try{ d = JSON.parse(xhr.responseText || '{}'); }catch(e){ d = null; }
+    if(xhr.status === 200 && d && d.ok && d.interview_id){
+      IV.iid = d.interview_id;
+      IV.live = {phase:'poll', data:{state:'queued', elapsed:0}};
+      ivRenderAll();
+      logUI('iv.upload_ok', {job: IV.job.id, interview: IV.iid, bytes: file.size});
+      ivPoll(seq, 0);                       // 先立刻问一次状态，之后按 IV_POLL_MS 轮询
+      return;
+    }
+    ivFail('上传失败：' + ((d && d.error) || ('服务返回 HTTP ' + xhr.status)), seq, 'upload');
+  };
+  xhr.onerror = ()=>{ if(seq !== IV.seq) return; IV.xhr = null; ivFail('上传失败：网络中断（服务没在跑？）', seq, 'upload'); };
+  xhr.onabort = ()=>{ if(seq !== IV.seq) return; IV.xhr = null; };
+  xhr.ontimeout = ()=>{ if(seq !== IV.seq) return; IV.xhr = null; ivFail('上传超时', seq, 'upload'); };
+  try{
+    xhr.send(file);
+  }catch(e){
+    IV.xhr = null;
+    ivFail('上传失败：' + e.message, seq, 'upload');
+  }
+}
+
+// 失败态的唯一出口：**不给任何「打开报告」的机会**，只给错误原文 + 重试
+function ivFail(msg, seq, retry){
+  if(seq !== IV.seq) return;
+  IV.live = {phase:'error', err: msg, retry: retry || 'none'};
+  ivRenderAll();
+  toast(msg);
+  logUI('iv.failed', {job: (IV.job && IV.job.id) || '', interview: IV.iid, error: msg}, 'error');
+}
+
+function ivRetry(){
+  const L = IV.live || {};
+  if(L.retry === 'record' && IV.iid){ ivDoRetry(); return; }
+  ivPickFile();                              // 上传阶段失败：输入框里的文件还在，直接重传
+}
+
+async function ivDoRetry(){
+  const seq = IV.seq, iid = IV.iid;
+  if(!iid) return;
+  IV.live = {phase:'poll', data:{state:'queued', elapsed:0}, note:'正在重试……'};
+  ivRenderLive();
+  let d;
+  try{
+    d = await (await fetch('/api/interview/retry', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({id: iid})})).json();
+  }catch(e){
+    if(seq !== IV.seq) return;
+    ivFail('重试失败：' + e.message, seq, 'record');
+    return;
+  }
+  if(seq !== IV.seq) return;
+  if(!d || !d.ok){ ivFail((d && d.error) || '重试失败（服务无响应）', seq, 'record'); return; }
+  logUI('iv.retry_ok', {interview: iid});
+  ivPoll(seq, 0);
+}
+
+function ivTrack(iid, retry){
+  if(!iid) return;
+  const seq = IV.seq;
+  IV.iid = iid;
+  const d = (IV.recs || []).filter(r=>r.id === iid)[0] || {id: iid, state: 'queued'};
+  if(retry){ ivDoRetry(); return; }
+  IV.live = {phase:'poll', data: d};
+  ivRenderLive(); ivRenderRecs();
+  ivPoll(seq, 0);
+}
+
+/* ---- 轮询：只用后端给的 state / elapsed / estimate_hint，前端不推算 ---- */
+function ivPoll(seq, delay){
+  if(seq !== IV.seq) return;
+  ivStopTimers();
+  IV.timer = setTimeout(()=>{ IV.timer = null; ivFetchStatus(seq); }, delay == null ? IV_POLL_MS : delay);
+}
+
+async function ivFetchStatus(seq){
+  if(seq !== IV.seq || !IV.iid) return;
+  const iid = IV.iid;
+  let d;
+  try{
+    d = await (await fetch('/api/interview/status?id=' + encodeURIComponent(iid))).json();
+  }catch(e){
+    if(seq !== IV.seq) return;
+    // 读不到状态 ≠ 完成：如实说读失败，并且继续轮询（服务只是一时抖的话会自愈）
+    IV.live = {phase:'error', err:'状态读取失败：' + e.message, retry:'none', auto:true};
+    ivRenderLive();
+    logUI('iv.status_failed', {interview: iid, error: e.message}, 'error');
+    ivPoll(seq);
+    return;
+  }
+  if(seq !== IV.seq) return;
+  if(!d || d.ok === false || !d.state){
+    IV.live = {phase:'error', err:(d && d.error) || '状态读取失败（服务无响应）', retry:'none', auto:true};
+    ivRenderLive();
+    ivPoll(seq);
+    return;
+  }
+  const st = String(d.state);
+  ivUpsertRec(d);
+  if(st === 'done'){
+    IV.live = {phase:'done', data: d};
+    ivRenderAll();                       // 面板里出现「📊 打开面试复盘报告 ↗」真链接
+    logUI('iv.done', {interview: iid});
+    ivRefreshStats();                    // 刚跑完 → 知识库的「没答上」可能变了，重取一次
+    return;                             // **停在这里**：不再排下一次轮询
+  }
+  if(st === 'error'){
+    IV.live = {phase:'error', err: String(d.error || '任务失败（后端没有给出原因）'), retry:'record', data: d};
+    ivRenderAll();
+    ivRefreshStats();
+    return;                             // 失败态不再轮询：等用户点「重试」
+  }
+  if(st === 'interrupted'){
+    IV.live = {phase:'error', err:'上次被中断，可重试', retry:'record', data: d};
+    ivRenderAll();
+    ivRefreshStats();
+    return;                             // 没有线程在跑，轮询也不会变
+  }
+  IV.live = {phase:'poll', data: d};
+  ivRenderLive();
+  ivPoll(seq);
+}
+
+function ivUpsertRec(d){
+  if(!d || !d.id) return;
+  IV.recs = [d].concat((IV.recs || []).filter(r=>r.id !== d.id));
+  if(IV.job) IV_CACHE[IV.job.id] = {rows: IV.recs};
+  ivPaintStats();
+}
+
+// 跑完之后知识库被后端改过（weak_concepts → last_outcome="没答上"）→ 台账那个 M 要重取
+async function ivRefreshStats(){
+  const seq = ++ivSeq;
+  const weak = await ivWeakCounts();
+  if(seq !== ivSeq || !weak) return;    // 拿不到就保持原样（不把 M 清零冒充「一个都没答砸」）
+  IV_WEAK = weak;
+  ivPaintStats();
+}
+
 /* ---------------- 简历 ---------------- */
+
 async function loadResumes(){
   const r = await fetch('/api/resumes').then(x=>x.json());
   const sel = $('#resumeSel');
@@ -961,6 +1508,7 @@ $('#logBundleBtn').addEventListener('click', async ()=>{
 });
 
 /* init */
+ivInit();                                   // 面试面板的关闭按钮 / 遮罩 / Esc 只绑一次
 loadResumes(); loadConfig(); loadJobs();
 </script>
 </body>
