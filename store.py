@@ -4,6 +4,7 @@ import json
 import os
 import re
 import tempfile
+from datetime import datetime
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 DATA_ROOT = os.path.join(ROOT, "data")
@@ -206,3 +207,69 @@ def load_knowledge(key=None):
 
 def save_knowledge(kb, key=None):
     write_json(knowledge_path(key), kb)
+
+
+# ---------- report_state（报告专属勾选状态，阶段 3.3）----------
+def report_state_dir(key=None):
+    return p_path("report_state", key=key)
+
+
+def report_state_path(report_id, key=None):
+    """报告专属勾选状态的文件路径。report_id 非法（空 / . / ..）时返回 ''。
+
+    safe_name 会取 basename，所以 '../../etc/passwd' 被削成 'passwd'，天然挡住越级。
+    """
+    name = safe_name(report_id)
+    if not name:
+        return ""
+    return os.path.join(report_state_dir(key), name + ".json")
+
+
+def _clean_checks(checks):
+    return {k: bool(v) for k, v in (checks or {}).items() if isinstance(k, str) and k}
+
+
+def _quarantine_report_state(path):
+    """读不出来的状态文件先改名备份，绝不用空状态静默顶掉用户积累。
+
+    判据是「文件有内容 **且** 解析失败」：不存在的文件、以及内容为空都直接放行
+    （没有可丢的数据），正常的 {"checks": {}} 解析成功也不会被误备份走。
+
+    时间戳带微秒（%f）：只用秒级粒度时，同一秒内两次隔离会互相覆盖备份。
+
+    这里不记日志：store.py 不 import log（要守住 store 不反依赖 log 的方向），
+    日志由调用方（路由）记。改名失败也不阻断本次写入 —— 状态文件只值几个勾，
+    为它挡掉用户刚做的勾选不划算（与知识库坏文件的「宁可这次不沉淀」方向不同）。
+    """
+    raw = read_text(path, "")
+    if not raw.strip() or read_json(path, None) is not None:
+        return
+    backup = "%s.corrupt-%s" % (path, datetime.now().strftime("%Y%m%d%H%M%S%f"))
+    try:
+        os.replace(path, backup)
+    except OSError:
+        pass
+
+
+def load_report_state(report_id, key=None):
+    """读报告专属勾选状态。缺失/损坏一律返回空结构，绝不抛异常。"""
+    rid = safe_name(report_id)
+    path = report_state_path(report_id, key)
+    if not path:
+        return {"version": 1, "report_id": "", "checks": {}}
+    d = read_json(path, None)
+    if not isinstance(d, dict):
+        return {"version": 1, "report_id": rid, "checks": {}}
+    return {"version": d.get("version") or 1, "report_id": rid,
+            "checks": _clean_checks(d.get("checks"))}
+
+
+def save_report_state(report_id, checks, key=None):
+    """写报告专属勾选状态。report_id 非法返回 False（路由据此回 400）。"""
+    path = report_state_path(report_id, key)
+    if not path:
+        return False
+    _quarantine_report_state(path)
+    write_json(path, {"version": 1, "report_id": safe_name(report_id),
+                      "checks": _clean_checks(checks)})
+    return True

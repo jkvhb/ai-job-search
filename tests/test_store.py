@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import glob
 import os
 import unittest
 
@@ -47,6 +48,44 @@ class StorePathTest(IsolatedCase):
         self.assertEqual(store.safe_name(".."), "")
         self.assertEqual(store.safe_name("."), "")
         self.assertEqual(store.safe_name(""), "")
+
+
+class ReportStateTest(IsolatedCase):
+    def test_roundtrip(self):
+        self.assertTrue(store.save_report_state("20261008_岗A_80分", {"gate:0": True, "cl:2": False}))
+        d = store.load_report_state("20261008_岗A_80分")
+        self.assertEqual(d["report_id"], "20261008_岗A_80分")
+        self.assertEqual(d["checks"], {"gate:0": True, "cl:2": False})
+
+    def test_missing_file_returns_empty(self):
+        self.assertEqual(store.load_report_state("没见过").get("checks"), {})
+
+    def test_path_traversal_is_neutralised(self):
+        for bad in ("", "..", ".", "../../etc/passwd", "a/../.."):
+            path = store.report_state_path(bad)
+            if path:
+                self.assertTrue(path.startswith(store.report_state_dir()),
+                                "越级路径逃出了 report_state 目录：%r -> %r" % (bad, path))
+        self.assertEqual(store.report_state_path(""), "")
+        self.assertEqual(store.report_state_path(".."), "")
+        self.assertFalse(store.save_report_state("..", {"a": True}))
+
+    def test_corrupt_file_is_quarantined_not_overwritten(self):
+        store.ensure_profile()
+        rid = "20261008_坏报告"
+        path = store.report_state_path(rid)
+        store.write_text(path, "{ 用户手改坏的 json")
+        d = store.load_report_state(rid)                      # 读到坏文件 → 空状态
+        self.assertEqual(d["checks"], {})
+        self.assertTrue(store.save_report_state(rid, {"gate:0": True}))
+        backups = glob.glob(path + ".corrupt-*")
+        self.assertEqual(len(backups), 1)                     # 旧文件被保住
+        self.assertEqual(store.read_text(backups[0]), "{ 用户手改坏的 json")
+        self.assertEqual(store.load_report_state(rid)["checks"], {"gate:0": True})
+
+    def test_checks_are_coerced_to_bool_and_junk_keys_dropped(self):
+        self.assertTrue(store.save_report_state("r1", {"a": 1, "b": 0, "": True}))
+        self.assertEqual(store.load_report_state("r1")["checks"], {"a": True, "b": False})
 
 
 if __name__ == "__main__":
