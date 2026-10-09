@@ -12,6 +12,7 @@
   3. sources 完整保留 —— 用户明确强调「来源尤其关键」，知识库里必须能点进原文
 """
 import log
+import os
 import re
 import store
 import unicodedata
@@ -19,7 +20,7 @@ from datetime import datetime
 
 # 本模块的配置面：下面这些常量供后续任务（来源清洗 / 合并 / 查询 / 回填）使用，
 # 提前集中声明是为了让契约可见，不是未使用的死代码。
-# **导入只写当前用到的**（log / re / store / unicodedata / datetime）；glob / json / os 到真正
+# **导入只写当前用到的**（log / os / re / store / unicodedata / datetime）；glob / json 到真正
 # 用到它们的那个任务再加，否则会被代码质量审查判为未使用导入。
 KB_VERSION = 1
 SNIPPET_LIMIT = 400      # knowledge.json 里的摘要截断长度（完整摘要仍在报告快照里）
@@ -154,8 +155,9 @@ def _add_jd(card, jd):
     """记录「这个知识点被哪个岗位提到过」，按 job_id 去重（幂等的关键）"""
     if not isinstance(jd, dict) or not jd.get("id"):
         return
-    frm = _as_list(card.get("from_jds"))
-    if any(isinstance(x, dict) and x.get("id") == jd["id"] for x in frm):
+    # 顺手清掉历史垃圾项（字符串/数字/None）：留着会被统计、回填与前端当成岗位记录踩到
+    frm = [x for x in _as_list(card.get("from_jds")) if isinstance(x, dict)]
+    if any(x.get("id") == jd["id"] for x in frm):
         return
     frm.append({"id": jd["id"], "job_title": jd.get("job_title") or "",
                 "company": jd.get("company") or "", "date": jd.get("date") or _today()})
@@ -171,7 +173,7 @@ def _new_card(node, jd):
         "definition": str(node.get("definition") or "").strip(),
         "plain_explanation": str(node.get("plain_explanation") or "").strip(),
         "category": str(node.get("category") or "").strip(),
-        "layer": _as_int(node.get("layer")),
+        "layer": max(0, _as_int(node.get("layer"))),
         "sources": clean_sources(node.get("sources")),
         "timeline": clean_timeline(node.get("timeline")),
         "related": clean_related(node.get("related")),
@@ -212,25 +214,54 @@ def _merge_into(card, node):
     if not str(card.get("category") or "").strip():
         card["category"] = str(node.get("category") or "").strip()
 
-    card["layer"] = min(_as_int(card.get("layer")), _as_int(node.get("layer")))
+    # 下界夹 0：min 是单调的，一旦让 -3 落盘，之后再来合法值也永远回不来
+    card["layer"] = min(max(0, _as_int(card.get("layer"))), max(0, _as_int(node.get("layer"))))
 
     card["related"] = clean_related(_as_list(card.get("related")) + _as_list(node.get("related")))
     card["interview_questions"] = clean_questions(
         _as_list(card.get("interview_questions")) + _as_list(node.get("interview_questions")))
 
-    # 补齐可能缺失的进度字段，但绝不覆盖已有值
-    card.setdefault("state", DEFAULT_STATE)
-    card.setdefault("last_outcome", DEFAULT_OUTCOME)
-    card.setdefault("asked_count", 0)
+    # 补齐可能缺失/损坏的进度字段，但绝不覆盖已有真值。
+    # 这里必须用 or 而不是 setdefault：knowledge.json 是用户可手改的，显式的 null 骗得过
+    # setdefault，却会让状态筛选与进度按钮全部落空、让复习调度的 +1 直接抛 TypeError。
+    # _as_int 顺带修掉 "3" 这类字符串写法。
+    card["state"] = card.get("state") or DEFAULT_STATE
+    card["last_outcome"] = card.get("last_outcome") or DEFAULT_OUTCOME
+    card["asked_count"] = _as_int(card.get("asked_count"))
     card.setdefault("first_seen", _today())
     card["last_seen"] = _today()
+
+
+def _quarantine_corrupt_kb():
+    """损坏的 knowledge.json 先改名备份，绝不当空库静默覆盖。
+
+    store.read_json 把「解析失败」和「文件为空」都归成 None，而 absorb 末尾会把内存里的库写回
+    文件 —— 一次坏读就等于清空用户全部积累。判据必须是「文件有内容 **且** 解析失败」：
+    正常的空库 {"nodes": []} 解析成功，绝不会被误备份走。
+    """
+    path = store.knowledge_path()
+    if store.read_json(path, None) is not None:
+        return
+    if not store.read_text(path, "").strip():
+        return                       # 文件不存在或为空：没有可丢的数据
+    backup = "%s.corrupt-%s" % (path, datetime.now().strftime("%Y%m%d%H%M%S"))
+    try:
+        os.replace(path, backup)
+    except OSError as e:
+        log.log_event("kb.corrupt_backup_failed", level="warn", error=str(e))
+        return
+    log.log_event("kb.corrupt_backup", level="warn", backup=os.path.basename(backup))
 
 
 def absorb(nodes, jd=None, kb=None):
     """把一次分析（或一份报告）的知识点并入知识库。返回 (added, merged)。
 
     幂等：同一个 jd['id'] 重复吸收不会重复计数 from_jds，来源也不会翻倍。
+
+    写盘之前先保住「读不出来」的旧文件（见 _quarantine_corrupt_kb）—— 本函数末尾一定会
+    save_knowledge，不先备份的话坏文件会被内存里的空库永久顶掉。
     """
+    _quarantine_corrupt_kb()
     kb = ensure_kb(kb if kb is not None else store.load_knowledge())
     index = {n.get("id"): n for n in kb["nodes"] if n.get("id")}
     added = merged = 0

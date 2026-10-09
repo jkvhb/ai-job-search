@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import glob
 import unittest
 
 import kb
@@ -87,6 +88,19 @@ class AbsorbTest(IsolatedCase):
         kb.absorb([_node(sources=[{"title": "no url"}, {"url": "  "}, _src("https://ok")])], {"id": "j1"})
         self.assertEqual(len(store.load_knowledge()["nodes"][0]["sources"]), 1)
 
+    def test_source_without_snippet_survives(self):
+        # 旧报告只存了 title/url，缺 snippet 键也不能丢掉整条来源
+        kb.absorb([_node(sources=[{"title": "旧报告", "url": "https://old", "date": "2023"}])],
+                  {"id": "j1"})
+        sources = store.load_knowledge()["nodes"][0]["sources"]
+        self.assertEqual(len(sources), 1)
+        self.assertEqual(sources[0]["snippet"], "")
+        self.assertEqual(sources[0]["date"], "2023")
+
+    def test_source_missing_accessed_is_backfilled(self):
+        kb.absorb([_node(sources=[{"title": "t", "url": "https://a"}])], {"id": "j1"})
+        self.assertEqual(store.load_knowledge()["nodes"][0]["sources"][0]["accessed"], "")
+
     def test_snippet_truncated(self):
         kb.absorb([_node(sources=[_src("https://a", snippet="x" * 1000)])], {"id": "j1"})
         s = store.load_knowledge()["nodes"][0]["sources"][0]
@@ -141,6 +155,37 @@ class MergeFieldsTest(IsolatedCase):
         kb.absorb([_node()], {"id": "j2"})
         self.assertEqual(store.load_knowledge()["nodes"][0]["asked_count"], 3)
 
+    def test_last_outcome_never_overwritten(self):
+        kb.absorb([_node()], {"id": "j1"})
+        d = store.load_knowledge()
+        d["nodes"][0]["last_outcome"] = "已面试"
+        store.save_knowledge(d)
+        kb.absorb([_node()], {"id": "j2"})
+        self.assertEqual(store.load_knowledge()["nodes"][0]["last_outcome"], "已面试")
+
+    def test_null_progress_fields_are_backfilled(self):
+        # knowledge.json 是用户可编辑的：显式 null 不能靠 setdefault 修掉
+        kb.absorb([_node()], {"id": "j1"})
+        d = store.load_knowledge()
+        d["nodes"][0].update({"state": None, "last_outcome": None, "asked_count": None})
+        store.save_knowledge(d)
+        kb.absorb([_node()], {"id": "j2"})
+        card = store.load_knowledge()["nodes"][0]
+        self.assertEqual(card["state"], kb.DEFAULT_STATE)
+        self.assertEqual(card["last_outcome"], kb.DEFAULT_OUTCOME)
+        self.assertEqual(card["asked_count"], 0)
+
+    def test_progress_fields_with_real_values_are_untouched(self):
+        kb.absorb([_node()], {"id": "j1"})
+        d = store.load_knowledge()
+        d["nodes"][0].update({"state": "已掌握", "last_outcome": "已面试", "asked_count": "3"})
+        store.save_knowledge(d)
+        kb.absorb([_node()], {"id": "j2"})
+        card = store.load_knowledge()["nodes"][0]
+        self.assertEqual(card["state"], "已掌握")
+        self.assertEqual(card["last_outcome"], "已面试")
+        self.assertEqual(card["asked_count"], 3)     # 字符串数字也顺手修好
+
     def test_timeline_keeps_richer(self):
         kb.absorb([_node(timeline=[{"year": "2017", "text": "a"}])], {"id": "j1"})
         kb.absorb([_node(timeline=[{"year": "2017", "text": "a"}, {"year": "2020", "text": "b"}])],
@@ -152,6 +197,13 @@ class MergeFieldsTest(IsolatedCase):
                   {"id": "j1"})
         kb.absorb([_node(timeline=[{"year": "2017", "text": "a"}])], {"id": "j2"})
         self.assertEqual(len(store.load_knowledge()["nodes"][0]["timeline"]), 2)
+
+    def test_timeline_equal_length_keeps_existing(self):
+        # 长度相等时保留原有，绝不用新节点覆盖（换掉会丢用户已看过的内容）
+        kb.absorb([_node(timeline=[{"year": "2017", "text": "a"}])], {"id": "j1"})
+        kb.absorb([_node(timeline=[{"year": "1999", "text": "z"}])], {"id": "j2"})
+        self.assertEqual(store.load_knowledge()["nodes"][0]["timeline"],
+                         [{"year": "2017", "text": "a"}])
 
     def test_definition_not_overwritten_by_shorter(self):
         kb.absorb([_node(definition="这是一段很长的完整定义内容")], {"id": "j1"})
@@ -166,6 +218,13 @@ class MergeFieldsTest(IsolatedCase):
     def test_layer_takes_min(self):
         kb.absorb([_node(layer=1)], {"id": "j1"})
         kb.absorb([_node(layer=0)], {"id": "j2"})
+        self.assertEqual(store.load_knowledge()["nodes"][0]["layer"], 0)
+
+    def test_negative_layer_cannot_pin_the_card(self):
+        # min 是单调的：不夹下界的话 -3 写进去就再也回不来
+        kb.absorb([_node(layer=-3)], {"id": "j1"})
+        self.assertEqual(store.load_knowledge()["nodes"][0]["layer"], 0)
+        kb.absorb([_node(layer=1)], {"id": "j2"})
         self.assertEqual(store.load_knowledge()["nodes"][0]["layer"], 0)
 
     def test_category_keeps_first_nonempty(self):
@@ -225,6 +284,35 @@ class ResilienceTest(IsolatedCase):
         self.assertEqual(store.load_knowledge(), {"nodes": []})
         added, _ = kb.absorb([_node()], {"id": "j1"})
         self.assertEqual(added, 1)          # 损坏后能从空库继续
+
+    def test_corrupt_knowledge_json_is_backed_up_not_overwritten(self):
+        # 一次坏读不能等于清空用户全部积累：先改名备份，再从空库继续
+        store.ensure_profile()
+        path = store.knowledge_path()
+        store.write_text(path, "{ this is not json")
+        added, _ = kb.absorb([_node()], {"id": "j1"})
+        self.assertEqual(added, 1)
+        backups = glob.glob(path + ".corrupt-*")
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(store.read_text(backups[0]), "{ this is not json")
+        self.assertEqual(store.load_knowledge()["nodes"][0]["term"], "省略恢复")
+
+    def test_valid_knowledge_json_is_never_backed_up(self):
+        # 正常空库 {"nodes": []} 解析成功，绝不能被误当成损坏文件备份走
+        store.ensure_profile()
+        store.save_knowledge({"nodes": []})
+        kb.absorb([_node()], {"id": "j1"})
+        self.assertEqual(glob.glob(store.knowledge_path() + ".corrupt-*"), [])
+
+    def test_junk_entries_in_from_jds_are_cleaned(self):
+        # 历史垃圾项（非 dict）不该永久留在卡上给统计/回填/前端踩
+        store.ensure_profile()
+        store.save_knowledge({"nodes": [{"id": "省略恢复", "term": "省略恢复",
+                                         "from_jds": ["junk", 5, None]}]})
+        kb.absorb([_node()], {"id": "j1"})
+        frm = store.load_knowledge()["nodes"][0]["from_jds"]
+        self.assertEqual(len(frm), 1)
+        self.assertEqual([j.get("id") for j in frm if isinstance(j, dict)], ["j1"])
 
     def test_knowledge_json_with_wrong_shape_is_recovered(self):
         store.ensure_profile()
