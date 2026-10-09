@@ -19,6 +19,7 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, unquote, quote
 
+import kb
 import knowledge
 import llm
 import log
@@ -279,6 +280,19 @@ def do_analyze(jd_text, image_data_url, resume_name, link=""):
         fname = render_report(d)
         job_id = fname[:-5]
 
+        # ---- 知识库自动沉淀（阶段 3.1）：失败绝不影响出报告 ----
+        # kb.absorb 故意不吞 store.save_knowledge 的 I/O 失败（吞掉就等于骗用户「已沉淀」），
+        # 所以边界必须在这里：知识库出任何问题都只记日志，报告已经写好了。
+        try:
+            kb.absorb(know_nodes, {
+                "id": job_id,
+                "job_title": d.get("job_title") or "",
+                "company": d.get("company") or "",
+                "date": datetime.now().strftime("%Y-%m-%d"),
+            })
+        except Exception as e:
+            log.log_exc("kb.absorb_error", e)
+
         # 落盘原始 JD，并写入岗位台账
         jd_text_file, jd_image_url = save_jd_source(job_id, jd_text, image_data_url)
         rec = {
@@ -447,6 +461,23 @@ class Handler(BaseHTTPRequestHandler):
         if p == "/api/jobs":
             return self._send(200, {"jobs": store.load_jobs(), "categories": store.CATEGORIES, "statuses": store.STATUSES})
 
+        if p == "/api/knowledge":
+            def one(k, d=""):
+                v = q.get(k)
+                return v[0] if v else d
+            data = store.load_knowledge()
+            return self._send(200, {
+                "ok": True,
+                "nodes": kb.list_nodes(data, q=one("q"), state=one("state"),
+                                       category=one("category"), jd_id=one("jd"),
+                                       sort=one("sort") or "mentions"),
+                "stats": kb.stats(data),
+                "duplicates": kb.find_duplicates(data),
+                "jds": kb.all_jds(data),
+                "categories": kb.all_categories(data),
+                "states": list(kb.STATE_VALUES),
+            })
+
         if p == "/api/jd_text":
             job = store.find_job(store.safe_name(q.get("id", [""])[0]))
             if not job or not job.get("jd_text_file"):
@@ -583,6 +614,23 @@ class Handler(BaseHTTPRequestHandler):
             log.log_event("job.update", id=job.get("id"), title=job.get("job_title"),
                       fields=fields, status=job.get("status"))
             return self._send(200, {"ok": True, "job": job})
+
+        if p == "/api/knowledge/state":
+            ok, msg = kb.set_state(str(body.get("id") or ""), str(body.get("state") or ""))
+            return self._send(200 if ok else 400, {"ok": ok, "error": msg})
+
+        if p == "/api/knowledge/merge":
+            ok, msg = kb.merge_nodes(str(body.get("keep_id") or ""), str(body.get("drop_id") or ""))
+            return self._send(200 if ok else 400, {"ok": ok, "error": msg, "message": msg})
+
+        if p == "/api/knowledge/import-reports":
+            try:
+                files, added, merged = kb.absorb_reports()
+                return self._send(200, {"ok": True, "files": files,
+                                        "added": added, "merged": merged})
+            except Exception as e:
+                log.log_exc("kb.import_error", e)
+                return self._send(200, {"ok": False, "error": str(e)})
 
         if p == "/api/analyze":
             try:
