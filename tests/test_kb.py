@@ -1536,3 +1536,45 @@ class RecordReviewTest(IsolatedCase):
     def test_accepts_raw_term_and_normalised_id_alike(self):
         self._one("待学习")
         self.assertTrue(kb.record_review("甲", kb.RESULT_UP)[0])
+
+
+class UpsertCheckTest(IsolatedCase):
+    def test_creates_card_when_missing(self):
+        ok, created, card = kb.upsert_check("品牌新概念", "已掌握",
+                                            {"definition": "定义", "category": "核心概念"})
+        self.assertTrue(ok)
+        self.assertTrue(created)
+        self.assertEqual(card["state"], "已掌握")
+        self.assertEqual(card["definition"], "定义")
+        self.assertEqual(len(store.load_knowledge()["nodes"]), 1)
+
+    def test_updates_existing_card_without_creating(self):
+        kb.absorb([_node(term="甲")], {"id": "j1"})
+        ok, created, card = kb.upsert_check("甲", "已掌握")
+        self.assertTrue(ok)
+        self.assertFalse(created)
+        self.assertEqual(card["state"], "已掌握")
+        self.assertEqual(len(store.load_knowledge()["nodes"]), 1)
+
+    def test_defined_metadata_does_not_overwrite_existing_richer_content(self):
+        kb.absorb([_node(term="甲", definition="很长很完整的原定义内容")], {"id": "j1"})
+        kb.upsert_check("甲", "学习中", {"definition": "短"})
+        self.assertEqual(store.load_knowledge()["nodes"][0]["definition"], "很长很完整的原定义内容")
+
+    def test_accepts_normalised_id_too(self):
+        kb.upsert_check("Transformer 架构", "已掌握")
+        ok, created, card = kb.upsert_check("transformer架构", "学习中")
+        self.assertTrue(ok)
+        self.assertFalse(created)
+        self.assertEqual(card["state"], "学习中")
+
+    def test_rejects_bad_state_and_empty_term(self):
+        self.assertFalse(kb.upsert_check("甲", "随便")[0])
+        self.assertFalse(kb.upsert_check("", "已掌握")[0])
+        self.assertFalse(kb.upsert_check("（）", "已掌握")[0])
+
+    def test_uncheck_maps_to_not_learned(self):
+        kb.upsert_check("甲", "已掌握")
+        ok, _, card = kb.upsert_check("甲", "待学习")
+        self.assertTrue(ok)
+        self.assertEqual(card["state"], "待学习")

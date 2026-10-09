@@ -493,6 +493,46 @@ def record_review(node_id, result, kb=None):
     return False, None
 
 
+def upsert_check(term, state, meta=None, kb=None):
+    """报告里勾选/取消一个知识点：不存在就建卡，存在就只改 state。
+
+    返回 (ok, created, card)。**只改 state 与"填空"，绝不用更短的定义覆盖已有内容**
+    —— 沿用 _merge_into 的既有原则。
+
+    为什么要自动建卡：报告里的勾是**用户已经做出的判断**。概念在知识库里还没有卡时
+    直接拒绝，勾就丢了（正是「关掉程序勾就没了」的复发）。宁可多一张卡，也不能丢用户的勾。
+
+    load → 改 → save 整段进 _KB_LOCK：与 absorb / set_state 同类，无锁并发会丢更新。
+    """
+    if state not in STATE_VALUES:
+        return False, False, None
+    nid = normalize_id(term)
+    if not nid:
+        return False, False, None
+    meta = meta if isinstance(meta, dict) else {}
+    with _KB_LOCK:
+        data = ensure_kb(kb if kb is not None else store.load_knowledge())
+        for n in data["nodes"]:
+            if n.get("id") == nid:
+                n["state"] = state
+                for key in ("definition", "plain_explanation", "category"):
+                    new_val = str(meta.get(key) or "").strip()
+                    if len(new_val) > len(str(n.get(key) or "").strip()):
+                        n[key] = new_val
+                store.save_knowledge(data)
+                return True, False, n
+        card = _new_card({"term": str(term).strip(),
+                          "definition": str(meta.get("definition") or "").strip(),
+                          "plain_explanation": str(meta.get("plain_explanation") or "").strip(),
+                          "category": str(meta.get("category") or "").strip()}, None)
+        card["state"] = state
+        _normalise_review_fields(card)
+        data["nodes"].append(card)
+        store.save_knowledge(data)
+        log.log_event("kb.check_created", id=nid, state=state)
+        return True, True, card
+
+
 def _strip_tail(t):
     for w in _TAIL_WORDS:
         if t.endswith(w) and len(t) > len(w):
