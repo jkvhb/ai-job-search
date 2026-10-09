@@ -376,6 +376,53 @@ class PipelineTest(IsolatedCase):
         self.assertEqual(store.load_interview_json("iv1", "status.json")["state"], "done")
         self.assertIn("interview", store.read_text(path))
 
+    def test_second_run_does_not_double_count_the_interview(self):
+        """重试（转写成功但分析挂了）绝不能把「被问过」再加一次 —— 那会直接污染复习优先级。
+
+        真实现里第二次 run_pipeline 会跳过转写、重跑分析，然后走到反哺那一步。
+        """
+        import kb
+        kb.absorb([{"term": "RLHF"}], {"id": "j1"})
+        store.save_stream("iv1", "audio.wav", io.BytesIO(b"x" * 100), max_bytes=10_000)
+        reply = json.dumps({"summary": "s"}, ensure_ascii=False)
+        first = self._deps(text="我们聊了 RLHF")
+        first["chat"] = fake_chat_factory([reply])
+        interview.run_pipeline("j1", "iv1", {}, deps=first)
+        self.assertEqual({n["term"]: n for n in store.load_knowledge()["nodes"]}["RLHF"]["asked_count"], 1)
+
+        again = self._deps(text="我们聊了 RLHF")
+        again["chat"] = fake_chat_factory([reply])
+        interview.run_pipeline("j1", "iv1", {}, deps=again)      # 重试
+        self.assertEqual({n["term"]: n for n in store.load_knowledge()["nodes"]}["RLHF"]["asked_count"], 1)
+        self.assertEqual(store.load_interview_json("iv1", "feedback.json")["j1"]["applied"], True)
+
+    def test_feedback_idempotency_is_per_job_not_global(self):
+        """同一场面试被算到另一个岗位上时，必须照样反哺（标记按 (面试, 岗位) 记，不是一个全局布尔）。"""
+        import kb
+        kb.absorb([{"term": "RLHF"}], {"id": "j1"})
+        self.assertIsNotNone(interview._apply_feedback("j1", {"text": "聊了 RLHF"}, {}, "iv1"))
+        self.assertIsNone(interview._apply_feedback("j1", {"text": "聊了 RLHF"}, {}, "iv1"))
+        self.assertIsNotNone(interview._apply_feedback("j2", {"text": "聊了 RLHF"}, {}, "iv1"))
+        cards = {n["term"]: n for n in store.load_knowledge()["nodes"]}
+        self.assertEqual(cards["RLHF"]["asked_count"], 2)        # j1 一次 + j2 一次
+
+    def test_failed_kb_write_does_not_leave_a_feedback_marker(self):
+        """知识库写盘失败时绝不能先落标记：否则那次反哺永远补不回来。"""
+        import kb
+        kb.absorb([{"term": "RLHF"}], {"id": "j1"})
+        old = kb.record_interview
+
+        def boom(*a, **k):
+            raise RuntimeError("写盘失败")
+
+        kb.record_interview = boom
+        self.addCleanup(setattr, kb, "record_interview", old)
+        with self.assertRaises(RuntimeError):
+            interview._apply_feedback("j1", {"text": "聊了 RLHF"}, {}, "iv1")
+        self.assertFalse(interview._feedback_done("iv1", "j1"))
+        kb.record_interview = old
+        self.assertIsNotNone(interview._apply_feedback("j1", {"text": "聊了 RLHF"}, {}, "iv1"))
+
     def test_start_runs_in_a_thread_and_reaches_a_terminal_state(self):
         store.save_stream("iv1", "audio.wav", io.BytesIO(b"x" * 100), max_bytes=10_000)
         t = interview.start("j1", "iv1", {}, deps=self._deps())
@@ -459,6 +506,71 @@ class PipelineTest(IsolatedCase):
         self.assertEqual(st["audio_bytes"], 100)
         self.assertEqual(st["state"], "done")
         self.assertGreaterEqual(st["elapsed"], 0)
+
+
+class StartGuardTest(IsolatedCase):
+    """同一次面试被连点两次上传 / 转写中又点重试：绝不允许跑两条流水线。
+
+    真跑的话是两条 27 分钟的转写互相覆盖文件，测试等不起，所以用「假 pipeline + Event 阻塞」
+    把「第一次还在跑」这个瞬间**确定性地**造出来。
+    """
+
+    def _blocking_pipeline(self):
+        import threading
+        gate = threading.Event()
+        blocked = threading.Event()
+        calls = []
+
+        def fake_run_pipeline(jd_id, interview_id, cfg, kind="audio", deps=None):
+            calls.append((jd_id, interview_id))
+            store.save_interview_json(interview_id, "status.json", {"state": "transcribing"})
+            blocked.set()
+            gate.wait(10)                       # 卡在「转写中」，直到测试放行
+            store.save_interview_json(interview_id, "status.json", {"state": "done"})
+
+        return fake_run_pipeline, gate, blocked, calls
+
+    def _patch_pipeline(self, fake):
+        old = interview.run_pipeline
+        interview.run_pipeline = fake
+        self.addCleanup(setattr, interview, "run_pipeline", old)
+
+    def test_second_start_reuses_the_live_thread_and_does_not_run_again(self):
+        store.save_stream("iv1", "audio.wav", io.BytesIO(b"x" * 100), max_bytes=10_000)
+        fake, gate, blocked, calls = self._blocking_pipeline()
+        self._patch_pipeline(fake)
+        first = None
+        try:
+            first = interview.start("j1", "iv1", {}, deps={})
+            self.assertTrue(blocked.wait(5), "假流水线没跑起来")
+            self.assertTrue(interview.is_running("iv1"))
+            second = interview.start("j1", "iv1", {}, deps={})   # 转写中又点了一次
+            self.assertIs(second, first)                        # 复用已有线程
+            self.assertEqual(len(calls), 1)                     # 没有第二次执行
+            self.assertEqual(interview.status("iv1")["state"], "transcribing")
+        finally:
+            gate.set()
+            if first is not None:
+                first.join(10)
+        self.assertEqual(len(calls), 1)
+        self.assertFalse(interview.is_running("iv1"))
+        self.assertEqual(interview.status("iv1")["state"], "done")
+
+    def test_start_again_after_finishing_runs_a_new_round(self):
+        """跑完了必须能再起一轮（否则「重试」在终态上永远无效）。"""
+        store.save_stream("iv1", "audio.wav", io.BytesIO(b"x" * 100), max_bytes=10_000)
+        fake, gate, blocked, calls = self._blocking_pipeline()
+        self._patch_pipeline(fake)
+        first = interview.start("j1", "iv1", {}, deps={})
+        blocked.wait(5)
+        gate.set()
+        first.join(10)
+        self.assertFalse(interview.is_running("iv1"))
+        second = interview.start("j1", "iv1", {}, deps={})       # 终态后重试
+        second.join(10)
+        self.assertIsNot(second, first)
+        self.assertEqual(len(calls), 2)                          # 真的又跑了一轮
+        self.assertFalse(second.is_alive())
 
 
 class DefaultRunnerTest(IsolatedCase):

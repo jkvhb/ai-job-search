@@ -469,11 +469,52 @@ def _meta_of(interview_id, transcript):
             "chars": len(_as_str(tr.get("text"))), "interview_id": interview_id}
 
 
-def _apply_feedback(jd_id, transcript, analysis):
-    """反哺知识库：转写里**确定性**命中的概念算「被问过」，模型点名答砸的降级。
+def _feedback_id(jd_id):
+    """feedback.json 里这条岗位的键。空 jd_id 也归一成 ""，不写 None（JSON 的 null 键没法查）。"""
+    return str(jd_id or "")
+
+
+def _feedback_done(interview_id, jd_id):
+    """这次面试的结果是否已经反哺给这个岗位了。
+
+    重试是一等流程（分析挂了就要重跑），而 kb.record_interview 会把 asked_count +1 ——
+    不拦的话「重试一次」就等于「面试官又问了一遍」，直接污染复习队列的优先级。
+    """
+    data = store.load_interview_json(interview_id, "feedback.json", {})
+    if not isinstance(data, dict):
+        return False
+    return bool((data.get(_feedback_id(jd_id)) or {}).get("applied"))
+
+
+def _mark_feedback(interview_id, jd_id):
+    """记下「已经反哺过」。**必须在 kb.record_interview 成功之后写**。
+
+    反过来（先标记再反哺）的话，知识库写盘失败时标记已经落盘 —— 那次反哺永远不会补上，
+    用户的知识库静默少一次面试记录。现在的顺序最坏是「知识库写成功但标记写失败」→
+    下次重试多记一次：可见、可改，比静默丢数据好。
+    """
+    path = store.interview_file(interview_id, "feedback.json")
+    data = store.load_interview_json(interview_id, "feedback.json", {})
+    if not isinstance(data, dict):
+        data = {}
+    data[_feedback_id(jd_id)] = {"applied": True, "jd_id": str(jd_id or ""), "at": _now()}
+    if path:
+        store.write_json(path, data)
+
+
+def _apply_feedback(jd_id, transcript, analysis, interview_id=None):
+    """反哺知识库：转写里**确定性**命中的概念算「被问过」，模型点名答砸的降级。返回
+    (hits, weak, downgraded)，或用 feedback.json 判为已应用过时返回 None（什么都没做）。
 
     命中的判定交给 kb.interview_hits（确定性、可测、零额度），不靠模型判 —— 模型漏读就漏记。
+
+    按 (interview_id, jd_id) 幂等：同一场面试的同一岗位只反哺一次（见 _feedback_done）。
+    没给 interview_id 时不做幂等（直接调用方自己负责，测试与脚本用得上）。
     """
+    if interview_id and _feedback_done(interview_id, jd_id):
+        log.log_event("interview.feedback_skip", interview=interview_id, job=jd_id,
+                      reason="已反哺过")
+        return None
     tr = transcript if isinstance(transcript, dict) else {}
     ana = analysis if isinstance(analysis, dict) else {}
     hits = kb.interview_hits(_as_str(tr.get("text")))
@@ -500,7 +541,10 @@ def _apply_feedback(jd_id, transcript, analysis):
         if nid and nid not in seen:
             seen.add(nid)
             asked_u.append(t)
-    return kb.record_interview(jd_id, asked=asked_u, weak=weak_u)
+    result = kb.record_interview(jd_id, asked=asked_u, weak=weak_u)
+    if interview_id:
+        _mark_feedback(interview_id, jd_id)               # 只在真写进知识库之后才标记
+    return result
 
 
 def render_report(out, jd_id, interview_id):
@@ -537,7 +581,7 @@ def run_pipeline(jd_id, interview_id, cfg, kind="audio", deps=None):
         _set_status(interview_id, "analyzing")
         ana = analyze(tr, _job_of(jd_id), cfg, chat=deps.get("chat"))
         store.save_interview_json(interview_id, "analysis.json", ana)
-        _apply_feedback(jd_id, tr, ana)                   # 见 Task 3 的 record_interview
+        _apply_feedback(jd_id, tr, ana, interview_id)     # 见 Task 3 的 record_interview（幂等）
         out = dict(ana, kind="interview", meta=_meta_of(interview_id, tr))
         (deps.get("render") or render_report)(out, jd_id, interview_id)
         _set_status(interview_id, "done")
@@ -553,13 +597,24 @@ def run_pipeline(jd_id, interview_id, cfg, kind="audio", deps=None):
 def start(jd_id, interview_id, cfg, kind="audio", deps=None):
     """起后台线程跑流水线，立刻返回（转写是 0.9× 音频时长，不能同步等）。
 
-    注册线程**在 start 之前**：反过来的话，短音频可能在 `_INTERVIEW_THREADS[id] = t`
-    之前就跑完了，而那个赋值会把一个**已死线程**放进表里 —— 之后 status() 一直判它
-    「没在跑」，会把已 done 的记录误报成 interrupted。
+    **同一面试记录已在跑时复用那个线程，绝不起第二个**：上传按钮连点两次、或在转写中
+    又点「重试」，会并发跑两次 27 分钟的转写 —— 既白烧机器，两份流水线还会互相覆盖
+    transcript.json / analysis.json（谁后写谁赢），反哺知识库也会被计两次。
+
+    判据用 `t.is_alive()` 而不是「字典里有没有这个键」：跑完的线程会留在字典里，
+    只看有没有键的话，一条已经 done 的记录会永远起不了新一轮（而 status() 也会把
+    它误判成在跑）。
+
+    注册线程**在 t.start() 之前**：反过来的话，短音频可能在赋值之前就跑完了，
+    而那个赋值会把一个**已死线程**放进表里 —— 之后 status() 一直判它「没在跑」，
+    会把已 done 的记录误报成 interrupted。
     """
-    t = threading.Thread(target=run_pipeline,
-                         args=(jd_id, interview_id, cfg, kind, deps or {}), daemon=True)
     with _THREADS_LOCK:
+        running = _INTERVIEW_THREADS.get(interview_id)
+        if running is not None and running.is_alive():
+            return running                                # 已在跑：复用，不起第二个
+        t = threading.Thread(target=run_pipeline,
+                             args=(jd_id, interview_id, cfg, kind, deps or {}), daemon=True)
         _INTERVIEW_THREADS[interview_id] = t
     t.start()
     return t
