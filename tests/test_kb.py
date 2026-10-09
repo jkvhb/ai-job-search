@@ -12,6 +12,14 @@ class NormalizeIdTest(unittest.TestCase):
         self.assertEqual(kb.normalize_id("省略恢复（Ellipsis）"), "省略恢复ellipsis")
         self.assertEqual(kb.normalize_id("A/B、C·D"), "abcd")
 
+    def test_folds_fullwidth_latin(self):
+        self.assertEqual(kb.normalize_id("ＡＢＣ"), "abc")
+        self.assertEqual(kb.normalize_id("ＡＩ标注"), kb.normalize_id("AI标注"))
+
+    def test_folds_fullwidth_digits_and_parens(self):
+        self.assertEqual(kb.normalize_id("（１）"), "1")
+        self.assertEqual(kb.normalize_id("ＫＢ＿ｖ２"), "kbv2")
+
     def test_empty_and_punctuation_only_become_empty(self):
         self.assertEqual(kb.normalize_id(""), "")
         self.assertEqual(kb.normalize_id("   "), "")

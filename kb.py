@@ -12,6 +12,7 @@
   3. sources 完整保留 —— 用户明确强调「来源尤其关键」，知识库里必须能点进原文
 """
 import re
+import unicodedata
 from datetime import datetime
 
 # 本模块的配置面：下面这些常量供后续任务（来源清洗 / 合并 / 查询 / 回填）使用，
@@ -35,13 +36,16 @@ REPORT_MARK = "const REPORT_DATA = "
 
 
 def normalize_id(term):
-    """术语 → 知识库身份键：小写、去标点与空白。
+    """术语 → 知识库身份键：NFKC 归一、小写、去标点与空白。
 
     这是跨岗位认定「同一个概念」的唯一依据。空/纯标点返回空串（调用方应跳过，避免垃圾卡）。
+
+    为什么要先 NFKC：中文输入法极易打出全角字符（ＡＩ／（１）），而全角与半角是**同一个概念**
+    的两种写法。不归一的话 "ＡＩ标注" 与 "AI标注" 会算成两张卡，违背「一个概念 = 一张卡」。
     """
     if not isinstance(term, str):
         return ""
-    return _PUNCT.sub("", term).lower()
+    return _PUNCT.sub("", unicodedata.normalize("NFKC", term)).lower()
 
 
 def _today():
