@@ -322,3 +322,85 @@ class ResilienceTest(IsolatedCase):
     def test_layer_string_is_tolerated(self):
         kb.absorb([_node(layer="1")], {"id": "j1"})
         self.assertEqual(store.load_knowledge()["nodes"][0]["layer"], 1)
+
+
+class DuplicateTest(IsolatedCase):
+    def _seed(self, terms):
+        kb.absorb([_node(term=t) for t in terms], {"id": "j1"})
+
+    def test_detects_containment_pair(self):
+        self._seed(["省略恢复", "省略识别及恢复"])
+        dups = kb.find_duplicates(store.load_knowledge())
+        self.assertEqual(len(dups), 1)
+        self.assertEqual({dups[0]["a"], dups[0]["b"]}, {"省略恢复", "省略识别及恢复"})
+
+    def test_detects_tail_word_variant(self):
+        self._seed(["根因分析", "根因分析方法"])
+        self.assertTrue(kb.find_duplicates(store.load_knowledge()))
+
+    def test_does_not_pair_unrelated_terms(self):
+        self._seed(["Transformer 架构", "抽样检验", "幻觉", "标注规范"])
+        for d in kb.find_duplicates(store.load_knowledge()):
+            self.assertNotEqual({d["a"], d["b"]}, {"transformer架构", "抽样检验"})
+
+    def test_short_terms_do_not_generate_prefix_noise(self):
+        self._seed(["抽样", "抽取", "抽检"])
+        self.assertEqual(kb.find_duplicates(store.load_knowledge()), [])
+
+    def test_two_char_terms_never_become_subsequence_pairs(self):
+        # 「插入式」分支要求短词 ≥3 字：2 字词极易互相成为有序子序列，
+        # 没有这道门槛会刷出一堆假配对（这条测试就是钉住这道门槛的）
+        self._seed(["抽样", "抽检", "抽取", "标注", "标准", "指标", "幻觉", "错觉"])
+        self.assertEqual(kb.find_duplicates(store.load_knowledge()), [])
+
+    def test_subsequence_variant_is_detected(self):
+        # 「省略恢复」不是「省略识别及恢复」的连续子串（中间插了「识别及」），
+        # 但每个字按序都能对上 —— 这是本领域真实存在的重复来源
+        self._seed(["省略恢复", "省略识别及恢复"])
+        dups = kb.find_duplicates(store.load_knowledge())
+        self.assertEqual(len(dups), 1)
+        self.assertEqual(dups[0]["reason"], "插入式")
+
+    def test_limit_is_respected(self):
+        self._seed(["概念%d号" % i for i in range(40)])
+        self.assertLessEqual(len(kb.find_duplicates(store.load_knowledge())), 20)
+
+
+class ManualMergeTest(IsolatedCase):
+    def test_merge_moves_sources_and_records_alias(self):
+        kb.absorb([_node(term="省略恢复", sources=[_src("https://a")])], {"id": "j1"})
+        kb.absorb([_node(term="省略识别及恢复", sources=[_src("https://b")])], {"id": "j2"})
+        ok, msg = kb.merge_nodes("省略恢复", "省略识别及恢复")
+        self.assertTrue(ok, msg)
+        cards = store.load_knowledge()["nodes"]
+        self.assertEqual(len(cards), 1)
+        self.assertEqual(len(cards[0]["sources"]), 2)
+        self.assertIn("省略识别及恢复", cards[0]["aliases"])
+        self.assertEqual([j["id"] for j in cards[0]["from_jds"]], ["j1", "j2"])
+
+    def test_merge_keeps_target_progress(self):
+        kb.absorb([_node(term="A词", sources=[_src("https://a")])], {"id": "j1"})
+        kb.absorb([_node(term="B词", sources=[_src("https://b")])], {"id": "j2"})
+        kb.set_state("A词", "已掌握")
+        kb.set_state("B词", "待学习")
+        kb.merge_nodes("A词", "B词")
+        self.assertEqual(store.load_knowledge()["nodes"][0]["state"], "已掌握")
+
+    def test_merge_rejects_same_id(self):
+        kb.absorb([_node(term="A词")], {"id": "j1"})
+        ok, msg = kb.merge_nodes("A词", "A词")
+        self.assertFalse(ok)
+        self.assertIn("自己", msg)
+
+    def test_merge_rejects_unknown_id(self):
+        kb.absorb([_node(term="A词")], {"id": "j1"})
+        ok, msg = kb.merge_nodes("A词", "不存在的词")
+        self.assertFalse(ok)
+        self.assertEqual(len(store.load_knowledge()["nodes"]), 1)
+
+    def test_merge_is_idempotent_when_target_gone(self):
+        kb.absorb([_node(term="A词")], {"id": "j1"})
+        kb.absorb([_node(term="B词")], {"id": "j2"})
+        kb.merge_nodes("A词", "B词")
+        ok, _ = kb.merge_nodes("A词", "B词")
+        self.assertFalse(ok)

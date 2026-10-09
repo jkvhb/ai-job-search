@@ -288,9 +288,14 @@ def absorb(nodes, jd=None, kb=None):
 
 
 def set_state(node_id, state, kb=None):
-    """只改学习状态，不碰任何其它字段。返回 (ok, msg)。"""
+    """只改学习状态，不碰任何其它字段。返回 (ok, msg)。
+
+    node_id 既可以是身份键，也可以是术语写法：先过 normalize_id 抹平大小写/全角/标点差异
+    （对已经归一化的 id 是 no-op），这样前端传 id、脚本或人传术语都能用。
+    """
     if state not in STATE_VALUES:
         return False, "状态不合法：%s" % state
+    node_id = normalize_id(node_id)
     kb = ensure_kb(kb if kb is not None else store.load_knowledge())
     for n in kb["nodes"]:
         if n.get("id") == node_id:
@@ -299,3 +304,97 @@ def set_state(node_id, state, kb=None):
             log.log_event("kb.state_set", id=node_id, state=state)
             return True, ""
     return False, "找不到该知识点"
+
+
+def _strip_tail(t):
+    for w in _TAIL_WORDS:
+        if t.endswith(w) and len(t) > len(w):
+            return t[: -len(w)]
+    return t
+
+
+def _is_subsequence(short, long_):
+    """short 的字符是否**按顺序**都出现在 long_ 里（允许中间插入别的字符）。
+
+    用于识别「插入式变体」：`省略恢复` 与 `省略识别及恢复` —— 前者并不是后者的连续子串
+    （中间插了「识别及」），但每个字都按序出现。
+    """
+    it = iter(long_)
+    return all(ch in it for ch in short)
+
+
+def _dup_reason(a, b):
+    """两个身份键疑似同一概念的原因；不是则 None。"""
+    if not a or not b or a == b:
+        return None
+    if a in b or b in a:
+        return "包含" if abs(len(a) - len(b)) <= 4 else None
+    # 插入式变体：不是连续子串，但按序都能对上。
+    # 短词门槛 ≥3 字是必要的：2 字词极易互相成为子序列，会刷出一堆假配对。
+    short, long_ = (a, b) if len(a) <= len(b) else (b, a)
+    if len(short) >= 3 and abs(len(a) - len(b)) <= 4 and _is_subsequence(short, long_):
+        return "插入式"
+    if _strip_tail(a) == _strip_tail(b):
+        return "同义后缀"
+    # 首尾相近：加长度门槛，否则短术语（4 字以内）会共享首尾字产生大量假配对
+    if len(a) >= 6 and len(b) >= 6:
+        n = min(len(a), len(b))
+        p = 0
+        while p < n and a[p] == b[p]:
+            p += 1
+        s = 0
+        while s < n - p and a[-1 - s] == b[-1 - s]:
+            s += 1
+        if p >= 4 and s >= 2:
+            return "首尾相近"
+    return None
+
+
+def find_duplicates(kb, limit=20):
+    """启发式找出可能指同一概念的术语对。**只提示，绝不自动合并**（错并难发现）。"""
+    ids = [n.get("id") for n in ensure_kb(kb)["nodes"] if n.get("id")]
+    out = []
+    for i in range(len(ids)):
+        for j in range(i + 1, len(ids)):
+            reason = _dup_reason(ids[i], ids[j])
+            if reason:
+                out.append({"a": ids[i], "b": ids[j], "reason": reason})
+                if len(out) >= limit:
+                    return out
+    return out
+
+
+def merge_nodes(keep_id, drop_id, kb=None):
+    """手动合并：把 drop 并入 keep，drop 的写法记进 aliases 后移除。返回 (ok, msg)。
+
+    两个参数既可以是身份键，也可以是术语写法（先过 normalize_id；对已归一化的 id 是 no-op）——
+    否则「A词」这类带大写的术语会被判成「找不到」，让人以为知识点丢了。
+    keep 的学习进度保持不变（合并方向永远是「你的进度 → 保留」，不用 drop 覆盖）。
+    """
+    keep_id, drop_id = normalize_id(keep_id), normalize_id(drop_id)
+    if not keep_id or not drop_id:
+        return False, "两个知识点都要选"
+    if keep_id == drop_id:
+        return False, "不能和自己合并"
+    kb = ensure_kb(kb if kb is not None else store.load_knowledge())
+    index = {n.get("id"): n for n in kb["nodes"] if n.get("id")}
+    keep, drop = index.get(keep_id), index.get(drop_id)
+    if keep is None or drop is None:
+        return False, "找不到要合并的知识点"
+
+    _merge_into(keep, drop)
+
+    aliases = _as_list(keep.get("aliases"))
+    for a in [drop.get("term")] + _as_list(drop.get("aliases")):
+        a = str(a or "").strip()
+        if a and a not in aliases:
+            aliases.append(a)
+    keep["aliases"] = aliases
+    for jd in _as_list(drop.get("from_jds")):
+        _add_jd(keep, jd)
+    _recompute_confidence(keep)
+
+    kb["nodes"] = [n for n in kb["nodes"] if n.get("id") != drop_id]
+    store.save_knowledge(kb)
+    log.log_event("kb.merge_done", keep=keep_id, drop=drop_id, aliases=len(aliases))
+    return True, "已把「%s」并入「%s」" % (drop.get("term"), keep.get("term"))
