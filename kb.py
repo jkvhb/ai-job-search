@@ -11,6 +11,7 @@
   2. 合并幂等：同一份报告吸收两次，结果相同（from_jds / sources 都不翻倍）
   3. sources 完整保留 —— 用户明确强调「来源尤其关键」，知识库里必须能点进原文
 """
+import log
 import re
 import store
 import unicodedata
@@ -18,7 +19,7 @@ from datetime import datetime
 
 # 本模块的配置面：下面这些常量供后续任务（来源清洗 / 合并 / 查询 / 回填）使用，
 # 提前集中声明是为了让契约可见，不是未使用的死代码。
-# **导入只写当前用到的**（re / store / unicodedata / datetime）；glob / json / os / log 到真正
+# **导入只写当前用到的**（log / re / store / unicodedata / datetime）；glob / json / os 到真正
 # 用到它们的那个任务再加，否则会被代码质量审查判为未使用导入。
 KB_VERSION = 1
 SNIPPET_LIMIT = 400      # knowledge.json 里的摘要截断长度（完整摘要仍在报告快照里）
@@ -184,8 +185,37 @@ def _recompute_confidence(card):
 
 
 def _merge_into(card, node):
-    """把新节点的内容并进已有卡片（Task 4 补全全部字段）"""
+    """把新节点的内容并进已有卡片。
+
+    **用户进度（state / last_outcome / asked_count）一律不动** —— 见文件头铁律 1。
+    """
     card["sources"] = clean_sources(_as_list(card.get("sources")) + _as_list(node.get("sources")))
+
+    tl_old = clean_timeline(card.get("timeline"))
+    tl_new = clean_timeline(node.get("timeline"))
+    card["timeline"] = tl_new if len(tl_new) > len(tl_old) else tl_old
+
+    # 定义/通俗解释：不用更短的值覆盖现有内容（保留更全的）
+    for key in ("definition", "plain_explanation"):
+        new_val = str(node.get(key) or "").strip()
+        if len(new_val) > len(str(card.get(key) or "").strip()):
+            card[key] = new_val
+
+    if not str(card.get("category") or "").strip():
+        card["category"] = str(node.get("category") or "").strip()
+
+    card["layer"] = min(int(card.get("layer") or 0), int(node.get("layer") or 0))
+
+    card["related"] = clean_related(_as_list(card.get("related")) + _as_list(node.get("related")))
+    card["interview_questions"] = clean_questions(
+        _as_list(card.get("interview_questions")) + _as_list(node.get("interview_questions")))
+
+    # 补齐可能缺失的进度字段，但绝不覆盖已有值
+    card.setdefault("state", DEFAULT_STATE)
+    card.setdefault("last_outcome", DEFAULT_OUTCOME)
+    card.setdefault("asked_count", 0)
+    card.setdefault("first_seen", _today())
+    card["last_seen"] = _today()
 
 
 def absorb(nodes, jd=None, kb=None):
@@ -216,3 +246,17 @@ def absorb(nodes, jd=None, kb=None):
     kb["version"] = KB_VERSION
     store.save_knowledge(kb)
     return added, merged
+
+
+def set_state(node_id, state, kb=None):
+    """只改学习状态，不碰任何其它字段。返回 (ok, msg)。"""
+    if state not in STATE_VALUES:
+        return False, "状态不合法：%s" % state
+    kb = ensure_kb(kb if kb is not None else store.load_knowledge())
+    for n in kb["nodes"]:
+        if n.get("id") == node_id:
+            n["state"] = state
+            store.save_knowledge(kb)
+            log.log_event("kb.state_set", id=node_id, state=state)
+            return True, ""
+    return False, "找不到该知识点"
