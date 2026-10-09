@@ -1,12 +1,11 @@
 # -*- coding: utf-8 -*-
-import os
-import shutil
-import tempfile
 import unittest
 
 import knowledge
 import log
 import store
+
+from tests.base import IsolatedCase as _Isolated   # noqa: E402
 
 
 def fake_chat_factory(responses):
@@ -18,24 +17,6 @@ def fake_chat_factory(responses):
 
     fake_chat.calls = calls
     return fake_chat
-
-
-class _Isolated(unittest.TestCase):
-    """隔离：knowledge 内部会调 log_event，必须重定向到临时目录，
-    否则会往用户真实的 data/profiles/.../logs/events.jsonl 追加记录。"""
-
-    def setUp(self):
-        self.tmp = tempfile.mkdtemp()
-        self._old_data = store.DATA_ROOT
-        self._old_logfile = log.LOG_FILE
-        store.DATA_ROOT = self.tmp
-        store.set_current_profile("default")
-        log.LOG_FILE = os.path.join(store.profile_dir(), "logs", "events.jsonl")
-
-    def tearDown(self):
-        store.DATA_ROOT = self._old_data
-        log.LOG_FILE = self._old_logfile
-        shutil.rmtree(self.tmp, ignore_errors=True)
 
 
 class ExtractTest(_Isolated):
