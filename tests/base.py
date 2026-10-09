@@ -15,14 +15,13 @@ import store
 
 class IsolatedCase(unittest.TestCase):
     def setUp(self):
+        # 用 addCleanup 而不是 tearDown：set_current_profile() 是真实磁盘 I/O，
+        # 一旦它抛错，unittest 不会调用 tearDown，全局路径就永久停在临时目录上。
+        # addCleanup 在 setUp 失败时仍会执行，且后进先出——所以必须在改值**之前**注册还原。
         self.tmp = tempfile.mkdtemp()
-        self._old_data = store.DATA_ROOT
-        self._old_logfile = log.LOG_FILE
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.addCleanup(setattr, store, "DATA_ROOT", store.DATA_ROOT)
+        self.addCleanup(setattr, log, "LOG_FILE", log.LOG_FILE)
         store.DATA_ROOT = self.tmp
         store.set_current_profile("default")
         log.LOG_FILE = os.path.join(store.profile_dir(), "logs", "events.jsonl")
-
-    def tearDown(self):
-        store.DATA_ROOT = self._old_data
-        log.LOG_FILE = self._old_logfile
-        shutil.rmtree(self.tmp, ignore_errors=True)

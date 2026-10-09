@@ -1,30 +1,14 @@
 # -*- coding: utf-8 -*-
-import os
-import shutil
-import tempfile
 import unittest
 
-import log
 import search
-import store
+
+from tests.base import IsolatedCase
 
 
-class ProviderFallbackTest(unittest.TestCase):
-    def setUp(self):
-        # 隔离：search() 全失败时会调 log.log_event，必须重定向到临时目录，
-        # 否则会往用户的真实 data/profiles/.../logs/events.jsonl 里追加记录。
-        self.tmp = tempfile.mkdtemp()
-        self._old_data = store.DATA_ROOT
-        self._old_logfile = log.LOG_FILE
-        store.DATA_ROOT = self.tmp
-        store.set_current_profile("default")
-        log.LOG_FILE = os.path.join(store.profile_dir(), "logs", "events.jsonl")
-
-    def tearDown(self):
-        store.DATA_ROOT = self._old_data
-        log.LOG_FILE = self._old_logfile
-        shutil.rmtree(self.tmp, ignore_errors=True)
-
+class ProviderFallbackTest(IsolatedCase):
+    # search() 全失败时会调 log.log_event，IsolatedCase 会把 store/log 重定向到临时目录，
+    # 否则会往用户的真实 data/profiles/.../logs/events.jsonl 里追加记录。
     def test_uses_first_provider_when_ok(self):
         calls = []
 

@@ -1,12 +1,10 @@
 # -*- coding: utf-8 -*-
 import json
-import os
-import shutil
-import tempfile
 import unittest
 
 import log
-import store
+
+from tests.base import IsolatedCase
 
 
 class RedactTest(unittest.TestCase):
@@ -25,20 +23,7 @@ class RedactTest(unittest.TestCase):
         self.assertEqual(log.redact({"n": 1, "s": "hello"}), {"n": 1, "s": "hello"})
 
 
-class LogEventTest(unittest.TestCase):
-    def setUp(self):
-        self.tmp = tempfile.mkdtemp()
-        self._old_data = store.DATA_ROOT
-        self._old_logfile = log.LOG_FILE
-        store.DATA_ROOT = self.tmp
-        store.set_current_profile("default")
-        log.LOG_FILE = os.path.join(store.profile_dir(), "logs", "events.jsonl")
-
-    def tearDown(self):
-        store.DATA_ROOT = self._old_data
-        log.LOG_FILE = self._old_logfile
-        shutil.rmtree(self.tmp, ignore_errors=True)
-
+class LogEventTest(IsolatedCase):
     def test_log_event_appends_jsonl(self):
         log.log_event("t.one", a=1)
         log.log_event("t.two", level="warn", b=2)

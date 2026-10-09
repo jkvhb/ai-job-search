@@ -1,22 +1,13 @@
 # -*- coding: utf-8 -*-
 import os
-import shutil
-import tempfile
 import unittest
 
 import store
 
+from tests.base import IsolatedCase
 
-class StorePathTest(unittest.TestCase):
-    def setUp(self):
-        self.tmp = tempfile.mkdtemp()
-        self._old = store.DATA_ROOT
-        store.DATA_ROOT = self.tmp
 
-    def tearDown(self):
-        store.DATA_ROOT = self._old
-        shutil.rmtree(self.tmp, ignore_errors=True)
-
+class StorePathTest(IsolatedCase):
     def test_profile_dir_uses_key(self):
         d = store.profile_dir("alice")
         self.assertTrue(d.endswith(os.path.join("profiles", "alice")))

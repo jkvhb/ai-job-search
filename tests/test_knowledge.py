@@ -5,7 +5,7 @@ import knowledge
 import log
 import store
 
-from tests.base import IsolatedCase as _Isolated   # noqa: E402
+from tests.base import IsolatedCase
 
 
 def fake_chat_factory(responses):
@@ -19,7 +19,7 @@ def fake_chat_factory(responses):
     return fake_chat
 
 
-class ExtractTest(_Isolated):
+class ExtractTest(IsolatedCase):
     def test_extract_returns_nodes(self):
         chat = fake_chat_factory(['{"nodes":[{"id":"rlhf","term":"RLHF","definition":"d",'
                                   '"plain_explanation":"p","category":"核心概念"}]}'])
@@ -41,7 +41,7 @@ class ExtractTest(_Isolated):
                                                                        "model": "m"}}, chat=chat), [])
 
 
-class SourceMergeTest(_Isolated):
+class SourceMergeTest(IsolatedCase):
     def test_merge_sources_dedupes_by_url(self):
         a = [{"url": "https://x", "title": "T"}]
         b = [{"url": "https://x", "title": "T2"}, {"url": "https://y", "title": "T3"}]
@@ -50,7 +50,7 @@ class SourceMergeTest(_Isolated):
         self.assertEqual({s["url"] for s in out}, {"https://x", "https://y"})
 
 
-class BrainstormTest(_Isolated):
+class BrainstormTest(IsolatedCase):
     def test_brainstorm_adds_layer1_nodes(self):
         chat = fake_chat_factory(['{"related":[{"id":"sft","term":"SFT","definition":"d",'
                                   '"plain_explanation":"p","relation":"前置"}]}'])
@@ -67,7 +67,7 @@ class BrainstormTest(_Isolated):
                                                                  "model": "m"}}), [])
 
 
-class SourceAndTimelineTest(_Isolated):
+class SourceAndTimelineTest(IsolatedCase):
     def test_attach_sources_marks_verified(self):
         def fake_search(query, providers=None, **kw):
             # 来源必须是本领域内容，否则会被 filter_relevant 丢弃（见 SearchQualityTest）
@@ -101,7 +101,7 @@ class SourceAndTimelineTest(_Isolated):
         self.assertEqual(out[0]["timeline"][0]["year"], "2022")
 
 
-class ResilienceTest(_Isolated):
+class ResilienceTest(IsolatedCase):
     def test_brainstorm_survives_non_list_related(self):
         # 合法 JSON 但 related 不是数组 → 不能抛，其他核心点要照常处理
         chat = fake_chat_factory(['{"related":"hello"}',
@@ -181,7 +181,7 @@ class ResilienceTest(_Isolated):
         self.assertTrue(all(n["layer"] == 0 for n in with_tl))
 
 
-class SearchQualityTest(_Isolated):
+class SearchQualityTest(IsolatedCase):
     def test_build_query_is_bare_term_without_domain_anchor(self):
         """查询**刻意不加领域词**——实测数据（2026-10-08，5 术语 × 2 写法，真实 Tavily）：
 
