@@ -90,6 +90,40 @@
   .lg .lv.info{color:var(--sub)} .lg .lv.warn{color:var(--amber)} .lg .lv.error{color:var(--red)}
   .lg .ev{flex:none;min-width:150px;max-width:230px;color:var(--accent);font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .lg .dt{color:var(--sub);word-break:break-all;flex:1}
+  /* 知识库（阶段 3.1） */
+  .kbstat{font-size:13px;color:var(--sub);margin:4px 0 12px}
+  .kbstat b{color:var(--ink);font-size:15px}
+  .kbbar{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
+  .kbbar input{flex:1;min-width:180px}
+  .kbbar select,.kbbar input{padding:7px 10px;border:1px solid var(--line);border-radius:8px;font-size:13px}
+  .kbsplit{display:flex;gap:14px;align-items:flex-start}
+  .kblist{flex:0 0 300px;max-height:560px;overflow:auto;border:1px solid var(--line);border-radius:10px}
+  .kbdetail{flex:1;min-width:0;border:1px solid var(--line);border-radius:10px;padding:16px;min-height:200px}
+  .kbi{padding:9px 12px;border-bottom:1px solid var(--line);cursor:pointer}
+  .kbi:last-child{border-bottom:0}
+  .kbi:hover{background:#f7f9fc}
+  .kbi.on{background:#eef4ff;box-shadow:inset 3px 0 0 var(--accent)}
+  .kbi .t{font-weight:600;font-size:13.5px}
+  .kbi .m{margin-top:4px;display:flex;gap:6px;flex-wrap:wrap}
+  .kbb{font-size:11px;padding:1px 6px;border-radius:6px;background:#eef1f5;color:var(--sub)}
+  .kbb.ver{background:#e9f9ef;color:#16a34a}
+  .kbb.ai{background:#fff7e6;color:#b45309}
+  .kbb.s1{background:#eef4ff;color:#1d4ed8}
+  .kbb.s2{background:#fff1e6;color:#c2410c}
+  .kbb.s3{background:#e9f9ef;color:#15803d}
+  .kbdempty{color:var(--sub);font-size:13px}
+  .kbsec{margin-top:14px}
+  .kbsec h4{margin:0 0 6px;font-size:13px;color:var(--sub);font-weight:600}
+  .kbdlist{margin:0;padding-left:18px;font-size:13.5px;line-height:1.7}
+  .kbdlist a{color:var(--accent);word-break:break-all}
+  .kbtl{font-size:13px;line-height:1.7}
+  .kbtl b{color:var(--accent);margin-right:6px}
+  .kbdup{margin-top:16px;border-top:1px dashed var(--line);padding-top:12px}
+  .kbdup .p{display:flex;gap:8px;align-items:center;font-size:13px;margin:6px 0}
+  .kbq{font-size:13.5px;line-height:1.7;color:var(--ink)}
+  .kbstates{display:flex;gap:6px;margin-top:10px}
+  .kbstates button{font-size:12.5px;padding:5px 12px}
+  .kbstates button.on{background:var(--accent);color:#fff;border-color:var(--accent)}
 </style>
 </head>
 <body>
@@ -101,6 +135,7 @@
     <button class="active" data-tab="analyze">① 分析岗位</button>
     <button data-tab="jobs">② 岗位台账</button>
     <button data-tab="resumes">③ 简历管理</button>
+    <button data-tab="know">🧠 知识库</button>
     <button data-tab="logs">🩺 日志</button>
     <button data-tab="config">⚙️ 设置</button>
   </nav>
@@ -170,6 +205,31 @@
         <button class="btn" id="saveResumeBtn">💾 保存</button>
         <button class="btn gray" id="clearResumeBtn">清空编辑区</button>
       </div>
+    </div>
+  </section>
+
+  <!-- 知识库（阶段 3.1） -->
+  <section class="panel" id="p-know">
+    <div class="card">
+      <h2>🧠 知识库 <span class="hint" style="font-weight:400;color:var(--sub);font-size:13px">跨岗位累积 · 刷题式复习</span></h2>
+      <div id="kbStat" class="kbstat"></div>
+      <div class="kbbar">
+        <input id="kbQ" placeholder="搜索术语 / 定义…">
+        <select id="kbState"></select>
+        <select id="kbCat"></select>
+        <select id="kbJd"></select>
+        <select id="kbSort">
+          <option value="mentions">按被提到次数</option>
+          <option value="recent">按最近出现</option>
+          <option value="term">按术语</option>
+        </select>
+        <button id="kbImport" class="ghost">从已有报告导入</button>
+      </div>
+      <div class="kbsplit">
+        <div class="kblist" id="kbList"></div>
+        <div class="kbdetail" id="kbDetail"><div class="kbdempty">← 左侧选一个知识点</div></div>
+      </div>
+      <div id="kbDup"></div>
     </div>
   </section>
 
@@ -260,6 +320,7 @@ $$('nav button').forEach(b=>b.addEventListener('click',()=>{
   if(b.dataset.tab==='jobs') loadJobs();
   if(b.dataset.tab==='resumes') loadResumes();
   if(b.dataset.tab==='logs') loadLogs();
+  if(b.dataset.tab==='know') initKnowTab();
   logUI('tab.switch', {tab: b.dataset.tab});
 }));
 
@@ -467,6 +528,145 @@ $('#saveCfgBtn').addEventListener('click', async ()=>{
   const r = await fetch('/api/config', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)}).then(x=>x.json());
   show($('#cfgSt'), r.ok?'ok':'err', r.ok?'设置已保存 ✓':'保存失败');
 });
+
+/* ---------- 🧠 知识库（阶段 3.1） ---------- */
+let kbData = { nodes: [], stats: null, duplicates: [], jds: [], categories: [], states: [] };
+let kbCur = '';              // 当前选中的知识点身份键
+let kbT = null;              // 搜索输入节流句柄
+let kbSeq = 0;               // 请求代次：只采用最新一次请求的响应，防止旧响应后到覆盖新结果
+
+const KB_STATE_CLASS = {'待学习':'s1','学习中':'s2','已掌握':'s3'};
+
+async function kbLoad(){
+  const seq = ++kbSeq;
+  const q = $('#kbQ').value.trim();
+  const url = '/api/knowledge?q='+encodeURIComponent(q)
+    +'&state='+encodeURIComponent($('#kbState').value)
+    +'&category='+encodeURIComponent($('#kbCat').value)
+    +'&jd='+encodeURIComponent($('#kbJd').value)
+    +'&sort='+encodeURIComponent($('#kbSort').value);
+  let d;
+  try{
+    d = await (await fetch(url)).json();
+  }catch(e){
+    if(seq !== kbSeq) return;          // 已被更新的请求取代，错误也不必显示了
+    $('#kbList').innerHTML = '<div class="kbi"><div class="kbdempty">知识库读取失败：'+esc(e.message)+'</div></div>';
+    logUI('kb.load_failed', {error: e.message}, 'error');
+    return;
+  }
+  if(seq !== kbSeq) return;            // 旧请求后到：直接丢弃，绝不覆盖新结果
+  kbData = d;
+  kbRenderFilters(); kbRenderStat(); kbRenderList(); kbRenderDetail(); kbRenderDup();
+}
+
+function kbFillSelect(sel, items, allLabel){
+  const cur = sel.value;
+  sel.innerHTML = '<option value="">'+allLabel+'</option>'
+    + items.map(o=>'<option value="'+esc(o.value)+'">'+esc(o.label)+'</option>').join('');
+  sel.value = cur;
+}
+
+function kbRenderFilters(){
+  kbFillSelect($('#kbState'), (kbData.states||[]).map(s=>({value:s,label:s})), '全部状态');
+  kbFillSelect($('#kbCat'), (kbData.categories||[]).map(c=>({value:c,label:c})), '全部分类');
+  kbFillSelect($('#kbJd'), (kbData.jds||[]).map(j=>({value:j.id,label:j.title||j.id})), '全部岗位');
+}
+
+function kbRenderStat(){
+  const s = kbData.stats; if(!s) return;
+  $('#kbStat').innerHTML = '共 <b>'+s.total+'</b> 个知识点 · <b>'+s.verified+'</b> 个有来源 · '
+    + '已掌握 <b>'+(s.by_state['已掌握']||0)+'</b> · 学习中 <b>'+(s.by_state['学习中']||0)+'</b> · '
+    + '被 2 个以上岗位提到 <b>'+s.multi_jd+'</b> · 来源共 <b>'+s.sources+'</b> 条';
+}
+
+function kbRenderList(){
+  const ns = kbData.nodes || [];
+  if(!ns.length){ $('#kbList').innerHTML = '<div class="kbi"><div class="kbdempty">知识库还是空的。点右上「从已有报告导入」把已有报告的知识收进来。</div></div>'; return; }
+  $('#kbList').innerHTML = ns.map(n=>{
+    const st = n.state || '待学习';
+    const badges = ['<span class="kbb '+(n.sources&&n.sources.length?'ver':'ai')+'">来源 '+(n.sources||[]).length+'</span>'];
+    const njd = (n.from_jds||[]).length;
+    if(njd>1) badges.push('<span class="kbb s1">被 '+njd+' 个岗位提到</span>');
+    badges.push('<span class="kbb '+(KB_STATE_CLASS[st]||'s1')+'">'+esc(st)+'</span>');
+    return '<div class="kbi'+(kbCur===n.id?' on':'')+'" data-kbid="'+esc(n.id)+'">'
+      + '<div class="t">'+esc(n.term||n.id)+'</div><div class="m">'+badges.join('')+'</div></div>';
+  }).join('');
+  $$('#kbList [data-kbid]').forEach(el=>el.addEventListener('click',()=>{
+    kbCur = el.dataset.kbid; kbRenderList(); kbRenderDetail();
+  }));
+}
+
+function kbRenderDetail(){
+  const box = $('#kbDetail');
+  const n = (kbData.nodes||[]).find(x=>x.id===kbCur);
+  if(!n){ box.innerHTML = '<div class="kbdempty">← 左侧选一个知识点</div>'; return; }
+  let h = '<div style="font-size:17px;font-weight:700">'+esc(n.term||n.id)+'</div>';
+  if((n.aliases||[]).length) h += '<div class="kbdempty" style="margin-top:4px">别名：'+esc(n.aliases.join('、'))+'</div>';
+  h += '<div class="kbstates">'+(kbData.states||[]).map(s=>
+        '<button data-kbstate="'+esc(s)+'" class="'+(n.state===s?'on':'')+'">'+esc(s)+'</button>').join('')+'</div>';
+  if(n.definition) h += '<div class="kbsec"><h4>专业定义</h4><div class="kbq">'+esc(n.definition)+'</div></div>';
+  if(n.plain_explanation) h += '<div class="kbsec"><h4>通俗解释</h4><div class="kbq">'+esc(n.plain_explanation)+'</div></div>';
+  if((n.timeline||[]).length) h += '<div class="kbsec"><h4>前世今生</h4><div class="kbtl">'
+      + n.timeline.map(t=>'<div><b>'+esc(t.year||'')+'</b>'+esc(t.text||'')+'</div>').join('')+'</div></div>';
+  if((n.sources||[]).length) h += '<div class="kbsec"><h4>来源（可点开原文）</h4><ul class="kbdlist">'
+      + n.sources.map(s=>'<li><a href="'+esc(s.url)+'" target="_blank" rel="noopener">'
+          + esc(s.title||s.url)+'</a>'+(s.date?' <span class="kbdempty">'+esc(s.date)+'</span>':'')+'</li>').join('')+'</ul></div>';
+  if((n.interview_questions||[]).length) h += '<div class="kbsec"><h4>面试会怎么问</h4><ul class="kbdlist">'
+      + n.interview_questions.map(q=>'<li>'+esc(q)+'</li>').join('')+'</ul></div>';
+  if((n.from_jds||[]).length) h += '<div class="kbsec"><h4>来源岗位</h4><ul class="kbdlist">'
+      + n.from_jds.map(j=>'<li>'+esc(j.job_title||j.id)+(j.company?' · '+esc(j.company):'')
+          +(j.date?' <span class="kbdempty">'+esc(j.date)+'</span>':'')+'</li>').join('')+'</ul></div>';
+  if((n.related||[]).length) h += '<div class="kbsec"><h4>关联概念</h4><div class="kbq">'
+      + n.related.map(r=>esc(r.id)+(r.relation?'（'+esc(r.relation)+'）':'')).join('、')+'</div></div>';
+  box.innerHTML = h;
+  $$('#kbDetail [data-kbstate]').forEach(b=>b.addEventListener('click',()=>kbSetState(n.id,b.dataset.kbstate)));
+}
+
+function kbRenderDup(){
+  const ds = kbData.duplicates || [];
+  if(!ds.length){ $('#kbDup').innerHTML=''; return; }
+  $('#kbDup').innerHTML = '<div class="kbdup"><h4 style="margin:0 0 6px;font-size:13px;color:var(--sub)">'
+    + '疑似同一个概念（只提示，你确认才合并）</h4>'
+    + ds.map(d=>'<div class="p"><span>「'+esc(d.a)+'」↔「'+esc(d.b)+'」'
+      + '<span class="kbb">'+esc(d.reason)+'</span></span>'
+      + '<button data-kbmerge="'+esc(d.a)+'|'+esc(d.b)+'" class="ghost" style="margin-left:auto">合并到左边</button></div>').join('')
+    + '</div>';
+  $$('#kbDup [data-kbmerge]').forEach(b=>b.addEventListener('click', async ()=>{
+    const [keep, drop] = b.dataset.kbmerge.split('|');
+    const r = await (await fetch('/api/knowledge/merge',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify({keep_id:keep,drop_id:drop})})).json();
+    toast(r.ok ? (r.message||'已合并') : ('合并失败：'+r.error));
+    kbCur = keep; kbLoad();
+  }));
+}
+
+async function kbSetState(id, state){
+  const r = await (await fetch('/api/knowledge/state',{method:'POST',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify({id:id,state:state})})).json();
+  if(!r.ok){ toast('切换失败：'+r.error); return; }
+  toast('已标记为「'+state+'」'); kbLoad();
+}
+
+async function kbImport(){
+  const btn = $('#kbImport'); btn.disabled = true; btn.textContent = '导入中…';
+  try{
+    const r = await (await fetch('/api/knowledge/import-reports',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:'{}'})).json();
+    toast(r.ok ? ('已从 '+r.files+' 份报告导入：新增 '+r.added+'，合并 '+r.merged) : ('导入失败：'+r.error));
+    kbLoad();
+  } finally { btn.disabled = false; btn.textContent = '从已有报告导入'; }
+}
+
+function initKnowTab(){
+  // 只绑一次：每次点 tab 都会调用本函数，重复绑定会让一次输入触发多次请求
+  if(!initKnowTab.done){
+    initKnowTab.done = true;
+    $('#kbQ').addEventListener('input', ()=>{ clearTimeout(kbT); kbT = setTimeout(kbLoad, 250); });
+    ['kbState','kbCat','kbJd','kbSort'].forEach(id=>$('#'+id).addEventListener('change', kbLoad));
+    $('#kbImport').addEventListener('click', kbImport);
+  }
+  kbLoad();
+}
 
 /* ---------------- 分析 ---------------- */
 function switchTab(tab){ const b = document.querySelector('nav button[data-tab="'+tab+'"]'); if(b) b.click(); }
