@@ -12,13 +12,14 @@
   3. sources 完整保留 —— 用户明确强调「来源尤其关键」，知识库里必须能点进原文
 """
 import re
+import store
 import unicodedata
 from datetime import datetime
 
 # 本模块的配置面：下面这些常量供后续任务（来源清洗 / 合并 / 查询 / 回填）使用，
 # 提前集中声明是为了让契约可见，不是未使用的死代码。
-# **导入只写当前用到的**（re / datetime）；glob / json / os / log / store 到真正用到它们
-# 的那个任务再加，否则会被代码质量审查判为未使用导入。
+# **导入只写当前用到的**（re / store / unicodedata / datetime）；glob / json / os / log 到真正
+# 用到它们的那个任务再加，否则会被代码质量审查判为未使用导入。
 KB_VERSION = 1
 SNIPPET_LIMIT = 400      # knowledge.json 里的摘要截断长度（完整摘要仍在报告快照里）
 MAX_QUESTIONS = 8        # 面试题并集上限
@@ -65,3 +66,153 @@ def ensure_kb(kb):
         nodes = []
     return {"version": kb.get("version") or KB_VERSION,
             "nodes": [n for n in nodes if isinstance(n, dict)]}
+
+
+def _as_list(v):
+    return v if isinstance(v, list) else []
+
+
+def clean_sources(src):
+    """清洗来源：只留 dict 且 url 非空；摘要截断；按 url 去重（保留信息更全的一条）。
+
+    历史数据里 sources 可能缺 snippet/date（旧报告只存了 title/url），必须容忍缺失，
+    绝不可因此丢掉整条来源。
+    """
+    out = []
+    seen = {}
+    for s in _as_list(src):
+        if not isinstance(s, dict):
+            continue
+        url = str(s.get("url") or "").strip()
+        if not url:
+            continue
+        item = {
+            "title": str(s.get("title") or "").strip(),
+            "url": url,
+            "date": str(s.get("date") or "").strip(),
+            "accessed": str(s.get("accessed") or "").strip(),
+            "snippet": str(s.get("snippet") or "").strip()[:SNIPPET_LIMIT],
+        }
+        old = seen.get(url)
+        if old is None:
+            seen[url] = item
+            out.append(item)
+            continue
+        if len(item["snippet"]) > len(old["snippet"]):
+            old["snippet"] = item["snippet"]
+        for k in ("title", "date", "accessed"):
+            if not old[k] and item[k]:
+                old[k] = item[k]
+    return out
+
+
+def clean_timeline(tl):
+    out = []
+    for t in _as_list(tl):
+        if not isinstance(t, dict):
+            continue
+        text = str(t.get("text") or "").strip()
+        if not text:
+            continue
+        out.append({"year": str(t.get("year") or "").strip(), "text": text})
+    return out
+
+
+def clean_related(rel):
+    out = []
+    seen = set()
+    for r in _as_list(rel):
+        if not isinstance(r, dict):
+            continue
+        rid = str(r.get("id") or "").strip()
+        if not rid or rid in seen:
+            continue
+        seen.add(rid)
+        out.append({"id": rid, "relation": str(r.get("relation") or "").strip()})
+    return out
+
+
+def clean_questions(qs):
+    out = []
+    for q in _as_list(qs):
+        q = str(q or "").strip()
+        if q and q not in out:
+            out.append(q)
+    return out[:MAX_QUESTIONS]
+
+
+def _add_jd(card, jd):
+    """记录「这个知识点被哪个岗位提到过」，按 job_id 去重（幂等的关键）"""
+    if not isinstance(jd, dict) or not jd.get("id"):
+        return
+    frm = _as_list(card.get("from_jds"))
+    if any(isinstance(x, dict) and x.get("id") == jd["id"] for x in frm):
+        return
+    frm.append({"id": jd["id"], "job_title": jd.get("job_title") or "",
+                "company": jd.get("company") or "", "date": jd.get("date") or _today()})
+    card["from_jds"] = frm
+
+
+def _new_card(node, jd):
+    term = str(node.get("term") or "").strip()
+    card = {
+        "id": normalize_id(term),
+        "term": term,
+        "aliases": [],
+        "definition": str(node.get("definition") or "").strip(),
+        "plain_explanation": str(node.get("plain_explanation") or "").strip(),
+        "category": str(node.get("category") or "").strip(),
+        "layer": int(node.get("layer") or 0),
+        "sources": clean_sources(node.get("sources")),
+        "timeline": clean_timeline(node.get("timeline")),
+        "related": clean_related(node.get("related")),
+        "interview_questions": clean_questions(node.get("interview_questions")),
+        "from_jds": [],
+        "state": DEFAULT_STATE,
+        "last_outcome": DEFAULT_OUTCOME,
+        "asked_count": 0,
+        "first_seen": _today(),
+        "last_seen": _today(),
+    }
+    _add_jd(card, jd)
+    _recompute_confidence(card)
+    return card
+
+
+def _recompute_confidence(card):
+    card["confidence"] = "verified" if _as_list(card.get("sources")) else "ai-generated"
+
+
+def _merge_into(card, node):
+    """把新节点的内容并进已有卡片（Task 4 补全全部字段）"""
+    card["sources"] = clean_sources(_as_list(card.get("sources")) + _as_list(node.get("sources")))
+
+
+def absorb(nodes, jd=None, kb=None):
+    """把一次分析（或一份报告）的知识点并入知识库。返回 (added, merged)。
+
+    幂等：同一个 jd['id'] 重复吸收不会重复计数 from_jds，来源也不会翻倍。
+    """
+    kb = ensure_kb(kb if kb is not None else store.load_knowledge())
+    index = {n.get("id"): n for n in kb["nodes"] if n.get("id")}
+    added = merged = 0
+    for node in _as_list(nodes):
+        if not isinstance(node, dict):
+            continue
+        nid = normalize_id(str(node.get("term") or "").strip())
+        if not nid:
+            continue                      # 空术语/纯标点 → 跳过，不产生垃圾卡
+        card = index.get(nid)
+        if card is None:
+            card = _new_card(node, jd)
+            kb["nodes"].append(card)
+            index[nid] = card
+            added += 1
+        else:
+            _merge_into(card, node)
+            _add_jd(card, jd)
+            _recompute_confidence(card)
+            merged += 1
+    kb["version"] = KB_VERSION
+    store.save_knowledge(kb)
+    return added, merged
