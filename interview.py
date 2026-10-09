@@ -12,6 +12,7 @@
 """
 import json
 import os
+import shutil
 import subprocess
 import threading
 import time
@@ -37,6 +38,12 @@ TRANSCRIBE_TIMEOUT_MAX = 4 * 3600
 MAX_ANALYZE_CHARS = 40000
 # 单块送进模型摘要时的硬上限（map 阶段，块本身不该太长）
 MAX_SUMMARY_CHARS = 12000
+
+# 实测转写 ≈ 0.9× 音频时长（规格 §5 的「预计」用它）。与 TRANSCRIBE_SLACK 是两件事：
+# 那个是超时余量（宁多不少），这个是给用户看的预计。
+TRANSCRIBE_RATE = 0.9
+# ffprobe 只读文件头，正常几十毫秒；给 20 秒是防网络盘/大文件卡住上传
+FFPROBE_TIMEOUT = 20
 
 # 录音/视频扩展名：优先顺序即这里的顺序（保证同一目录下选出的是同一份文件，测试可重复）
 AUDIO_EXTS = (".wav", ".mp3", ".m4a", ".aac", ".flac", ".ogg", ".opus",
@@ -106,6 +113,14 @@ def _elapsed_since(started_at):
         return 0.0
 
 
+def _as_float(v, default=0.0):
+    """容错取浮点：'3725.5' → 3725.5；'abc'/None/[] → default（绝不抛异常）。"""
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
 def is_running(interview_id):
     """这个面试记录此刻是否真有活动线程。"""
     with _THREADS_LOCK:
@@ -113,17 +128,42 @@ def is_running(interview_id):
     return bool(t and t.is_alive())
 
 
+def estimate_hint(st):
+    """「预计 ≈ N 分钟」要用的数据；**拿不到音频时长就返回 None**（前端只显示已运行）。
+
+    绝不编数字：只有上传时 ffprobe 真的探到了时长（status.json 里的 `audio_duration`）才有它。
+    规格 §5 的两种口径就是这个意思 —— 有 ffprobe → 给预计；没有 → 只给已运行。
+    """
+    dur = _as_float((st or {}).get("audio_duration"))
+    if dur <= 0:
+        return None
+    est = dur * TRANSCRIBE_RATE
+    # 不到一分钟的短录音按秒说（对 3 秒的片段说「预计 ≈ 1 分钟」是错的）
+    span = ("预计 ≈ %d 秒" % max(1, round(est))) if est < 60 \
+        else ("预计 ≈ %d 分钟" % max(1, round(est / 60.0)))
+    return {
+        "duration_sec": round(dur, 1),
+        "estimate_sec": round(est, 1),
+        "text": "%s（音频时长 × %g）" % (span, TRANSCRIBE_RATE),
+    }
+
+
 def status(interview_id):
     """给前端轮询的状态。文件里停在「转写中/分析中」但**没有活动线程** → 报 interrupted。
 
     这个判据是「程序中途被关掉」唯一能被看出来的地方：进程死了线程就没了，
     于是重启后前端会显示「上次被中断，可重试」，而不是永远转圈。
+
+    `estimate_hint` 只在真知道音频时长时才有这个键（拿不到就不给，前端自己退回「已运行 N 分钟」）。
     """
     st = _read_status(interview_id)
     if not st:
         return {}
     if st.get("state") in ("transcribing", "analyzing") and not is_running(interview_id):
         st = dict(st, state="interrupted", interrupted_from=st.get("state"))
+    hint = estimate_hint(st)
+    if hint:
+        st = dict(st, estimate_hint=hint)
     return st
 
 
@@ -186,20 +226,24 @@ def _extract_duration(out):
     return 0.0
 
 
-def _default_runner(cmd, cfg=None, cwd=None):
+def _default_runner(cmd, cfg=None, cwd=None, timeout=None):
     """真起子进程。返回 stdout 文本；非零退出码 → RuntimeError（附末尾输出便于定位）。
 
-    timeout 按音频时长算（见 _transcribe_timeout）—— 固定超时会在 1 小时的面试上误杀。
+    timeout 默认按音频时长算（见 _transcribe_timeout）—— 固定超时会在 1 小时的面试上误杀；
+    但只读文件头的 ffprobe 必须自己给个短上限（见 ffprobe_duration），否则怪文件能卡满上传请求。
     """
     audio = str(cmd[-1]) if len(cmd) > 1 else ""
-    timeout = _transcribe_timeout(audio)
+    if not timeout:
+        timeout = _transcribe_timeout(audio)
     try:
         p = subprocess.run(cmd, cwd=cwd, capture_output=True, timeout=timeout)
     except subprocess.TimeoutExpired:
-        raise RuntimeError("转写超时（超过 %d 分钟仍未结束）。可以调小模型或改用更短的录音。"
-                           % int(timeout // 60))
+        span = ("%d 分钟" % int(timeout // 60)) if timeout >= 60 else ("%d 秒" % int(timeout))
+        raise RuntimeError("子进程 %s 超时（超过 %s 仍未结束）%s"
+                           % (os.path.basename(str(cmd[0])), span,
+                              "。转写可以调小模型或改用更短的录音。" if timeout >= TRANSCRIBE_FLOOR else ""))
     except OSError as e:
-        raise RuntimeError("启动 vidkit 的 python 失败：%s" % e)
+        raise RuntimeError("启动子进程失败：%s" % e)
     out = (p.stdout or b"").decode("utf-8", "replace")
     if p.returncode != 0:
         err = (p.stderr or b"").decode("utf-8", "replace")
@@ -233,6 +277,45 @@ def _json_from_output(out):
         if isinstance(data, dict):
             return data
     return None
+
+
+def _parsed_first_number(out):
+    """从 ffprobe 输出里取第一个能解析成数字的行（它可能带换行/警告行）。"""
+    for line in str(out or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            return max(0.0, float(line))
+        except ValueError:
+            continue
+    return 0.0
+
+
+def ffprobe_duration(path, runner=None):
+    """用 ffprobe 探测音频/视频时长（秒）。**任何情况都不抛、不猜**：拿不到就返回 0.0。
+
+    为什么容错到底：这个数字只用来给用户一句「预计 ≈ N 分钟」（规格 §5），
+    上传绝不能因为它失败而失败 —— 没装 ffprobe、文件不是媒体、探测超时都很常见。
+    拿不到就返回 0.0，`status()` 干脆不给 `estimate_hint`（前端只显示已运行时长）。
+
+    `runner` 可注入（与 run_transcribe 同一约定）—— **测试绝不真跑 ffprobe**。
+    """
+    if runner is None:
+        exe = shutil.which("ffprobe")
+        if not exe:
+            return 0.0                      # 没装 ffprobe：静默跳过，不阻断上传
+        # 只读文件头，正常几十毫秒；给 20 秒硬上限 —— 上传请求在同步等它，不能被怪文件拖死
+        probe = lambda cmd, cfg=None, cwd=None: _default_runner(cmd, cwd=cwd, timeout=FFPROBE_TIMEOUT)
+    else:
+        exe, probe = "ffprobe", runner
+    cmd = [exe, "-v", "error", "-show_entries", "format=duration",
+           "-of", "default=noprint_wrappers=1:nokey=1", str(path)]
+    try:
+        out = probe(cmd, cfg=None, cwd=None)
+    except Exception:
+        return 0.0
+    return _parsed_first_number(out)
 
 
 def run_transcribe(audio_path, cfg, runner=None):

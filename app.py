@@ -854,10 +854,19 @@ class Handler(BaseHTTPRequestHandler):
             # 空文件转写出来必然是空文本：当场说清，别让用户等半小时拿到一份空报告
             cleanup_failed_upload(iid, fname)
             return self._send(400, {"ok": False, "error": "上传的文件是空的（0 字节）"})
+        duration = 0.0
+        if kind == "audio":
+            try:
+                # 只为「预计 ≈ N 分钟」这一个提示探测时长（规格 §5）：拿不到/没装 ffprobe/
+                # 不是媒体文件一律静默跳过（ffprobe_duration 本身就不抛，这里再兜一层
+                # 是为了防注入的探针抛错）—— **绝不因为它阻断上传**。
+                duration = interview.ffprobe_duration(store.interview_file(iid, fname))
+            except Exception:
+                duration = 0.0
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         meta = {"state": "queued", "job_id": job_id, "kind": kind, "original_name": original,
-                "stored_name": fname, "audio_bytes": written, "started_at": now,
-                "updated_at": now, "elapsed": 0.0, "error": ""}
+                "stored_name": fname, "audio_bytes": written, "audio_duration": duration,
+                "started_at": now, "updated_at": now, "elapsed": 0.0, "error": ""}
         store.save_interview_json(iid, "status.json", meta)
         log.log_event("interview.upload", interview=iid, job=job_id, kind=kind,
                       bytes=written, name=original)

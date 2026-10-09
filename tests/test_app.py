@@ -307,18 +307,20 @@ class InterviewRouteTest(IsolatedCase):
         p.start()
         self.addCleanup(p.stop)
 
-    def _no_start(self):
-        """把 interview.start 换成空实现，返回记录调用的列表。
+    def _no_external_calls(self):
+        """把上传路由的两个「真世界副作用」都换掉，返回（start 调用记录, ffprobe 调用记录）。
 
-        **每个碰上传路由的用例都必须先调它**，哪怕那条路径"按理说走不到 start"：
-        实现被改坏时（例如漏了 413 判断）路由会继续往下走并**真起一条流水线线程**；
-        那个线程在 addCleanup 还原 store.DATA_ROOT / log.LOG_FILE **之后**才跑完，
-        于是它会把 status.json / 日志写进**用户真实的 data 根**（真事故，见汇报）。
-        测试里关掉 start 是唯一能挡住这个的结构性做法。
+        - `interview.start`：**每个碰上传路由的用例都必须先调它**，哪怕那条路径"按理说走不到 start"。
+          实现被改坏时（例如漏了 413 判断）路由会继续往下走并**真起一条流水线线程**；那个线程在
+          addCleanup 还原 store.DATA_ROOT / log.LOG_FILE **之后**才跑完，于是会把 status.json /
+          日志写进**用户真实的 data 根**（真事故，见汇报）。
+        - `interview.ffprobe_duration`：**绝不真跑 ffprobe**（这台机器装了 ffmpeg，PATH 上可能真有
+          ffprobe）。不然用例的耗时/结果就取决于机器环境，还可能被一个 20 秒超时拖慢。
         """
-        calls = []
-        self._patch(interview, "start", lambda *a, **k: calls.append((a, k)))
-        return calls
+        starts, probes = [], []
+        self._patch(interview, "start", lambda *a, **k: starts.append((a, k)))
+        self._patch(interview, "ffprobe_duration", lambda path: probes.append(path) or 0.0)
+        return starts, probes
 
     def _upload(self, body=b"RIFF....", headers=None):
         """上传一条音频（默认 8 字节），返回 (code, body)。"""
@@ -328,13 +330,13 @@ class InterviewRouteTest(IsolatedCase):
 
     # ---- 上传
     def test_upload_rejects_missing_job(self):
-        self._no_start()
+        self._no_external_calls()
         code, _ = self._post_binary("/api/interview/upload", b"x" * 10,
                                     {"X-Job-Id": "", "X-File-Name": "a.wav"})
         self.assertEqual(code, 400)
 
     def test_upload_rejects_oversize_without_reading_body(self):
-        self._no_start()      # 实现被改坏时这条路径会继续往下走 —— 必须挡住真流水线
+        self._no_external_calls()      # 实现被改坏时这条路径会继续往下走 —— 必须挡住真流水线
         # 用一个"声称超大"的 Content-Length（不真传那么多字节）→ 必须 413 且不写文件
         code, _ = self._post_binary("/api/interview/upload", b"x" * 10,
                                     {"X-Job-Id": "j1", "X-File-Name": "a.wav",
@@ -344,8 +346,7 @@ class InterviewRouteTest(IsolatedCase):
         self.assertFalse(os.path.exists(store.interviews_dir()))
 
     def test_upload_writes_the_file_and_starts_the_pipeline(self):
-        started = []
-        self._patch(interview, "start", lambda *a, **k: started.append((a, k)))
+        started, _ = self._no_external_calls()
         code, body = self._post_binary("/api/interview/upload", b"RIFF....",
                                        {"X-Job-Id": "j1", "X-File-Name": "面试录音.m4a"})
         self.assertEqual(code, 200)
@@ -361,7 +362,7 @@ class InterviewRouteTest(IsolatedCase):
         刻意**不**用那个"裸中文头"的用例当唯一证据：`unquote("面试录音.m4a")` 恰好等于原串，
         去掉 unquote 也照样绿（假绿）。这里传的是真编码过的名字，去掉 unquote 必红。
         """
-        self._patch(interview, "start", lambda *a, **k: None)
+        self._no_external_calls()
         name = quote("面试录音 第2轮.m4a")
         self.assertNotIn("面试", name)                    # 反证：发出去的确实不是明文
         self.assertNotEqual(name, "面试录音 第2轮.m4a")
@@ -374,7 +375,7 @@ class InterviewRouteTest(IsolatedCase):
 
     def test_upload_never_uses_the_client_filename_as_a_path(self):
         """X-File-Name 带目录穿越也不能越出这场面试的目录。"""
-        self._patch(interview, "start", lambda *a, **k: None)
+        self._no_external_calls()
         code, body = self._upload(headers={"X-File-Name": quote("../../evil.wav")})
         self.assertEqual(code, 200)
         iv = body["interview_id"]
@@ -384,8 +385,7 @@ class InterviewRouteTest(IsolatedCase):
 
     def test_upload_text_kind_skips_transcribing(self):
         """文字稿必须存成 source.txt 并且 kind=text —— run_pipeline 对文字稿读的就是这个名字。"""
-        started = []
-        self._patch(interview, "start", lambda *a, **k: started.append((a, k)))
+        started, probes = self._no_external_calls()
         code, body = self._upload(body="面试官：你好".encode("utf-8"),
                                   headers={"X-File-Name": quote("面试记录.md")})
         self.assertEqual(code, 200)
@@ -393,12 +393,13 @@ class InterviewRouteTest(IsolatedCase):
         self.assertEqual(store.load_interview_json(iv, "status.json")["kind"], "text")
         self.assertEqual(store.read_text(store.interview_file(iv, "source.txt")), "面试官：你好")
         self.assertEqual(started[0][1].get("kind"), "text")     # 传给 start 的 kind 是 text
+        self.assertEqual(probes, [])                           # 文字稿不该去探时长
 
     def test_upload_honors_x_kind_and_falls_back_for_unknown_extensions(self):
         """X-Kind 优先（规格 §4：audio/text/auto）；扩展名认不出时按音频存成 audio.wav ——
         否则 interview._find_audio 按扩展名找录音会找不到，转写直接报「请重新上传录音」。
         """
-        self._no_start()
+        self._no_external_calls()
         code, body = self._upload(body="口头转写的文本".encode("utf-8"),
                                   headers={"X-Kind": "text", "X-File-Name": "recording.mp4"})
         self.assertEqual(code, 200)
@@ -472,7 +473,7 @@ class InterviewRouteTest(IsolatedCase):
                 self.pos += len(out)
                 return out
 
-        self._no_start()
+        self._no_external_calls()
         h = self._raw_upload_handler(Dropping(b"RIFF" * 5), 100)      # 声明 100，实际只给 20
         app.Handler.do_POST(h)
         self.assertEqual(h._status, 400, h._body)
@@ -486,12 +487,11 @@ class InterviewRouteTest(IsolatedCase):
         （沙箱 BytesIO 版本对 read() 的阻塞语义一无所知）。
 
         服务只绑 127.0.0.1 的临时端口、数据根与日志都被 IsolatedCase 隔离，
-        interview.start 被替换 → 不起真转写线程、不碰用户真实数据。
+        interview.start / ffprobe_duration 都被替换 → 不起真转写线程、不跑真 ffprobe、不碰用户真实数据。
         """
         import http.client
         from http.server import ThreadingHTTPServer
-        started = []
-        self._patch(interview, "start", lambda *a, **k: started.append(a))
+        started, _ = self._no_external_calls()
         srv = ThreadingHTTPServer(("127.0.0.1", 0), app.Handler)
         self.addCleanup(srv.server_close)
         t = threading.Thread(target=srv.serve_forever, daemon=True)
@@ -520,6 +520,42 @@ class InterviewRouteTest(IsolatedCase):
         self._patch(interview, "start", lambda *a, **k: retried.append(a))
         self.assertEqual(self._post_json("/api/interview/retry", {"id": "iv1"})[0], 200)
         self.assertEqual(len(retried), 1)
+
+    def test_upload_records_probed_duration_for_the_estimate(self):
+        """上传时用 ffprobe 探到的时长效进 status.json（规格 §5 的「预计」全靠它）。
+
+        **绝不真跑 ffprobe**：把 interview.ffprobe_duration 换成假实现。
+        """
+        self._no_external_calls()
+        self._patch(interview, "ffprobe_duration", lambda path: 600.0)
+        code, body = self._upload()
+        self.assertEqual(code, 200)
+        st = self._get("/api/interview/status?id=" + quote(body["interview_id"]))[1]
+        self.assertEqual(st["audio_duration"], 600.0)
+        self.assertEqual(st["estimate_hint"]["estimate_sec"], 540.0)
+        self.assertIn("音频时长 × 0.9", st["estimate_hint"]["text"])
+
+    def test_upload_survives_a_failing_duration_probe_and_has_no_estimate(self):
+        """探测失败/没装 ffprobe：上传照常成功，但**不返回** estimate_hint（不编预计）。"""
+        def boom(_path):
+            raise OSError("ffprobe 不存在")
+        self._no_external_calls()
+        self._patch(interview, "ffprobe_duration", boom)
+        code, body = self._upload()
+        self.assertEqual(code, 200, body)
+        st = self._get("/api/interview/status?id=" + quote(body["interview_id"]))[1]
+        self.assertEqual(st["audio_duration"], 0.0)
+        self.assertNotIn("estimate_hint", st)
+
+    def test_upload_does_not_probe_text_transcripts(self):
+        """文字稿没有音频可探：不该去调 ffprobe（调了也是白等）。"""
+        self._no_external_calls()
+        called = []
+        self._patch(interview, "ffprobe_duration", lambda path: called.append(path) or 600.0)
+        code, _ = self._upload(body="面试官：你好".encode("utf-8"),
+                               headers={"X-File-Name": quote("面试记录.md")})
+        self.assertEqual(code, 200)
+        self.assertEqual(called, [])
 
     def test_status_failure_returns_a_structured_500(self):
         """do_GET 没有外层 try：路由必须自己兜底，否则客户端拿到的是连接裸断（RemoteDisconnected）。"""

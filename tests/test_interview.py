@@ -587,6 +587,92 @@ class DefaultRunnerTest(IsolatedCase):
         self.assertIn("3", str(cm.exception))
 
 
+class FfprobeDurationTest(IsolatedCase):
+    """上传时的时长探测（规格 §5「预计 ≈ N 分钟」的数据来源）。
+
+    **绝不真跑 ffprobe**：runner 一律注入。这里只钉两件事 —— 解析正确，以及
+    「拿不到就 0.0、绝不抛」（上传不能因为一个提示失败）。
+    """
+
+    def _fake(self, out=None, boom=None):
+        calls = []
+
+        def runner(cmd, cfg=None, cwd=None, **kw):
+            calls.append(cmd)
+            if boom:
+                raise boom
+            return out
+        return runner, calls
+
+    def test_parses_seconds_from_ffprobe_output(self):
+        runner, calls = self._fake(out="3725.5\n")
+        self.assertEqual(interview.ffprobe_duration("a.m4a", runner=runner), 3725.5)
+        self.assertIn("ffprobe", calls[0][0])                      # 调的真是 ffprobe
+        self.assertIn("format=duration", calls[0])                 # 只问时长
+        self.assertEqual(calls[0][-1], "a.m4a")
+
+    def test_tolerates_noise_and_blank_lines(self):
+        for out, want in (("\n  3.5  \n", 3.5), ("N/A\n12.0\n", 12.0), ("0\n", 0.0)):
+            runner, _ = self._fake(out=out)
+            self.assertEqual(interview.ffprobe_duration("a.wav", runner=runner), want, repr(out))
+
+    def test_returns_zero_instead_of_raising(self):
+        for out in ("", "   ", "N/A", "not-a-number", None, "-5"):
+            runner, _ = self._fake(out=out)
+            self.assertEqual(interview.ffprobe_duration("a.wav", runner=runner), 0.0, repr(out))
+        for boom in (OSError("ffprobe 不存在"), RuntimeError("超时"), ValueError("坏输出")):
+            runner, _ = self._fake(boom=boom)
+            self.assertEqual(interview.ffprobe_duration("a.wav", runner=runner), 0.0, repr(boom))
+
+    def test_missing_ffprobe_is_a_silent_zero(self):
+        """没装 ffprobe：静默返回 0（不抛、不阻断上传）—— 用注入的 runner 证明真的没起子进程。"""
+        runner, calls = self._fake(out="1\n")
+        import unittest.mock as mock
+        with mock.patch.object(interview.shutil, "which", return_value=None):
+            self.assertEqual(interview.ffprobe_duration("a.wav"), 0.0)
+        self.assertEqual(calls, [])                                # 注入的 runner 一次都没被调
+
+
+class EstimateHintTest(IsolatedCase):
+    """status() 里的 estimate_hint：**只有真知道音频时长时才有这个键**，绝不编。"""
+
+    def _status(self, **extra):
+        store.save_interview_json("iv1", "status.json", dict({"state": "done"}, **extra))
+        return interview.status("iv1")
+
+    def test_hint_present_when_duration_is_known(self):
+        st = self._status(audio_duration=3725.0)
+        hint = st["estimate_hint"]
+        self.assertEqual(hint["duration_sec"], 3725.0)
+        self.assertEqual(hint["estimate_sec"], round(3725.0 * 0.9, 1))
+        self.assertIn("预计 ≈", hint["text"])
+        self.assertIn("音频时长 × 0.9", hint["text"])
+
+    def test_short_audio_is_reported_in_seconds(self):
+        """3 秒的片段说「预计 ≈ 1 分钟」就是错的 —— 不到一分钟按秒报。"""
+        self.assertEqual(self._status(audio_duration=3.0)["estimate_hint"]["text"],
+                         "预计 ≈ 3 秒（音频时长 × 0.9）")
+        self.assertEqual(self._status(audio_duration=70.0)["estimate_hint"]["text"],
+                         "预计 ≈ 1 分钟（音频时长 × 0.9）")
+
+    def test_hint_absent_when_duration_is_unknown(self):
+        for extra in ({}, {"audio_duration": 0}, {"audio_duration": 0.0},
+                      {"audio_duration": None}, {"audio_duration": "abc"}, {"audio_duration": -3}):
+            st = self._status(**extra)
+            self.assertNotIn("estimate_hint", st, repr(extra))
+            self.assertNotIn("预计", str(st), repr(extra))          # 整个状态里都不该冒出预计
+
+    def test_hint_survives_state_transitions(self):
+        """上传时写下的 audio_duration 必须被后续 _set_status 继承 —— 否则预计会在第一步就消失。"""
+        store.save_interview_json("iv1", "status.json",
+                                  {"state": "queued", "audio_duration": 600.0, "original_name": "a.m4a"})
+        interview._set_status("iv1", "analyzing")
+        st = interview.status("iv1")
+        self.assertEqual(st["audio_duration"], 600.0)
+        self.assertEqual(st["estimate_hint"]["estimate_sec"], 540.0)
+        self.assertEqual(st["original_name"], "a.m4a")
+
+
 class VidkitProbeTest(unittest.TestCase):
     def test_vidkit_python_uses_the_scripts_layout(self):
         self.assertEqual(interview._vidkit_python("D:/x"), os.path.join("D:/x", ".venv", "Scripts", "python.exe"))
