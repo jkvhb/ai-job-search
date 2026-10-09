@@ -404,3 +404,67 @@ class ManualMergeTest(IsolatedCase):
         kb.merge_nodes("A词", "B词")
         ok, _ = kb.merge_nodes("A词", "B词")
         self.assertFalse(ok)
+
+    def test_entry_points_accept_raw_terms_and_ids_alike(self):
+        kb.absorb([_node(term="Transformer 架构")], {"id": "j1"})
+        # 归一化 id
+        self.assertTrue(kb.set_state("transformer架构", "学习中")[0])
+        # 原始术语（含大小写/空格差异）
+        self.assertTrue(kb.set_state("Transformer 架构", "已掌握")[0])
+        self.assertEqual(store.load_knowledge()["nodes"][0]["state"], "已掌握")
+        # merge 同理
+        kb.absorb([_node(term="省略识别及恢复")], {"id": "j2"})
+        ok, msg = kb.merge_nodes("Transformer 架构", "省略识别及恢复")
+        self.assertTrue(ok, msg)
+
+
+class QueryTest(IsolatedCase):
+    def setUp(self):
+        super().setUp()
+        kb.absorb([
+            _node(term="省略恢复", category="NLP", layer=0, sources=[_src("https://a")],
+                  definition="把省略成分补全", interview_questions=["q"]),
+            _node(term="抽样检验", category="数据标注/质检", layer=1, sources=[],
+                  definition="统计抽样"),
+            _node(term="Kappa系数", category="数据标注/质检", layer=1, sources=[_src("https://b")],
+                  definition="标注一致性强度的度量"),
+        ], {"id": "j1", "job_title": "岗位一"})
+        kb.absorb([_node(term="省略恢复", sources=[_src("https://c")])],
+                  {"id": "j2", "job_title": "岗位二"})
+
+    def test_stats_shape(self):
+        s = kb.stats(store.load_knowledge())
+        self.assertEqual(s["total"], 3)
+        self.assertEqual(s["verified"], 2)
+        self.assertEqual(s["multi_jd"], 1)
+        self.assertEqual(s["sources"], 3)
+        self.assertEqual(s["by_state"]["待学习"], 3)
+
+    def test_stats_on_empty_kb(self):
+        s = kb.stats({"nodes": []})
+        self.assertEqual(s["total"], 0)
+        self.assertEqual(s["by_state"], {"待学习": 0, "学习中": 0, "已掌握": 0})
+
+    def test_search_matches_term_and_definition(self):
+        self.assertEqual(len(kb.list_nodes(store.load_knowledge(), q="省略")), 1)
+        self.assertEqual(len(kb.list_nodes(store.load_knowledge(), q="统计抽样")), 1)
+        self.assertEqual(len(kb.list_nodes(store.load_knowledge(), q="不存在的词")), 0)
+
+    def test_filter_by_state_and_category(self):
+        kb.set_state("省略恢复", "已掌握")
+        self.assertEqual(len(kb.list_nodes(store.load_knowledge(), state="已掌握")), 1)
+        self.assertEqual(len(kb.list_nodes(store.load_knowledge(), category="数据标注/质检")), 2)
+
+    def test_filter_by_jd(self):
+        self.assertEqual(len(kb.list_nodes(store.load_knowledge(), jd_id="j2")), 1)
+
+    def test_sort_by_mentions_puts_multi_jd_first(self):
+        out = kb.list_nodes(store.load_knowledge(), sort="mentions")
+        self.assertEqual(out[0]["term"], "省略恢复")
+
+    def test_sort_by_term_is_deterministic(self):
+        out = kb.list_nodes(store.load_knowledge(), sort="term")
+        self.assertEqual([n["term"] for n in out], sorted(n["term"] for n in out))
+
+    def test_unknown_sort_falls_back_to_mentions(self):
+        self.assertEqual(len(kb.list_nodes(store.load_knowledge(), sort="bogus")), 3)

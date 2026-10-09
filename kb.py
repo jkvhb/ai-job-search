@@ -398,3 +398,57 @@ def merge_nodes(keep_id, drop_id, kb=None):
     store.save_knowledge(kb)
     log.log_event("kb.merge_done", keep=keep_id, drop=drop_id, aliases=len(aliases))
     return True, "已把「%s」并入「%s」" % (drop.get("term"), keep.get("term"))
+
+
+def stats(kb):
+    """知识库统计：总数 / 有来源 / 各状态 / 被多岗位提到 / 来源总数。"""
+    nodes = ensure_kb(kb)["nodes"]
+    return {
+        "total": len(nodes),
+        "verified": sum(1 for n in nodes if _as_list(n.get("sources"))),
+        "by_state": {s: sum(1 for n in nodes if n.get("state") == s) for s in STATE_VALUES},
+        "multi_jd": sum(1 for n in nodes if len(_as_list(n.get("from_jds"))) > 1),
+        "sources": sum(len(_as_list(n.get("sources"))) for n in nodes),
+    }
+
+
+def list_nodes(kb, q="", state="", category="", jd_id="", sort="mentions"):
+    """查询知识库。默认按「被多少个岗位提到过」降序 —— 提到越多越是岗位刚需。"""
+    nodes = list(ensure_kb(kb)["nodes"])
+    q = (q or "").strip().lower()
+    if q:
+        nodes = [n for n in nodes
+                 if q in str(n.get("term") or "").lower()
+                 or q in str(n.get("definition") or "").lower()
+                 or q in str(n.get("plain_explanation") or "").lower()]
+    if state:
+        nodes = [n for n in nodes if n.get("state") == state]
+    if category:
+        nodes = [n for n in nodes if n.get("category") == category]
+    if jd_id:
+        nodes = [n for n in nodes if any(isinstance(x, dict) and x.get("id") == jd_id
+                                        for x in _as_list(n.get("from_jds")))]
+    if sort == "term":
+        nodes.sort(key=lambda n: str(n.get("term") or ""))
+    elif sort == "recent":
+        nodes.sort(key=lambda n: str(n.get("last_seen") or ""), reverse=True)
+    else:
+        nodes.sort(key=lambda n: (-len(_as_list(n.get("from_jds"))),
+                                 -len(_as_list(n.get("sources"))),
+                                 str(n.get("term") or "")))
+    return nodes
+
+
+def all_jds(kb):
+    """知识库里出现过的来源岗位（给筛选下拉用）"""
+    out = {}
+    for n in ensure_kb(kb)["nodes"]:
+        for j in _as_list(n.get("from_jds")):
+            if isinstance(j, dict) and j.get("id"):
+                out[j["id"]] = j.get("job_title") or j["id"]
+    return [{"id": k, "title": v} for k, v in sorted(out.items())]
+
+
+def all_categories(kb):
+    return sorted({str(n.get("category") or "").strip()
+                   for n in ensure_kb(kb)["nodes"] if str(n.get("category") or "").strip()})
