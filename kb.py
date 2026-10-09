@@ -11,6 +11,8 @@
   2. 合并幂等：同一份报告吸收两次，结果相同（from_jds / sources 都不翻倍）
   3. sources 完整保留 —— 用户明确强调「来源尤其关键」，知识库里必须能点进原文
 """
+import glob
+import json
 import log
 import os
 import re
@@ -20,8 +22,8 @@ from datetime import datetime
 
 # 本模块的配置面：下面这些常量供后续任务（来源清洗 / 合并 / 查询 / 回填）使用，
 # 提前集中声明是为了让契约可见，不是未使用的死代码。
-# **导入只写当前用到的**（log / os / re / store / unicodedata / datetime）；glob / json 到真正
-# 用到它们的那个任务再加，否则会被代码质量审查判为未使用导入。
+# **导入只写当前用到的**（glob / json / log / os / re / store / unicodedata / datetime）——
+# 到真正用到它们的那个任务再加，否则会被代码质量审查判为未使用导入。
 KB_VERSION = 1
 SNIPPET_LIMIT = 400      # knowledge.json 里的摘要截断长度（完整摘要仍在报告快照里）
 MAX_QUESTIONS = 8        # 面试题并集上限
@@ -290,8 +292,7 @@ def absorb(nodes, jd=None, kb=None):
 def set_state(node_id, state, kb=None):
     """只改学习状态，不碰任何其它字段。返回 (ok, msg)。
 
-    node_id 既可以是身份键，也可以是术语写法：先过 normalize_id 抹平大小写/全角/标点差异
-    （对已经归一化的 id 是 no-op），这样前端传 id、脚本或人传术语都能用。
+    参数可以是**身份键**也可以是**原始术语**（内部先 normalize_id，对已归一化的 id 是 no-op）。
     """
     if state not in STATE_VALUES:
         return False, "状态不合法：%s" % state
@@ -367,8 +368,8 @@ def find_duplicates(kb, limit=20):
 def merge_nodes(keep_id, drop_id, kb=None):
     """手动合并：把 drop 并入 keep，drop 的写法记进 aliases 后移除。返回 (ok, msg)。
 
-    两个参数既可以是身份键，也可以是术语写法（先过 normalize_id；对已归一化的 id 是 no-op）——
-    否则「A词」这类带大写的术语会被判成「找不到」，让人以为知识点丢了。
+    参数可以是**身份键**也可以是**原始术语**（内部先 normalize_id，对已归一化的 id 是 no-op）。
+
     keep 的学习进度保持不变（合并方向永远是「你的进度 → 保留」，不用 drop 覆盖）。
     """
     keep_id, drop_id = normalize_id(keep_id), normalize_id(drop_id)
@@ -452,3 +453,58 @@ def all_jds(kb):
 def all_categories(kb):
     return sorted({str(n.get("category") or "").strip()
                    for n in ensure_kb(kb)["nodes"] if str(n.get("category") or "").strip()})
+
+
+_REPORT_DATE = re.compile(r"^(\d{4})(\d{2})(\d{2})")
+
+
+def read_report_data(path):
+    """从报告 HTML 里取 REPORT_DATA。读不出（旧格式/被改过）返回 None。
+
+    用 raw_decode 而不是正则：JSON 之后的 JS 代码里也有 `}`，正则容易截错。
+    """
+    text = store.read_text(path)
+    i = text.find(REPORT_MARK)
+    if i < 0:
+        return None
+    try:
+        data, _ = json.JSONDecoder().raw_decode(text, i + len(REPORT_MARK))
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _report_jd(data, filename):
+    """从报告的 REPORT_DATA / 文件名推出「来源岗位」元信息"""
+    rid = str(data.get("report_id") or os.path.splitext(filename)[0])
+    m = _REPORT_DATE.match(os.path.basename(filename))
+    date = "%s-%s-%s" % m.groups() if m else _today()
+    return {"id": rid, "job_title": data.get("job_title") or "",
+            "company": data.get("company") or "", "date": date}
+
+
+def absorb_reports():
+    """回填：把所有已有报告的知识吸进知识库。纯本地、零 API 额度、幂等。
+
+    返回 (处理成功的报告数, 新增卡片数, 合并次数)。
+    """
+    folder = store.p_path("reports")
+    files = sorted(glob.glob(os.path.join(folder, "*.html"))) if os.path.isdir(folder) else []
+    done = added = merged = 0
+    for path in files:
+        name = os.path.basename(path)
+        data = read_report_data(path)
+        if not data:
+            log.log_event("kb.import_skip", level="warn", file=name)
+            continue
+        nodes = data.get("knowledge")
+        if isinstance(nodes, dict):
+            nodes = nodes.get("nodes")
+        if not isinstance(nodes, list) or not nodes:
+            continue
+        a, m = absorb(nodes, _report_jd(data, name))
+        added += a
+        merged += m
+        done += 1
+    log.log_event("kb.import_done", files=done, added=added, merged=merged)
+    return done, added, merged

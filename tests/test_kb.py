@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
 import glob
+import json
+import os
 import unittest
 
 import kb
@@ -468,3 +470,79 @@ class QueryTest(IsolatedCase):
 
     def test_unknown_sort_falls_back_to_mentions(self):
         self.assertEqual(len(kb.list_nodes(store.load_knowledge(), sort="bogus")), 3)
+
+
+class StateTest(IsolatedCase):
+    def test_set_state_updates_only_state(self):
+        kb.absorb([_node(sources=[_src("https://a")])], {"id": "j1"})
+        before = json.loads(json.dumps(store.load_knowledge()["nodes"][0]))
+        ok, _ = kb.set_state("省略恢复", "学习中")
+        self.assertTrue(ok)
+        after = store.load_knowledge()["nodes"][0]
+        self.assertEqual(after["state"], "学习中")
+        before["state"] = "学习中"
+        self.assertEqual(after, before)
+
+    def test_set_state_rejects_bad_value(self):
+        kb.absorb([_node()], {"id": "j1"})
+        ok, msg = kb.set_state("省略恢复", "随便")
+        self.assertFalse(ok)
+        self.assertIn("状态不合法", msg)
+        self.assertEqual(store.load_knowledge()["nodes"][0]["state"], "待学习")
+
+    def test_set_state_unknown_id(self):
+        ok, msg = kb.set_state("不存在", "已掌握")
+        self.assertFalse(ok)
+        self.assertIn("找不到", msg)
+
+
+class ImportReportsTest(IsolatedCase):
+    def _write_report(self, name, payload):
+        store.ensure_profile()
+        path = os.path.join(store.p_path("reports"), name)
+        store.write_text(path, "<html><body><script>\n%s%s;\n</script></body></html>"
+                         % (kb.REPORT_MARK, json.dumps(payload, ensure_ascii=False).replace("</", "<\\/")))
+        return path
+
+    def test_imports_knowledge_from_report(self):
+        self._write_report("20261008_岗A_80分.html", {
+            "report_id": "20261008_岗A_80分", "job_title": "岗A", "company": "甲公司",
+            "knowledge": [_node(term="省略恢复", sources=[_src("https://a")])]})
+        files, added, merged = kb.absorb_reports()
+        self.assertEqual((files, added, merged), (1, 1, 0))
+        card = store.load_knowledge()["nodes"][0]
+        self.assertEqual(card["from_jds"][0]["job_title"], "岗A")
+        self.assertEqual(card["from_jds"][0]["id"], "20261008_岗A_80分")
+        self.assertEqual(card["from_jds"][0]["date"], "2026-10-08")
+
+    def test_import_is_idempotent(self):
+        self._write_report("20261008_岗A_80分.html", {
+            "report_id": "20261008_岗A_80分", "job_title": "岗A",
+            "knowledge": [_node(sources=[_src("https://a")])]})
+        kb.absorb_reports()
+        kb.absorb_reports()
+        cards = store.load_knowledge()["nodes"]
+        self.assertEqual(len(cards), 1)
+        self.assertEqual(len(cards[0]["from_jds"]), 1)
+        self.assertEqual(len(cards[0]["sources"]), 1)
+
+    def test_knowledge_as_dict_shape_is_supported(self):
+        self._write_report("20261001_岗B_70分.html", {
+            "report_id": "20261001_岗B_70分", "knowledge": {"nodes": [_node(term="幻觉")]}})
+        files, added, _ = kb.absorb_reports()
+        self.assertEqual((files, added), (1, 1))
+
+    def test_report_without_knowledge_is_skipped(self):
+        self._write_report("20260901_岗C_60分.html", {"report_id": "20260901_岗C_60分"})
+        files, added, _ = kb.absorb_reports()
+        self.assertEqual((files, added), (0, 0))
+
+    def test_unreadable_report_does_not_crash(self):
+        store.ensure_profile()
+        store.write_text(os.path.join(store.p_path("reports"), "坏报告.html"), "<html>no data")
+        files, added, _ = kb.absorb_reports()
+        self.assertEqual((files, added), (0, 0))
+
+    def test_empty_folder_is_fine(self):
+        store.ensure_profile()
+        self.assertEqual(kb.absorb_reports(), (0, 0, 0))
