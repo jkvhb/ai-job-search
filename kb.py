@@ -33,6 +33,11 @@ STATE_VALUES = ("待学习", "学习中", "已掌握")
 DEFAULT_STATE = "待学习"
 DEFAULT_OUTCOME = "未面试"
 
+# 自测结果只有两种：答上了 / 没答上。用常量而不是裸字符串，避免前端/路由/存储三处拼写漂移。
+RESULT_UP = "答上了"
+RESULT_DOWN = "没答上"
+_RESULTS = (RESULT_UP, RESULT_DOWN)
+
 # 掌握度排序：手动合并两张「用户卡」时用 max 取更靠后的那个状态（见 merge_nodes）
 _STATE_RANK = {s: i for i, s in enumerate(STATE_VALUES)}
 
@@ -87,6 +92,21 @@ def _today():
     return datetime.now().strftime("%Y-%m-%d")
 
 
+def _normalise_review_fields(card):
+    """补/修复习三字段。容错：非 int → _as_int；非 str → 空串；结果值非法 → 空串。
+
+    为什么放在 ensure_kb 这条咽喉上：knowledge.json 是用户可手改的（也可能来自旧版本），
+    缺字段的卡片一进 review_queue / record_review 就会 KeyError 或把 "+1" 算成字符串拼接。
+    和 from_jds 清洗同一个理由 —— 所有查询与序列化都经过这里，只改一处就全口径归位。
+    """
+    card["review_count"] = _as_int(card.get("review_count"))
+    dt = card.get("last_reviewed_at")
+    card["last_reviewed_at"] = dt.strip() if isinstance(dt, str) else ""
+    r = card.get("last_result")
+    card["last_result"] = r.strip() if isinstance(r, str) and r.strip() in _RESULTS else ""
+    return card
+
+
 def empty_kb():
     return {"version": KB_VERSION, "nodes": []}
 
@@ -114,6 +134,8 @@ def ensure_kb(kb):
         # from_jds 不是 list 时按空处理；顺手把原地清洗结果写回节点（这就是副作用本身）
         n["from_jds"] = [x for x in _as_list(n.get("from_jds"))
                          if isinstance(x, dict) and isinstance(x.get("id"), str) and x["id"]]
+        # 复习三字段也在同一个咽喉点补齐/修坏：与 from_jds 同样「原地改」的副作用
+        _normalise_review_fields(n)
     return {"version": kb.get("version") or KB_VERSION, "nodes": nodes}
 
 
@@ -231,6 +253,9 @@ def _new_card(node, jd):
         "state": DEFAULT_STATE,
         "last_outcome": DEFAULT_OUTCOME,
         "asked_count": 0,
+        "review_count": 0,
+        "last_reviewed_at": "",
+        "last_result": "",
         "first_seen": _today(),
         "last_seen": _today(),
     }

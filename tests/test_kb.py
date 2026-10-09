@@ -1400,3 +1400,29 @@ class KnowledgeWriteRouteTest(IsolatedCase):
         self.assertEqual(code, 400)
         self.assertFalse(body["ok"])
         self.assertIn("两个知识点都要选", body["error"])
+
+
+class ReviewFieldsTest(IsolatedCase):
+    def test_new_card_has_review_defaults(self):
+        kb.absorb([_node(term="甲")], {"id": "j1"})
+        c = store.load_knowledge()["nodes"][0]
+        self.assertEqual(c["review_count"], 0)
+        self.assertEqual(c["last_reviewed_at"], "")
+        self.assertEqual(c["last_result"], "")
+
+    def test_existing_card_without_fields_gets_defaults_on_read(self):
+        store.save_knowledge({"version": 1, "nodes": [
+            {"id": "甲", "term": "甲", "sources": [], "from_jds": []}]})
+        c = kb.ensure_kb(store.load_knowledge())["nodes"][0]
+        self.assertEqual(c["review_count"], 0)
+        self.assertEqual(c["last_reviewed_at"], "")
+        self.assertEqual(c["last_result"], "")
+
+    def test_junk_review_fields_are_tolerated(self):
+        store.save_knowledge({"version": 1, "nodes": [
+            {"id": "甲", "term": "甲", "review_count": "3", "last_reviewed_at": 5,
+             "last_result": {"x": 1}, "sources": [], "from_jds": []}]})
+        c = kb.ensure_kb(store.load_knowledge())["nodes"][0]
+        self.assertEqual(c["review_count"], 3)          # 字符串数字能被修好
+        self.assertEqual(c["last_reviewed_at"], "")     # 非字符串一律当"没复习过"
+        self.assertEqual(c["last_result"], "")          # 非法结果值一律清空
