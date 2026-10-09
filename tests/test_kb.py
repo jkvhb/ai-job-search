@@ -201,3 +201,36 @@ class MergeFieldsTest(IsolatedCase):
         card = store.load_knowledge()["nodes"][0]
         self.assertEqual(card["first_seen"], first)
         self.assertTrue(card["last_seen"])
+
+
+class ResilienceTest(IsolatedCase):
+    def test_malformed_node_fields_do_not_raise(self):
+        weird = {"term": "怪节点", "sources": "not-a-list", "timeline": {"a": 1},
+                 "related": 42, "interview_questions": None, "layer": "abc",
+                 "definition": None, "plain_explanation": 7}
+        added, merged = kb.absorb([weird], {"id": "j1"})
+        self.assertEqual((added, merged), (1, 0))
+        card = store.load_knowledge()["nodes"][0]
+        self.assertEqual(card["sources"], [])
+        self.assertEqual(card["timeline"], [])
+        self.assertEqual(card["related"], [])
+
+    def test_sources_containing_non_dict_are_ignored(self):
+        kb.absorb([_node(sources=["junk", 5, _src("https://ok"), {"url": ""}])], {"id": "j1"})
+        self.assertEqual(len(store.load_knowledge()["nodes"][0]["sources"]), 1)
+
+    def test_corrupt_knowledge_json_returns_empty_without_crash(self):
+        store.ensure_profile()
+        store.write_text(store.knowledge_path(), "{ this is not json")
+        self.assertEqual(store.load_knowledge(), {"nodes": []})
+        added, _ = kb.absorb([_node()], {"id": "j1"})
+        self.assertEqual(added, 1)          # 损坏后能从空库继续
+
+    def test_knowledge_json_with_wrong_shape_is_recovered(self):
+        store.ensure_profile()
+        store.write_json(store.knowledge_path(), {"nodes": "nope"})
+        self.assertEqual(store.load_knowledge(), {"nodes": []})
+
+    def test_layer_string_is_tolerated(self):
+        kb.absorb([_node(layer="1")], {"id": "j1"})
+        self.assertEqual(store.load_knowledge()["nodes"][0]["layer"], 1)

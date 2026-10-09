@@ -50,6 +50,14 @@ def normalize_id(term):
     return _PUNCT.sub("", unicodedata.normalize("NFKC", term)).lower()
 
 
+def _as_int(v, default=0):
+    """容错取整数：'1' → 1；'abc'/None/[] → default（绝不抛异常）"""
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
+
 def _today():
     return datetime.now().strftime("%Y-%m-%d")
 
@@ -163,7 +171,7 @@ def _new_card(node, jd):
         "definition": str(node.get("definition") or "").strip(),
         "plain_explanation": str(node.get("plain_explanation") or "").strip(),
         "category": str(node.get("category") or "").strip(),
-        "layer": int(node.get("layer") or 0),
+        "layer": _as_int(node.get("layer")),
         "sources": clean_sources(node.get("sources")),
         "timeline": clean_timeline(node.get("timeline")),
         "related": clean_related(node.get("related")),
@@ -204,7 +212,7 @@ def _merge_into(card, node):
     if not str(card.get("category") or "").strip():
         card["category"] = str(node.get("category") or "").strip()
 
-    card["layer"] = min(int(card.get("layer") or 0), int(node.get("layer") or 0))
+    card["layer"] = min(_as_int(card.get("layer")), _as_int(node.get("layer")))
 
     card["related"] = clean_related(_as_list(card.get("related")) + _as_list(node.get("related")))
     card["interview_questions"] = clean_questions(
