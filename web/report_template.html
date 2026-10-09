@@ -20,6 +20,7 @@
   .toolbar button{background:var(--card);color:var(--ink);border:1px solid var(--line);border-radius:9px;padding:8px 14px;font-size:13.5px;cursor:pointer;font-weight:600;box-shadow:0 1px 2px rgba(16,24,40,.04);transition:.15s}
   .toolbar button:hover{border-color:var(--accent);color:var(--accent)}
   .toolbar .hint{font-size:12px;color:var(--muted);margin-left:auto}
+  .offline{display:none;background:var(--amber-soft);border:1px solid #f3d9a4;color:#92400e;border-radius:10px;padding:9px 14px;font-size:13px;font-weight:600;margin-bottom:14px}
   /* 目录 */
   .toc{position:sticky;top:8px;z-index:50;display:flex;gap:6px;flex-wrap:wrap;background:linear-gradient(135deg,#f0fdfa,#effcfb);backdrop-filter:blur(10px);border:1px solid #c9ece6;border-radius:12px;padding:9px 11px;margin-bottom:16px;box-shadow:0 2px 10px rgba(13,148,136,.10)}
   .toc a{font-size:12.6px;color:#0f766e;text-decoration:none;padding:5px 11px;border-radius:8px;font-weight:600;white-space:nowrap;transition:.15s;cursor:pointer}
@@ -172,6 +173,7 @@
     <button onclick="resetState()">↺ 重置我的勾选</button>
     <span class="hint" id="hint">你的勾选/打分/投递状态会保存在本机浏览器</span>
   </div>
+  <div class="offline" id="offline" style="display:none"></div>
   <header class="hero" id="hero"></header>
   <nav class="toc" id="toc"></nav>
   <main id="main"></main>
@@ -189,11 +191,119 @@ if (!state.app) state.app = {};
 if (typeof state.listScroll !== 'number') state.listScroll = 0;   // 列表视图滚动位置（跨卡片往返保持）
 if (!state.lastKnow) state.lastKnow = '';                          // 上次打开的知识点 id（用于高亮）
 
+/* ---------- 打钩的服务端持久化（localStorage 只作降级兜底） ----------
+   报告的打开方式有两种：工具内置服务里打开（http://127.0.0.1:…/reports/x.html，能打 API），
+   以及直接双击 html（file:// 或别的 origin，打不到 API）。后者必须退回 localStorage，
+   但**必须让用户看见**"这次打钩只存在这个浏览器里"，不能装作存上了。
+   另外：know: 这类勾不再单独存，它就是知识库那张卡的 state —— 勾上=已掌握，取消=待学习。 */
+const RS_API = { read:'/api/report_state/read', write:'/api/report_state/write' };
+const OFFLINE_MSG = '⚠️ 未连接到工具，本次打钩只存在这个浏览器里';
+const HINT_LOCAL = '你的勾选/打分/投递状态会保存在本机浏览器';
+const HINT_ONLINE = '已连接工具：勾选会存住，关掉程序也不丢';
+let HINT_TEXT = HINT_LOCAL;
+let SRV = { online:false, resolved:false };   // resolved = 服务端读取已跑完（无论成功或失败）
+let K_STATE = {};                             // 术语 → 知识库 state（只有在线模式有服务端真值）
+
+async function apiPost(url, payload){
+  const r = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'},
+                              body: JSON.stringify(payload)});
+  return r.json();
+}
+function withTimeout(p, ms){
+  return new Promise((resolve, reject)=>{
+    const t = setTimeout(()=>reject(new Error('连接工具超时')), ms);
+    p.then(v=>{ clearTimeout(t); resolve(v); }, e=>{ clearTimeout(t); reject(e); });
+  });
+}
+function showOffline(msg){
+  const el = document.getElementById('offline');
+  if(el){ el.textContent = msg || OFFLINE_MSG; el.style.display = 'block'; }
+  HINT_TEXT = HINT_LOCAL;
+  const h = document.getElementById('hint'); if(h) h.textContent = HINT_LOCAL;
+}
+function markOnline(){
+  const el = document.getElementById('offline'); if(el) el.style.display = 'none';
+  HINT_TEXT = HINT_ONLINE;
+  const h = document.getElementById('hint'); if(h) h.textContent = HINT_ONLINE;
+}
+function footText(){
+  return '由 AI 求职 SOP 生成 · 文件：'+RID+'.html · '
+    + (SRV.online ? '勾选已存到工具里（关掉程序也不丢）' : '勾选与打分保存在本机浏览器');
+}
+/* 启动时把服务端的勾选 + 知识库状态读回来。失败（file:// / 工具没开 / 超时）→ 降级 + 告示条。 */
+async function loadServerState(){
+  const terms = [];
+  KNOW.forEach(n=>{ const t = n && (n.term || n.id); if(t) terms.push(t); });
+  try{
+    const r = await withTimeout(apiPost(RS_API.read, {report_id: RID, terms: terms}), 8000);
+    if(!r || r.ok !== true) throw new Error((r && r.error) || '读取失败');
+    const ck = (r.checks && typeof r.checks === 'object') ? r.checks : {};
+    Object.keys(ck).forEach(k=>{ state.checks[k] = !!ck[k]; });   // gate:/iq:/cl: 以服务端为准
+    const kw = (r.know && typeof r.know === 'object') ? r.know : {};
+    Object.keys(kw).forEach(t=>{ K_STATE[t] = String(kw[t]==null ? '' : kw[t]); });
+    SRV.online = true;
+    markOnline();
+  }catch(e){
+    SRV.online = false;
+    K_STATE = {};
+    showOffline();
+  }
+  SRV.resolved = true;
+  return SRV.online;
+}
+/* 知识点节点 → 状态。'学习中' 与 '待学习' 都渲染成未勾选：你没说已掌握，就不给你打勾。 */
+function knowStateOf(n){
+  const t = (n && (n.term || n.id)) || '';
+  if(SRV.online) return K_STATE[t] || '待学习';
+  return state.checks['know:'+((n && n.id) || '')] ? '已掌握' : '待学习';
+}
+function knowChecked(n){ return knowStateOf(n) === '已掌握'; }
+
+/* 勾选框 change → 写服务端；**成功之后才更新本地状态**，失败回滚勾选框（不假装存上）。 */
+async function applyCheck(cb){
+  const key = (cb && cb.dataset && cb.dataset.key) || '';
+  if(!key) return false;
+  const want = !!cb.checked;
+  const isKnow = key.indexOf('know:') === 0;
+  const nid = isKnow ? key.slice(5) : '';
+  const n = isKnow ? (kNode(nid) || {}) : null;
+  const term = isKnow ? (n.term || nid) : '';
+  const st = want ? '已掌握' : '待学习';
+
+  if(!SRV.online){
+    // 降级模式：工具不可用，本地记录仍是可用的兜底 —— 不阻断，但要说清"只在本机"。
+    state.checks[key] = want;
+    if(isKnow) K_STATE[term] = st;
+    save();
+    flash('⚠️ 未连接到工具，只存在这个浏览器里', true);
+    return true;
+  }
+  const payload = isKnow
+    ? {report_id: RID, know: {[term]: {state: st,
+        definition: n.definition || '', plain_explanation: n.plain_explanation || '',
+        category: n.category || ''}}}
+    : {report_id: RID, checks: {[key]: want}};
+  try{
+    const r = await withTimeout(apiPost(RS_API.write, payload), 8000);
+    if(!r || r.ok !== true) throw new Error((r && r.error) || '写入失败');
+  }catch(e){
+    cb.checked = !want;                                        // 回滚：绝不假装存上了
+    flash('⚠️ 没存上，勾选已还原（未同步到工具）', true);
+    return false;
+  }
+  state.checks[key] = want;                                    // 成功之后才更新本地状态
+  if(isKnow) K_STATE[term] = st;
+  save();
+  flash('已保存 ✓');
+  return true;
+}
+
 function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function save(){ try { localStorage.setItem(SKEY, JSON.stringify(state)); } catch(e){} }
-function flash(msg){ const h=document.getElementById('hint'); if(!h)return; h.textContent = msg||'已保存 ✓'; h.style.color='var(--green)'; clearTimeout(window.__ft); window.__ft=setTimeout(()=>{h.textContent='你的勾选/打分/投递状态会保存在本机浏览器';h.style.color='';},1200); }
+function flash(msg, bad){ const h=document.getElementById('hint'); if(!h)return; h.textContent = msg||'已保存 ✓'; h.style.color = bad ? 'var(--red)' : 'var(--green)'; clearTimeout(window.__ft); window.__ft=setTimeout(()=>{h.textContent=HINT_TEXT;h.style.color='';},1600); }
 function toggleAll(open){ document.querySelectorAll('#main details').forEach(d => d.open = open); }
-function resetState(){ if(!confirm('确定清空本报告的勾选、打分和投递状态吗？')) return; state={checks:{},scores:{},app:{}}; save(); location.reload(); }
+/* 只清"本机浏览器"这一层缓存：真正存到工具里的勾选在服务端，这里删不掉，也不该假装删掉了。 */
+function resetState(){ if(!confirm('确定清空本报告的勾选、打分和投递状态吗？\n（只清本机浏览器缓存；已存到工具里的勾选要用勾选框逐个取消）')) return; state={checks:{},scores:{},app:{}}; save(); location.reload(); }
 function fmt(n){ return (Math.round(Number(n)*10)/10).toFixed(1).replace(/\.0$/,''); }
 function verdictText(lvl, fallback){
   if (lvl==='green') return '✅ '+(fallback||'建议投递');
@@ -336,7 +446,7 @@ function kListData(){
 
 function kListItem(n, sub){
   const ver = n.confidence === 'verified';
-  const done = state.checks['know:'+n.id];
+  const done = knowChecked(n);
   const last = (state.lastKnow === n.id) ? ' last' : '';   // 上次打开的那一条：琥珀色高亮
   return '<div class="kli'+(sub?' sub':'')+last+'" data-kopen2="'+esc(n.id)+'">'+
     '<span class="kln">'+esc(n.term || n.id)+'</span>'+
@@ -400,7 +510,7 @@ function kCard(n, expanded){
       ).join(' ｜ ') + '</div>'
     : '<div class="ksrc">📎 未找到可靠来源，以上内容为 AI 整理，请自行查证。</div>';
 
-  const checked = state.checks['know:'+n.id] ? 'checked' : '';
+  const checked = knowChecked(n) ? 'checked' : '';
   return '<div class="kc'+(expanded?' open':'')+'" id="kc-'+esc(n.id)+'">'+
     '<div class="kh" data-ktoggle="'+esc(n.id)+'">'+
       '<span class="kt">'+esc(n.term)+'</span>'+badges+
@@ -687,7 +797,7 @@ function bindKnow(){
     root.addEventListener('change', e=>{
       const cb = e.target;
       if(!cb || cb.__knowWired || !cb.dataset || !cb.dataset.key) return;
-      state.checks[cb.dataset.key] = cb.checked; save(); flash();
+      applyCheck(cb);
     });
   }
   root.querySelectorAll('[data-ktoggle]').forEach(el=>{
@@ -909,7 +1019,7 @@ function recalc(){
 /* ---------- 事件绑定 ---------- */
 function bind(){
   document.querySelectorAll('#main input[type=checkbox][data-key]').forEach(cb=>{
-    cb.addEventListener('change', ()=>{ state.checks[cb.dataset.key] = cb.checked; save(); flash(); });
+    cb.addEventListener('change', ()=>{ applyCheck(cb); });
   });
   document.querySelectorAll('#main input[type=range][data-score]').forEach(r=>{
     const i = r.dataset.score;
@@ -939,12 +1049,17 @@ function render(){
   document.getElementById('main').innerHTML =
     renderContact()+renderGates()+renderScores()+renderBreakdown()+renderOutline()
     +renderOptimization()+renderKnowledge()+renderInterview()+renderApplication();
-  document.getElementById('foot').textContent = '由 AI 求职 SOP 生成 · 文件：'+RID+'.html · 勾选与打分保存在本机浏览器';
+  document.getElementById('foot').textContent = footText();
   bind();
   recalc();
   buildToc();
 }
-render();
+/* 先读服务端的勾选/状态，再渲染：否则会闪一下"全未勾选"，用户以为勾丢了。 */
+async function boot(){
+  await loadServerState();
+  render();
+}
+boot();
 </script>
 </body>
 </html>
