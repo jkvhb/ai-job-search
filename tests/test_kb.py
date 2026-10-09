@@ -1426,3 +1426,113 @@ class ReviewFieldsTest(IsolatedCase):
         self.assertEqual(c["review_count"], 3)          # 字符串数字能被修好
         self.assertEqual(c["last_reviewed_at"], "")     # 非字符串一律当"没复习过"
         self.assertEqual(c["last_result"], "")          # 非法结果值一律清空
+
+
+class ReviewQueueTest(IsolatedCase):
+    def _seed(self):
+        kb.absorb([
+            _node(term="待学多岗", layer=0),
+            _node(term="已掌握", layer=0),
+            _node(term="学习中", layer=0),
+        ], {"id": "j1"})
+        kb.absorb([_node(term="待学多岗")], {"id": "j2"})     # 让它是"被 2 个岗位提到"
+        kb.set_state("已掌握", "已掌握")
+        kb.set_state("学习中", "学习中")
+
+    def test_ordering_weights_learning_state_and_jd_count(self):
+        self._seed()
+        q = [n["term"] for n in kb.review_queue(store.load_knowledge())]
+        self.assertEqual(q[0], "待学多岗")                    # 待学习 + 2 个岗位
+        self.assertLess(q.index("学习中"), q.index("已掌握"))  # 学习中的权重高于已掌握
+
+    def test_score_and_reason_are_returned(self):
+        self._seed()
+        first = kb.review_queue(store.load_knowledge())[0]
+        self.assertGreater(first["score"], 0)
+        self.assertIn("待学习", first["reason"])
+        self.assertIn("2 个岗位", first["reason"])
+
+    def test_never_reviewed_ranks_above_recently_reviewed(self):
+        kb.absorb([_node(term="甲"), _node(term="乙")], {"id": "j1"})
+        d = store.load_knowledge()
+        for n in d["nodes"]:
+            if n["term"] == "乙":
+                n["last_reviewed_at"] = kb._today()
+        store.save_knowledge(d)
+        q = [n["term"] for n in kb.review_queue(store.load_knowledge())]
+        self.assertEqual(q[0], "甲")
+
+    def test_limit_is_respected_and_order_is_deterministic(self):
+        kb.absorb([_node(term="概念%02d" % i) for i in range(30)], {"id": "j1"})
+        a = [n["term"] for n in kb.review_queue(store.load_knowledge(), limit=10)]
+        b = [n["term"] for n in kb.review_queue(store.load_knowledge(), limit=10)]
+        self.assertEqual(len(a), 10)
+        self.assertEqual(a, b)                                # 同分按术语升序，稳定
+
+    def test_weight_ordering_is_not_a_term_tie_break_accident(self):
+        """「学习中」必须**严格高于**「已掌握」—— 不能让术语升序替权重蒙对答案。
+
+        上面 test_ordering_weights_learning_state_and_jd_count 里两张卡同分（都是 1 个岗位、
+        都没复习过），而 tie-break 是术语升序 + 「学」(U+5B66) 恰好排在「已」(U+5DF2) 前面，
+        所以把 _REVIEW_WEIGHT 改成都相等时它**依然全绿**（实测假绿）。
+        这里让「已掌握」那张卡的术语排在最前做对照：只有权重真的起作用，它才会掉到后面。
+        """
+        kb.absorb([_node(term="A 已掌握对照"), _node(term="B 学习中对照")], {"id": "j1"})
+        kb.set_state("A 已掌握对照", "已掌握")
+        kb.set_state("B 学习中对照", "学习中")
+        q = [n["term"] for n in kb.review_queue(store.load_knowledge())]
+        self.assertEqual(q[0], "B 学习中对照")
+
+    def test_empty_kb_is_fine(self):
+        self.assertEqual(kb.review_queue({"nodes": []}), [])
+
+
+class RecordReviewTest(IsolatedCase):
+    def _one(self, state):
+        kb.absorb([_node(term="甲")], {"id": "j1"})
+        if state != "待学习":
+            kb.set_state("甲", state)
+        return "甲"
+
+    def test_answer_up_sets_mastered(self):
+        nid = self._one("待学习")
+        ok, node = kb.record_review(nid, kb.RESULT_UP)
+        self.assertTrue(ok)
+        self.assertEqual(node["state"], "已掌握")
+        self.assertEqual(node["review_count"], 1)
+        self.assertEqual(node["last_reviewed_at"], kb._today())
+        self.assertEqual(node["last_result"], "答上了")
+
+    def test_answer_down_from_mastered_goes_to_learning(self):
+        nid = self._one("已掌握")
+        ok, node = kb.record_review(nid, kb.RESULT_DOWN)
+        self.assertTrue(ok)
+        self.assertEqual(node["state"], "学习中")
+        self.assertEqual(node["last_result"], "没答上")
+
+    def test_answer_down_from_learning_goes_to_not_started(self):
+        nid = self._one("学习中")
+        ok, node = kb.record_review(nid, kb.RESULT_DOWN)
+        self.assertTrue(ok)
+        self.assertEqual(node["state"], "待学习")
+
+    def test_answer_down_from_not_started_stays_put(self):
+        nid = self._one("待学习")
+        ok, node = kb.record_review(nid, kb.RESULT_DOWN)
+        self.assertTrue(ok)
+        self.assertEqual(node["state"], "待学习")
+
+    def test_review_count_accumulates(self):
+        nid = self._one("待学习")
+        kb.record_review(nid, kb.RESULT_DOWN)
+        kb.record_review(nid, kb.RESULT_UP)
+        self.assertEqual(kb.review_queue(store.load_knowledge())[0]["review_count"], 2)
+
+    def test_rejects_bad_result_and_unknown_id(self):
+        nid = self._one("待学习")
+        self.assertFalse(kb.record_review(nid, "随便")[0])
+        self.assertFalse(kb.record_review("不存在", kb.RESULT_UP)[0])
+
+    def test_accepts_raw_term_and_normalised_id_alike(self):
+        self._one("待学习")
+        self.assertTrue(kb.record_review("甲", kb.RESULT_UP)[0])

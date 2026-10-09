@@ -406,6 +406,93 @@ def set_state(node_id, state, kb=None):
         return False, "找不到该知识点"
 
 
+_REVIEW_WEIGHT = {"待学习": 3, "学习中": 2, "已掌握": 1}
+_REVIEW_AGE_CAP = 30        # 久未复习的加成上限（天），防止"从没看过"无限压过一切
+
+
+def _valid_jds(card):
+    """只算「有非空字符串 id」的来源岗位 —— 与 all_jds / stats 同一把尺子。"""
+    return [j for j in _as_list(card.get("from_jds"))
+            if isinstance(j, dict) and isinstance(j.get("id"), str) and j["id"]]
+
+
+def _days_since(date_str):
+    try:
+        d = datetime.strptime(str(date_str), "%Y-%m-%d").date()
+    except Exception:
+        return _REVIEW_AGE_CAP              # 从没复习过（或格式坏了）→ 按最久算
+    return max(0, (datetime.now().date() - d).days)
+
+
+def _review_score(card):
+    """优先级 = 状态权重 × (1 + 被多少岗位提到) × (1 + 久未复习加成)。
+
+    全部是乘性：任何一个维度为 0 都不会把分数压成 0（未掌握但只被 1 个岗位提到，仍应排在
+    已掌握且刚复习过的前面）。
+    """
+    state = str(card.get("state") or DEFAULT_STATE)
+    weight = _REVIEW_WEIGHT.get(state, 1)
+    jd_n = len(_valid_jds(card))
+    age = min(_days_since(card.get("last_reviewed_at")), _REVIEW_AGE_CAP)
+    return weight * (1 + jd_n) * (1 + age / 7.0)
+
+
+def _review_reason(card):
+    """给人看的排序理由 —— 黑箱排序会让人不信任它。"""
+    state = str(card.get("state") or DEFAULT_STATE)
+    parts = [state]
+    jd_n = len(_valid_jds(card))
+    if jd_n > 1:
+        parts.append("被 %d 个岗位提到" % jd_n)
+    age = _days_since(card.get("last_reviewed_at"))
+    parts.append("还没复习过" if age >= _REVIEW_AGE_CAP else "%d 天没复习" % age)
+    return " · ".join(parts)
+
+
+def review_queue(kb, limit=20):
+    """按优先级排出的自测队列。每项 = 节点副本 + score + reason。"""
+    nodes = list(ensure_kb(kb)["nodes"])
+    out = []
+    for n in nodes:
+        item = dict(n)
+        item["score"] = round(_review_score(n), 3)
+        item["reason"] = _review_reason(n)
+        out.append(item)
+    out.sort(key=lambda x: (-x["score"], str(x.get("term") or "")))
+    return out[:limit] if limit else out
+
+
+def record_review(node_id, result, kb=None):
+    """记录一次自测结果并推进状态。返回 (ok, 节点或 None)。
+
+    答上了 → 直接「已掌握」；没答上 → 退一档（已掌握→学习中→待学习，待学习留在原地）。
+    退档而不是清零：答错一次不该把「学习中」打回原点，但也不该留在原位骗自己。
+
+    load → 改 → save 整段进 _KB_LOCK：与 absorb / set_state 同类，无锁并发会丢更新。
+    """
+    if result not in _RESULTS:
+        return False, None
+    nid = normalize_id(node_id)
+    if not nid:
+        return False, None
+    with _KB_LOCK:
+        data = ensure_kb(kb if kb is not None else store.load_knowledge())
+        for n in data["nodes"]:
+            if n.get("id") == nid:
+                if result == RESULT_UP:
+                    n["state"] = "已掌握"
+                else:
+                    rank = _STATE_RANK.get(str(n.get("state")), 0)
+                    n["state"] = STATE_VALUES[max(0, rank - 1)]
+                n["review_count"] = _as_int(n.get("review_count")) + 1
+                n["last_reviewed_at"] = _today()
+                n["last_result"] = result
+                store.save_knowledge(data)
+                log.log_event("kb.review_recorded", id=nid, result=result, state=n["state"])
+                return True, n
+    return False, None
+
+
 def _strip_tail(t):
     for w in _TAIL_WORDS:
         if t.endswith(w) and len(t) > len(w):
