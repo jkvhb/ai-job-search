@@ -141,6 +141,35 @@ def normalize(data, resume_name, source):
     return d
 
 
+def _report_title(path):
+    """取报告 HTML 里的 <title>…</title>；取不到就退回文件名（与 报告体检.py 同一口径）。"""
+    m = re.search(r"<title>(.*?)</title>", store.read_text(path), re.S)
+    return m.group(1) if m else os.path.basename(path)
+
+
+def _render_report_page(path):
+    """用**当前模板**重渲染一份已存在的报告；做不到时返回 None。
+
+    为什么必须这样：报告的前端 JS 是内嵌在每份 HTML 里的，改模板只影响之后新生成的报告 ——
+    老报告的逻辑永远停在「生成那一天」的版本（「列表视图位置记忆」和「打钩存服务端」
+    已经两次踩到同一个坑）。所以 /reports/* 一律动态拼装：
+      - 分析数据：仍然取该报告文件里的 REPORT_DATA 快照，一个字都不改
+      - 页面骨架 / 前端逻辑：用当前 web/report_template.html
+
+    读不出 REPORT_DATA（旧格式 / 文件被改坏）或模板缺失时返回 None，
+    由调用方退回 _send_file 原样发送 —— 报告绝不能因此打不开。
+    """
+    data = kb.read_report_data(path)
+    if not data:
+        return None
+    tpl = store.read_text(TEMPLATE_PATH)
+    if not tpl:
+        return None
+    # 拼装方式必须与 render_report() 完全一致，否则同一份数据会渲染出两种页面
+    payload = json.dumps(data, ensure_ascii=False).replace("</", "<\\/")
+    return tpl.replace("__TITLE__", _report_title(path)).replace("__REPORT_DATA__", payload)
+
+
 def render_report(d, fixed_id=None):
     tpl = store.read_text(TEMPLATE_PATH)
     if not tpl:
@@ -425,8 +454,16 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_file(os.path.join(WEB, "index.html"), "text/html; charset=utf-8")
 
         if p.startswith("/reports/"):
-            return self._send_file(os.path.join(store.p_path("reports"), store.safe_name(unquote(p[len("/reports/"):]))),
-                                   "text/html; charset=utf-8")
+            fp = os.path.join(store.p_path("reports"), store.safe_name(unquote(p[len("/reports/"):])))
+            # 老报告也要吃到最新模板：REPORT_DATA 取文件里的快照，骨架/前端逻辑用当前模板。
+            # 读不出快照、模板缺失、或拼装时出任何意外 → 一律退回原文件原样发送，绝不 5xx。
+            try:
+                html = _render_report_page(fp)
+            except Exception:
+                html = None
+            if html is not None:
+                return self._send(200, html, "text/html; charset=utf-8", raw=True)
+            return self._send_file(fp, "text/html; charset=utf-8")
 
         if p.startswith("/jd/"):
             name = store.safe_name(unquote(p[len("/jd/"):]))
