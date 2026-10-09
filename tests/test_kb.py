@@ -1699,3 +1699,86 @@ class ReviewRouteTest(IsolatedCase):
         kb.absorb([_node(term="甲")], {"id": "j1"})
         code, _ = self._post_raw("/api/knowledge/review", {"id": "不存在的卡", "result": "答上了"})
         self.assertEqual(code, 400)
+
+
+class InterviewFeedbackTest(IsolatedCase):
+    def _seed(self):
+        kb.absorb([_node(term="RLHF"), _node(term="语音识别"),
+                   _node(term="上下文窗口"), _node(term="模型")], {"id": "j1"})
+
+    def test_hits_are_deterministic_and_skip_two_char_terms(self):
+        self._seed()
+        text = "我们聊了 RLHF 和语音识别，也提到上下文窗口。模型这个词出现了很多次。"
+        hits = [n["term"] for n in kb.interview_hits(text, store.load_knowledge())]
+        self.assertIn("RLHF", hits)
+        self.assertIn("语音识别", hits)
+        self.assertNotIn("模型", hits)                    # 2 字词不参与
+
+    def test_two_char_terms_need_repeated_mentions(self):
+        self._seed()
+        once = kb.interview_hits("模型", store.load_knowledge())
+        thrice = kb.interview_hits("模型 模型 模型", store.load_knowledge())
+        self.assertEqual(once, [])
+        self.assertEqual([n["term"] for n in thrice], ["模型"])
+
+    def test_record_interview_updates_asked_count_and_outcome(self):
+        self._seed()
+        kb.record_interview("j1", asked=["RLHF"], weak=["RLHF"], good=["语音识别"])
+        cards = {n["term"]: n for n in store.load_knowledge()["nodes"]}
+        self.assertEqual(cards["RLHF"]["asked_count"], 1)
+        self.assertEqual(cards["RLHF"]["last_outcome"], "没答上")
+        self.assertEqual(cards["语音识别"]["last_outcome"], "答上了")
+
+    def test_weak_concept_already_mastered_is_downgraded(self):
+        self._seed()
+        kb.set_state("RLHF", "已掌握")
+        kb.record_interview("j1", weak=["RLHF"])
+        cards = {n["term"]: n for n in store.load_knowledge()["nodes"]}
+        self.assertEqual(cards["RLHF"]["state"], "学习中")     # 你以为会了，其实不会
+
+    def test_weak_concept_from_not_started_is_not_promoted(self):
+        self._seed()
+        kb.record_interview("j1", weak=["上下文窗口"])
+        cards = {n["term"]: n for n in store.load_knowledge()["nodes"]}
+        self.assertEqual(cards["上下文窗口"]["state"], "待学习")
+
+    def test_unknown_terms_are_ignored_not_created(self):
+        self._seed()
+        before = len(store.load_knowledge()["nodes"])
+        kb.record_interview("j1", asked=["从没见过的词"], weak=["从没见过的词"])
+        self.assertEqual(len(store.load_knowledge()["nodes"]), before)   # 不自动建卡
+
+    def test_asked_count_raises_review_priority(self):
+        kb.absorb([_node(term="甲概念"), _node(term="乙概念")], {"id": "j1"})
+        d = store.load_knowledge()
+        for n in d["nodes"]:
+            if n["term"] == "乙概念":
+                n["asked_count"] = 3
+        store.save_knowledge(d)
+        q = [n["term"] for n in kb.review_queue(store.load_knowledge())]
+        self.assertEqual(q[0], "乙概念")
+
+    def test_reason_mentions_interview(self):
+        kb.absorb([_node(term="甲概念")], {"id": "j1"})
+        d = store.load_knowledge(); d["nodes"][0]["asked_count"] = 2
+        store.save_knowledge(d)
+        self.assertIn("面试", kb.review_queue(store.load_knowledge())[0]["reason"])
+
+    def test_asked_count_beats_the_alphabetical_tie_break(self):
+        """「被问过」因子必须**真的**参与打分，不能靠术语升序蒙对答案。
+
+        上面 test_asked_count_raises_review_priority 里被提到的是「乙概念」，而 tie-break 是术语
+        升序 + 「乙」(U+4E59) 恰好排在「甲」(U+7532) 前面 —— 把 (1 + asked) 因子整个删掉，
+        那张卡**依然排第一**，用例照样绿（实测假绿）。这里把被问过的换成字母序靠后的「甲概念」做对照：
+        两张卡状态/岗位数/复习时间完全相同，只有因子能让它翻到前面。
+        """
+        kb.absorb([_node(term="甲概念"), _node(term="乙概念")], {"id": "j1"})
+        d = store.load_knowledge()
+        for n in d["nodes"]:
+            if n["term"] == "甲概念":
+                n["asked_count"] = 3
+        store.save_knowledge(d)
+        q = [n["term"] for n in kb.review_queue(store.load_knowledge())]
+        self.assertEqual(q[0], "甲概念")
+        # 反证：按术语升序（同分时的 tie-break）「乙概念」本排在前面，只有因子能把它压下去
+        self.assertLess("乙概念", "甲概念")

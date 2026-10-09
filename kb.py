@@ -425,16 +425,21 @@ def _days_since(date_str):
 
 
 def _review_score(card):
-    """优先级 = 状态权重 × (1 + 被多少岗位提到) × (1 + 久未复习加成)。
+    """优先级 = 状态权重 × (1 + 被多少岗位提到) × (1 + 久未复习加成) × (1 + 被面试问过几次)。
 
     全部是乘性：任何一个维度为 0 都不会把分数压成 0（未掌握但只被 1 个岗位提到，仍应排在
     已掌握且刚复习过的前面）。
+
+    为什么把 asked_count 也算进来：这份库是**为真实面试准备**的，被面试官真问过的概念，
+    复习价值远高于只在 JD 里出现过的（ask=0 时因子为 1，与旧行为完全一致，老数据不会被搅动）。
     """
     state = str(card.get("state") or DEFAULT_STATE)
     weight = _REVIEW_WEIGHT.get(state, 1)
     jd_n = len(_valid_jds(card))
     age = min(_days_since(card.get("last_reviewed_at")), _REVIEW_AGE_CAP)
-    return weight * (1 + jd_n) * (1 + age / 7.0)
+    asked = _as_int(card.get("asked_count"))
+    # 被真实面试问过 → 优先复习（asked=0 时因子为 1，与旧行为一致）
+    return weight * (1 + jd_n) * (1 + age / 7.0) * (1 + asked)
 
 
 def _review_reason(card):
@@ -444,6 +449,9 @@ def _review_reason(card):
     jd_n = len(_valid_jds(card))
     if jd_n > 1:
         parts.append("被 %d 个岗位提到" % jd_n)
+    asked = _as_int(card.get("asked_count"))
+    if asked:
+        parts.append("面试被问过 %d 次" % asked)
     age = _days_since(card.get("last_reviewed_at"))
     parts.append("还没复习过" if age >= _REVIEW_AGE_CAP else "%d 天没复习" % age)
     return " · ".join(parts)
@@ -491,6 +499,72 @@ def record_review(node_id, result, kb=None):
                 log.log_event("kb.review_recorded", id=nid, result=result, state=n["state"])
                 return True, n
     return False, None
+
+
+# ---------- 面试（阶段 3.4）：确定性命中 + 结果回写 ----------
+HIT_MIN_LEN = 3          # 术语 ≥3 字：出现即命中
+HIT_REPEAT_2CHAR = 3     # 2 字词太宽泛：要出现 ≥3 次才算被问到
+
+
+def interview_hits(text, kb=None):
+    """确定性命中：知识库里哪些概念的术语出现在这段转写里。
+
+    不靠模型判 —— 确定性、可测、零额度，也不会因为模型漏读而漏记。
+    2 字词（「模型」「标注」）在口语里遍地都是，单次出现不算数。
+    """
+    blob = str(text or "").lower()
+    if not blob:
+        return []
+    out = []
+    for n in ensure_kb(kb if kb is not None else store.load_knowledge())["nodes"]:
+        term = str(n.get("term") or "").strip()
+        if not term:
+            continue
+        t = term.lower()
+        if len(t) >= HIT_MIN_LEN:
+            if t in blob:
+                out.append(n)
+        elif blob.count(t) >= HIT_REPEAT_2CHAR:
+            out.append(n)
+    return out
+
+
+def record_interview(jd_id, asked=None, weak=None, good=None, kb=None):
+    """把一次面试的结果写回知识库。返回 (hits, weak, downgraded) 计数。
+
+    **顺序**：先 +1（asked_count），再写 last_outcome，最后做「已掌握 → 学习中」的降级
+    —— 保证降级不会被后续写回覆盖掉。
+    **找不到的术语直接忽略，绝不自动建卡**（新词由用户在复盘报告里手动加入）。
+    """
+    with _KB_LOCK:
+        data = ensure_kb(kb if kb is not None else store.load_knowledge())
+        index = {n.get("id"): n for n in data["nodes"] if n.get("id")}
+        hits = weak_n = downgraded = 0
+        for term in _as_list(asked):
+            card = index.get(normalize_id(term))
+            if card is None:
+                continue
+            card["asked_count"] = _as_int(card.get("asked_count")) + 1
+            hits += 1
+        for term, outcome in [(t, "没答上") for t in _as_list(weak)] + \
+                             [(t, "答上了") for t in _as_list(good)]:
+            card = index.get(normalize_id(term))
+            if card is None:
+                continue
+            card["last_outcome"] = outcome
+            card["last_interview_jd"] = str(jd_id or "")
+        for term in _as_list(weak):
+            card = index.get(normalize_id(term))
+            if card is None:
+                continue
+            weak_n += 1
+            if str(card.get("state")) == "已掌握":
+                card["state"] = "学习中"          # 你以为会了，其实不会
+                downgraded += 1
+        store.save_knowledge(data)
+        log.log_event("kb.interview_recorded", jd=jd_id, hits=hits,
+                      weak=weak_n, downgraded=downgraded)
+        return hits, weak_n, downgraded
 
 
 def upsert_check(term, state, meta=None, kb=None):
