@@ -633,8 +633,11 @@ function kbRenderDup(){
     + '</div>';
   $$('#kbDup [data-kbmerge]').forEach(b=>b.addEventListener('click', async ()=>{
     const [keep, drop] = b.dataset.kbmerge.split('|');
-    const r = await (await fetch('/api/knowledge/merge',{method:'POST',
-      headers:{'Content-Type':'application/json'},body:JSON.stringify({keep_id:keep,drop_id:drop})})).json();
+    let r;
+    try{
+      r = await (await fetch('/api/knowledge/merge',{method:'POST',
+        headers:{'Content-Type':'application/json'},body:JSON.stringify({keep_id:keep,drop_id:drop})})).json();
+    }catch(e){ toast('操作失败：'+e.message); return; }   // 服务中途挂掉也要有反馈，且失败后不能改选中项/刷新
     toast(r.ok ? (r.message||'已合并') : ('合并失败：'+r.error));
     kbCur = keep; kbLoad();
   }));

@@ -165,19 +165,23 @@ def clean_questions(qs):
 def _add_jd(card, jd):
     """记录「这个知识点被哪个岗位提到过」，按 job_id 去重（幂等的关键）。
 
-    `from_jds` 里的历史项也按同一把尺子过滤：只有**有 id 的 dict** 才算一条来源岗位。
-    没有 id 的 dict 留着会被 stats()["multi_jd"] 计入，而 all_jds() 又会跳过它 —— 同一个库
-    两处口径打架，前端会显示出「被 2 个以上岗位提到」却在下拉里找不到对应岗位的幻影。
+    历史项和传进来的 `jd` 都按**同一把尺子**过滤：只有 id 是**非空字符串**的 dict 才算一条来源岗位。
+    没有 id 的、以及真值但非字符串的 id（`{"id": 5}` / `{"id": [1]}`）留着会被 stats()["multi_jd"]
+    计入，而 all_jds() 又会跳过它 —— 同一个库两处口径打架，前端会显示出「被 2 个以上岗位提到」
+    却在下拉里找不到对应岗位的幻影。
+
+    入参那道守卫也必须过字符串关：merge_nodes() 会把 drop 卡（用户可手改的 knowledge.json）里的
+    from_jds **原样**喂进来，只压历史项等于给幻影留了后门。
     """
-    if not isinstance(jd, dict) or not jd.get("id"):
+    if not isinstance(jd, dict) or not isinstance(jd.get("id"), str) or not jd["id"]:
         return
-    # 顺手清掉历史垃圾项（字符串/数字/None，以及没有 id 的 dict）
+    # 顺手清掉历史垃圾项（字符串/数字/列表/None，以及没有 id 的 dict）
     frm = [x for x in _as_list(card.get("from_jds"))
-           if isinstance(x, dict) and x.get("id")]
-    if any(x.get("id") == jd["id"] for x in frm):
-        return
-    frm.append({"id": jd["id"], "job_title": jd.get("job_title") or "",
-                "company": jd.get("company") or "", "date": jd.get("date") or _today()})
+           if isinstance(x, dict) and isinstance(x.get("id"), str) and x["id"]]
+    # 先落盘清洗结果再去重：这个岗位早就记过时下面会 return，手改进去的垃圾不能因此留在原地
+    if not any(x.get("id") == jd["id"] for x in frm):
+        frm.append({"id": jd["id"], "job_title": jd.get("job_title") or "",
+                    "company": jd.get("company") or "", "date": jd.get("date") or _today()})
     card["from_jds"] = frm
 
 

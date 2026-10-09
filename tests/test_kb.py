@@ -76,9 +76,9 @@ def _log_events(name):
 
 
 def _real_jd_ids(card):
-    """卡片里「算数」的来源岗位 id：只认有 id 的 dict（与 kb._add_jd 同一把尺子）"""
-    return [x.get("id") for x in kb._as_list(card.get("from_jds"))
-            if isinstance(x, dict) and x.get("id")]
+    """卡片里「算数」的来源岗位 id：只认 id 是**非空字符串**的 dict（与 kb._add_jd / kb.all_jds 同一把尺子）"""
+    return [x["id"] for x in kb._as_list(card.get("from_jds"))
+            if isinstance(x, dict) and isinstance(x.get("id"), str) and x["id"]]
 
 
 def _consistent_multi_jd(kb_data):
@@ -434,6 +434,69 @@ class ResilienceTest(IsolatedCase):
         self.assertEqual([j["id"] for j in kb.all_jds(d)], _consistent_jd_ids(d))
         self.assertEqual(kb.stats(d)["multi_jd"], 1)                           # 只有「抽样检验」被多岗提到
         self.assertEqual([j["id"] for j in kb.all_jds(d)], ["j1", "j8", "j9"])
+
+    def test_non_string_jd_ids_are_cleaned_and_stats_agrees_with_all_jds(self):
+        # 手改成**真值但非字符串**的 id（`{"id": 5}` / `{"id": [1]}`）：旧实现的历史项过滤只挡「非 dict」，
+        # 这两条会被 stats()["multi_jd"] 按 raw 长度数进去，all_jds() 却看不见它们 ——
+        # 前端于是显示「被 2 个以上岗位提到」却在下拉里找不到对应岗位。两处必须同一把尺子。
+        store.ensure_profile()
+        store.save_knowledge({"nodes": [
+            {"id": "省略恢复", "term": "省略恢复", "state": "待学习",
+             "from_jds": [{"id": 5, "job_title": "数字 id"}, {"id": [1], "job_title": "列表 id"},
+                          {"id": "j9", "job_title": "岗9"}]},
+            {"id": "抽样检验", "term": "抽样检验", "state": "待学习",
+             "from_jds": [{"id": 5, "job_title": "数字 id"}, {"id": [1], "job_title": "列表 id"}]},
+        ]})
+        kb.absorb([_node(), _node(term="抽样检验")], {"id": "j1", "job_title": "岗1"})
+        d = store.load_knowledge()
+        self.assertEqual([j.get("id") for j in d["nodes"][0]["from_jds"]], ["j9", "j1"])  # 非字符串 id 清掉
+        self.assertEqual([j.get("id") for j in d["nodes"][1]["from_jds"]], ["j1"])        # 幻影清掉，只剩真岗位
+        self.assertEqual(kb.stats(d)["multi_jd"], _consistent_multi_jd(d))                # 口径一致
+        self.assertEqual(kb.stats(d)["multi_jd"], 1)                       # 只有第 1 张卡真被多岗提到
+        self.assertEqual([j["id"] for j in kb.all_jds(d)], _consistent_jd_ids(d))
+        self.assertEqual([j["id"] for j in kb.all_jds(d)], ["j1", "j9"])
+
+    def test_reabsorbing_an_already_recorded_jd_still_cleans_non_string_ids(self):
+        # 幂等分支：同一个岗位再 absorb 一次时，旧实现清洗完发现 id 已存在就直接 return，
+        # 手改进去的非字符串 id 会留在原地 —— 库依旧是「数得着、选不到」的状态。
+        store.ensure_profile()
+        store.save_knowledge({"nodes": [
+            {"id": "省略恢复", "term": "省略恢复", "state": "待学习",
+             "from_jds": [{"id": 5, "job_title": "数字 id"}, {"id": "j1", "job_title": "岗1"}]},
+        ]})
+        kb.absorb([_node()], {"id": "j1", "job_title": "岗1"})
+        d = store.load_knowledge()
+        self.assertEqual([j.get("id") for j in d["nodes"][0]["from_jds"]], ["j1"])
+        self.assertEqual(kb.stats(d)["multi_jd"], 0)                       # 唯一一张卡只有 1 个真岗位
+        self.assertEqual(kb.stats(d)["multi_jd"], _consistent_multi_jd(d))
+        self.assertEqual([j["id"] for j in kb.all_jds(d)], ["j1"])
+
+    def test_non_string_jd_id_argument_is_not_recorded(self):
+        # 入参守卫也要字符串：merge_nodes() 会把 drop 卡里手改过的 from_jds **原样**喂进 _add_jd，
+        # 非字符串 id 一旦落盘就是 stats() 数得着、all_jds() 看不见的幻影。
+        kb.absorb([_node()], {"id": 5, "job_title": "数字 id"})
+        kb.absorb([_node()], {"id": [1], "job_title": "列表 id"})
+        card = store.load_knowledge()["nodes"][0]
+        self.assertEqual(card["from_jds"], [])
+        self.assertEqual(kb.stats(store.load_knowledge())["multi_jd"], 0)
+        self.assertEqual(kb.all_jds(store.load_knowledge()), [])
+
+    def test_merge_does_not_carry_non_string_jd_ids_from_the_dropped_card(self):
+        # 同一条不变式走手动合并分支：merge_nodes 会把 drop 卡的 from_jds **原样**喂进 _add_jd，
+        # 手改成 {"id": 5} 的幻影不能借合并钻进 keep 卡
+        store.ensure_profile()
+        store.save_knowledge({"nodes": [
+            {"id": "省略恢复", "term": "省略恢复", "state": "待学习",
+             "from_jds": [{"id": "j1", "job_title": "岗1"}]},
+            {"id": "省略识别及恢复", "term": "省略识别及恢复", "state": "待学习",
+             "from_jds": [{"id": 5, "job_title": "数字 id"}, {"id": "j2", "job_title": "岗2"}]},
+        ]})
+        ok, _ = kb.merge_nodes("省略恢复", "省略识别及恢复")
+        self.assertTrue(ok)
+        d = store.load_knowledge()
+        self.assertEqual([j.get("id") for j in d["nodes"][0]["from_jds"]], ["j1", "j2"])
+        self.assertEqual(kb.stats(d)["multi_jd"], _consistent_multi_jd(d))
+        self.assertEqual([j["id"] for j in kb.all_jds(d)], ["j1", "j2"])
 
 
 class DuplicateTest(IsolatedCase):
