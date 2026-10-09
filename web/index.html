@@ -537,6 +537,14 @@ let kbSeq = 0;               // 请求代次：只采用最新一次请求的响
 
 const KB_STATE_CLASS = {'待学习':'s1','学习中':'s2','已掌握':'s3'};
 
+// 来源链接的协议白名单：source.url 来自模型 / 报告 / 用户手改的 knowledge.json，
+// 只做 esc() 挡不住 href="javascript:..."（esc 不转义冒号），点一下就能执行脚本。
+// 非 http(s) 一律不渲染成 <a>，改成纯文本（内容仍然可见，只是点不动）。
+function kbSafeUrl(u){
+  const s = String(u == null ? '' : u).trim();
+  return /^https?:\/\//i.test(s) ? s : '';
+}
+
 async function kbLoad(){
   const seq = ++kbSeq;
   const q = $('#kbQ').value.trim();
@@ -555,6 +563,16 @@ async function kbLoad(){
     return;
   }
   if(seq !== kbSeq) return;            // 旧请求后到：直接丢弃，绝不覆盖新结果
+  // 只判 fetch 抛异常是不够的：HTTP 500 时 json() 照样正常解析出
+  // {ok:false, error:"知识库读取失败：…"}，若不判 ok 就会把 kbData 写成这个错误对象，
+  // nodes/stats/jds 全是 undefined → 列表走空分支显示「知识库还是空的」，
+  // 真正的错误被丢掉、logUI 也不记。这里必须显式处理，且同样要过 seq 守卫。
+  if(!d || d.ok === false){
+    const msg = (d && d.error) || '知识库读取失败（服务无响应）';
+    $('#kbList').innerHTML = '<div class="kbi"><div class="kbdempty">'+esc(msg)+'</div></div>';
+    logUI('kb.load_failed', {error: msg}, 'error');
+    return;
+  }
   kbData = d;
   kbRenderFilters(); kbRenderStat(); kbRenderList(); kbRenderDetail(); kbRenderDup();
 }
@@ -584,7 +602,11 @@ function kbRenderList(){
   if(!ns.length){ $('#kbList').innerHTML = '<div class="kbi"><div class="kbdempty">知识库还是空的。点右上「从已有报告导入」把已有报告的知识收进来。</div></div>'; return; }
   $('#kbList').innerHTML = ns.map(n=>{
     const st = n.state || '待学习';
-    const badges = ['<span class="kbb '+(n.sources&&n.sources.length?'ver':'ai')+'">来源 '+(n.sources||[]).length+'</span>'];
+    // confidence 用**后端字段**，不在前端重算判定规则：否则将来后端加第三种
+    // confidence（例如 "community"）时，这里会静默按「有来源/无来源」走错分支。
+    const verified = n.confidence ? n.confidence === 'verified' : (n.sources||[]).length > 0;
+    const badges = ['<span class="kbb '+(verified?'ver':'ai')+'">来源 '+(n.sources||[]).length+'</span>'];
+    // 徽章口径必须与后端 /api/knowledge 返回的 from_jds 一致（kb.ensure_kb 已清掉非字符串 id 的幻影）
     const njd = (n.from_jds||[]).length;
     if(njd>1) badges.push('<span class="kbb s1">被 '+njd+' 个岗位提到</span>');
     badges.push('<span class="kbb '+(KB_STATE_CLASS[st]||'s1')+'">'+esc(st)+'</span>');
@@ -609,8 +631,14 @@ function kbRenderDetail(){
   if((n.timeline||[]).length) h += '<div class="kbsec"><h4>前世今生</h4><div class="kbtl">'
       + n.timeline.map(t=>'<div><b>'+esc(t.year||'')+'</b>'+esc(t.text||'')+'</div>').join('')+'</div></div>';
   if((n.sources||[]).length) h += '<div class="kbsec"><h4>来源（可点开原文）</h4><ul class="kbdlist">'
-      + n.sources.map(s=>'<li><a href="'+esc(s.url)+'" target="_blank" rel="noopener">'
-          + esc(s.title||s.url)+'</a>'+(s.date?' <span class="kbdempty">'+esc(s.date)+'</span>':'')+'</li>').join('')+'</ul></div>';
+      + n.sources.map(s=>{
+          const label = esc(s.title||s.url);
+          const date = s.date ? ' <span class="kbdempty">'+esc(s.date)+'</span>' : '';
+          const url = kbSafeUrl(s.url);
+          // 非 http(s) 不渲染成链接（见 kbSafeUrl 的注释）
+          return url ? '<li><a href="'+esc(url)+'" target="_blank" rel="noopener">'+label+'</a>'+date+'</li>'
+                     : '<li>'+label+date+'</li>';
+        }).join('')+'</ul></div>';
   if((n.interview_questions||[]).length) h += '<div class="kbsec"><h4>面试会怎么问</h4><ul class="kbdlist">'
       + n.interview_questions.map(q=>'<li>'+esc(q)+'</li>').join('')+'</ul></div>';
   if((n.from_jds||[]).length) h += '<div class="kbsec"><h4>来源岗位</h4><ul class="kbdlist">'

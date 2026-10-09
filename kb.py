@@ -18,6 +18,7 @@ import log
 import os
 import re
 import store
+import threading
 import unicodedata
 from datetime import datetime
 
@@ -47,6 +48,18 @@ REPORT_MARK = "const REPORT_DATA = "
 # 用 itertools.count 而不是 `+= 1`：后者是 LOAD/ADD/STORE 三步，在 ThreadingHTTPServer 下
 # 两个请求线程可能读到同一个旧值，导致备份名相撞、先备份的文件被后一个覆盖掉。
 _QUARANTINE_SEQ = itertools.count(1)
+
+# knowledge.json 的读-改-写必须整体串行。本模块的每个写路径都是
+# 「load_knowledge → 改内存 → save_knowledge」三步，而这三步之间是**没有**保护的：
+# absorb 要 7.5–24ms、set_state 要 10–15ms，ThreadingHTTPServer 下「分析结尾的 absorb」
+# 与「用户在知识库 tab 点掌握度」完全会撞上（分析要 20–60 秒且只禁用 #goBtn）。
+# 撞上的后果是丢更新：后写完的那个线程把先写线程的改动整个覆盖掉（实测 120 轮丢 31–99 次）。
+#
+# 用 RLock 而不是 Lock：absorb_reports() 在循环里调 absorb()，将来若有别的写路径互相调用，
+# 普通 Lock 会直接死锁；RLock 让同一线程可重入。风格照 log.py 的 _LOG_LOCK。
+# store.write_json 的原子写是第二道防线（保证文件不会被读成半截），
+# 这道锁才是第一道：保证「读到的旧内容」不会把别人的改动盖掉。
+_KB_LOCK = threading.RLock()
 
 
 def normalize_id(term):
@@ -79,14 +92,29 @@ def empty_kb():
 
 
 def ensure_kb(kb):
-    """把任意输入（含损坏结构）规整成可用知识库，绝不抛异常。"""
+    """把任意输入（含损坏结构）规整成可用知识库，绝不抛异常。
+
+    **注意：这个函数有副作用 —— 它原地过滤 `from_jds`。**
+    每个节点的 `from_jds` 里「id 不是非空字符串」的项会被**就地丢掉**（直接改传进来的 dict，
+    不是返回一份副本）。之所以选在这里做，是因为它**唯一咽喉点**：stats() / list_nodes() /
+    all_jds() / find_duplicates() 以及 /api/knowledge 序列化给前端的节点**全部**经过这里，
+    只改一处就能让四处口径同时归位。
+
+    不清洗会怎样：knowledge.json 是用户可手改的，手改出 `from_jds:[{"id":5},{"id":"j1"}]` 后
+    会出现「stats 数 2 个岗位、排序按 2 排、前端徽章显示 2 个，而筛选下拉里只有 1 个」的幻影。
+    过滤后 all_jds() 那段只认字符串 id 的逻辑退化为第二道防线（保留，防止有人绕过 ensure_kb）。
+    """
     if not isinstance(kb, dict):
         return empty_kb()
     nodes = kb.get("nodes")
     if not isinstance(nodes, list):
         nodes = []
-    return {"version": kb.get("version") or KB_VERSION,
-            "nodes": [n for n in nodes if isinstance(n, dict)]}
+    nodes = [n for n in nodes if isinstance(n, dict)]
+    for n in nodes:
+        # from_jds 不是 list 时按空处理；顺手把原地清洗结果写回节点（这就是副作用本身）
+        n["from_jds"] = [x for x in _as_list(n.get("from_jds"))
+                         if isinstance(x, dict) and isinstance(x.get("id"), str) and x["id"]]
+    return {"version": kb.get("version") or KB_VERSION, "nodes": nodes}
 
 
 def _as_list(v):
@@ -288,32 +316,49 @@ def absorb(nodes, jd=None, kb=None):
 
     写盘之前先保住「读不出来」的旧文件（见 _quarantine_corrupt_kb）—— 本函数末尾一定会
     save_knowledge，不先备份的话坏文件会被内存里的空库永久顶掉。备份都失败时直接放弃本次吸收。
+
+    **零可吸收节点时在隔离之前就返回 (0, 0)**：一个节点都没有的调用（报告知识点全是空术语/
+    纯标点）本来就没有任何东西可沉淀，却会走完隔离 + save_knowledge —— 于是「库文件坏 + 本次
+    零知识点」的组合会先把用户的库改名走，再写回一份空库，等于「吸收了个寂寞还把库清空」。
+    判断必须在 _quarantine_corrupt_kb() **之前**做，否则坏文件已经被改名走了。
     """
-    if not _quarantine_corrupt_kb():
-        return 0, 0
-    kb = ensure_kb(kb if kb is not None else store.load_knowledge())
-    index = {n.get("id"): n for n in kb["nodes"] if n.get("id")}
-    added = merged = 0
-    for node in _as_list(nodes):
-        if not isinstance(node, dict):
-            continue
-        nid = normalize_id(str(node.get("term") or "").strip())
-        if not nid:
-            continue                      # 空术语/纯标点 → 跳过，不产生垃圾卡
-        card = index.get(nid)
-        if card is None:
-            card = _new_card(node, jd)
-            kb["nodes"].append(card)
-            index[nid] = card
-            added += 1
-        else:
-            _merge_into(card, node)
-            _add_jd(card, jd)
-            _recompute_confidence(card)
-            merged += 1
-    kb["version"] = KB_VERSION
-    store.save_knowledge(kb)
-    return added, merged
+    # 先筛出真正可吸收的节点（术语是非空字符串、normalize_id 后也非空），再决定做不做隔离与写盘。
+    # 这里必须整节点保留（不是只留 term）：_new_card / _merge_into 还要读 definition / sources /
+    # timeline / related / interview_questions 等字段，只留 term 会把它们全丢掉。
+    #
+    # 为什么要 isinstance(term, str) 这道类型关（不能只靠 normalize_id）：`str(5)` → `"5"`、
+    # `str(None)` → `"None"` 都是**非空**的合法身份键，`{"term": 5}` 会凭空造出一张 id 为 "5"、
+    # term 为 "5" 的垃圾卡；而 find_duplicates() 与前端本来就把非字符串 id 当幻影跳过 ——
+    # 那会造出「有卡片、却查不到也合并不了」的死节点。非字符串术语一律不算可吸收。
+    absorbable = [n for n in _as_list(nodes)
+                  if isinstance(n, dict) and isinstance(n.get("term"), str)
+                  and normalize_id(n["term"].strip())]
+    if not absorbable:
+        return 0, 0                      # 零可吸收节点：连隔离都不做，文件原样不动
+
+    # 整段「检查坏文件 → load → 改内存 → save」必须串行：见 _KB_LOCK 的注释
+    with _KB_LOCK:
+        if not _quarantine_corrupt_kb():
+            return 0, 0
+        kb = ensure_kb(kb if kb is not None else store.load_knowledge())
+        index = {n.get("id"): n for n in kb["nodes"] if n.get("id")}
+        added = merged = 0
+        for node in absorbable:
+            nid = normalize_id(node["term"].strip())   # 上面已保证 term 是字符串且非空
+            card = index.get(nid)
+            if card is None:
+                card = _new_card(node, jd)
+                kb["nodes"].append(card)
+                index[nid] = card
+                added += 1
+            else:
+                _merge_into(card, node)
+                _add_jd(card, jd)
+                _recompute_confidence(card)
+                merged += 1
+        kb["version"] = KB_VERSION
+        store.save_knowledge(kb)
+        return added, merged
 
 
 def set_state(node_id, state, kb=None):
@@ -324,14 +369,16 @@ def set_state(node_id, state, kb=None):
     if state not in STATE_VALUES:
         return False, "状态不合法：%s" % state
     node_id = normalize_id(node_id)
-    kb = ensure_kb(kb if kb is not None else store.load_knowledge())
-    for n in kb["nodes"]:
-        if n.get("id") == node_id:
-            n["state"] = state
-            store.save_knowledge(kb)
-            log.log_event("kb.state_set", id=node_id, state=state)
-            return True, ""
-    return False, "找不到该知识点"
+    # load → 改 → save 整段串行：不加锁会被并发的 absorb 用「它读到的旧库」覆盖掉这次掌握度
+    with _KB_LOCK:
+        kb = ensure_kb(kb if kb is not None else store.load_knowledge())
+        for n in kb["nodes"]:
+            if n.get("id") == node_id:
+                n["state"] = state
+                store.save_knowledge(kb)
+                log.log_event("kb.state_set", id=node_id, state=state)
+                return True, ""
+        return False, "找不到该知识点"
 
 
 def _strip_tail(t):
@@ -418,6 +465,16 @@ def merge_nodes(keep_id, drop_id, kb=None):
         return False, "两个知识点都要选"
     if keep_id == drop_id:
         return False, "不能和自己合并"
+    # load → 改两张卡 → save 整段串行：不加锁时并发的 absorb/set_state 会把这次合并整个覆盖掉
+    with _KB_LOCK:
+        return _merge_nodes_locked(keep_id, drop_id, kb)
+
+
+def _merge_nodes_locked(keep_id, drop_id, kb):
+    """merge_nodes 的主体，**调用方必须已持有 _KB_LOCK**（拆出来只是为了让锁的范围一眼可见）。
+
+    入参的 keep_id / drop_id 已 normalize、且已排除「空 id」与「自己和自己合并」。
+    """
     kb = ensure_kb(kb if kb is not None else store.load_knowledge())
     index = {n.get("id"): n for n in kb["nodes"] if n.get("id")}
     keep, drop = index.get(keep_id), index.get(drop_id)

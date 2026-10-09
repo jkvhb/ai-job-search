@@ -4,6 +4,7 @@ import io
 import json
 import log
 import os
+import threading
 import unittest
 from unittest import mock
 
@@ -498,6 +499,218 @@ class ResilienceTest(IsolatedCase):
         self.assertEqual(kb.stats(d)["multi_jd"], _consistent_multi_jd(d))
         self.assertEqual([j["id"] for j in kb.all_jds(d)], ["j1", "j2"])
 
+    def test_ensure_kb_filters_phantom_from_jds_in_place(self):
+        # I4：手改出的非字符串 id 是「stats 数得着、all_jds 选不到」的幻影。
+        # 清洗放在 ensure_kb 这唯一咽喉点上 → stats / list_nodes / all_jds 三处口径同时归位。
+        kb_data = {"nodes": [{
+            "id": "省略恢复", "term": "省略恢复", "state": "待学习",
+            "from_jds": [{"id": "j1", "job_title": "岗1"}, {"id": 5},
+                         {"id": None}, {"id": ""}, {"id": [1]}, "junk"],
+        }]}
+        out = kb.ensure_kb(kb_data)
+        # 原地过滤：不只是返回值干净，传进去的那个 dict 也已经被改干净
+        self.assertEqual([j["id"] for j in kb_data["nodes"][0]["from_jds"]], ["j1"])
+        self.assertEqual([j["id"] for j in out["nodes"][0]["from_jds"]], ["j1"])
+        # 不是 list 时按空处理（绝不抛异常）
+        self.assertEqual(kb.ensure_kb({"nodes": [{"id": "卡", "from_jds": "j1"}]})["nodes"][0]["from_jds"], [])
+        self.assertEqual(kb.ensure_kb({"nodes": [{"id": "卡", "from_jds": None}]})["nodes"][0]["from_jds"], [])
+        # 没有 from_jds 字段的节点会被补上空列表（不是缺字段）—— 调用方读 n["from_jds"] 也安全
+        self.assertEqual(kb.ensure_kb({"nodes": [{"id": "卡"}]})["nodes"][0]["from_jds"], [])
+
+    def test_ensure_kb_filter_makes_stats_list_and_sort_agree(self):
+        # I4 的三处口径一致性：修复前 stats 数 3、排序按 3 排、徽章显示 3，而下拉里只有 1 个岗位
+        store.ensure_profile()
+        store.save_knowledge({"nodes": [
+            {"id": "幻影卡", "term": "幻影卡", "state": "待学习",
+             "from_jds": [{"id": 5}, {"id": "j1", "job_title": "岗1"}, {"id": [1]}, "junk"]},
+            {"id": "单岗卡", "term": "单岗卡", "state": "待学习",
+             "from_jds": [{"id": "j1", "job_title": "岗1"}]},
+            {"id": "真多岗卡", "term": "真多岗卡", "state": "待学习",
+             "from_jds": [{"id": "j1", "job_title": "岗1"}, {"id": "j2", "job_title": "岗2"}]},
+            {"id": "怪卡", "term": "怪卡", "state": "待学习", "from_jds": {"id": "j9"}},
+        ]})
+        # 先看磁盘上的原始内容（read_json 走的是 store.load_knowledge 同一条解析路径，
+        # 但**不经过** ensure_kb）—— 证明清洗真的发生了，而不是一开始就没写进去。
+        # 注意 ["junk"] 是字符串不是 dict，本来就不算一条 from_jds 项。
+        raw_nodes = store.read_json(store.knowledge_path())["nodes"]
+        self.assertEqual(len(raw_nodes[0]["from_jds"]), 4)
+        self.assertEqual(len(store.load_knowledge()["nodes"][3]["from_jds"]), 1)   # 怪卡：from_jds 是 dict
+        d = store.load_knowledge()
+        self.assertEqual(kb.stats(d)["multi_jd"], 1)                      # 只有「真多岗卡」算多岗位
+        # **副作用实证**：上面这一行 kb.stats(d) 内部只是调了 ensure_kb，就地把 d 自己的节点改写了
+        self.assertEqual(len(d["nodes"][0]["from_jds"]), 1)
+        self.assertEqual(len(d["nodes"][3]["from_jds"]), 0)
+        # 排序键是 (-岗位数, -来源数, 术语)：清掉幻影后「幻影卡」与「单岗卡」同为 1 个岗位，
+        # 靠术语定序（Python sort 稳定，但不能依赖输入顺序 —— 那正是本条要钉住的口径）
+        self.assertEqual([n["id"] for n in kb.list_nodes(d, sort="mentions")],
+                         ["真多岗卡", "单岗卡", "幻影卡", "怪卡"])
+        # 反证：如果 ensure_kb 没清幻影，「幻影卡」会以 3 个岗位排到最前面
+        self.assertEqual([j["id"] for j in kb.all_jds(d)], ["j1", "j2"])
+        # 序列化给前端的节点（/api/knowledge 走的就是 list_nodes）里也不含幻影
+        for n in kb.list_nodes(d):
+            self.assertEqual([j.get("id") for j in n["from_jds"]],
+                             _real_jd_ids(n))
+
+    def test_absorb_with_zero_absorbable_terms_does_not_quarantine_or_write(self):
+        # I1：坏库 + 「零可吸收节点」的调用。修复前 absorb 会先 _quarantine_corrupt_kb 把坏文件
+        # 改名走、再 save_knowledge 写回空库 —— 用户卡片从可见库消失，只剩一个 UI 从不提示的
+        # .corrupt-* 文件。现在必须在隔离之前就 return，文件与目录都原样不动。
+        store.ensure_profile()
+        path = store.knowledge_path()
+        store.write_text(path, "{ 坏文件")
+        self.assertEqual(kb.absorb([_node(term=""), _node(term="（）·、。"), _node(term="   ")]), (0, 0))
+        self.assertEqual(store.read_text(path), "{ 坏文件")
+        self.assertEqual(glob.glob(path + ".corrupt-*"), [])
+
+    def test_absorb_with_zero_absorbable_terms_does_not_wipe_a_valid_live_kb(self):
+        # 同一个早退在「库是好的」时同样是纯 no-op：文件连 mtime 都不该动。
+        # 注意「!!! 纯标点」**不是**零可吸收 —— normalize_id 只去标点，中文会留下（结果是「纯标点」）。
+        # 真正的零可吸收是「去标点后什么都不剩」与「根本不是 dict/字符串术语」这两类。
+        store.ensure_profile()
+        path = store.knowledge_path()
+        kb.absorb([_node(term="省略恢复")], {"id": "j1"})
+        before = store.read_text(path)
+        mtime = os.path.getmtime(path)
+        self.assertEqual(kb.absorb([]), (0, 0))
+        self.assertEqual(kb.absorb([_node(term="（）·、。"), _node(term="   "),
+                                    "junk", 5, None, {}]), (0, 0))
+        self.assertEqual(store.read_text(path), before)
+        self.assertEqual(os.path.getmtime(path), mtime)
+        self.assertEqual(len(store.load_knowledge()["nodes"]), 1)
+
+    def test_non_string_term_cannot_fabricate_a_card(self):
+        # str(5) → "5"、str(None) → "none" 都非空，只靠 normalize_id 的话 {"term": 5} 会凭空造出
+        # 一张 id 为 "5" 的垃圾卡；而 find_duplicates / 前端都把非字符串 id 当幻影跳过 ——
+        # 那就成了「有卡片却查不到也合并不了」的死节点。术语必须是字符串才算可吸收。
+        store.ensure_profile()
+        self.assertEqual(kb.absorb([{"term": 5}, {"term": None}, {"term": [1]},
+                                    {"term": 3.5}, {"term": True}]), (0, 0))
+        self.assertEqual(store.load_knowledge()["nodes"], [])
+        # 反向确认：字符串术语照常吸收（守卫不能把正常值一起挡掉）
+        self.assertEqual(kb.absorb([{"term": "省略恢复"}]), (1, 0))
+        self.assertEqual([n["id"] for n in store.load_knowledge()["nodes"]], ["省略恢复"])
+
+    def test_absorb_still_records_a_jd_when_only_some_nodes_are_absorbable(self):
+        # 反向确认：早退守卫不能把「有货 + 有垃圾」的正常调用一起挡掉
+        added, merged = kb.absorb([_node(term=""), _node(term="省略恢复")], {"id": "j1"})
+        self.assertEqual((added, merged), (1, 0))
+        card = store.load_knowledge()["nodes"][0]
+        self.assertEqual(card["term"], "省略恢复")
+        self.assertEqual([j["id"] for j in card["from_jds"]], ["j1"])
+
+
+class ConcurrentWriteTest(IsolatedCase):
+    """C1：knowledge.json 的读-改-写必须串行。
+
+    真实故障形态（实测过）：分析要 20–60 秒，且只禁用 #goBtn —— 用户完全可以在知识库 tab 里
+    点掌握度。于是「分析结尾的 absorb」与「set_state」两个线程会同时 load→改→save，
+    后写完的把先写完的整个覆盖掉（审查者 120 轮丢 31 次，我 120 轮丢 99 次）。
+
+    这条测试同时钉住三件事：① 每一轮 state 改动都没丢 ② 每次读回的文件都能解析 ③ 节点数符合预期。
+    """
+
+    THREADS = 4
+    ROUNDS = 12
+
+    def test_concurrent_absorb_and_set_state_never_lose_updates_or_corrupt_the_file(self):
+        store.ensure_profile()
+        path = store.knowledge_path()
+        barrier = threading.Barrier(self.THREADS)
+        errors = []
+
+        def worker(t):
+            try:
+                for r in range(self.ROUNDS):
+                    barrier.wait(timeout=30)
+                    added, _ = kb.absorb([_node(term="概念-%d-%d" % (t, r))],
+                                         {"id": "j%d" % t, "job_title": "岗%d" % t})
+                    if added != 1:
+                        errors.append("线程 %d 第 %d 轮 absorb 报告 added=%d" % (t, r, added))
+                    ok, msg = kb.set_state("概念-%d-%d" % (t, r), "已掌握")
+                    if not ok:
+                        errors.append("线程 %d 第 %d 轮 set_state 失败：%s" % (t, r, msg))
+            except Exception as e:                 # 异常必须带回主线程，否则会被 unittest 吞掉
+                errors.append("线程 %d 抛异常：%r" % (t, e))
+
+        threads = [threading.Thread(target=worker, args=(t,)) for t in range(self.THREADS)]
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join(timeout=120)
+
+        self.assertEqual(errors, [])
+        # ② 文件必须还能解析（去掉任一保护都会出现半截文件 → read_json 归 None）
+        raw = store.read_text(path)
+        try:
+            parsed = json.loads(raw)
+        except ValueError as e:
+            self.fail("并发写之后 knowledge.json 无法解析：%s" % e)
+        # ③ 节点数符合预期
+        self.assertEqual(len(parsed["nodes"]), self.THREADS * self.ROUNDS)
+        # ① 每一轮的 state 改动都没有丢
+        states = {n["id"]: n.get("state") for n in parsed["nodes"]}
+        missing = [k for k, v in states.items() if v != "已掌握"]
+        self.assertEqual(missing, [])
+        self.assertEqual(len(states), self.THREADS * self.ROUNDS)
+        self.assertEqual(len(store.load_knowledge()["nodes"]), self.THREADS * self.ROUNDS)
+
+
+class AtomicWriteTest(IsolatedCase):
+    """C1 的第二道防线：store.write_json 原子写。
+
+    即使将来还有别的交错路径（或多进程），也不能再产生「无法解析」的文件；
+    进程被 kill 时也不能留下截断成半截的 knowledge.json。
+    """
+
+    def test_write_json_replaces_target_atomically(self):
+        store.ensure_profile()
+        path = store.knowledge_path()
+        store.write_json(path, {"version": 1, "nodes": [{"id": "a"}]})
+        store.write_json(path, {"version": 1, "nodes": [{"id": "b"}]})
+        self.assertEqual(store.read_json(path), {"version": 1, "nodes": [{"id": "b"}]})
+        # 保留原有格式：ensure_ascii=False + indent=2（中文不转义、两空格缩进）
+        raw = store.read_text(path)
+        self.assertIn('"id": "b"', raw)
+        self.assertIn("\n  ", raw)
+        self.assertNotIn("\\u", raw)
+
+    def test_dump_failure_leaves_the_old_file_intact_and_no_temp_junk(self):
+        store.ensure_profile()
+        path = store.knowledge_path()
+        good = {"version": 1, "nodes": [{"id": "省略恢复", "term": "省略恢复"}]}
+        store.write_json(path, good)
+        before = store.read_text(path)
+        d = os.path.dirname(path)
+        real_dump = json.dump
+        calls = {"n": 0}
+
+        def flaky_dump(obj, fp, **kw):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                real_dump(obj, fp, **kw)          # 先往临时文件里写一份完整内容……
+                raise RuntimeError("模拟写到一半磁盘/进程挂了")
+            return real_dump(obj, fp, **kw)
+
+        with mock.patch.object(json, "dump", flaky_dump):
+            with self.assertRaises(RuntimeError):
+                store.write_json(path, {"version": 1, "nodes": [{"id": "会被丢掉的新内容"}]})
+
+        self.assertEqual(store.read_text(path), before)    # 原文件分毫未动
+        self.assertEqual(store.read_json(path), good)
+        # 临时文件必须被清理干净，目录里不能留垃圾
+        leftovers = [f for f in os.listdir(d) if f.startswith(".tmp-")]
+        self.assertEqual(leftovers, [])
+
+    def test_serialization_failure_also_leaves_no_temp_junk(self):
+        store.ensure_profile()
+        path = store.knowledge_path()
+        store.write_json(path, {"version": 1, "nodes": []})
+        before = store.read_text(path)
+        with self.assertRaises(TypeError):
+            store.write_json(path, {"bad": {1, 2, 3}})     # set 不可 JSON 序列化
+        self.assertEqual(store.read_text(path), before)
+        self.assertEqual([f for f in os.listdir(os.path.dirname(path)) if f.startswith(".tmp-")], [])
+
 
 class DuplicateTest(IsolatedCase):
     def _seed(self, terms):
@@ -577,13 +790,25 @@ class DuplicateTest(IsolatedCase):
         self.assertEqual(kb.find_duplicates(store.load_knowledge()), [])
 
     def test_short_terms_do_not_generate_prefix_noise(self):
+        # 守的是「首尾相近」的两个 ≥6 字门槛：这批 2 字词共享首尾字，没有门槛会被刷成一片假配对。
+        # （与「插入式」的 len(short)>=3 门槛无关 —— 那条由 test_two_char_term_inside_a_long_term_is_not_a_pair 钉住。）
         self._seed(["抽样", "抽取", "抽检"])
         self.assertEqual(kb.find_duplicates(store.load_knowledge()), [])
 
     def test_two_char_terms_never_become_subsequence_pairs(self):
-        # 「插入式」分支要求短词 ≥3 字：2 字词极易互相成为有序子序列，
-        # 没有这道门槛会刷出一堆假配对（这条测试就是钉住这道门槛的）
+        # 这一批负例守住的是「同一个字在两个 2 字词里都出现」这类噪音不成对。
+        # **注意它守不住 len(short)>=3 那道门槛**：两个长度都是 2 的不同术语永远不可能互为
+        # 有序子序列（长度 2 是长度 2 的子序列 ⟺ 两者相等，而相等在 _dup_reason 开头就被排除了），
+        # 所以删掉门槛这批照样绿。真正钉门槛的是下面 test_two_char_term_inside_a_long_term_is_not_a_pair。
         self._seed(["抽样", "抽检", "抽取", "标注", "标准", "指标", "幻觉", "错觉"])
+        self.assertEqual(kb.find_duplicates(store.load_knowledge()), [])
+
+    def test_two_char_term_inside_a_long_term_is_not_a_pair(self):
+        # 「插入式」分支的 len(short) >= 3 门槛。这里是**真能红**的负例：
+        # 「幻觉」2 字，每个字都按序出现在「幻象觉知」里（跳过了中间的「象」），长度差 2 ≤ 4，
+        # 互相又不是连续子串、去后缀词后词干也不同 —— 删掉门槛就会被判成「插入式」。
+        # 上面那批 2 字两两配对的负例与这道门槛无关，所以必须单列一条（否则门槛被删也是全绿）。
+        self._seed(["幻觉", "幻象觉知"])
         self.assertEqual(kb.find_duplicates(store.load_knowledge()), [])
 
     def test_subsequence_variant_is_detected(self):
@@ -595,8 +820,10 @@ class DuplicateTest(IsolatedCase):
         self.assertEqual(dups[0]["reason"], "插入式")
 
     def test_limit_is_respected(self):
+        # 必须是等号：40 个「概念N号」里前 20 对能配满 20 条，assertLessEqual 连恒返回 [] 的
+        # 实现都能绿（假绿）。
         self._seed(["概念%d号" % i for i in range(40)])
-        self.assertLessEqual(len(kb.find_duplicates(store.load_knowledge())), 20)
+        self.assertEqual(len(kb.find_duplicates(store.load_knowledge())), 20)
 
 
 class ManualMergeTest(IsolatedCase):
@@ -971,11 +1198,13 @@ class _SandboxedHandler(app.Handler):
     冒出来就等于真实世界里的裸断。DATA_ROOT / LOG_FILE 由 IsolatedCase 指向临时目录。
     """
 
-    def __init__(self, path):
+    def __init__(self, path, method="GET", body=None):
         self.path = path
-        self.command = "GET"
-        self.rfile = io.BytesIO(b"")      # do_GET 不读 body，但 handler 得有这个属性
-        self.headers = {}
+        self.command = method
+        payload = b"" if body is None else json.dumps(body, ensure_ascii=False).encode("utf-8")
+        self.rfile = io.BytesIO(payload)
+        # Content-Length 必须与 payload 一致：_json_body() 按它读，不一致就会读空/读残
+        self.headers = {"Content-Length": str(len(payload))}
         self.wfile = io.BytesIO()
         self.code = None
 
@@ -996,6 +1225,12 @@ class _SandboxedHandler(app.Handler):
 def _get(path):
     h = _SandboxedHandler(path)
     h.do_GET()
+    return h.code, h.body()
+
+
+def _post(path, body):
+    h = _SandboxedHandler(path, method="POST", body=body)
+    h.do_POST()
     return h.code, h.body()
 
 
@@ -1058,3 +1293,110 @@ class AnalyzeAbsorbGuardTest(IsolatedCase):
         # 反向确认：守卫不能把正常沉淀一起挡掉
         self._run_analyze([_node(term="省略恢复")])
         self.assertEqual([n["term"] for n in store.load_knowledge()["nodes"]], ["省略恢复"])
+
+    def test_zero_absorbable_terms_does_not_touch_a_corrupt_kb_file(self):
+        # I1 的第二形态：报告/回填传进来的节点全是空术语（analyze 那条路径有 if know_nodes 守卫，
+        # 但 absorb_reports / CLI 回填没有）。absorb 自己必须在隔离之前早退。
+        store.ensure_profile()
+        path = store.knowledge_path()
+        store.write_text(path, "{ 坏文件")
+        self.assertEqual(kb.absorb([_node(term=""), _node(term="、、。")], {"id": "j1"}), (0, 0))
+        self.assertEqual(store.read_text(path), "{ 坏文件")
+        self.assertEqual(glob.glob(path + ".corrupt-*"), [])
+
+
+class KnowledgeWriteRouteTest(IsolatedCase):
+    """I5：/api/knowledge/state 与 /api/knowledge/merge 是前端仅有的两条写路径，此前零覆盖。
+
+    用与 KnowledgeRouteTest 同一套沙箱化 handler（不接套接字、直接调 do_POST），
+    DATA_ROOT / LOG_FILE 由 IsolatedCase 指向临时目录。
+    """
+
+    def _seed(self):
+        store.ensure_profile()
+        store.save_knowledge({"nodes": [
+            {"id": "省略恢复", "term": "省略恢复", "state": "待学习", "last_outcome": "未面试",
+             "asked_count": 0, "from_jds": [{"id": "j1", "job_title": "岗1"}]},
+            {"id": "省略识别及恢复", "term": "省略识别及恢复", "state": "待学习", "last_outcome": "未面试",
+             "asked_count": 0, "from_jds": [{"id": "j2", "job_title": "岗2"}]},
+        ]})
+
+    def test_set_state_route_200_and_persists(self):
+        self._seed()
+        code, body = _post("/api/knowledge/state", {"id": "省略恢复", "state": "已掌握"})
+        self.assertEqual(code, 200)
+        self.assertTrue(body["ok"])
+        # 不只是看响应：库内的数据必须真的变了，而且另一张卡一点没动
+        cards = {n["id"]: n for n in store.load_knowledge()["nodes"]}
+        self.assertEqual(cards["省略恢复"]["state"], "已掌握")
+        self.assertEqual(cards["省略识别及恢复"]["state"], "待学习")
+        self.assertTrue(_log_events("kb.state_set"))
+
+    def test_set_state_route_accepts_raw_term(self):
+        # 前端传的是节点 id，但接口契约允许原始术语（内部 normalize_id）
+        self._seed()
+        code, body = _post("/api/knowledge/state", {"id": "省略恢复（全角括号）", "state": "学习中"})
+        self.assertEqual(code, 400)                    # 归一化后对不上，如实报错而不是假装成功
+        self.assertFalse(body["ok"])
+        code, body = _post("/api/knowledge/state", {"id": "省略恢复", "state": "学习中"})
+        self.assertEqual(code, 200)
+        self.assertTrue(body["ok"])
+        self.assertEqual(store.load_knowledge()["nodes"][0]["state"], "学习中")
+
+    def test_set_state_route_rejects_bad_state(self):
+        self._seed()
+        code, body = _post("/api/knowledge/state", {"id": "省略恢复", "state": "已精通"})
+        self.assertEqual(code, 400)
+        self.assertFalse(body["ok"])
+        self.assertIn("状态不合法", body["error"])
+        self.assertEqual(store.load_knowledge()["nodes"][0]["state"], "待学习")   # 库没被改
+
+    def test_set_state_route_rejects_unknown_id(self):
+        self._seed()
+        code, body = _post("/api/knowledge/state", {"id": "不存在的卡", "state": "已掌握"})
+        self.assertEqual(code, 400)
+        self.assertFalse(body["ok"])
+        self.assertIn("找不到该知识点", body["error"])
+
+    def test_set_state_route_tolerates_missing_fields(self):
+        # 请求体缺 id/state 时不能抛（do_POST 外层 try 会兜成 500，但这是客户端错误，该是 400）
+        self._seed()
+        code, body = _post("/api/knowledge/state", {})
+        self.assertEqual(code, 400)
+        self.assertFalse(body["ok"])
+
+    def test_merge_route_200_and_merges_for_real(self):
+        self._seed()
+        code, body = _post("/api/knowledge/merge", {"keep_id": "省略恢复", "drop_id": "省略识别及恢复"})
+        self.assertEqual(code, 200)
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["message"], body["error"])          # 成功时两者同文案
+        cards = store.load_knowledge()["nodes"]
+        self.assertEqual(len(cards), 1)                            # drop 卡真的被移除了
+        self.assertEqual(cards[0]["id"], "省略恢复")
+        self.assertIn("省略识别及恢复", cards[0]["aliases"])
+        self.assertEqual([j["id"] for j in cards[0]["from_jds"]], ["j1", "j2"])
+        self.assertTrue(_log_events("kb.merge_done"))
+
+    def test_merge_route_rejects_identical_ids(self):
+        self._seed()
+        code, body = _post("/api/knowledge/merge", {"keep_id": "省略恢复", "drop_id": "省略恢复"})
+        self.assertEqual(code, 400)
+        self.assertFalse(body["ok"])
+        self.assertIn("不能和自己合并", body["error"])
+        self.assertEqual(len(store.load_knowledge()["nodes"]), 2)  # 拒绝时绝不动库
+
+    def test_merge_route_rejects_unknown_id(self):
+        self._seed()
+        code, body = _post("/api/knowledge/merge", {"keep_id": "省略恢复", "drop_id": "不存在的卡"})
+        self.assertEqual(code, 400)
+        self.assertFalse(body["ok"])
+        self.assertIn("找不到要合并的知识点", body["error"])
+        self.assertEqual(len(store.load_knowledge()["nodes"]), 2)
+
+    def test_merge_route_rejects_empty_ids(self):
+        self._seed()
+        code, body = _post("/api/knowledge/merge", {})
+        self.assertEqual(code, 400)
+        self.assertFalse(body["ok"])
+        self.assertIn("两个知识点都要选", body["error"])

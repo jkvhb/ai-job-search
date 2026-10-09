@@ -3,6 +3,7 @@
 import json
 import os
 import re
+import tempfile
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 DATA_ROOT = os.path.join(ROOT, "data")
@@ -93,9 +94,31 @@ def read_json(path, default=None):
 
 
 def write_json(path, obj):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(obj, f, ensure_ascii=False, indent=2)
+    """原子写 JSON：先写同目录临时文件，再 os.replace 换过去。
+
+    为什么必须原子：`open(path,"w")` 会立刻把原文件截断成 0 字节，之后 json.dump 是一段一段
+    往盘上写的（knowledge.json 有 27 万字节）。这中间任何一次并发读（例如用户在知识库 tab
+    里点掌握度时的 load）读到的是半截文件，`read_json` 归成 None、`load_knowledge` 静默返回
+    `{"nodes": []}`，下一次 absorb 还会把这份坏文件当垃圾隔离走 —— 用户 97 个概念就此从可见库
+    消失。进程被 kill / 断电时同样会留下半截文件。
+
+    临时文件必须与目标**同目录**：os.replace 只在同一文件系统内保证原子（跨盘会退化成复制）。
+    序列化或写盘中途失败时删掉临时文件，绝不在目录里留垃圾。
+    """
+    d = os.path.dirname(path)
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".tmp-", suffix=".json", dir=d)
+    os.close(fd)
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def safe_name(name):
