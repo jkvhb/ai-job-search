@@ -284,12 +284,15 @@ def do_analyze(jd_text, image_data_url, resume_name, link=""):
         # kb.absorb 故意不吞 store.save_knowledge 的 I/O 失败（吞掉就等于骗用户「已沉淀」），
         # 所以边界必须在这里：知识库出任何问题都只记日志，报告已经写好了。
         try:
-            kb.absorb(know_nodes, {
-                "id": job_id,
-                "job_title": d.get("job_title") or "",
-                "company": d.get("company") or "",
-                "date": datetime.now().strftime("%Y-%m-%d"),
-            })
+            # 没抽出任何知识点时绝不碰库文件：库文件损坏 + 本次零知识点的组合下，absorb 会
+            # 「先隔离坏文件、再写回空库」—— 等于吸收了个寂寞，还把用户已有的积累清空。
+            if know_nodes:
+                kb.absorb(know_nodes, {
+                    "id": job_id,
+                    "job_title": d.get("job_title") or "",
+                    "company": d.get("company") or "",
+                    "date": datetime.now().strftime("%Y-%m-%d"),
+                })
         except Exception as e:
             log.log_exc("kb.absorb_error", e)
 
@@ -462,21 +465,28 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"jobs": store.load_jobs(), "categories": store.CATEGORIES, "statuses": store.STATUSES})
 
         if p == "/api/knowledge":
-            def one(k, d=""):
+            def one(k, default=""):
                 v = q.get(k)
-                return v[0] if v else d
-            data = store.load_knowledge()
-            return self._send(200, {
-                "ok": True,
-                "nodes": kb.list_nodes(data, q=one("q"), state=one("state"),
-                                       category=one("category"), jd_id=one("jd"),
-                                       sort=one("sort") or "mentions"),
-                "stats": kb.stats(data),
-                "duplicates": kb.find_duplicates(data),
-                "jds": kb.all_jds(data),
-                "categories": kb.all_categories(data),
-                "states": list(kb.STATE_VALUES),
-            })
+                return v[0] if v else default
+            try:
+                data = store.load_knowledge()
+                return self._send(200, {
+                    "ok": True,
+                    "nodes": kb.list_nodes(data, q=one("q"), state=one("state"),
+                                           category=one("category"), jd_id=one("jd"),
+                                           sort=one("sort") or "mentions"),
+                    "stats": kb.stats(data),
+                    "duplicates": kb.find_duplicates(data),
+                    "jds": kb.all_jds(data),
+                    "categories": kb.all_categories(data),
+                    "states": list(kb.STATE_VALUES),
+                })
+            except Exception as e:
+                # do_POST 有外层 try，do_GET 没有：手改坏的 knowledge.json 曾让这里抛 TypeError，
+                # 服务器直接关连接 —— 客户端拿到的是 RemoteDisconnected，连 500 都没有。
+                # 兜底成结构化错误，前端才能显示「知识库读取失败」而不是静默白屏。
+                log.log_exc("kb.api_error", e)
+                return self._send(500, {"ok": False, "error": "知识库读取失败：%s" % e})
 
         if p == "/api/jd_text":
             job = store.find_job(store.safe_name(q.get("id", [""])[0]))

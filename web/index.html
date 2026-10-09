@@ -641,8 +641,11 @@ function kbRenderDup(){
 }
 
 async function kbSetState(id, state){
-  const r = await (await fetch('/api/knowledge/state',{method:'POST',
-    headers:{'Content-Type':'application/json'},body:JSON.stringify({id:id,state:state})})).json();
+  let r;
+  try{
+    r = await (await fetch('/api/knowledge/state',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify({id:id,state:state})})).json();
+  }catch(e){ toast('操作失败：'+e.message); return; }   // 服务中途挂掉也要有反馈，不能静默
   if(!r.ok){ toast('切换失败：'+r.error); return; }
   toast('已标记为「'+state+'」'); kbLoad();
 }
@@ -654,7 +657,8 @@ async function kbImport(){
       headers:{'Content-Type':'application/json'},body:'{}'})).json();
     toast(r.ok ? ('已从 '+r.files+' 份报告导入：新增 '+r.added+'，合并 '+r.merged) : ('导入失败：'+r.error));
     kbLoad();
-  } finally { btn.disabled = false; btn.textContent = '从已有报告导入'; }
+  }catch(e){ toast('操作失败：'+e.message); }           // 失败也必须走 finally 把按钮恢复
+  finally { btn.disabled = false; btn.textContent = '从已有报告导入'; }
 }
 
 function initKnowTab(){

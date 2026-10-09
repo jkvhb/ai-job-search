@@ -12,6 +12,7 @@
   3. sources 完整保留 —— 用户明确强调「来源尤其关键」，知识库里必须能点进原文
 """
 import glob
+import itertools
 import json
 import log
 import os
@@ -42,8 +43,10 @@ _PUNCT = re.compile(r"[\s\u3000·・、,，.。;；:：!！?？\"'“”‘’()
 
 REPORT_MARK = "const REPORT_DATA = "
 
-# 隔离备份名的自增序号：只到秒会互相覆盖，加 pid 也挡不住「同一进程同一秒内两次隔离」
-_QUARANTINE_SEQ = 0
+# 隔离备份名的自增序号：只到秒会互相覆盖，加 pid 也挡不住「同一进程同一秒内两次隔离」。
+# 用 itertools.count 而不是 `+= 1`：后者是 LOAD/ADD/STORE 三步，在 ThreadingHTTPServer 下
+# 两个请求线程可能读到同一个旧值，导致备份名相撞、先备份的文件被后一个覆盖掉。
+_QUARANTINE_SEQ = itertools.count(1)
 
 
 def normalize_id(term):
@@ -160,11 +163,17 @@ def clean_questions(qs):
 
 
 def _add_jd(card, jd):
-    """记录「这个知识点被哪个岗位提到过」，按 job_id 去重（幂等的关键）"""
+    """记录「这个知识点被哪个岗位提到过」，按 job_id 去重（幂等的关键）。
+
+    `from_jds` 里的历史项也按同一把尺子过滤：只有**有 id 的 dict** 才算一条来源岗位。
+    没有 id 的 dict 留着会被 stats()["multi_jd"] 计入，而 all_jds() 又会跳过它 —— 同一个库
+    两处口径打架，前端会显示出「被 2 个以上岗位提到」却在下拉里找不到对应岗位的幻影。
+    """
     if not isinstance(jd, dict) or not jd.get("id"):
         return
-    # 顺手清掉历史垃圾项（字符串/数字/None）：留着会被统计、回填与前端当成岗位记录踩到
-    frm = [x for x in _as_list(card.get("from_jds")) if isinstance(x, dict)]
+    # 顺手清掉历史垃圾项（字符串/数字/None，以及没有 id 的 dict）
+    frm = [x for x in _as_list(card.get("from_jds"))
+           if isinstance(x, dict) and x.get("id")]
     if any(x.get("id") == jd["id"] for x in frm):
         return
     frm.append({"id": jd["id"], "job_title": jd.get("job_title") or "",
@@ -256,10 +265,9 @@ def _quarantine_corrupt_kb():
     if not store.read_text(path, "").strip():
         return True                  # 文件不存在或为空：没有可丢的数据
     # 文件名带自增序号：同秒内两次隔离（或两个进程）绝不能互相覆盖备份
-    global _QUARANTINE_SEQ
-    _QUARANTINE_SEQ += 1
+    seq = next(_QUARANTINE_SEQ)
     backup = "%s.corrupt-%s-%d-%04d" % (path, datetime.now().strftime("%Y%m%d%H%M%S"),
-                                       os.getpid(), _QUARANTINE_SEQ)
+                                       os.getpid(), seq)
     try:
         os.replace(path, backup)
     except OSError as e:
@@ -412,26 +420,24 @@ def merge_nodes(keep_id, drop_id, kb=None):
     if keep is None or drop is None:
         return False, "找不到要合并的知识点"
 
-    # 进度并集必须在 _merge_into **之前**取快照：_merge_into 会就地改 keep/drop 两个 dict
-    # （index 与 kb["nodes"] 是同一批对象），它会把 drop 的 last_outcome 补成默认值，
-    # 之后再去读 drop 就已经把用户真实的「已面试」读丢了。
-    union = {
-        "state": drop.get("state"),
-        "last_outcome": drop.get("last_outcome"),
-        "asked_count": _as_int(drop.get("asked_count")),
-        "first_seen": str(drop.get("first_seen") or ""),
-    }
-
+    # 进度并集在 _merge_into **之后**取（计划原文顺序）：_merge_into 只写 keep、从不写 drop
+    # （对 drop 只有 clean_*(node.get(...)) 这类读取），所以「先合并内容」与「先取进度快照」
+    # 结果完全相同；放在后面只是让「合并内容」与「合并进度」两段连起来读。
     _merge_into(keep, drop)
 
     # 手动合并两张「用户卡」时进度要取并集：否则误选合并方向就会静默丢掉复习进度
-    keep["asked_count"] = max(_as_int(keep.get("asked_count")), union["asked_count"])
-    if _STATE_RANK.get(str(union["state"]), 0) > _STATE_RANK.get(str(keep.get("state")), 0):
-        keep["state"] = union["state"]
-    if str(union["last_outcome"] or "") not in ("", DEFAULT_OUTCOME):
-        keep["last_outcome"] = union["last_outcome"]
-    fs = union["first_seen"]
-    if fs and (not keep.get("first_seen") or fs < str(keep["first_seen"])):
+    keep["asked_count"] = max(_as_int(keep.get("asked_count")), _as_int(drop.get("asked_count")))
+    if _STATE_RANK.get(str(drop.get("state")), 0) > _STATE_RANK.get(str(keep.get("state")), 0):
+        keep["state"] = drop["state"]
+    # last_outcome 取值也要归一：knowledge.json 是用户可手改的，`"last_outcome": 5` 这类非法值
+    # 只该回落默认（keep 已由 _merge_into 补齐），绝不能原样落到本该干净的 keep 卡上。
+    # state 有 rank 守卫、asked_count 过了 _as_int，这里同样必须过一道类型关。
+    outcome = drop.get("last_outcome")
+    outcome = outcome.strip() if isinstance(outcome, str) else ""
+    if outcome and outcome != DEFAULT_OUTCOME:
+        keep["last_outcome"] = outcome
+    fs = str(drop.get("first_seen") or "")
+    if fs and (not keep.get("first_seen") or fs < str(keep.get("first_seen"))):
         keep["first_seen"] = fs
 
     aliases = _as_list(keep.get("aliases"))
@@ -494,11 +500,16 @@ def list_nodes(kb, q="", state="", category="", jd_id="", sort="mentions"):
 
 
 def all_jds(kb):
-    """知识库里出现过的来源岗位（给筛选下拉用）"""
+    """知识库里出现过的来源岗位（给筛选下拉用）。
+
+    只索引**字符串** id：knowledge.json 是用户可手改的，`{"id": [1]}` 这类不可哈希的 id 会让
+    `out[j["id"]]` 直接抛 `TypeError: unhashable type: 'list'` —— 顺着 /api/knowledge 冒出去，
+    整个知识库 tab 就打不开了。非字符串 id 既选不了也没法当筛选条件，跳过它们。
+    """
     out = {}
     for n in ensure_kb(kb)["nodes"]:
         for j in _as_list(n.get("from_jds")):
-            if isinstance(j, dict) and j.get("id"):
+            if isinstance(j, dict) and isinstance(j.get("id"), str) and j["id"]:
                 out[j["id"]] = j.get("job_title") or j["id"]
     return [{"id": k, "title": v} for k, v in sorted(out.items())]
 
@@ -564,7 +575,11 @@ def absorb_reports():
             a, m = absorb(nodes, _report_jd(data, name))
             added += a
             merged += m
-            done += 1
+            # 只有真的吸收进去才算「这份报告处理成功」：absorb 在库文件损坏、且改名备份也失败时
+            # 会早退 return (0, 0)（宁可这次不沉淀也绝不用空库顶掉坏文件），那不是成功、不能计数；
+            # 知识点全是空术语的报告同样是 0/0，它确实什么都没沉淀。
+            if a or m:
+                done += 1
         except Exception as e:
             log.log_exc("kb.import_report_error", e, file=name)
             continue

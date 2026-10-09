@@ -1,10 +1,13 @@
 # -*- coding: utf-8 -*-
 import glob
+import io
 import json
 import log
 import os
 import unittest
+from unittest import mock
 
+import app
 import kb
 import store
 
@@ -70,6 +73,22 @@ def _log_events(name):
         return []
     return [e for e in (json.loads(l) for l in store.read_text(path).splitlines() if l.strip())
             if e.get("event") == name]
+
+
+def _real_jd_ids(card):
+    """卡片里「算数」的来源岗位 id：只认有 id 的 dict（与 kb._add_jd 同一把尺子）"""
+    return [x.get("id") for x in kb._as_list(card.get("from_jds"))
+            if isinstance(x, dict) and x.get("id")]
+
+
+def _consistent_multi_jd(kb_data):
+    """按「算数的来源岗位」重算 multi_jd：stats() 必须与它一致，否则两处口径打架"""
+    return sum(1 for n in kb_data["nodes"] if len(_real_jd_ids(n)) > 1)
+
+
+def _consistent_jd_ids(kb_data):
+    """all_jds() 应该返回的岗位 id 全集（同一把尺子）"""
+    return sorted({i for n in kb_data["nodes"] for i in _real_jd_ids(n)})
 
 
 class AbsorbTest(IsolatedCase):
@@ -342,12 +361,10 @@ class ResilienceTest(IsolatedCase):
         store.ensure_profile()
         path = store.knowledge_path()
         store.write_text(path, "{ this is not json")
-        real_replace = kb.os.replace
-        kb.os.replace = lambda *a, **kw: (_ for _ in ()).throw(OSError("rename failed"))
-        try:
+        # 用 patch.object 而不是直接给 kb.os.replace 赋值：后者是**进程级**改动 stdlib 的 os 模块，
+        # 断言中途抛错就永久留在原地，会污染之后的每一个测试
+        with mock.patch.object(kb.os, "replace", side_effect=OSError("rename failed")):
             added, merged = kb.absorb([_node()], {"id": "j1"})
-        finally:
-            kb.os.replace = real_replace
         self.assertEqual((added, merged), (0, 0))
         self.assertEqual(store.read_text(path), "{ this is not json")   # 坏文件原样保留
         self.assertEqual(glob.glob(path + ".corrupt-*"), [])            # 没有半成品备份
@@ -365,6 +382,13 @@ class ResilienceTest(IsolatedCase):
         self.assertEqual(sorted(store.read_text(x) for x in backups),
                          ["{ 坏文件 1", "{ 坏文件 2"])
 
+    def test_quarantine_sequence_yields_unique_values(self):
+        # 原实现是 `_QUARANTINE_SEQ += 1`（LOAD/ADD/STORE 三步）：ThreadingHTTPServer 下两个
+        # 请求线程可能读到同一个旧值，备份名相撞 → 先备份的坏文件被后一个覆盖掉。
+        # 现在是 C 层原子自增的计数器：连续取值必须两两不同
+        seq = [next(kb._QUARANTINE_SEQ) for _ in range(5)]
+        self.assertEqual(len(set(seq)), len(seq))
+
     def test_absorb_does_not_wipe_an_existing_live_kb(self):
         # 反向确认：正常库（能解析）绝不被隔离，absorb 之后内容只增不减
         kb.absorb([_node(term="A词")], {"id": "j1"})
@@ -372,22 +396,44 @@ class ResilienceTest(IsolatedCase):
         kb.absorb([_node(term="B词")], {"id": "j2"})
         self.assertEqual(sorted(n["term"] for n in store.load_knowledge()["nodes"]),
                          ["A词", "B词"])
+
     def test_jd_without_id_is_not_recorded(self):
-        # _add_jd 只过滤非 dict 时，「没有 id 的 dict」会被记进 from_jds：
-        # stats()["multi_jd"] 数它、all_jds() 又跳过它 —— 统计口径打架
+        # _add_jd 的**入参**守卫：没有 id 的岗位不该产生任何来源记录
         kb.absorb([_node()], {"job_title": "没有 id 的岗位"})
         card = store.load_knowledge()["nodes"][0]
         self.assertEqual(card["from_jds"], [])
         self.assertEqual(kb.stats(store.load_knowledge())["multi_jd"], 0)
         self.assertEqual(kb.all_jds(store.load_knowledge()), [])
 
-    def test_id_less_jd_does_not_inflate_multi_jd(self):
-        kb.absorb([_node()], {"id": "j1"})
-        kb.absorb([_node()], {"job_title": "没有 id"})
-        kb.absorb([_node()], {"company": "没有 id 的公司"})
+    def test_phantom_jd_without_id_is_cleaned_on_next_absorb(self):
+        # 只压入参守卫是**假绿**：历史/手改的卡片里已经存在的无 id dict 也必须在下一次 absorb
+        # 时被清掉。旧实现只过滤「非 dict」，这条幻影会留在 from_jds 里 → 统计口径打架。
+        store.ensure_profile()
+        store.save_knowledge({"nodes": [{"id": "省略恢复", "term": "省略恢复", "state": "待学习",
+                                         "from_jds": [{"job_title": "幻影"}]}]})
+        kb.absorb([_node()], {"id": "j1", "job_title": "岗1"})
         d = store.load_knowledge()
-        self.assertEqual(len(d["nodes"][0]["from_jds"]), 1)
+        self.assertEqual([j.get("id") for j in d["nodes"][0]["from_jds"]], ["j1"])   # 幻影被清掉
         self.assertEqual(kb.stats(d)["multi_jd"], 0)
+        self.assertEqual([j["id"] for j in kb.all_jds(d)], ["j1"])
+
+    def test_multi_jd_agrees_with_all_jds_when_history_has_id_less_entries(self):
+        # stats()["multi_jd"] 与 all_jds() 必须同一把尺子：幻影项（无 id）既不该算进 multi_jd、
+        # 也不该出现在岗位下拉里，否则前端会显示「被 2 个以上岗位提到」却找不到那个岗位
+        store.ensure_profile()
+        store.save_knowledge({"nodes": [
+            {"id": "省略恢复", "term": "省略恢复", "state": "待学习",
+             "from_jds": [{"job_title": "幻影"}]},
+            {"id": "抽样检验", "term": "抽样检验", "state": "待学习",
+             "from_jds": [{"id": "j9", "job_title": "岗9"}, {"id": "j8", "job_title": "岗8"}]},
+        ]})
+        kb.absorb([_node(), _node(term="抽样检验")], {"id": "j1", "job_title": "岗1"})
+        d = store.load_knowledge()
+        self.assertEqual([j.get("id") for j in d["nodes"][0]["from_jds"]], ["j1"])
+        self.assertEqual(kb.stats(d)["multi_jd"], _consistent_multi_jd(d))     # 口径一致
+        self.assertEqual([j["id"] for j in kb.all_jds(d)], _consistent_jd_ids(d))
+        self.assertEqual(kb.stats(d)["multi_jd"], 1)                           # 只有「抽样检验」被多岗提到
+        self.assertEqual([j["id"] for j in kb.all_jds(d)], ["j1", "j8", "j9"])
 
 
 class DuplicateTest(IsolatedCase):
@@ -599,6 +645,21 @@ class ProgressUnionTest(IsolatedCase):
         self.assertEqual(card["last_outcome"], "已面试")
         self.assertEqual(card["asked_count"], 3)
 
+    def test_merge_normalizes_junk_last_outcome_instead_of_copying_it(self):
+        # knowledge.json 可手改：drop 的 last_outcome 是 5 这类非法值时应回落默认，
+        # 绝不能原样写到本该干净的 keep 卡上（旧实现原样拷贝，keep 就变成了 5）
+        self._seed("A词", "j1")
+        self._seed("B词", "j2", outcome=5)
+        self.assertTrue(kb.merge_nodes("A词", "B词")[0])
+        self.assertEqual(store.load_knowledge()["nodes"][0]["last_outcome"], kb.DEFAULT_OUTCOME)
+
+    def test_merge_strips_last_outcome_whitespace(self):
+        # 归一：合法值两侧的空白要吃掉，否则状态筛选与「已面试」的判等全部落空
+        self._seed("A词", "j1")
+        self._seed("B词", "j2", outcome="  已面试  ")
+        self.assertTrue(kb.merge_nodes("A词", "B词")[0])
+        self.assertEqual(store.load_knowledge()["nodes"][0]["last_outcome"], "已面试")
+
     def test_merge_takes_earliest_first_seen(self):
         # first_seen = 「这个概念最早什么时候出现」，并集口径下应取更早的一侧
         self._seed("A词", "j1", first_seen="2026-10-08")
@@ -802,3 +863,135 @@ class ImportReportsTest(IsolatedCase):
         self.assertTrue(res)
         self.assertTrue(all(e["level"] == "info" for e in res))
         self.assertFalse(_log_events("kb.import_report_error"))
+
+    def test_report_is_not_counted_done_when_kb_quarantine_fails(self):
+        # absorb 早退（坏库 + 改名备份失败）返回 (0, 0)：那不是「这份报告处理成功」，done 不能 +1
+        store.ensure_profile()
+        path = store.knowledge_path()
+        store.write_text(path, "{ 坏文件")
+        self._write_report("20261008_岗A_80分.html", {
+            "report_id": "20261008_岗A_80分", "job_title": "岗A",
+            "knowledge": [_node(term="省略恢复")]})
+        with mock.patch.object(kb.os, "replace", side_effect=OSError("rename failed")):
+            files, added, merged = kb.absorb_reports()
+        self.assertEqual((files, added, merged), (0, 0, 0))
+        self.assertEqual(store.read_text(path), "{ 坏文件")     # 坏文件原样保留
+        self.assertEqual(glob.glob(path + ".corrupt-*"), [])
+
+
+class AllJdsTest(IsolatedCase):
+    def test_unhashable_and_non_string_ids_do_not_raise(self):
+        # 用户手改的 knowledge.json：`{"id": [1]}` 曾让 all_jds() 抛
+        # TypeError: unhashable type: 'list'，顺着 /api/knowledge 让连接裸断
+        kb_data = {"nodes": [
+            {"id": "卡1", "term": "卡1", "from_jds": [{"id": [1], "job_title": "列表 id"}]},
+            {"id": "卡2", "term": "卡2", "from_jds": [{"id": {"a": 1}}, {"id": 5}]},
+            {"id": {"a": 1}, "term": "怪节点", "from_jds": [{"id": "j1", "job_title": "岗1"}]},
+            {"id": 5, "term": "数字节点",
+             "from_jds": ["junk", {"id": None}, {"job_title": "无 id"}]},
+        ]}
+        self.assertEqual([j["id"] for j in kb.all_jds(kb_data)], ["j1"])
+
+    def test_string_ids_are_still_collected_and_sorted(self):
+        # 反向确认：跳过非字符串 id 不等于把岗位下拉清空
+        kb_data = {"nodes": [{"id": "卡", "from_jds": [{"id": "j2", "job_title": "岗2"},
+                                                       {"id": "j1"}]}]}
+        self.assertEqual(kb.all_jds(kb_data),
+                         [{"id": "j1", "title": "j1"}, {"id": "j2", "title": "岗2"}])
+
+
+class _SandboxedHandler(app.Handler):
+    """不接套接字的 Handler 沙箱：直接调 do_GET 并收下响应。
+
+    为什么必须这么测：Fix ② 的故障形态就是「do_GET 抛异常 → 服务器关掉连接、没有任何 HTTP
+    响应」，客户端只看到 RemoteDisconnected，连 500 都没有。这里异常会原样冒出来 ——
+    冒出来就等于真实世界里的裸断。DATA_ROOT / LOG_FILE 由 IsolatedCase 指向临时目录。
+    """
+
+    def __init__(self, path):
+        self.path = path
+        self.command = "GET"
+        self.rfile = io.BytesIO(b"")      # do_GET 不读 body，但 handler 得有这个属性
+        self.headers = {}
+        self.wfile = io.BytesIO()
+        self.code = None
+
+    def send_response(self, code, message=None):
+        self.code = code
+
+    def send_header(self, key, value):
+        pass
+
+    def end_headers(self):
+        pass
+
+    def body(self):
+        raw = self.wfile.getvalue()
+        return json.loads(raw.decode("utf-8")) if raw else None
+
+
+def _get(path):
+    h = _SandboxedHandler(path)
+    h.do_GET()
+    return h.code, h.body()
+
+
+class KnowledgeRouteTest(IsolatedCase):
+    """Fix ② 的路由层：手改坏的 knowledge.json 必须得到结构化响应，绝不能让连接裸断。
+
+    （与 kb.py 的修正同属一次改动，仓库还没有 test_app.py，所以路由测试先落在这里。）
+    """
+
+    def test_route_survives_hand_edited_knowledge_json(self):
+        store.ensure_profile()
+        store.write_json(store.knowledge_path(), {"nodes": [
+            {"id": "卡1", "term": "卡1", "from_jds": [{"id": [1]}]},
+            {"id": {"a": 1}, "term": "怪卡", "from_jds": [{"id": 5}]},
+            {"id": 5, "term": "数字卡", "from_jds": [{"id": "j1", "job_title": "岗1"}]},
+        ]})
+        code, body = _get("/api/knowledge")
+        self.assertEqual(code, 200)
+        self.assertTrue(body["ok"])
+        self.assertEqual([j["id"] for j in body["jds"]], ["j1"])
+
+    def test_route_returns_500_instead_of_dropping_the_connection(self):
+        # 第二道防线：即使读取路径以外的地方炸了，也必须回结构化 500 而不是裸断连接
+        store.ensure_profile()
+        store.save_knowledge({"nodes": []})
+        with mock.patch.object(kb, "stats", side_effect=RuntimeError("boom")):
+            code, body = _get("/api/knowledge")
+        self.assertEqual(code, 500)
+        self.assertFalse(body["ok"])
+        self.assertIn("知识库读取失败", body["error"])
+        self.assertTrue(_log_events("kb.api_error"))
+
+
+class AnalyzeAbsorbGuardTest(IsolatedCase):
+    """Fix ⑤：分析时零知识点就绝不碰库文件。
+
+    否则「库文件损坏 + 本次没抽出任何知识点」的组合会先隔离坏文件、再写回空库 ——
+    等于吸收了个寂寞，还把用户已有的积累清空。
+    """
+
+    def _run_analyze(self, know_nodes):
+        store.ensure_profile()
+        store.write_text(os.path.join(store.p_path("resumes"), "简历.md"), "候选人简历")
+        payload = {"job_title": "岗A", "company": "甲公司", "score": 80}
+        with mock.patch.object(app.llm, "call_openai_compatible", return_value="{}"), \
+             mock.patch.object(app.llm, "parse_json_reply", return_value=payload), \
+             mock.patch.object(app.knowledge, "build_for_jd", return_value=know_nodes), \
+             mock.patch.object(app, "render_report", return_value="20261008_岗A_80分.html"):
+            app.do_analyze("一份 JD 文本", None, "简历.md")
+
+    def test_zero_knowledge_does_not_touch_a_corrupt_kb_file(self):
+        store.ensure_profile()
+        path = store.knowledge_path()
+        store.write_text(path, "{ 坏文件")
+        self._run_analyze([])
+        self.assertEqual(store.read_text(path), "{ 坏文件")     # 坏文件原样留着
+        self.assertEqual(glob.glob(path + ".corrupt-*"), [])    # 也没被隔离走
+
+    def test_knowledge_is_still_absorbed_when_present(self):
+        # 反向确认：守卫不能把正常沉淀一起挡掉
+        self._run_analyze([_node(term="省略恢复")])
+        self.assertEqual([n["term"] for n in store.load_knowledge()["nodes"]], ["省略恢复"])
