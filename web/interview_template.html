@@ -1,0 +1,517 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>__TITLE__</title>
+<style>
+  :root{
+    --bg:#f4f6fb; --card:#fff; --line:#e5e9f2; --ink:#1a2233; --sub:#6b7488; --muted:#9aa3b5;
+    --accent:#2563eb; --accent-soft:#eef3ff; --green:#16a34a; --green-soft:#e9f9ef;
+    --amber:#d97706; --amber-soft:#fdf3e3; --red:#dc2626; --red-soft:#fdeaea;
+    --radius:14px; --shadow:0 1px 3px rgba(16,24,40,.06),0 8px 24px rgba(16,24,40,.05);
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html{scroll-behavior:smooth}
+  body{background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;line-height:1.65;padding:26px 16px;-webkit-font-smoothing:antialiased}
+  .wrap{max-width:880px;margin:0 auto}
+  /* 工具栏 */
+  .toolbar{display:flex;align-items:center;gap:10px;margin-bottom:14px;flex-wrap:wrap}
+  .toolbar button{background:var(--card);color:var(--ink);border:1px solid var(--line);border-radius:9px;padding:8px 14px;font-size:13.5px;cursor:pointer;font-weight:600;box-shadow:0 1px 2px rgba(16,24,40,.04);transition:.15s;font-family:inherit}
+  .toolbar button:hover{border-color:var(--accent);color:var(--accent)}
+  .toolbar .hint{font-size:12px;color:var(--muted);margin-left:auto}
+  .offline{display:none;background:var(--amber-soft);border:1px solid #f3d9a4;color:#92400e;border-radius:10px;padding:9px 14px;font-size:13px;font-weight:600;margin-bottom:14px}
+  /* 目录 */
+  .toc{position:sticky;top:8px;z-index:50;display:flex;gap:6px;flex-wrap:wrap;background:linear-gradient(135deg,#f0fdfa,#effcfb);backdrop-filter:blur(10px);border:1px solid #c9ece6;border-radius:12px;padding:9px 11px;margin-bottom:16px;box-shadow:0 2px 10px rgba(13,148,136,.10)}
+  .toc a{font-size:12.6px;color:#0f766e;text-decoration:none;padding:5px 11px;border-radius:8px;font-weight:600;white-space:nowrap;transition:.15s;cursor:pointer}
+  .toc a:hover{background:#ccfbf1;color:#0f766e}
+  .toc a.active{background:#0d9488;color:#fff;box-shadow:0 2px 6px rgba(13,148,136,.28)}
+  .toc .top{margin-left:auto;color:#4ba69d;font-weight:600}
+  /* 页头 */
+  .hero{background:linear-gradient(135deg,#0f766e 0%,#2563eb 100%);color:#fff;border-radius:var(--radius);padding:30px 34px;box-shadow:var(--shadow);margin-bottom:18px}
+  .hero .kicker{font-size:12.5px;letter-spacing:.5px;opacity:.85;margin-bottom:9px}
+  .hero h1{font-size:28px;font-weight:700;margin-bottom:10px}
+  .hero .tags{display:flex;flex-wrap:wrap;gap:8px;margin-top:6px}
+  .hero .tags span{background:rgba(255,255,255,.16);border:1px solid rgba(255,255,255,.22);padding:3px 12px;border-radius:999px;font-size:12.5px}
+  .hero .meta-line{margin-top:14px;font-size:12.5px;opacity:.82}
+  /* 卡片 */
+  .card{background:var(--card);border-radius:var(--radius);box-shadow:var(--shadow);padding:24px 26px;margin-bottom:16px;border:1px solid var(--line);border-top:3px solid var(--c,var(--line));scroll-margin-top:74px}
+  .card h2{font-size:17.5px;font-weight:700;margin-bottom:15px;display:flex;align-items:center;gap:10px;padding-bottom:10px;border-bottom:1px solid var(--line)}
+  .card h2 .num{display:inline-flex;align-items:center;justify-content:center;width:26px;height:26px;background:var(--cbg,var(--accent-soft));color:var(--c,var(--accent));border-radius:8px;font-size:12.5px;font-weight:700;flex:none}
+  .card h3{font-size:14.5px;font-weight:700;margin:17px 0 9px}
+  .card p{color:var(--sub);font-size:13.8px;margin-bottom:7px}
+  .m-summary{--c:#2563eb;--cbg:#eef3ff}
+  .m-focus{--c:#8b5cf6;--cbg:#f5f3ff}
+  .m-questions{--c:#06b6d4;--cbg:#ecfeff}
+  .m-interviewer{--c:#f59e0b;--cbg:#fffbeb}
+  .m-review{--c:#ec4899;--cbg:#fdf2f8}
+  .m-terms{--c:#10b981;--cbg:#ecfdf5}
+  .m-weak{--c:#dc2626;--cbg:#fdeaea}
+  .m-prep{--c:#0d9488;--cbg:#f0fdfa}
+  .m-transcript{--c:#64748b;--cbg:#f1f5f9}
+  /* 标签 */
+  .pill{display:inline-block;padding:2px 10px;border-radius:999px;font-size:11.8px;font-weight:600;white-space:nowrap}
+  .ok{background:var(--green-soft);color:var(--green)} .warn{background:var(--amber-soft);color:var(--amber)}
+  .bad{background:var(--red-soft);color:var(--red)} .info{background:var(--accent-soft);color:var(--accent)}
+  /* 总评 */
+  .summary{background:var(--accent-soft);border-left:4px solid var(--accent);border-radius:8px;padding:14px 18px;font-size:14.2px;color:var(--ink);white-space:pre-wrap}
+  /* 考察重点条形图（纯 CSS） */
+  .bar-row{display:flex;align-items:center;gap:12px;margin:9px 0}
+  .bar-name{width:150px;font-size:13px;color:var(--sub);flex:none;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .bar-track{flex:1;height:14px;background:#eef1f7;border-radius:999px;overflow:hidden}
+  .bar-fill{height:100%;border-radius:999px;background:linear-gradient(90deg,#8b5cf6,#2563eb)}
+  .bar-val{width:52px;text-align:right;font-size:13px;font-weight:700;color:#7c3aed;flex:none}
+  /* 问题清单 */
+  .q{border:1px solid var(--line);border-left:3px solid var(--c,var(--accent));border-radius:10px;padding:12px 15px;margin-bottom:10px;background:#fcfdff}
+  .q .qh{display:flex;align-items:flex-start;gap:9px;flex-wrap:wrap}
+  .q .qq{font-size:14px;font-weight:600;color:var(--ink);flex:1;min-width:220px}
+  .q .qc{font-size:13.2px;color:var(--sub);margin-top:7px}
+  .q .evi{font-size:12.3px;color:var(--muted);margin-top:6px}
+  /* 逐题点评 */
+  .ar{border:1px solid var(--line);border-radius:10px;padding:13px 16px;margin-bottom:11px;background:#fcfdff}
+  .ar .arh{display:flex;align-items:center;gap:9px;flex-wrap:wrap;margin-bottom:8px}
+  .ar .art{font-size:14.5px;font-weight:700;color:var(--ink)}
+  .ar .lbl{font-size:12px;font-weight:700;color:var(--muted);margin:9px 0 3px}
+  .ar .ans{font-size:13.4px;color:var(--sub);white-space:pre-wrap}
+  .ar .better{background:var(--green-soft);border-left:3px solid var(--green);border-radius:7px;padding:9px 13px;font-size:13.4px;color:#14532d;white-space:pre-wrap}
+  /* 新词 */
+  .term{border:1px solid var(--line);border-radius:10px;padding:12px 15px;margin-bottom:10px;background:#fcfdff}
+  .term .th{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .term .tt{font-size:14.5px;font-weight:700;color:var(--ink)}
+  .term .td{font-size:13.4px;color:var(--sub);margin-top:7px}
+  .term .tw{font-size:12.3px;color:var(--muted);margin-top:5px}
+  .kbadd{font-family:inherit;font-size:12.5px;font-weight:700;color:#065f46;background:var(--green-soft);border:1px solid #b7e4c7;border-radius:8px;padding:5px 12px;cursor:pointer;transition:.15s;white-space:nowrap}
+  .kbadd:hover:not(:disabled){background:#d1fae5;border-color:var(--green)}
+  .kbadd:disabled{cursor:default;opacity:.85;color:var(--muted);background:#f1f5f9;border-color:var(--line)}
+  .kbadd.done{color:var(--green);background:var(--green-soft);border-color:#b7e4c7;opacity:1}
+  .kbhint{font-size:12.2px;color:var(--muted);margin-top:9px}
+  /* 答砸 / 准备 */
+  .wc{border:1px solid #f3d9d9;border-left:3px solid var(--red);border-radius:10px;padding:11px 15px;margin-bottom:9px;background:#fffafa}
+  .wc .wt{font-size:14px;font-weight:700;color:var(--ink)}
+  .wc .ww{font-size:13.2px;color:var(--sub);margin-top:5px}
+  ul,ol{margin:5px 0 5px 2px;padding-left:20px}
+  li{font-size:13.6px;color:var(--sub);margin-bottom:5px}
+  li b{color:var(--ink)}
+  .cols{display:grid;grid-template-columns:repeat(auto-fit,minmax(270px,1fr));gap:16px}
+  /* 折叠 */
+  details{border:1px solid var(--line);border-radius:10px;margin:8px 0;background:#fcfdff;overflow:hidden}
+  details summary{padding:11px 14px;cursor:pointer;font-size:13.8px;font-weight:600;display:flex;align-items:center;gap:9px;list-style:none}
+  details summary::-webkit-details-marker{display:none}
+  details summary::before{content:"▸";color:var(--c,var(--accent));font-size:12px;transition:.2s}
+  details[open] summary::before{transform:rotate(90deg)}
+  details .ans{padding:0 15px 13px 36px;font-size:13.5px;color:var(--sub);border-top:1px dashed var(--line);padding-top:11px;margin-top:2px}
+  pre.trtext{white-space:pre-wrap;word-break:break-word;font-family:inherit;font-size:13.2px;color:var(--sub);max-height:560px;overflow:auto;padding:13px 15px;border-top:1px dashed var(--line);line-height:1.8}
+  .note{background:#fffaf0;border:1px solid #f3e3bb;color:#8a6d1a;border-radius:8px;padding:10px 14px;font-size:12.8px;margin:11px 0}
+  footer{text-align:center;color:var(--muted);font-size:12px;padding:12px 0 28px}
+  @media print{
+    body{background:#fff;padding:0}
+    .toolbar{display:none}
+    .toc{display:none}
+    .card,.hero{box-shadow:none;border:1px solid #ddd;break-inside:avoid}
+    /* 打印时去掉「加入知识库」按钮（纸面上点不了），但状态是「已加入」的保留成一行字 */
+    .kbadd{display:none !important}
+    details{border-color:#ddd;break-inside:avoid}
+    details > summary{display:none}
+    details > .ans,details > pre.trtext{display:block !important;max-height:none;overflow:visible}
+  }
+  @media (max-width:640px){.bar-name{width:96px}.hero h1{font-size:22px}.toc .top{display:none}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="toolbar">
+    <button onclick="window.print()">📤 导出 PDF</button>
+    <button onclick="toggleAll(true)">展开全部</button>
+    <button onclick="toggleAll(false)">收起全部</button>
+    <span class="hint" id="hint">这份复盘由本机模型生成；「加入知识库」需要工具在运行</span>
+  </div>
+  <div class="offline" id="offline" style="display:none"></div>
+  <header class="hero" id="hero"></header>
+  <nav class="toc" id="toc"></nav>
+  <main id="main"></main>
+  <footer id="foot"></footer>
+</div>
+<script>
+/* 面试复盘报告。数据由 app._render_report_page 注入（与 JD 报告同一套约定：
+   __TITLE__ / const REPORT_DATA = …），模板自包含、零外部资源。
+   报告有两种打开方式：工具里（http://127.0.0.1…，能打 API）与直接双击（file://）。
+   后者点「加入知识库」不可能成功 —— 必须**明说并禁用**，绝不假装加成功。 */
+const REPORT_DATA = __REPORT_DATA__;
+const KB_API = '/api/knowledge/add';
+const OFFLINE_KB_MSG = '未连接到工具，无法入库';
+const OFFLINE_BANNER = '⚠️ 未连接到工具，无法入库 —— 请从工具里打开这份报告（或在能访问 127.0.0.1 的浏览器里打开）。';
+let HINT_TEXT = '这份复盘由本机模型生成；「加入知识库」需要工具在运行';
+
+function esc(s){
+  return String(s==null?'':s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+function flash(msg, bad){
+  const h = document.getElementById('hint'); if(!h) return;
+  h.textContent = msg || '已保存 ✓';
+  h.style.color = bad ? 'var(--red)' : 'var(--green)';
+  clearTimeout(window.__ft);
+  window.__ft = setTimeout(()=>{ h.textContent = HINT_TEXT; h.style.color=''; }, 2400);
+}
+function showOffline(msg){
+  const el = document.getElementById('offline');
+  if(el){ el.textContent = msg || OFFLINE_BANNER; el.style.display = 'block'; }
+}
+function toggleAll(open){
+  document.querySelectorAll('#main details').forEach(d => { d.open = open; });
+}
+function isFileProtocol(){
+  try { return String((window.location && window.location.protocol) || '') === 'file:'; }
+  catch(e){ return false; }
+}
+/* 注入的字符串全部来自模型：数值先归一，文本一律 esc()，绝不直接拼。 */
+function num(v, dflt){
+  const n = Number(v);
+  return isFinite(n) ? n : (dflt==null?0:dflt);
+}
+function arr(v){ return Array.isArray(v) ? v : []; }
+function obj(v){ return (v && typeof v === 'object' && !Array.isArray(v)) ? v : {}; }
+/* 列表项归一：模型偶尔把 [{"term":"X"}] 写成 ["X"]（Python 侧已经补过一轮，这里再兜一次底）。 */
+function rows(v, key){
+  return arr(v).map(x => (typeof x === 'string' ? {[key]: x} : obj(x)));
+}
+function txt(v){ return String(v==null?'':v); }
+function firstOf(o, keys){
+  for(const k of keys){ const v = txt(o[k]).trim(); if(v) return v; }
+  return '';
+}
+function durText(sec){
+  const s = Math.round(num(sec, 0));
+  if(s <= 0) return '';
+  const h = Math.floor(s/3600), m = Math.floor((s%3600)/60), r = s%60;
+  if(h) return h+' 小时 '+m+' 分';
+  if(m) return m+' 分 '+r+' 秒';
+  return r+' 秒';
+}
+const LANG_NAME = {zh:'中文', en:'英文', ja:'日文', ko:'韩文', yue:'粤语'};
+function langText(v){
+  const t = txt(v).trim();
+  if(!t) return '';
+  return LANG_NAME[t.toLowerCase()] || t;
+}
+function qualityPill(v){
+  const t = txt(v).trim();
+  if(t.indexOf('未作答') >= 0 || t.indexOf('没答') >= 0) return 'bad';
+  if(t.indexOf('好') >= 0) return 'ok';
+  if(t.indexOf('差') >= 0) return 'bad';
+  if(t.indexOf('一般') >= 0) return 'warn';
+  return 'info';
+}
+function verdictPill(v){
+  const t = txt(v).trim();
+  if(t.indexOf('好') >= 0 && t.indexOf('一般') < 0) return 'ok';
+  if(t.indexOf('砸') >= 0 || t.indexOf('差') >= 0) return 'bad';
+  if(t.indexOf('一般') >= 0) return 'warn';
+  return 'info';
+}
+function scorePill(score){
+  const n = num(score, 0);
+  if(n >= 4) return 'ok';
+  if(n >= 3) return 'warn';
+  return 'bad';
+}
+function card(num, title, body, anchor){
+  if(!body) return '';
+  return '<section class="card m-'+anchor+'" id="sec-'+anchor+'" data-label="'+esc(num+' '+title)+'">'
+    + '<h2><span class="num">'+esc(num)+'</span>'+esc(title)+'</h2>'+body+'</section>';
+}
+function note(msg){ return '<div class="note">'+esc(msg)+'</div>'; }
+
+/* ---------- 页头：岗位 / 公司 / 日期 / 音频时长 / 转写领域 ---------- */
+function renderHero(){
+  const d = obj(REPORT_DATA), m = obj(d.meta);
+  const title = firstOf(d, ['job_title','job']) || '面试复盘';
+  const tags = [];
+  if(txt(d.company).trim()) tags.push('🏢 '+txt(d.company).trim());
+  if(txt(d.date).trim()) tags.push('📅 '+txt(d.date).trim());
+  const dur = durText(m.duration);
+  if(dur) tags.push('⏱ 音频时长 '+dur);
+  const lang = langText(m.language);
+  if(lang) tags.push('🌐 转写语言 '+lang);
+  if(txt(m.detected_domain).trim()) tags.push('🗂 转写领域 '+txt(m.detected_domain).trim());
+  if(num(m.chars,0) > 0) tags.push('✍️ 转写 '+num(m.chars,0)+' 字');
+  const who = firstOf(d, ['candidate']);
+  const idText = firstOf(m, ['interview_id']) || firstOf(d, ['report_id']);
+  document.getElementById('hero').innerHTML =
+    '<div class="kicker">AI 求职 SOP · 面试复盘报告</div>'
+    + '<h1>'+esc(title)+'</h1>'
+    + '<div class="tags">'+tags.map(t=>'<span>'+esc(t)+'</span>').join('')+'</div>'
+    + '<div class="meta-line">候选人：'+esc(who||'—')
+      + (idText ? ' ｜ 面试记录：'+esc(idText) : '')
+      + (d.source ? ' ｜ 来源：'+esc(d.source) : '')+'</div>';
+}
+
+/* ---------- 01 总评 ---------- */
+function renderSummary(){
+  const d = obj(REPORT_DATA);
+  const s = txt(d.summary).trim();
+  const body = s ? '<div class="summary">'+esc(s)+'</div>'
+                 : note('这次分析没有给出总评（模型输出里缺这一段）。');
+  return card('01','总评', body, 'summary');
+}
+
+/* ---------- 02 考察重点占比（纯 CSS 条形图） ---------- */
+function renderFocus(){
+  const rows = arr(obj(REPORT_DATA).focus_areas).map(f=>obj(f))
+    .filter(f => txt(f.area).trim());
+  if(!rows.length) return '';
+  const total = rows.reduce((s,f)=>s+num(f.share,0), 0);
+  const bars = rows.map(f=>{
+    const share = Math.max(0, Math.min(100, num(f.share, 0)));
+    return '<div class="bar-row"><div class="bar-name" title="'+esc(txt(f.area))+'">'+esc(txt(f.area))+'</div>'
+      + '<div class="bar-track"><div class="bar-fill" style="width:'+share+'%"></div></div>'
+      + '<div class="bar-val">'+share+'%</div></div>';
+  }).join('');
+  const tail = (total > 0 && Math.abs(total-100) >= 5)
+    ? '<div class="kbhint">占比之和为 '+total+'%（模型把一部分算作「其他」），不必强凑到 100%。</div>' : '';
+  return card('02','考察重点占比', bars+tail, 'focus');
+}
+
+/* ---------- 03 问题清单 ---------- */
+function renderQuestions(){
+  const qs = rows(obj(REPORT_DATA).questions, 'q').filter(q => firstOf(q, ['q','question']));
+  if(!qs.length) return '';
+  const items = qs.map(q=>{
+    const cat = txt(q.category).trim();
+    const quality = txt(q.answer_quality).trim();
+    return '<div class="q"><div class="qh"><div class="qq">'+esc(firstOf(q,['q','question']))+'</div>'
+      + (cat ? '<span class="pill info">'+esc(cat)+'</span>' : '')
+      + (quality ? '<span class="pill '+qualityPill(quality)+'">'+esc(quality)+'</span>' : '')
+      + '</div>'
+      + (txt(q.comment).trim() ? '<div class="qc">'+esc(txt(q.comment))+'</div>' : '')
+      + '</div>';
+  }).join('');
+  return card('03','面试问题清单', items, 'questions');
+}
+
+/* ---------- 04 面试官提问质量 ---------- */
+function renderInterviewer(){
+  const iq = obj(obj(REPORT_DATA).interviewer_quality);
+  const score = num(iq.score, 0);
+  const comment = txt(iq.comment).trim();
+  const issues = arr(iq.issues).map(x=>txt(x)).filter(Boolean);
+  if(!score && !comment && !issues.length) return '';
+  let h = '';
+  if(score) h += '<p><span class="pill '+scorePill(score)+'">专业度 '+score+' / 5</span></p>';
+  if(comment) h += '<div class="summary">'+esc(comment)+'</div>';
+  if(issues.length) h += '<h3>提问上的问题</h3><ul>'+issues.map(x=>'<li>'+esc(x)+'</li>').join('')+'</ul>';
+  return card('04','面试官提问质量', h, 'interviewer');
+}
+
+/* ---------- 05 逐题点评（含「更好的答法」） ---------- */
+function renderAnswerReview(){
+  const rows_ = rows(obj(REPORT_DATA).answer_review, 'topic')
+    .filter(r => firstOf(r, ['topic','q']));
+  if(!rows_.length) return '';
+  const items = rows_.map(r=>{
+    const verdict = txt(r.verdict).trim();
+    const wrong = firstOf(r, ['what_went_wrong','comment','why']);
+    const ans = firstOf(r, ['answer','my_answer']);
+    const better = firstOf(r, ['better_answer','better','suggestion']);
+    return '<div class="ar"><div class="arh"><div class="art">'+esc(firstOf(r,['topic','q']))+'</div>'
+      + (verdict ? '<span class="pill '+verdictPill(verdict)+'">'+esc(verdict)+'</span>' : '')
+      + '</div>'
+      + (wrong ? '<div class="lbl">问题出在哪</div><div class="ans">'+esc(wrong)+'</div>' : '')
+      + (ans ? '<div class="lbl">你当时的答法</div><div class="ans">'+esc(ans)+'</div>' : '')
+      + (better ? '<div class="lbl">✅ 更好的答法（可以直接背）</div><div class="better">'+esc(better)+'</div>'
+                : note('这一题没给出更好的答法。'))
+      + '</div>';
+  }).join('');
+  return card('05','逐题点评', items, 'review');
+}
+
+/* ---------- 「➕ 加入知识库」 ---------- */
+function kbButton(term, definition, category){
+  return '<button class="kbadd" data-term="'+esc(term)+'" data-definition="'+esc(definition||'')+'"'
+    + ' data-category="'+esc(category||'')+'">➕ 加入知识库</button>';
+}
+function disableAllKbButtons(reason){
+  document.querySelectorAll('.kbadd').forEach(b=>{
+    b.disabled = true;
+    if(b.dataset.done !== '1') b.textContent = reason || OFFLINE_KB_MSG;
+  });
+}
+/* 成功 → 变「已加入」并禁用；失败 → 明确提示且**按钮仍可用**；fetch 抛错 → 未连接、禁用。 */
+async function addTerm(btn){
+  if(!btn || btn.disabled) return;
+  const term = txt(btn.getAttribute('data-term')).trim();
+  if(!term) return;
+  const payload = {term: term,
+                   definition: txt(btn.getAttribute('data-definition')).trim(),
+                   category: txt(btn.getAttribute('data-category')).trim()};
+  btn.disabled = true;                       // 防连点（失败时下面会放开）
+  let r = null;
+  try{
+    const resp = await fetch(KB_API, {method:'POST',
+      headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+    r = await resp.json();
+  }catch(e){
+    // fetch 抛错 = 根本没连上工具（双击 file:// 打开就是这种）→ 说清 + 禁用，绝不假装成功
+    showOffline(OFFLINE_BANNER);
+    disableAllKbButtons();
+    return;
+  }
+  if(!r || r.ok !== true){
+    const msg = (r && r.error) ? txt(r.error) : '服务器没有返回成功';
+    btn.disabled = false;                    // 失败必须还能再点
+    btn.textContent = '➕ 加入知识库（失败，可重试）';
+    flash('⚠️ 入库失败：'+msg, true);
+    return;
+  }
+  btn.dataset.done = '1';
+  btn.disabled = true;
+  btn.classList.add('done');
+  btn.textContent = '✓ 已加入知识库';
+  flash('已加入知识库：'+term);
+}
+
+/* ---------- 06 新词（每个带「➕ 加入知识库」） ---------- */
+function renderNewTerms(){
+  const d = obj(REPORT_DATA);
+  const terms = rows(d.new_terms, 'term').filter(t => txt(t.term).trim());
+  const weak = rows(d.weak_concepts, 'term').filter(w => txt(w.term).trim());
+  const seen = {};
+  terms.forEach(t=>{ seen[txt(t.term).trim().toLowerCase()] = true; });
+  // 答砸但没被列进新词的知识点：也给一个按钮，由用户决定要不要进复习队列（规格 §8.2）
+  const extra = weak.filter(w => !seen[txt(w.term).trim().toLowerCase()]);
+  if(!terms.length && !extra.length) return '';
+  let h = '';
+  if(terms.length){
+    h += terms.map(t=>{
+      const term = txt(t.term).trim();
+      const def = firstOf(t, ['definition','plain_explanation','why']);
+      const cat = txt(t.category).trim();
+      return '<div class="term"><div class="th"><div class="tt">'+esc(term)+'</div>'
+        + (cat ? '<span class="pill info">'+esc(cat)+'</span>' : '')
+        + kbButton(term, def, cat) + '</div>'
+        + (txt(t.definition).trim() ? '<div class="td">'+esc(txt(t.definition))+'</div>' : '')
+        + (txt(t.why).trim() ? '<div class="tw">为什么算新词：'+esc(txt(t.why))+'</div>' : '')
+        + '</div>';
+    }).join('');
+    h += '<div class="kbhint">新词不会自动建卡：点「➕ 加入知识库」才会进复习队列（状态「待学习」；'
+       + '该术语已有卡片时会把它置为「待学习」）。</div>';
+  }
+  if(extra.length){
+    h += '<h3>面试里答砸、但没列进新词的术语</h3>'
+      + extra.map(w=>{
+          const term = txt(w.term).trim();
+          const why = firstOf(w, ['why','reason']);
+          return '<div class="term"><div class="th"><div class="tt">'+esc(term)+'</div>'
+            + '<span class="pill bad">答砸了</span>'
+            + kbButton(term, why, '') + '</div>'
+            + (why ? '<div class="td">'+esc(why)+'</div>' : '')
+            + '</div>';
+        }).join('');
+  }
+  return card('06','新词 · 加入知识库', h, 'terms');
+}
+
+/* ---------- 07 答砸的知识点 ---------- */
+function renderWeak(){
+  const rows_ = rows(obj(REPORT_DATA).weak_concepts, 'term').filter(w => txt(w.term).trim());
+  if(!rows_.length) return '';
+  const items = rows_.map(w=>{
+    const why = firstOf(w, ['why','reason']);
+    return '<div class="wc"><div class="wt">'+esc(txt(w.term).trim())+'</div>'
+      + (why ? '<div class="ww">'+esc(why)+'</div>' : '')+'</div>';
+  }).join('');
+  return card('07','答砸的知识点', items + '<div class="kbhint">这些知识点在知识库里的复习优先级会被提高'
+    + '（「被面试问过」是排序因子）。</div>', 'weak');
+}
+
+/* ---------- 08 二面准备建议 ---------- */
+function renderPrep(){
+  const prep = obj(obj(REPORT_DATA).next_round_prep);
+  const followups = arr(prep.likely_followups).map(x=>txt(x)).filter(Boolean);
+  const study = arr(prep.to_study).map(x=>txt(x)).filter(Boolean);
+  if(!followups.length && !study.length) return '';
+  const col = (title, list) => list.length
+    ? '<div><h3>'+esc(title)+'</h3><ul>'+list.map(x=>'<li>'+esc(x)+'</li>').join('')+'</ul></div>' : '';
+  return card('08','二面准备建议',
+    '<div class="cols">'+col('🎯 二面可能追问', followups)+col('📚 优先补的知识点', study)+'</div>', 'prep');
+}
+
+/* ---------- 09 原始转写全文（折叠） ---------- */
+function renderTranscript(){
+  const d = obj(REPORT_DATA), m = obj(d.meta);
+  const text = txt(d.transcript_text);
+  const chars = num(m.chars, 0) || text.length;
+  if(!text.trim()){
+    return card('09','原始转写全文',
+      note('报告数据里没有转写正文'+(chars ? '（这次面试共 '+chars+' 字，正文在面试记录的 transcript.json 里）' : '')
+           + '。旧报告或面试记录被清理后会出现这种情况。'), 'transcript');
+  }
+  return card('09','原始转写全文',
+    '<details><summary>📄 展开原始转写（共 '+esc(chars)+' 字）</summary>'
+    + '<pre class="trtext">'+esc(text)+'</pre></details>', 'transcript');
+}
+
+/* ---------- 目录：点击跳转 + 滚动高亮 ---------- */
+function buildToc(){
+  const secs = Array.prototype.slice.call(document.querySelectorAll('#main .card[id]'));
+  const toc = document.getElementById('toc');
+  if(!toc) return;
+  if(!secs.length){ toc.style.display = 'none'; return; }
+  toc.innerHTML = secs.map(s=>'<a href="#'+s.id+'" data-target="'+s.id+'">'+esc(s.dataset.label)+'</a>').join('')
+    + '<a class="top" href="#hero">↑ 顶部</a>';
+  const links = Array.prototype.slice.call(toc.querySelectorAll('a[data-target]'));
+  function onScroll(){
+    const y = window.scrollY + 96;
+    let idx = 0;
+    secs.forEach((s,i)=>{ if(s && s.offsetTop <= y) idx = i; });
+    links.forEach((a,i)=>a.classList.toggle('active', i===idx && window.scrollY > 60));
+  }
+  window.addEventListener('scroll', onScroll, {passive:true});
+  onScroll();
+}
+
+/* 打印：把折叠区全展开（否则纸上只有一行 summary），打完再还原 */
+let __printOpened = null;
+window.addEventListener('beforeprint', ()=>{
+  const ds = Array.prototype.slice.call(document.querySelectorAll('#main details'));
+  __printOpened = ds.map(d=>d.open);
+  ds.forEach(d=>{ d.open = true; });
+});
+window.addEventListener('afterprint', ()=>{
+  const ds = Array.prototype.slice.call(document.querySelectorAll('#main details'));
+  if(__printOpened && __printOpened.length === ds.length){
+    ds.forEach((d,i)=>{ d.open = __printOpened[i]; });
+  }
+  __printOpened = null;
+});
+
+/* ---------- 启动 ---------- */
+function render(){
+  const main = document.getElementById('main');
+  renderHero();
+  main.innerHTML = renderSummary()+renderFocus()+renderQuestions()+renderInterviewer()
+    + renderAnswerReview()+renderNewTerms()+renderWeak()+renderPrep()+renderTranscript();
+  const foot = document.getElementById('foot');
+  if(foot){
+    const d = obj(REPORT_DATA), m = obj(d.meta);
+    foot.textContent = '由 AI 求职 SOP 生成 · 面试复盘 · '
+      + (firstOf(m,['interview_id']) || firstOf(d,['report_id']) || '') + ' · '
+      + (txt(d.date).trim() || '') ;
+  }
+  // 事件委托：#main 每次 render 都被重建内容，但 #main 本身一直在
+  main.addEventListener('click', ev=>{
+    const b = ev.target && ev.target.closest ? ev.target.closest('.kbadd') : null;
+    if(b) addTerm(b);
+  });
+  buildToc();
+}
+function boot(){
+  render();
+  if(isFileProtocol()){                 // 双击打开：入库 API 根本不可达，先说清再禁用
+    showOffline(OFFLINE_BANNER);
+    disableAllKbButtons();
+  }
+}
+boot();
+</script>
+</body>
+</html>
