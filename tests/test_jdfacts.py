@@ -9,11 +9,15 @@
 知识地图占一次分析 87% 的时间与**全部** ~53 次 Tavily 搜索额度，而它是**纯 JD 级**的
 （"这个岗位要会什么"，与哪份简历无关）。所以「同一个 JD 只算一次、换简历直接复用」就是全部收益。
 
-**本文件的三条硬纪律**（每一条都对应本项目抓到过的假绿）：
+**本文件的四条硬纪律**（每一条都对应本项目抓到过的假绿）：
 1. 「复用了缓存」**必须同时**断言注入的 builder 调用次数为 **0** —— 只断言"返回了节点"是恒真的；
 2. 「播种」同理：断言没调 builder、`source == "seeded:<报告id>"`、且节点与报告里那份**逐字相同**；
 3. 落盘断言一律看**原始 jds.json**（`_raw_jd`），不看 `get()` 的返回值 —— 只有真写进文件才算数
    （「加字段型」变异会被读侧净化，只有钉住落盘那一行才抓得住）。
+4. **并发测试必须用 `Event` 做确定性同步，绝不能 sleep**：服务是 ThreadingHTTPServer，双击 /
+   双标签页 / 重试都会让同一个 JD 被两个线程同时 resolve（= 2×206 秒 + 2×53 次搜索）。
+   sleep 型的并发测试既可能假绿（第二个线程其实没赶上窗口）也可能假红（机器快慢），
+   所以「等待者已经就位」由**事件**（注入的 `_join_inflight` 探针）报告，不靠猜。
 
 **绝不联网 / 绝不真调模型**：真算那一步由测试注入的假 builder 承担；生产里由 app.py 注入
 `knowledge.build_for_jd`（本模块刻意不 import knowledge，见 `ModuleHygieneTest`）。
@@ -22,6 +26,7 @@ import ast
 import json
 import os
 import re
+import threading
 import unittest
 from unittest import mock
 
@@ -162,8 +167,12 @@ class GetAndSaveTest(IsolatedCase):
         覆盖掉它就等于把「这份地图有多旧」这条信息弄丢（复用时要展示给用户看）。
         时钟必须**注入**：真实实现是分钟粒度，同一分钟内两次写入本来就是同一个字符串，
         不注入的话这条断言会靠巧合恒真（正是本项目抓过的假绿形态）。
+
+        ⚠️ 只有**旧缓存是非空列表**时那条时间戳才叫「某份地图的生成时间」才值得保留
+        （见下面两条：空列表 / 孤儿时间戳一律不沿用）。
         """
-        jdid.upsert_jd({"id": JD_A, "jd_facts": {"knowledge_at": "2020-01-01 08:00"}})
+        jdid.upsert_jd({"id": JD_A, "jd_facts": {"knowledge": _nodes("第一次"),
+                                                "knowledge_at": "2020-01-01 08:00"}})
         with mock.patch.object(jdfacts, "_now", return_value="2026-11-01 12:00"):
             jdfacts.save_knowledge(JD_A, _nodes("第二次"), "seeded:r9")
         facts = _raw_facts(JD_A)
@@ -178,6 +187,28 @@ class GetAndSaveTest(IsolatedCase):
             jdfacts.save_knowledge(JD_B, _nodes("second"), "computed")
         self.assertEqual(_raw_facts(JD_B)["knowledge_at"], "2026-10-03 00:35")
         self.assertEqual(_jdump(_raw_facts(JD_B)["knowledge"]), _jdump(_nodes("second")))
+
+    def test_a_saved_map_never_inherits_a_timestamp_from_an_empty_map(self):
+        """空列表**不是可用的缓存**（既有约定，有测试钉住）→ 它的时间戳也不该被沿用。
+
+        不修的话：builder 返回 `[]` 落盘成 `knowledge: []` + 一个时间戳；下次真算出一份
+        **非空**地图时却沿用那份空地图的时间戳 → 报告里的「生成于」是错的时间（而且旧得离谱）。
+        """
+        jdid.upsert_jd({"id": JD_A, "jd_facts": {"knowledge": [], "knowledge_at": "2020-01-01 08:00"}})
+        with mock.patch.object(jdfacts, "_now", return_value="2026-11-01 12:00"):
+            jdfacts.save_knowledge(JD_A, _nodes("新"), "computed")
+        facts = _raw_facts(JD_A)
+        self.assertEqual(facts["knowledge_at"], "2026-11-01 12:00",
+                         "新地图沿用了那份空地图的时间戳（报告会显示错的时间）")
+        self.assertEqual(_jdump(facts["knowledge"]), _jdump(_nodes("新")))
+        self.assertEqual(facts["knowledge_source"], "computed")
+
+    def test_a_saved_map_never_inherits_an_orphan_timestamp(self):
+        """`knowledge_at` 有值但**没有**地图（用户手改 / 迁移留下的孤儿）→ 同样不沿用。"""
+        jdid.upsert_jd({"id": JD_A, "jd_facts": {"knowledge_at": "2020-01-01 08:00"}})
+        with mock.patch.object(jdfacts, "_now", return_value="2026-11-01 12:00"):
+            jdfacts.save_knowledge(JD_A, _nodes("新"), "computed")
+        self.assertEqual(_raw_facts(JD_A)["knowledge_at"], "2026-11-01 12:00")
 
     def test_save_knowledge_stamps_a_time_only_when_there_was_none(self):
         jdid.upsert_jd({"id": JD_A})
@@ -214,6 +245,22 @@ class GetAndSaveTest(IsolatedCase):
                 with self.assertRaises(ValueError):
                     jdfacts.save_knowledge(JD_A, junk, "computed")
                 self.assertEqual(store.read_text(store.p_path("jds.json"), None), before)
+
+    def test_save_knowledge_rejects_a_missing_source_instead_of_writing_an_empty_one(self):
+        """`knowledge_source` 是契约的一部分（报告照着它写来源标记）→ **不许静默写成 ""**。
+
+        审查 Nit：`_text(source) or ""` 会把「调用方传错了」这种 bug 悄悄落盘成一个空来源。
+        """
+        jdid.upsert_jd({"id": JD_A})
+        before = store.read_text(store.p_path("jds.json"), None)
+        for junk in (None, "", "   ", 5, [], {}):
+            with self.subTest(source=junk):
+                with self.assertRaises(ValueError):
+                    jdfacts.save_knowledge(JD_A, _nodes("x"), junk)
+                self.assertEqual(store.read_text(store.p_path("jds.json"), None), before)
+        # 反向对照：合法来源照旧写得进去
+        jdfacts.save_knowledge(JD_A, _nodes("x"), " seeded:r1 ")
+        self.assertEqual(_raw_facts(JD_A)["knowledge_source"], "seeded:r1")
 
     def test_save_knowledge_allows_an_empty_list_but_it_is_not_a_usable_cache(self):
         """空列表是合法的「真算结果」（这个 JD 没抽出知识点），但不是可用的缓存。"""
@@ -276,8 +323,14 @@ class SeedFromReportsTest(IsolatedCase):
         facts = _raw_facts(JD_A)                                   # ← 真落盘的那一行
         self.assertEqual(_jdump(facts["knowledge"]), _jdump(_nodes("report")))   # 逐字相同
         self.assertEqual(facts["knowledge_source"], "seeded:20261003_岗A_75分")
+        # 两个字段**不是**一回事：`seeded_at` 是「这次播种发生在何时」，
+        # `knowledge_at` 是「这份地图**真正生成**于何时」= 那份报告的 `created_at`。
+        # 写成同一个时间的话，报告里的小字会显示一个**晚于报告本身**的生成日期。
         self.assertEqual(facts["seeded_at"], "2026-10-20 09:00")
-        self.assertEqual(facts["knowledge_at"], "2026-10-20 09:00")
+        self.assertEqual(facts["knowledge_at"], "2026-10-03 00:30",
+                         "播种把 knowledge_at 写成了「播种那一刻」而不是报告的生成时间")
+        self.assertNotEqual(facts["knowledge_at"], facts["seeded_at"],
+                            "两个字段退化成一个了（报告里会显示晚于报告本身的日期）")
         self.assertEqual(_jdump(jdfacts.knowledge_of(JD_A)), _jdump(_nodes("report")))
 
     def test_report_id_is_the_report_filename_stem(self):
@@ -389,12 +442,50 @@ class SeedFromReportsTest(IsolatedCase):
         self.assertEqual(jdfacts.seed_from_reports(JD_A), (True, "r1"))
         self.assertEqual(_jdump(jdfacts.knowledge_of(JD_A)), _jdump(_nodes("dict")))
 
-    def test_a_later_seed_does_not_rewrite_an_existing_first_generated_at(self):
-        jdid.upsert_jd({"id": JD_A, "jd_facts": {"knowledge_at": "2020-01-01 08:00"}})
+    def test_a_stale_timestamp_without_a_map_does_not_survive_a_seed(self):
+        """有 `knowledge_at` 但地图是**空列表** → 那不是「某份地图的生成时间」，不沿用。
+
+        播种必须给出这份地图**真正**的生成时间（那份报告的 `created_at`），
+        既不是那个孤儿时间戳、也不是「播种那一刻」。
+        """
+        jdid.upsert_jd({"id": JD_A, "jd_facts": {"knowledge": [], "knowledge_at": "2020-01-01 08:00"}})
         _analysis("r1", JD_A, "2026-10-01 09:00")
         _write_report("r1.html", {"report_id": "r1", "knowledge": _nodes("report")})
-        jdfacts.seed_from_reports(JD_A)
-        self.assertEqual(_raw_facts(JD_A)["knowledge_at"], "2020-01-01 08:00")
+        with mock.patch.object(jdfacts, "_now", return_value="2026-11-01 12:00"):
+            self.assertEqual(jdfacts.seed_from_reports(JD_A), (True, "r1"))
+        facts = _raw_facts(JD_A)
+        self.assertEqual(facts["knowledge_at"], "2026-10-01 09:00")     # ← 报告真正生成的时间
+        self.assertEqual(facts["seeded_at"], "2026-11-01 12:00")        # ← 播种那一刻
+
+    def test_seeding_never_overwrites_a_usable_cache(self):
+        """**播种写守卫**：进临界区后重判「此刻已经有可用缓存」→ 放弃这次播种写。
+
+        窄窗口：A 的真算刚落盘、B 的播种才进临界区。没有这道守卫的话，B 会把 knowledge
+        换成旧报告那份、source 换成 `seeded:<id>`，而 `knowledge_at` 保留 A 的时间 →
+        **内容与时间戳对不上**（报告拿 A 的时间显示 B 的内容）。
+        """
+        jdid.upsert_jd({"id": JD_A})
+        jdfacts.save_knowledge(JD_A, _nodes("computed"), "computed")     # A 的真算已经落盘
+        _analysis("r1", JD_A, "2026-10-01 09:00")
+        _write_report("r1.html", {"report_id": "r1", "knowledge": _nodes("report")})
+        before = _raw_facts(JD_A)
+        self.assertEqual(jdfacts.seed_from_reports(JD_A), (False, None),
+                         "已经有真算落盘了，播种还报告「播成功」")
+        facts = _raw_facts(JD_A)
+        self.assertEqual(_jdump(facts["knowledge"]), _jdump(_nodes("computed")),
+                         "播种用旧报告覆盖了刚落盘的真算")
+        self.assertEqual(facts["knowledge_source"], "computed")
+        self.assertEqual(facts["knowledge_at"], before["knowledge_at"])
+        self.assertNotIn("seeded_at", facts)
+        self.assertEqual(_events("analyze.knowledge_seeded"), [])
+        self.assertEqual(len(_events("analyze.knowledge_seed_skipped")), 1)
+        # 反向对照：同一份报告在**没有**缓存时照样播得进去
+        # （证明上面那个 False 不是因为「报告根本读不出来」）
+        jdid.upsert_jd({"id": JD_B})
+        _analysis("rB", JD_B, "2026-10-01 09:00")
+        _write_report("rB.html", {"report_id": "rB", "knowledge": _nodes("report")})
+        self.assertEqual(jdfacts.seed_from_reports(JD_B), (True, "rB"))
+        self.assertEqual(_raw_facts(JD_B)["knowledge_source"], "seeded:rB")
 
     def test_seeding_only_touches_the_jd_library(self):
         jdid.upsert_jd({"id": JD_A})
@@ -548,6 +639,8 @@ class ResolveTest(IsolatedCase):
         b1 = _Builder(_nodes("seeded-era"))
         with mock.patch.object(jdfacts, "_now", return_value="2026-10-03 00:35"):
             self.assertEqual(jdfacts.resolve(JD_A, "JD 原文-A", CFG, builder=b1)[1], "seeded:r1")
+        # 播种那份地图的生成时间是**报告自己的**（`replaced_at` 读的就是落盘的 knowledge_at）
+        self.assertEqual(_raw_facts(JD_A)["knowledge_at"], "2026-10-01 09:00")
         # 刷新：既不看缓存、也不看报告，直接真算
         b2 = _Builder(_nodes("refreshed"))
         with mock.patch.object(jdfacts, "_now", return_value="2026-11-01 12:00"):
@@ -562,7 +655,7 @@ class ResolveTest(IsolatedCase):
         evs = _events("analyze.knowledge_computed")
         self.assertEqual(len(evs), 1)
         self.assertEqual(evs[0]["data"]["refresh"], True)
-        self.assertEqual(evs[0]["data"]["replaced_at"], "2026-10-03 00:35")
+        self.assertEqual(evs[0]["data"]["replaced_at"], "2026-10-01 09:00")
         # 刷新后再分析一次：又回到复用（不是每次都真算）
         n4, s4 = jdfacts.resolve(JD_A, "JD 原文-A", CFG, builder=b2)
         self.assertEqual((s4, len(b2.calls), _jdump(n4)), ("cache", 1, _jdump(_nodes("refreshed"))))
@@ -614,6 +707,52 @@ class ResolveTest(IsolatedCase):
         self.assertIsNone(jdfacts.knowledge_of(JD_A))              # 空缓存不算「有缓存」
         self.assertTrue(jdfacts.needs_compute(JD_A, False))
 
+    def test_an_empty_map_does_not_lend_its_timestamp_to_the_next_compute(self):
+        """空地图不算可用缓存（既有约定）→ 它落盘的时间戳也不许被下一份**非空**地图沿用。
+
+        不修的话：第二次真算出来的地图会挂着那份空地图的生成时间，报告里显示错的时间。
+        """
+        self._new_jd()
+        with mock.patch.object(jdfacts, "_now", return_value="2026-10-03 00:35"):
+            self.assertEqual(jdfacts.resolve(JD_A, "JD 原文-A", CFG, builder=_Builder([])),
+                             ([], "computed"))
+        self.assertEqual(_raw_facts(JD_A)["knowledge_at"], "2026-10-03 00:35")
+        with mock.patch.object(jdfacts, "_now", return_value="2026-11-01 12:00"):
+            nodes, source = jdfacts.resolve(JD_A, "JD 原文-A", CFG, builder=_Builder(_nodes("second")))
+        self.assertEqual((source, _jdump(nodes)), ("computed", _jdump(_nodes("second"))))
+        self.assertEqual(_raw_facts(JD_A)["knowledge_at"], "2026-11-01 12:00",
+                         "新地图沿用了那份空地图的时间戳（报告会显示错的生成时间）")
+
+    def test_a_cache_that_appears_while_seeding_is_not_overwritten(self):
+        """**窄窗口**（审查原文）：`resolve` 在第①级看到「没缓存」，但播种写进临界区之前
+        另一个线程刚把真算落盘了 —— 这次播种写必须**放弃**。
+
+        这里用「读报告」这一步注入那次并发写入（它是播种路径上必然发生的一步）：
+        确定性，不靠 sleep。没有守卫的话 source 会变成 `seeded:r1`、内容变成旧报告那份、
+        而 `knowledge_at` 还是真算那份的时间 → 内容与时间戳对不上。
+        """
+        self._new_jd()
+        _analysis("r1", JD_A, "2026-10-01 09:00")
+        _write_report("r1.html", {"report_id": "r1", "knowledge": _nodes("report")})
+        real_read = kb.read_report_data
+
+        def read_then_race(path):
+            data = real_read(path)
+            jdfacts.save_knowledge(JD_A, _nodes("computed"), "computed")   # 另一个线程刚算完
+            return data
+
+        b = _Builder(_nodes("绝不该出现"))
+        with mock.patch.object(kb, "read_report_data", read_then_race):
+            nodes, source = jdfacts.resolve(JD_A, "JD 原文-A", CFG, builder=b)
+        self.assertEqual(b.calls, [], "播种路径居然调了 builder（= 真搜索）")
+        self.assertEqual(source, "cache", "播种写覆盖了刚落盘的真算：%r" % (source,))
+        self.assertEqual(_jdump(nodes), _jdump(_nodes("computed")))
+        facts = _raw_facts(JD_A)
+        self.assertEqual(_jdump(facts["knowledge"]), _jdump(_nodes("computed")))
+        self.assertEqual(facts["knowledge_source"], "computed")
+        self.assertNotIn("seeded_at", facts)
+        self.assertEqual(len(_events("analyze.knowledge_seed_skipped")), 1)
+
     def test_a_failing_builder_leaves_no_half_written_cache(self):
         self._new_jd()
 
@@ -644,7 +783,149 @@ class ResolveTest(IsolatedCase):
         self.assertFalse(os.path.exists(store.knowledge_path()))
 
 
-# ---------------------------------------------------------------- ④ 架构铁律
+# ---------------------------------------------------------------- ④ 单飞（同一个 JD 只许算一次）
+class SingleFlightTest(IsolatedCase):
+    """服务是 `ThreadingHTTPServer`：双击 / 双标签页 / 重试会让同一个 JD 被并发 resolve。
+
+    一次真算 = 206 秒 + ~53 次搜索额度，所以**同一个 JD 同一时刻只许算一次**，
+    第二个线程等它算完**直接拿它的结果**。
+
+    **为什么这里的同步全是 `Event`**：sleep 型的并发测试既可能假绿（第二个线程其实没赶上
+    窗口、悄悄走了缓存，看起来也"只算了一次"）也可能假红（机器快慢）。本类里的确定性来自：
+      * 领导者被 builder 里的 `release` 卡住 —— 它跑完之前盘上**没有**缓存（第①级必然落空）；
+      * 等待者「进入等待」由注入的 `_join_inflight` 探针报告（那是个真同步点，不是猜的）；
+      * 所以「两个线程同时 resolve」是被事件钉住的，不是靠时间差碰运气。
+    """
+
+    def _new_jd(self, jd_id=JD_A):
+        jdid.upsert_jd({"id": jd_id, "seq": 1})
+        return jd_id
+
+    def _run_pair(self, builder, jd_id=JD_A):
+        """两个线程并发 `resolve` 同一个 JD；返回 (结果, 异常, builder 调用序列)。
+
+        先起 t1（它会卡在 builder 里），等到**确认 t2 已经进入单飞等待**才放行 t1。
+        """
+        self._new_jd(jd_id)
+        results, errors, calls = {}, {}, []
+        entered, release, waiting = threading.Event(), threading.Event(), threading.Event()
+
+        def wrapped(jd_text, cfg):
+            calls.append(threading.current_thread().name)
+            return builder(jd_text, cfg)
+
+        def worker(name):
+            try:
+                results[name] = jdfacts.resolve(jd_id, "JD 原文-A", CFG, builder=wrapped)
+            except BaseException as e:                     # noqa: BLE001 - 失败也要能被断言看到
+                errors[name] = e
+
+        real_join = jdfacts._join_inflight
+
+        def watch_join(flight):
+            waiting.set()
+            return real_join(flight)
+
+        self._entered, self._release = entered, release
+        with mock.patch.object(jdfacts, "_join_inflight", watch_join):
+            t1 = threading.Thread(target=worker, args=("t1",), name="t1")
+            t1.start()
+            self.assertTrue(entered.wait(30),
+                            "第一个线程没进 builder（t1 的异常 / 结果：%r / %r）" % (errors, results))
+            t2 = threading.Thread(target=worker, args=("t2",), name="t2")
+            t2.start()
+            self.assertTrue(waiting.wait(30),
+                            "第二个线程没有进入单飞等待（它自己又去算了一遍）")
+            release.set()
+            t1.join(30)
+            t2.join(30)
+        self.assertFalse(t1.is_alive() or t2.is_alive(), "有线程没跑完（死等了）")
+        # 登记必须注销干净：漏一份就会让这个 JD 后面的请求一直去等一个不会再有结果的信号
+        self.assertEqual(jdfacts._INFLIGHT, {}, "单飞登记没注销干净")
+        return results, errors, calls
+
+    def test_two_threads_on_one_jd_compute_once_and_share_the_result(self):
+        def builder(jd_text, cfg):
+            self._entered.set()
+            self.assertTrue(self._release.wait(30), "测试自己没放行 builder")
+            return json.loads(json.dumps(_nodes("once"), ensure_ascii=False))
+
+        results, errors, calls = self._run_pair(builder)
+        self.assertEqual(errors, {})
+        self.assertEqual(calls, ["t1"],
+                         "同一个 JD 被真算了 %d 次（= 烧了 %d 份 206 秒 + 搜索额度）"
+                         % (len(calls), len(calls)))
+        n1, s1 = results["t1"]
+        n2, s2 = results["t2"]
+        # 等待者拿的是**领导者刚算出来的那份**：source 是 computed 而不是 cache ——
+        # 只有真的走了「加入在飞的那一次」才会是它（走了缓存会是 "cache"）。
+        self.assertEqual((s1, s2), ("computed", "computed"),
+                         "第二个线程没拿到领导者的结果：%r" % ((s1, s2),))
+        self.assertEqual(_jdump(n2), _jdump(n1), "两个线程拿到的不是同一份知识地图")
+        self.assertEqual(_jdump(n1), _jdump(_nodes("once")))
+        self.assertIsNot(n1, n2,
+                         "两个线程共享了同一个列表对象：谁就地改一下（kb.absorb 就会）就污染另一个")
+        facts = _raw_facts(JD_A)                                    # ← 真落盘的那一行
+        self.assertEqual(_jdump(facts["knowledge"]), _jdump(_nodes("once")))
+        self.assertEqual(facts["knowledge_source"], "computed")
+        self.assertEqual(len(_events("analyze.knowledge_computed")), 1)
+        joined = _events("analyze.knowledge_joined")
+        self.assertEqual(len(joined), 1, "等待者没有走「加入在飞的那一次」这条路")
+        self.assertEqual(joined[0]["data"]["jd"], JD_A)
+        self.assertEqual(joined[0]["data"]["nodes"], 2)
+
+    def test_a_waiting_thread_does_not_hang_when_the_leader_fails(self):
+        """领导者**失败**（builder 抛异常）时，等待者**绝不死等**。
+
+        选定的行为：失败的那份登记被摘掉，等待者醒来发现没有结果 → 自己抢领导权再算一次。
+        这里钉住三样：领导者确实抛了 RuntimeError（不是静默成功）、等待者拿到了真结果、
+        builder 一共被调 **2** 次（不是死等不动，也不是「只算一次就返回一份空地图」）。
+        """
+        calls = []
+
+        def builder(jd_text, cfg):
+            calls.append(1)
+            if len(calls) == 1:                       # 领导者：卡到测试确认等待者就位，再炸
+                self._entered.set()
+                self.assertTrue(self._release.wait(30), "测试自己没放行 builder")
+                raise RuntimeError("模型/搜索炸了")
+            return json.loads(json.dumps(_nodes("after-failure"), ensure_ascii=False))
+
+        results, errors, threaded_calls = self._run_pair(builder)
+        self.assertEqual(len(calls), 2)
+        self.assertIsInstance(errors.get("t1"), RuntimeError,
+                              "领导者居然没失败（这条测试没验证到东西）：%r" % (errors,))
+        self.assertNotIn("t2", errors, "等待者被领导者的失败带死了：%r" % (errors.get("t2"),))
+        self.assertEqual(threaded_calls, ["t1", "t2"], "等待者没有自己再算一次")
+        n2, s2 = results["t2"]
+        self.assertEqual(s2, "computed")
+        self.assertEqual(_jdump(n2), _jdump(_nodes("after-failure")))
+        facts = _raw_facts(JD_A)
+        self.assertEqual(_jdump(facts["knowledge"]), _jdump(_nodes("after-failure")))
+        self.assertEqual(facts["knowledge_source"], "computed")
+        # 失败那次**没有**写盘（既不写空缓存，也不留半截）
+        self.assertEqual(len(_events("analyze.knowledge_computed")), 1)
+
+    def test_the_builder_is_called_outside_the_jd_lock(self):
+        """真算（206 秒）**绝不能**抱着 `_JD_LOCK`：那会让**所有 JD 的写入**一起停 206 秒。
+
+        判据：builder 被调的那一刻那把锁不归本线程（`_store` 那次「读 → 改 → 写」仍然必须在
+        锁内，由 `GetAndSaveTest.test_read_modify_write_happens_under_the_jd_lock` 钉着）。
+        """
+        self._new_jd()
+        owned = []
+
+        def builder(jd_text, cfg):
+            owned.append(jdid._JD_LOCK._is_owned())
+            return _nodes("x")
+
+        jdfacts.resolve(JD_A, "JD 原文-A", CFG, builder=builder)
+        self.assertTrue(owned, "_builder 一次都没被调，这条测试没验证到东西")
+        self.assertEqual(owned, [False],
+                         "builder 是在 _JD_LOCK 里被调的：所有 JD 的写入都会被它堵 206 秒")
+
+
+# ---------------------------------------------------------------- ⑤ 架构铁律
 class ModuleHygieneTest(IsolatedCase):
     def test_it_never_imports_knowledge(self):
         """`knowledge.build_for_jd` 会**真联网搜索**：本模块绝不能 import 它。
@@ -669,7 +950,8 @@ class ModuleHygieneTest(IsolatedCase):
             elif isinstance(node, ast.ImportFrom):
                 names.add((node.module or "").split(".")[0])
         self.assertTrue(names, "一个 import 都没找到？解析方式不对")
-        self.assertEqual(names - {"os", "datetime", "jdid", "kb", "log", "store"}, set())
+        self.assertEqual(names - {"os", "threading", "time", "datetime",
+                                  "jdid", "kb", "log", "store"}, set())
 
     def test_it_takes_only_the_jd_lock(self):
         """锁顺序恒为 `_JD_LOCK` → `_KB_LOCK`：本模块**只**碰前者，绝不反向。

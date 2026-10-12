@@ -31,10 +31,17 @@ JD 文本，所以「同一个 JD 只算一次、换简历直接复用」是白�
      「这个 JD 当时的视图」了。知识库那边照旧由 `kb.absorb` 累积，两者用途不同。
   5. 磁盘是唯一真相源：每次读都重新解析 `jds.json`，所以调用方（比如 `kb.absorb`）就地改动
      返回的节点列表也不会污染缓存。
+  6. **同一个 JD 的并发请求只许真算一次**（单飞）：真算是 206 秒 + ~53 次搜索额度，而服务是
+     `ThreadingHTTPServer` —— 双击 / 双标签页 / 重试都会让两个线程同时看到「没有缓存」。
+     等待者**绝不各算一遍**，也不许死等：领导者失败时它自己再算一次。
+     单飞登记表由 `_INFLIGHT_LOCK` 护着，**绝不用 `_JD_LOCK` 跨 `builder`**
+     （那会让所有 JD 的写入一起停 206 秒）。
 
 数据模型与接口见 `docs/superpowers/specs/2026-10-12-知识地图缓存-design.md` §3 / §5。
 """
 import os
+import threading
+import time
 from datetime import datetime
 
 import jdid
@@ -48,6 +55,59 @@ NOW_FMT = "%Y-%m-%d %H:%M"          # 与 `jdid.upsert_jd` 的 created_at 同一
 SOURCE_CACHE = "cache"              # 复用缓存
 SOURCE_COMPUTED = "computed"        # 真算
 SEEDED_PREFIX = "seeded:"           # 播种：`seeded:<报告id>`
+
+EVENT_JOINED = "analyze.knowledge_joined"        # 等待者加入了别人「在飞」的那次真算
+EVENT_SEED_SKIPPED = "analyze.knowledge_seed_skipped"   # 临界区里发现已有可用缓存 → 放弃播种写
+
+
+# ---------------------------------------------------------------- 单飞（同一个 JD 只算一次）
+_INFLIGHT_LOCK = threading.Lock()   # 只护着下面这张登记表；**绝不**跨 `builder` 持有
+_INFLIGHT = {}                      # jd_id -> _Flight：这个 JD 上正在「真算」的那一次
+
+
+class _Flight(object):
+    """一次「真算」的登记。`done` 给等待者发信号；`source` / `nodes` / `error` 是那次的结果。
+
+    第二个线程**等它算完直接拿结果**，绝不各算一遍。领导者失败（builder 抛异常）时
+    `error` 会被填上、`done` **照样**会被置上：等待者醒来发现没有结果就自己再去算一次 ——
+    **绝不死等**。
+    """
+    __slots__ = ("done", "source", "nodes", "error")
+
+    def __init__(self):
+        self.done = threading.Event()
+        self.source = SOURCE_COMPUTED
+        self.nodes = None
+        self.error = None
+
+
+def _join_inflight(flight):
+    """等同一个 JD 上正在真算的那个线程；返回等了多久（秒）。
+
+    **单独一个函数是给测试留的同步缝**：替换它，测试就能确定性地知道「等待者已经进入了
+    等待」，不必靠 sleep 去猜（sleep 型的并发测试既可能假绿也可能假红）。
+    """
+    t0 = time.monotonic()
+    flight.done.wait()
+    return time.monotonic() - t0
+
+
+def _enter_flight(jd_id):
+    """登记「本线程要真算这个 JD」；已经有线程在算 → `(None, 那份登记)`。"""
+    with _INFLIGHT_LOCK:
+        flight = _INFLIGHT.get(jd_id)
+        if flight is None:
+            flight = _Flight()
+            _INFLIGHT[jd_id] = flight
+            return flight, None
+        return None, flight
+
+
+def _leave_flight(jd_id, flight):
+    """注销登记。结果（`done`/`nodes`）**先写好**，所以这中间到的线程会直接拿到刚算好的那份。"""
+    with _INFLIGHT_LOCK:
+        if _INFLIGHT.get(jd_id) is flight:
+            del _INFLIGHT[jd_id]
 
 
 def _now():
@@ -106,23 +166,40 @@ def needs_compute(jd_id, refresh=False):
 
 
 # ---------------------------------------------------------------- 写
-def _store(jd_id, nodes, source, at=None, seeded_at=None):
+def _store(jd_id, nodes, source, at=None, seeded_at=None, only_if_no_cache=False):
     """在 `jdid._JD_LOCK` 里「读 `jd_facts` → 改 → 写回」，返回落盘后的那份 `jd_facts`。
 
-    `knowledge_at` 是**这份知识地图的生成时间**：已有就保留（只有「强制刷新」会显式传 `at`
-    覆盖它 —— 用户明确要了一份新的，报告里的「生成于」就该跟着走）。
+    `knowledge_at` 是**这份知识地图的生成时间**：
+      * 给了 `at`（强制刷新 = 本次时间；播种 = 那份报告**真正生成**的时间）→ 用它；
+      * 否则只在**旧缓存是非空列表**时沿用旧时间戳 —— 空列表不是可用缓存，
+        沿用它的时间戳会让新算出来的地图显示错的时间（报告里「生成于」那行）。
+
+    `only_if_no_cache=True`（播种用）：进临界区后**重判**一次，此刻已经有可用缓存就
+    **放弃这次写入**并返回 `None` —— 播种绝不用旧报告覆盖更新的那份（那会让内容与
+    时间戳对不上：内容来自旧报告、时间来自刚算完的那次）。
     """
     got = _as_nodes(nodes)
     if got is None:
         raise ValueError("知识地图必须是节点列表（或 {\"nodes\": [...]}）：%r" % (nodes,))
+    src = _text(source)
+    if src is None:
+        raise ValueError("knowledge_source 必须是非空字符串：%r" % (source,))
     with jdid._JD_LOCK:
         rec = jdid.find_jd(jd_id)
         if rec is None:
             raise LookupError("JD 库里没有这个岗位：%r" % (jd_id,))
         facts = dict(_facts_of(rec))
+        old = _as_nodes(facts.get("knowledge"))      # 覆盖**之前**的旧缓存
+        if only_if_no_cache and old:
+            return None                              # 此刻已经有可用缓存了：放弃这次写入
         facts["knowledge"] = got
-        facts["knowledge_source"] = _text(source) or ""
-        facts["knowledge_at"] = _text(at) or _text(facts.get("knowledge_at")) or _now()
+        facts["knowledge_source"] = src
+        if _text(at):
+            facts["knowledge_at"] = _text(at)
+        elif old:
+            facts["knowledge_at"] = _text(facts.get("knowledge_at")) or _now()
+        else:
+            facts["knowledge_at"] = _now()
         if seeded_at:
             facts["seeded_at"] = seeded_at
         jdid.upsert_jd({"id": rec.get("id"), FACTS_KEY: facts})
@@ -130,7 +207,10 @@ def _store(jd_id, nodes, source, at=None, seeded_at=None):
 
 
 def save_knowledge(jd_id, nodes, source):
-    """写 `jd_facts.knowledge` + `knowledge_at`（**首次生成时间，已存在则保留**）+ `knowledge_source`。
+    """写 `jd_facts.knowledge` + `knowledge_source` + `knowledge_at`。
+
+    `knowledge_at` 是这份地图的生成时间：**旧缓存是非空列表**时保留它（首次生成时间比这次写入
+    更有信息量），否则盖成本次时间。`source` 必须是非空字符串（报告照着它写来源标记）。
 
     岗位不存在 → LookupError（绝不凭空造一条 JD 记录）。
     """
@@ -174,7 +254,17 @@ def _seed(jd_id):
             nodes = None                          # 任何意外都当「读不出来」，静默走真算
         if not nodes:
             continue
-        _store(want, nodes, SEEDED_PREFIX + rid, seeded_at=_now())
+        facts = _store(want, nodes, SEEDED_PREFIX + rid,
+                       # `knowledge_at` 是这份地图**真正生成**的时间 = 那份分析记录的
+                       # `created_at`；`seeded_at` 才是「这次播种发生在何时」。写成同一个时间
+                       # 的话，报告里的小字会显示一个**晚于报告本身**的生成日期。
+                       at=_text(analysis.get("created_at")), seeded_at=_now(),
+                       only_if_no_cache=True)
+        if facts is None:
+            # 临界区里发现已经有可用缓存（窄窗口：另一个线程刚把真算落盘）→ 放弃这次播种写。
+            # 调用方（`resolve`）会再看一眼缓存：那时那份缓存比任何旧报告都新。
+            log.log_event(EVENT_SEED_SKIPPED, jd=want, report=rid)
+            return None, None
         log.log_event("analyze.knowledge_seeded", jd=want, report=rid, nodes=len(nodes))
         return nodes, rid
     return None, None
@@ -186,6 +276,9 @@ def seed_from_reports(jd_id):
     返回 `(True, 报告id)` 或 `(False, None)`。读不出来（文件缺失 / 坏 JSON / 没有 REPORT_DATA /
     知识地图为空或垃圾）一律**静默**返回 `(False, None)`：不抛异常、不写空缓存、
     更不用别的 JD 的知识地图 —— 由调用方退回真算那条路。
+
+    **播种写守卫**：进 `_JD_LOCK` 临界区后重判一次，此刻已经有可用缓存（比如另一个线程刚
+    真算完）就**放弃这次写入**、同样返回 `(False, None)` —— 绝不用旧报告覆盖更新的那份。
     """
     nodes, rid = _seed(jd_id)
     if nodes and rid:
@@ -194,6 +287,69 @@ def seed_from_reports(jd_id):
 
 
 # ---------------------------------------------------------------- 编排
+def _reuse(jd_id, cached):
+    """① 缓存命中（或等待者拿到了刚落盘的那份）：记事件、返回 `(节点, "cache")`。"""
+    log.log_event("analyze.knowledge_reused", jd=jd_id, nodes=len(cached),
+                  at=_text(get(jd_id).get("knowledge_at")) or "")
+    return cached, SOURCE_CACHE
+
+
+def _compute(jd_id, jd_text, cfg, builder, refresh):
+    """③ 真算一次并落盘。**单飞登记由调用方负责**（同一个 JD 同一时刻只走一个）。"""
+    replaced_at = (_text(get(jd_id).get("knowledge_at")) or "") if refresh else ""
+    # ⚠️ `builder(...)` 是**实参**：它在 `_store` 取 `_JD_LOCK` 之前就求值完了。
+    # 真算要 206 秒，抱着 `_JD_LOCK` 去算就等于让**所有 JD 的写入**一起停 206 秒。
+    computed = builder(jd_text, cfg)
+    facts = _store(jd_id, computed, SOURCE_COMPUTED, at=_now() if refresh else None)
+    nodes = facts["knowledge"]
+    log.log_event("analyze.knowledge_computed", jd=jd_id, nodes=len(nodes),
+                  refresh=bool(refresh), replaced_at=replaced_at)
+    return nodes, SOURCE_COMPUTED
+
+
+def _compute_once(jd_id, jd_text, cfg, builder, refresh):
+    """③ 真算的**单飞**入口：同一个 JD 同一时刻只算一次，其它线程等它、直接拿它的结果。
+
+    没有单飞的话，双击 / 双标签页 / 重试会让两个线程同时看到「没有缓存」→ 各烧一遍
+    206 秒 + ~53 次搜索额度（服务是 `ThreadingHTTPServer`，全项目没有分析级锁）。
+    """
+    while True:
+        mine, other = _enter_flight(jd_id)
+        if mine is None:
+            # ---- 等待者：绝不各算一遍 ----
+            waited = _join_inflight(other)
+            if other.error is not None:
+                # 领导者失败了 → **绝不死等**：摘掉那份失败的登记，自己再抢一次领导权去算
+                with _INFLIGHT_LOCK:
+                    if _INFLIGHT.get(jd_id) is other:
+                        del _INFLIGHT[jd_id]
+                continue
+            nodes = knowledge_of(jd_id)      # 磁盘是唯一真相源：重新解析，不与它共享同一个列表
+            if not nodes:
+                nodes = list(other.nodes or [])   # 空地图（`[]` 不算可用缓存）：结果就是它那份
+            log.log_event(EVENT_JOINED, jd=jd_id, nodes=len(nodes), ms=int(waited * 1000))
+            return nodes, other.source
+
+        result = None
+        try:
+            if not refresh:
+                cached = knowledge_of(jd_id)   # 抢到领导权后再判一次：别人可能刚算完并注销了
+                if cached:
+                    result = _reuse(jd_id, cached)
+                    return result
+            result = _compute(jd_id, jd_text, cfg, builder, refresh)
+            return result
+        except BaseException as exc:
+            # 让等待者知道「这次没算出来」—— 否则它会把「空地图」当成领导者的结果（等于骗用户）
+            mine.error = exc
+            raise
+        finally:
+            if result is not None:
+                mine.nodes, mine.source = result
+            mine.done.set()                 # 先把结果放出去（`done` 一置上等待者就会读它）…
+            _leave_flight(jd_id, mine)      # …再注销登记
+
+
 def resolve(jd_id, jd_text, cfg, refresh=False, builder=None):
     """**唯一编排入口**：① 缓存 → ② 播种 → ③ 真算（三级回退）。返回 `(nodes, source)`。
 
@@ -202,6 +358,9 @@ def resolve(jd_id, jd_text, cfg, refresh=False, builder=None):
     `builder(jd_text, cfg)` 由调用方注入（生产里是 `knowledge.build_for_jd`）；本模块不 import
     knowledge，所以测试里永远不会真联网搜索。`refresh=True` 跳过①②直接重算，并把
     `knowledge_at` 改成本次时间（用户明确要了一份新的）。
+
+    ③ 那一步是**单飞**的：同一个 JD 的并发请求只烧一次（206 秒 + ~53 次搜索额度），
+    等待者拿的正是领导者的结果（`source` 同样是 `computed`）。
     """
     if jdid.find_jd(jd_id) is None:
         # 身份先校验：否则「强制刷新」会在一个不存在的岗位上空烧 53 次搜索，最后才写盘失败
@@ -210,21 +369,18 @@ def resolve(jd_id, jd_text, cfg, refresh=False, builder=None):
     if not refresh:
         cached = knowledge_of(jd_id)
         if cached:
-            log.log_event("analyze.knowledge_reused", jd=jd_id, nodes=len(cached),
-                          at=_text(get(jd_id).get("knowledge_at")) or "")
-            return cached, SOURCE_CACHE
+            return _reuse(jd_id, cached)
         ok, rid = seed_from_reports(jd_id)
         if ok:
             seeded = knowledge_of(jd_id)      # 从**落盘的那份**取，保证返回的与缓存逐字一致
             if seeded:
                 return seeded, SEEDED_PREFIX + rid
+        # 播种可能**故意没写**（临界区里发现另一个线程刚把真算落盘）→ 再看一眼缓存：
+        # 那份比任何旧报告都新，直接复用它（否则又会多烧一次 206 秒）。
+        cached = knowledge_of(jd_id)
+        if cached:
+            return _reuse(jd_id, cached)
 
     if builder is None:
         raise ValueError("真算知识地图需要调用方注入 builder（生产里是 knowledge.build_for_jd）")
-    replaced_at = (_text(get(jd_id).get("knowledge_at")) or "") if refresh else ""
-    facts = _store(jd_id, builder(jd_text, cfg), SOURCE_COMPUTED,
-                   at=_now() if refresh else None)
-    nodes = facts["knowledge"]
-    log.log_event("analyze.knowledge_computed", jd=jd_id, nodes=len(nodes),
-                  refresh=bool(refresh), replaced_at=replaced_at)
-    return nodes, SOURCE_COMPUTED
+    return _compute_once(jd_id, jd_text, cfg, builder, refresh)
