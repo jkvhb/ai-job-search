@@ -166,11 +166,48 @@ class NormalizeFieldsTest(IsolatedCase):
 
     def test_company_without_brackets_is_truncated_to_twelve_chars(self):
         self.assertEqual(jdid._normalize_company("四川金沙人力资源开发管理有限公司"),
-                         "四川金沙人力资源开发管理")          # 16 → 12
+                         "四川金沙人力资源开发管理")          # 16 → 剥后缀后正好 12
         self.assertEqual(jdid._normalize_company("字节跳动"), "字节跳动")   # 短的照旧
         # 截断不能留半个括号（未闭合的括号也要砍在它前面）
         self.assertEqual(jdid._normalize_company("某某某某某某某某某某（简称"),
                          "某某某某某某某某某某")
+
+    def test_legal_suffix_is_stripped_before_truncating(self):
+        """**这条规则存在的理由**：不留「半个后缀」。
+
+        名字**超过** 12 字时最明显：`北京字节跳动网络技术有限公司`（14 字）不剥后缀、
+        直接截断到 12 字就会切出 `北京字节跳动网络技术有限` —— 半个 `有限公司`，
+        用户每天看这个身份串，一眼就是坏的。
+        """
+        raw = "北京字节跳动网络技术有限公司"
+        self.assertEqual(len(raw), 14)
+        self.assertEqual(raw[:12], "北京字节跳动网络技术有限")      # 不剥就是这个坏结果
+        self.assertEqual(jdid._normalize_company(raw), "北京字节跳动网络技术")
+        # 其余形态
+        self.assertEqual(jdid._normalize_company("北京字节跳动科技有限公司"), "北京字节跳动科技")
+        self.assertEqual(jdid._normalize_company("北京某某科技有限公司"), "北京某某科技")
+        self.assertEqual(jdid._normalize_company("广州某某信息技术有限责任公司"), "广州某某信息技术")
+        self.assertEqual(jdid._normalize_company("某某某某某某某某某某有限公司"), "某某某某某某某某某某")
+
+    def test_legal_suffix_stripping_tries_the_longest_first(self):
+        """`集团有限公司` 必须先于 `公司` 匹配，否则会剥出 `某某集团有限`。"""
+        self.assertEqual(jdid._normalize_company("某某集团有限公司"), "某某")
+        self.assertEqual(jdid._normalize_company("某某集团"), "某某")
+        self.assertEqual(jdid._normalize_company("某某股份有限公司"), "某某")
+
+    def test_stripping_to_an_empty_company_falls_back_to_not_stripping(self):
+        """后缀剥完**为空**时必须退回不剥：否则用户填过的公司名变成 `【未知单位】`。"""
+        for raw in ("有限公司", "公司", "集团", "有限责任公司"):
+            with self.subTest(raw=raw):
+                self.assertEqual(jdid._normalize_company(raw), raw)
+        self.assertEqual(jdid.normalize_fields({"company": "有限公司"})["company"], "有限公司")
+        self.assertEqual(jdid.build_id(jdid.normalize_fields({"company": "有限公司"}), 1),
+                         "【未知学历】_有限公司_【未知职责】_【未知领域】_【未知城市】_【未知薪资】_0001")
+
+    def test_bracketed_company_still_uses_the_shorter_side_rule(self):
+        """带括号的**不受**剥后缀影响，仍走「取更短一侧」——
+        `阿里巴巴（中国）有限公司` 取括号内的 `中国`（先匹配括号，就不会去剥 `有限公司`）。"""
+        self.assertEqual(jdid._normalize_company("阿里巴巴（中国）有限公司"), "中国")
 
     def test_company_empty_stays_none(self):
         for raw in ("", "   ", None, 7):
@@ -251,6 +288,27 @@ class RealReportIdTest(IsolatedCase):
                 for ch in "（()）" + jdid.BAD_CHARS:
                     self.assertNotIn(ch, jd_id)
                 self.assertIsNone(jdid.validate_id(jd_id, []))
+
+    def test_the_suffix_strip_changes_none_of_the_six_real_ids(self):
+        """**零影响证据**：剥法定后缀前后，6 份真实报告的归一化单位与整条 ID 都逐字不变。
+
+        真实数据里唯一没有括号的那条（`四川金沙人力资源开发管理有限公司`）剥掉 `有限公司` 后
+        正好是 12 字，与「不剥直接截断到 12 字」的结果完全相同 —— 所以这条改进对真实数据
+        一个字符都没动（期望值就是上一版冻结的 `REAL_IDS`）。
+        """
+        want_companies = ["金沙人力", "四川金沙人力资源开发管理", "金沙人力",
+                          None, None, "示例"]
+        for seq, ((name, data), want_id, want_co) in enumerate(
+                zip(REAL_REPORTS, REAL_IDS, want_companies), 1):
+            with self.subTest(report=name):
+                fields = jdid.derive_fields(data)
+                self.assertEqual(fields["company"], want_co)
+                self.assertEqual(jdid.build_id(fields, seq), want_id)
+        # 那条无括号的真实公司名：剥后缀与「不剥直接截断」得到同一个值
+        self.assertEqual(jdid._strip_legal_suffix("四川金沙人力资源开发管理有限公司"),
+                         "四川金沙人力资源开发管理")
+        self.assertEqual("四川金沙人力资源开发管理有限公司"[:12],
+                         "四川金沙人力资源开发管理")
 
     def test_the_two_analyses_of_the_same_real_jd_now_share_one_identity(self):
         """**这就是本块要修的根因**：`20261003` 与 `20261008` 是同一份 JD 的两次分析。
