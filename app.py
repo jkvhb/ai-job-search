@@ -13,12 +13,14 @@ import os
 import re
 import socket
 import sys
+import threading
 import time
 import webbrowser
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, unquote, quote
 
+import jdid
 import jobdup
 import kb
 import knowledge
@@ -284,8 +286,89 @@ def _job_merged_into(job):
     return v.strip() if isinstance(v, str) else ""
 
 
-def _ledger_jobs():
-    """台账里**当前有效**的岗位记录：`merged_into` 非空的（已合并的标记记录）全部排除。
+# ---------------------------------------------------------------- JD 形象（jds.json = JD 级真相源）
+# 阶段 4A 的分界线（规格 §3）。**这不是抄一份，是两套字段**：
+#   * **JD 级**（`JD_FIELDS`）—— 岗位是什么、投递到哪一步、结果如何。**只存 `jds.json`**。
+#     为什么 outcome_* 也算 JD 级：你在一个岗位上只投一次、只用一个简历，结果属于岗位。
+#   * **分析级**（`ANALYSIS_FIELDS`）—— 这次分析用哪份简历、多少分、报告在哪。只存 `jobs.json`。
+# 两边各存一份是本项目反复栽的坑：`status` 在 jobs.json 改了、jds.json 里还是旧的，
+# 于是台账一个说法、结果面板另一个说法。**写 jobs.json 之前一律过 `_analysis_fields` 剥一遍。**
+JD_FIELDS = ("job_title", "job_category", "location", "salary", "company", "hr_name", "phone",
+             "address", "status", "verdict", "notes", "jd_text_file", "jd_image", "source_type",
+             "source_link", "outcome_at", "outcome_reason", "outcome_ai")
+ANALYSIS_FIELDS = ("id", "jd_id", "resume", "score", "report", "created_at", "merged_into")
+
+# `_with_job_views` 换 `store.find_job` / `store.upsert_job` 期间的互斥（模块级全局，服务器是多线程的）
+_STORE_VIEW_LOCK = threading.RLock()
+# `store.upsert_job` 的**原函数**（`_write_analysis` 用它，绝不用模块属性 —— 会被换成视图版 → 递归）
+_STORE_UPSERT = store.upsert_job
+
+
+def _analysis_fields(rec):
+    """只留分析级字段 + `jd_id`（`merged_into` 是 3.6 的合并标记，也要留着才过滤得掉）。
+
+    写 `jobs.json` 的**唯一入口**都走这里 —— 否则 JD 级字段会悄悄漏回 jobs.json，
+    又要回到「两个文件各存一份」。`jd_id` 空但 `id` 有值（迁移前的记录）时退回 `id`：
+    迁移前身份 == 报告文件名，而历史 `from_jds` 指的正是它，两者一致才不会指丢。
+    """
+    if not isinstance(rec, dict):
+        return {}
+    out = {k: rec[k] for k in ANALYSIS_FIELDS if k in rec}
+    if not str(out.get("jd_id") or "") and str(out.get("id") or ""):
+        out["jd_id"] = out["id"]
+    return out
+
+
+def _write_analysis(rec, key=None):
+    """真正写 `jobs.json` 的那一层。
+
+    ⚠️ 必须走 `store.upsert_job` 的**模块级原函数**：`_with_job_views` 会把
+    `store.upsert_job` 换成视图版，而视图版内部要写分析记录 —— 直接调模块属性会
+    无限递归（实测踩到过 `maximum recursion depth exceeded`）。
+    """
+    clean = _analysis_fields(rec)
+    if not clean.get("id"):
+        raise ValueError("分析记录必须有 id")
+    with _STORE_VIEW_LOCK:
+        return _STORE_UPSERT(clean, key)
+
+
+def _save_analysis(rec, key=None):
+    """把一条**分析**记录写进 `jobs.json`（JD 级字段在这里被剥掉）。"""
+    return _write_analysis(rec, key)
+
+
+def _jd_of_analysis(rec):
+    """一条分析记录挂在哪个 JD 下。`jd_id` 优先，迁移前的记录退回 `id`（那时身份==报告文件名）。"""
+    if not isinstance(rec, dict):
+        return {}
+    jid = str(rec.get("jd_id") or rec.get("id") or "")
+    return jdid.find_jd(jid) if jid else None
+
+
+def _analysis_view(rec):
+    """`jds.json` 的 JD 记录 **+** 这条分析的 `id`/`score`/`report`/`resume` —— 给 outcome 用。
+
+    为什么要有这一层：`outcome` 模块读的是「一条岗位记录」的扁平形状（`job.get("status")` …），
+    而真相已经搬进 `jds.json`。这层把同一个形状照旧端出来；**写回**时由 `_with_job_views`
+    把 JD 级字段交给 `jdid.upsert_jd`、分析级字段交给 `_write_analysis`（写错地方就退回两处各存一份）。
+    """
+    if not isinstance(rec, dict):
+        return None
+    jd = _jd_of_analysis(rec) or {}
+    view = dict(jd)
+    view["id"] = str(rec.get("id") or "")            # 只读视图里 id = 这条分析的 id
+    view["jd_id"] = str(rec.get("jd_id") or jd.get("id") or rec.get("id") or "")
+    for k in ("score", "report", "resume", "created_at"):
+        if k in rec:
+            view[k] = rec[k]
+    if "merged_into" in rec:
+        view["merged_into"] = rec["merged_into"]
+    return view
+
+
+def _ledger_analyses():
+    """台账里**当前有效**的分析记录：`merged_into` 非空的（已合并的标记记录）全部排除。
 
     §4：合并只打标记不删记录，所以「列表」与「统计」都必须过滤，否则被并的那条
     会一直躺在台账里，用户看到两个岗位。
@@ -293,32 +376,299 @@ def _ledger_jobs():
     return [j for j in store.load_jobs() if not _job_merged_into(j)]
 
 
-def _job_in_ledger(job_id):
-    """按 id 在**有效台账**里找一条记录（已合并的不算「台账里还有这个岗位」）。"""
-    jid = str(job_id or "")
-    if not jid:
+def _jd_id_of_row(rec):
+    """一条分析记录对应的 JD id（`jd_id` 优先，迁移前退回 `id`）。"""
+    return str(rec.get("jd_id") or rec.get("id") or "")
+
+
+def _jd_row(jd_id, records):
+    """一行 = 一个 JD：JD 记录全字段 + 分析聚合（份数 / 最高分 / 每份分析）。
+
+    ⚠️ `id` = **JD id**（不是分析 id）：前端拿它去 `/api/jd_text`、`/api/job/outcome`、
+    `/api/job/result`、`X-Job-Id`，这些现在都以 JD 为身份。分析级字段（`report`/`resume`/
+    `score`/`jd_text_file`）逐份挂在 `analyses` 里，**不**冒充 JD 字段。
+    """
+    jd = jdid.find_jd(jd_id) or {}
+    rows = sorted(records, key=lambda r: (str(r.get("created_at") or ""), str(r.get("id") or "")))
+    analyses = [{
+        "id": str(r.get("id") or ""),
+        "resume": str(r.get("resume") or ""),
+        "score": r.get("score"),
+        "report": str(r.get("report") or ""),
+        "created_at": str(r.get("created_at") or ""),
+    } for r in rows]
+    scores = []
+    for r in rows:
+        try:
+            if r.get("score") is not None:
+                scores.append(float(r.get("score")))
+        except (TypeError, ValueError):
+            pass
+    row = dict(jd) if isinstance(jd, dict) else {}
+    row["id"] = jd_id
+    row["jd_id"] = jd_id
+    row["analysis_count"] = len(rows)
+    row["max_score"] = max(scores) if scores else None
+    row["analyses"] = analyses
+    # 顶层 score 也放最高分：老前端把它当「这个岗位的分」，改成最高分才符合「一行 = 一个 JD」
+    row["score"] = row["max_score"]
+    if rows:
+        row["created_at"] = str(rows[0].get("created_at") or row.get("created_at") or "")
+        row["updated_at"] = str(rows[-1].get("created_at") or row.get("updated_at") or "")
+        if not str(row.get("resume") or ""):
+            row["resume"] = str(rows[-1].get("resume") or "")
+        if not str(row.get("report") or ""):
+            row["report"] = str(rows[-1].get("report") or "")
+    return row
+
+
+def _ledger_rows():
+    """台账：**一行 = 一个 JD**（JD 级真相来自 `jds.json`，分析份数/最高分现算）。
+
+    没有 JD 记录的历史分析**兜底成一行**（用记录本身当 JD 级来源）：迁移还没跑时
+    台账不能因此空白 —— 「记录看不见」比「字段是老形状」严重得多。
+    """
+    groups = {}
+    order = []
+    for rec in store.load_jobs():
+        if not isinstance(rec, dict) or _job_merged_into(rec):
+            continue
+        jd_id = _jd_id_of_row(rec)
+        if jd_id not in groups:
+            groups[jd_id] = []
+            order.append(jd_id)
+        groups[jd_id].append(rec)
+    rows = [_jd_row(jd_id, groups[jd_id]) for jd_id in order]
+    rows.sort(key=lambda r: (str(r.get("created_at") or ""), str(r.get("id") or "")), reverse=True)
+    return rows
+
+
+def _jd_row_of(jd_id):
+    """按 **JD id** 找台账里那一行（已合并的分析不算「台账里还有这个岗位」）。找不到回 None。"""
+    want = str(jd_id or "")
+    if not want:
         return None
-    for j in _ledger_jobs():
-        if j.get("id") == jid:
-            return j
+    rows = _analysis_records_of(want)
+    return _jd_row(want, rows) if rows else None
+
+
+def _analysis_records_of(jd_id):
+    """该 JD 下**有效**（未合并）的分析记录，按 created_at 升序。"""
+    want = str(jd_id or "")
+    if not want:
+        return []
+    rows = [r for r in _ledger_analyses() if _jd_id_of_row(r) == want]
+    return sorted(rows, key=lambda r: (str(r.get("created_at") or ""), str(r.get("id") or "")))
+
+
+def _analysis_record_by_id(analysis_id):
+    """按**分析 id** 找一条有效分析记录。"""
+    want = str(analysis_id or "")
+    if not want:
+        return None
+    for r in _ledger_analyses():
+        if str(r.get("id") or "") == want:
+            return r
     return None
 
 
-def _similar_saved_job(jd_text):
-    """在**有效台账**里找一条 JD 原文与新提交 JD 判定为重复的记录；找不到回 None。
+def _job_in_ledger(job_id):
+    """按 id 在**有效台账**里找一条记录（已合并的不算「台账里还有这个岗位」）。
 
-    只比较能读到 `jd/<id>.txt` 的岗位（缺原文的用 jobdup.jd_text_of 拿到空串 → 不判定）。
-    返回 `(job, similarity)`；命中时取相似度最高的那条。
+    新模型的**读写入口都收 JD id**（前端从 `/api/jobs` 拿到的 `id` 就是 JD id），
+    但历史记录 / 老前端可能还传分析 id 或报告文件名 —— 两种都认，认不出回 None
+    （调用方据此回 404 / 400）。返回的是**分析记录**，JD 级字段请用 `_jd_of_analysis`。
+    """
+    want = str(job_id or "")
+    if not want:
+        return None
+    by_id = _analysis_record_by_id(want)
+    if by_id is not None:
+        return by_id
+    rows = _analysis_records_of(want)
+    return rows[-1] if rows else None
+
+
+def _jd_view(job_id):
+    """把一个 id（JD id / 分析 id 都认）解析成 `(JD记录, 有效分析记录)`；认不出回 `(None, None)`。
+
+    **已合并的分析不算「台账里还有这个岗位」**（`_job_in_ledger` 已排除）—— 写接口拿到
+    `(JD, None)` 时必须回 404，否则就变成「悄悄改一条用户看不到的记录」。
+    """
+    want = str(job_id or "")
+    if not want:
+        return None, None
+    jd = jdid.find_jd(want)
+    rec = _job_in_ledger(want)
+    if jd is None and rec is not None:
+        jd = _jd_of_analysis(rec)
+    if rec is None and jd is not None:
+        rows = _analysis_records_of(want)
+        rec = rows[-1] if rows else None
+    return jd, rec
+
+
+def _jd_text_path(jd):
+    """JD 原文的磁盘路径；没有原文回空串。
+    新记录：`jd_text_file` 是 `<jd_id>.txt`；迁移前的老记录 `jd_text_file` 可能是
+    `<报告文件名>.txt` —— 两种都按字段走，字段空时才退回 `<jd_id>.txt`（Task 2 之前的
+    记录根本没有 `jd_text_file` 指向 JD id 这一说）。
+    """
+    if not isinstance(jd, dict):
+        return ""
+    name = store.safe_name(jd.get("jd_text_file"))
+    if not name and str(jd.get("id") or ""):
+        name = store.safe_name(str(jd.get("id")) + ".txt")
+    return os.path.join(store.p_path("jd"), name) if name else ""
+
+
+def _jd_text_of(jd_id):
+    """读该 JD 的原文（`jds.json` 的 `jd_text_file` → 磁盘）；读不到回空串。"""
+    jd = jdid.find_jd(jd_id)
+    path = _jd_text_path(jd)
+    if path and os.path.exists(path):
+        return store.read_text(path, "")
+    # 兜底：老记录 / 还没建 JD 记录时，原文就叫 `<id>.txt`
+    return jobdup.jd_text_of(jd_id)
+
+
+def _similar_saved_jd(jd_text):
+    """在**已有 JD** 里找与新提交 JD 判定为重复的那一个；找不到回 None。
+
+    命中时返回 `(jd_id, similarity)`，取相似度最高的那条（§3 的指纹判定，
+    复用 `jobdup.containment` / `jobdup.THRESHOLD` —— 阈值只有一份实现）。
+    只能比较**读得到 JD 原文**的 JD（缺原文的一律不猜，与迁移脚本同一条纪律）。
     """
     best = None
-    for job in _ledger_jobs():
-        text = jobdup.jd_text_of(job.get("id"))
-        if not text.strip():
+    for jd in jdid.load_jds()["jds"]:
+        if not isinstance(jd, dict) or not str(jd.get("id") or ""):
             continue
-        score = jobdup.containment(jd_text, text)
+        saved = _jd_text_of(jd.get("id"))
+        if not saved.strip():
+            continue
+        score = jobdup.containment(jd_text, saved)
         if score >= jobdup.THRESHOLD and (best is None or score > best[1]):
-            best = (job, score)
+            best = (str(jd.get("id")), score)
     return best
+
+
+def _with_job_views(fn, *args, **kw):
+    """在「id = JD id」的请求里跑 `fn`，期间把 `store.find_job` / `store.upsert_job`
+    接到**扁平视图**上（读拼起来、写分头落盘）。
+
+    为什么必须有这一层：`outcome` 模块的读写接口收的是「一条岗位记录的 id」，内部走
+    `store.find_job(id)` / `store.upsert_job(job)`。阶段 4A 之后 JD 级字段住在 `jds.json`
+    （键是 `jd_id`），`jobs.json` 里按分析 id 才找得到 —— 不接这一层，`outcome` 会对着一个
+    JD id 说「找不到岗位」（404），结果面板与归因全线失效。
+
+    写回时**分头落盘**（这是本层存在的全部意义）：
+      * JD 级字段 → `jdid.upsert_jd`（`jds.json`）
+      * 分析级字段 → `_save_analysis`（`jobs.json`，JD 级字段在这里被剥掉）
+    这样「两处各存一份」不会因为 outcome 的一次保存就复活。
+
+    ⚠️ **线程安全**：两个函数都是模块级全局（服务器是多线程的）。这里用模块锁 +
+    try/finally 保证「改回去」一定发生；窗口只覆盖一次同步调用（含一次模型调用）。
+    这是**明确的取舍**：把 JD 级真相搬进 `jds.json` 之后，`outcome` 那份「单文件记录」的
+    假设必须有人来翻译，而本任务只允许改 `app.py`。
+    """
+    with _STORE_VIEW_LOCK:
+        original_find, original_upsert = store.find_job, store.upsert_job
+
+        def view_of(job_id, key=None):
+            rec = _job_in_ledger(job_id)
+            if rec is not None:
+                return _analysis_view(rec)
+            jd = jdid.find_jd(job_id)
+            if jd is not None:
+                rows = _analysis_records_of(jd.get("id"))
+                base = dict(rows[-1]) if rows else {"id": jd.get("id"), "jd_id": jd.get("id")}
+                # 手改坏的 JD 记录也要让 outcome 走它的容错分支（它是纯数据模块）
+                return dict(list(_analysis_view(base).items()) + list(jd.items()))
+            return None
+
+        def upsert(record, key=None):
+            if not isinstance(record, dict):
+                raise ValueError("记录必须是字典")
+            jd_id = str(record.get("jd_id") or "")
+            rec = None
+            if jd_id:
+                rows = _analysis_records_of(jd_id)
+                rec = rows[-1] if rows else None
+            if rec is None:
+                rec = _job_in_ledger(record.get("id"))
+            if rec is None:
+                # 没有对应的分析记录（不该发生）：至少别把 JD 级字段写进 jobs.json
+                return _save_analysis(record)
+            merged = dict(_analysis_fields(rec))
+            merged.update(_analysis_fields(record))
+            merged["jd_id"] = str(merged.get("jd_id") or jd_id or rec.get("jd_id") or "")
+            merged["id"] = str(rec.get("id") or record.get("id") or "")
+            if jd_id:
+                jd = dict(record)
+                jd["id"] = jd_id
+                jdid.upsert_jd(jd)
+            # ⚠️ 用 `_write_analysis`（内部走**模块级原函数**）：直接调 `_save_analysis`
+            # 会再落到这个被换掉的 `store.upsert_job` 上 → 无限递归（实测踩到过）。
+            _write_analysis(merged)
+            # 返回**视图**（JD 级 + 分析级拼起来的扁平形状）：调用方 `outcome.save_result`
+            # 会拿返回值去做 `_view_of(...)` —— 只回分析记录的话状态永远是「未投递」。
+            out = view_of(merged.get("id"))
+            return out if isinstance(out, dict) else merged
+
+        store.find_job, store.upsert_job = view_of, upsert
+        try:
+            return fn(*args, **kw)
+        finally:
+            store.find_job, store.upsert_job = original_find, original_upsert
+
+
+def _seq_of_id(jd_id):
+    """ID 末尾的编号段；不是结构化 ID（历史报告文件名）→ 0。"""
+    try:
+        return jdid.parse_id(jd_id)[1]
+    except ValueError:
+        return 0
+
+
+def _jd_record_of(jd_id, data, source_bits, link, jd_text_file, jd_image_url, base=None):
+    """一条 JD 记录的 JD 级字段。**展示值用原始表述，ID 用归一化后的短值**（Task 1 交接注意 1）。
+
+    `derive_fields` 会把 `6-8K（入职五险，提及一金7k+）` 归成 `6-8K`、把公司全名缩成简称 ——
+    那是**身份**该有的样子。用户在台账里要看的却是原始薪资 / 原始公司名，所以这一份
+    从 `REPORT_DATA`（也就是 `normalize` 之后的 `data`）直接取原值，不经过归一化。
+    `base` 是已有 JD 记录（复用同一个 JD 时）：用户手改过、或上一次分析有而这次没有的字段
+    **不能被空值覆盖**（那是把用户填过的东西丢掉）。
+    """
+    old = base if isinstance(base, dict) else {}
+
+    def pick(key, value):
+        v = value if isinstance(value, str) else ("" if value is None else str(value))
+        v = v.strip()
+        if v:
+            return v
+        return old.get(key) if isinstance(old.get(key), str) else ""
+
+    app = data.get("application") if isinstance(data.get("application"), dict) else {}
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    return {
+        "id": str(jd_id),
+        "job_title": pick("job_title", data.get("job_title")),
+        "job_category": pick("job_category", data.get("job_category") or "其他"),
+        "location": pick("location", data.get("location")),
+        "salary": pick("salary", data.get("salary")),            # **原始**薪资表述
+        "company": pick("company", data.get("company")),         # **原始**公司名
+        "hr_name": pick("hr_name", data.get("hr_name")),
+        "phone": pick("phone", data.get("phone")),
+        "address": pick("address", data.get("address")),
+        "status": pick("status", app.get("status") or "未投递"),
+        "verdict": pick("verdict", data.get("verdict")),
+        "notes": pick("notes", app.get("notes")),
+        "jd_text_file": str(jd_text_file or old.get("jd_text_file") or ""),
+        "jd_image": str(jd_image_url or old.get("jd_image") or ""),
+        "source_type": pick("source_type", " + ".join(source_bits) or "文本输入"),
+        "source_link": pick("source_link", link),
+        "created_at": str(old.get("created_at") or now),
+    }
 
 
 def find_analyze_duplicate(jd_text, overwrite_id=""):
@@ -330,28 +680,37 @@ def find_analyze_duplicate(jd_text, overwrite_id=""):
 
     `overwrite_id` 非空时必须**真的**是相似的那一条（用 jobdup 复核一次）：
     否则前端传错 id 就会把这次分析的结果写到一条**无关岗位**上。
+
+    **命中的粒度是 JD**（阶段 4A）：返回的 `job_id` / `jd_id` 都是**已有 JD 的 id** ——
+    前端拿它当 `overwrite` 发回来就走「沿用原身份」那一支，不会再算成一个新岗位。
     """
     overwrite_id = str(overwrite_id or "").strip()
     if overwrite_id:
-        job = _job_in_ledger(overwrite_id)
-        if job is None:
+        jd, job = _jd_view(overwrite_id)
+        hit_id = str((jd or {}).get("id") or (job or {}).get("jd_id") or "")
+        if not hit_id or _job_in_ledger(overwrite_id) is None:
             raise BadOverwrite("要覆盖的岗位不存在或已被合并：%s" % overwrite_id)
-        saved = jobdup.jd_text_of(job.get("id"))
+        saved = _jd_text_of(hit_id)
         score = jobdup.containment(jd_text, saved)
         if score < jobdup.THRESHOLD:
             raise BadOverwrite(
                 "要覆盖的岗位（%s）与这次提交的 JD 不相似（相似度 %.3f）："
                 "拒绝把结果写到无关岗位上" % (overwrite_id, score))
         return None
-    hit = _similar_saved_job(jd_text)
+    hit = _similar_saved_jd(jd_text)
     if hit is None:
         return None
-    job, score = hit
+    jd_id, score = hit
+    jd = jdid.find_jd(jd_id) or {}
+    rows = _analysis_records_of(jd_id)
+    latest = rows[-1] if rows else {}
     return {
-        "job_id": job.get("id"),
-        "job_title": job.get("job_title") or "",
-        "created_at": job.get("created_at") or "",
-        "score": job.get("score"),
+        # `job_id` 留着是为了老前端（阶段 3.6 的弹窗读它）；两者现在都是 **JD id**
+        "job_id": jd_id,
+        "jd_id": jd_id,
+        "job_title": str(jd.get("job_title") or ""),
+        "created_at": str(latest.get("created_at") or jd.get("created_at") or ""),
+        "score": latest.get("score") if latest else jd.get("score"),
         "similarity": score,
         "suggestions": list(ANALYZE_DUP_SUGGESTIONS),
     }
@@ -499,6 +858,33 @@ def do_analyze(jd_text, image_data_url, resume_name, link="", overwrite_id="", a
             d["knowledge_error"] = str(e)
         d["knowledge"] = know_nodes
 
+        # ---- JD 稳定身份（阶段 4A）：分析挂在 JD 下，不再挂在报告文件名下 ----
+        # 顺序是契约的一部分：**先定 JD 身份（可能复用已有 JD），再出报告、再写记录** ——
+        # `jobs.json` 里的 `jd_id` 必须指向一条已存在的 JD（绝不写悬空引用）。
+        #
+        # ① 复用还是新建，**由 JD 原文的指纹说了算**（`jobdup` 的判定，§3.6 的同一套算法）：
+        #    命中 → 挂到那个已有 JD 下（**不新建**）；未命中 → `next_seq()` + `build_id()` 建新的。
+        #    为什么不能只看「字段拼出来的 ID 一样不一样」：同一份 JD 换个说法（多一句职责）
+        #    就会拼出另一个 ID —— 那正是本阶段要根除的「同一份 JD 两个身份」。
+        jd_base = None
+        jd_hit = None
+        if not overwrite_id:
+            jd_hit = _similar_saved_jd(jd_text)
+        if overwrite_id and overwrite_job is not None:
+            # 覆盖：沿用那条分析**挂着的 JD**（用户已经明确说了「这次是同一个岗位」）
+            jd_id = str(overwrite_job.get("jd_id") or overwrite_job.get("id") or "")
+            jd_base = jdid.find_jd(jd_id)
+        elif jd_hit is not None:
+            jd_id = jd_hit[0]
+            jd_base = jdid.find_jd(jd_id)
+        else:
+            # 归一化后的字段拿来拼 ID（**展示字段另取原值**，见 _jd_record_of）
+            jd_id = jdid.build_id(jdid.derive_fields(d), jdid.next_seq())
+        if not jd_id:
+            raise RuntimeError("无法为这次分析确定 JD 身份")
+        log.log_event("analyze.jd_identity", jd=jd_id, reused=jd_base is not None,
+                      similarity=round(jd_hit[1], 4) if jd_hit else 0)
+
         # 覆盖时必须用**固定文件名**（fixed_id = 原 id）：报告文件名与岗位 id 都不变。
         # 走的是与示例报告同一条「固定文件名」路径 —— 不另写一份写盘逻辑（否则两处迟早分叉）。
         fname = render_report(d, fixed_id=fixed_id or None)
@@ -511,8 +897,11 @@ def do_analyze(jd_text, image_data_url, resume_name, link="", overwrite_id="", a
             # 没抽出任何知识点时绝不碰库文件：库文件损坏 + 本次零知识点的组合下，absorb 会
             # 「先隔离坏文件、再写回空库」—— 等于吸收了个寂寞，还把用户已有的积累清空。
             if know_nodes:
+                # ⚠️ 这里必须喂 **JD id**（不是报告文件名）：知识库 `from_jds[].id` 指向的是
+                # **岗位身份**。喂报告文件名就等于把身份又绑回「日期+分数」上 —— 同一份 JD
+                # 分析两次会记成两个岗位，`multi_jd` 又算错（本阶段要修的根因）。
                 kb.absorb(know_nodes, {
-                    "id": job_id,
+                    "id": jd_id,
                     "job_title": d.get("job_title") or "",
                     "company": d.get("company") or "",
                     "date": datetime.now().strftime("%Y-%m-%d"),
@@ -520,37 +909,32 @@ def do_analyze(jd_text, image_data_url, resume_name, link="", overwrite_id="", a
         except Exception as e:
             log.log_exc("kb.absorb_error", e)
 
-        # 落盘原始 JD，并写入岗位台账
-        jd_text_file, jd_image_url = save_jd_source(job_id, jd_text, image_data_url)
+        # 落盘原始 JD（文件名用 **JD id**：同一 JD + 同一简历重跑即覆盖，不会攒出一堆副本）
+        jd_text_file, jd_image_url = save_jd_source(jd_id, jd_text, image_data_url)
+
+        # ---- JD 级字段 → `jds.json`（唯一真相源）----
+        # 注意：这里写的是 `_jd_record_of(...)` 的**原始展示值**（薪资原文 / 公司全名），
+        # 而 ID 里那六段是**归一化后的短值**。两者刻意不同（Task 1 交接注意 1）。
+        jd_rec = _jd_record_of(jd_id, d, source_bits, link, jd_text_file, jd_image_url, base=jd_base)
+        jd_rec["seq"] = jd_rec.get("seq") or _seq_of_id(jd_id)
+        jdid.upsert_jd(jd_rec)
+
+        # ---- 分析级字段 → `jobs.json`（JD 级字段一个都不写进去）----
         rec = {
             "id": job_id,
+            "jd_id": jd_id,
             "report": fname,
             # 覆盖：沿用原记录的 created_at（同一条记录的新分析，不是新记录）
             "created_at": created_at_kept or datetime.now().strftime("%Y-%m-%d %H:%M"),
-            "job_title": d.get("job_title") or "",
-            "company": d.get("company") or "",
-            "hr_name": d.get("hr_name") or "",
-            "phone": d.get("phone") or "",
-            "address": d.get("address") or "",
-            "job_category": d.get("job_category") or "其他",
-            "location": d.get("location") or "",
-            "salary": d.get("salary") or "",
             "score": d["score"],
-            "verdict": d.get("verdict") or "",
-            "source_type": " + ".join(source_bits) or "文本输入",
-            "source_link": link,
-            "jd_text_file": jd_text_file,
-            "jd_image": jd_image_url,
             "resume": os.path.splitext(store.safe_name(resume_name))[0],
-            "status": (d.get("application") or {}).get("status") or "未投递",
-            "notes": (d.get("application") or {}).get("notes") or "",
         }
-        store.upsert_job(rec)
+        _save_analysis(rec)
         log.log_event("analyze.success", ms=int((time.time() - t_start) * 1000), repair_rounds=repairs,
-                  report=fname, job_title=rec["job_title"], score=rec["score"],
-                  category=rec["job_category"], verdict=rec["verdict"],
-                  contact_found=bool(rec["phone"] or rec["hr_name"] or rec["company"]),
-                  source=rec["source_type"], jd_chars=len(jd_text))
+                  report=fname, jd=jd_id, job_title=jd_rec["job_title"], score=rec["score"],
+                  category=jd_rec["job_category"], verdict=jd_rec["verdict"],
+                  contact_found=bool(jd_rec["phone"] or jd_rec["hr_name"] or jd_rec["company"]),
+                  source=jd_rec["source_type"], jd_chars=len(jd_text))
         return fname
     except Exception as e:
         log.log_exc("analyze.error", e, ms=int((time.time() - t_start) * 1000), resume=resume_name,
@@ -568,17 +952,24 @@ def do_demo():
     d.setdefault("application", {"status": "未投递", "next_followup": "", "notes": ""})
     fname = render_report(d, fixed_id=DEMO_ID)
     job_id = fname[:-5]
-    store.upsert_job({
-        "id": job_id, "report": fname,
+    jd_id = job_id or DEMO_ID                   # 示例报告的 id 就是它的 JD 身份（固定文件名，不会攒副本）
+    jdid.upsert_jd({
+        "id": jd_id,
         "created_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
         "job_title": d.get("job_title") or "", "company": d.get("company") or "",
         "hr_name": d.get("hr_name") or "", "phone": d.get("phone") or "",
         "address": d.get("address") or "", "job_category": d.get("job_category") or "数据标注/质检",
         "location": d.get("location") or "", "salary": d.get("salary") or "",
-        "score": d.get("score") or 0, "verdict": d.get("verdict") or "",
+        "verdict": d.get("verdict") or "",
         "source_type": "示例数据", "source_link": "",
-        "jd_text_file": "", "jd_image": "", "resume": "示例简历",
+        "jd_text_file": "", "jd_image": "",
         "status": "未投递", "notes": "示例数据，可删除",
+        "seq": _seq_of_id(jd_id),
+    })
+    _save_analysis({
+        "id": job_id, "jd_id": jd_id, "report": fname,
+        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "score": d.get("score") or 0, "resume": "示例简历",
     })
     return fname
 
@@ -795,7 +1186,18 @@ class Handler(BaseHTTPRequestHandler):
         if p == "/api/jobs":
             # §4：`merged_into` 非空的只是「已合并」标记，不该继续出现在列表里
             # （否则用户台账里会同时看到被并的那条，等于合并没生效）。
-            return self._send(200, {"jobs": _ledger_jobs(), "categories": store.CATEGORIES, "statuses": store.STATUSES})
+            # 阶段 4A：**一行 = 一个 JD** —— JD 级字段来自 `jds.json`，份数/最高分现算。
+            rows = _ledger_rows()
+            return self._send(200, {"jobs": rows, "jds": rows,
+                                    "categories": store.CATEGORIES, "statuses": store.STATUSES})
+
+        if p == "/api/jds":
+            # JD 列表 + 聚合（份数 / 最高分 / 每份分析）。与 /api/jobs 同一份数据 ——
+            # 分开的路径只是因为「JD 库」是新概念，前端要有个明确的入口。
+            rows = _ledger_rows()
+            return self._send(200, {"ok": True, "jds": rows, "jobs": rows,
+                                    "total": len(rows),
+                                    "categories": store.CATEGORIES, "statuses": store.STATUSES})
 
         if p == "/api/knowledge":
             def one(k, default=""):
@@ -845,21 +1247,37 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(500, {"ok": False, "error": "复习队列读取失败：%s" % e})
 
         if p == "/api/jd_text":
-            job = store.find_job(store.safe_name(q.get("id", [""])[0]))
-            if not job or not job.get("jd_text_file"):
+            # JD 原文挂在 **JD** 上（阶段 4A）：id 是 JD id（前端从 /api/jobs 拿到的就是它），
+            # 老前端 / 历史链接传分析 id 也认（`_jd_view` 两种都解析）。
+            jd, rec = _jd_view(q.get("id", [""])[0])
+            if jd is None and rec is None:
                 return self._send(404, {"error": "没有保存 JD 原文"})
-            return self._send(200, {"text": store.read_text(os.path.join(store.p_path("jd"), job["jd_text_file"]))})
+            path = _jd_text_path(jd) if jd else ""
+            if not path or not os.path.exists(path):
+                # 老记录 / 还没建 JD 记录：原文就叫 `<id>.txt`
+                path = _jd_text_path({"id": (jd or {}).get("id") or (rec or {}).get("id")})
+            if not path or not os.path.exists(path):
+                return self._send(404, {"error": "没有保存 JD 原文"})
+            return self._send(200, {"text": store.read_text(path, "")})
 
         if p == "/api/job/outcome":
             # 结果面板的读接口：读回 application（含「是否已复盘」）供前端渲染。
+            # 阶段 4A：**JD 级真相在 `jds.json`** —— 这里把该 JD 的记录与分析记录拼成
+            # `outcome` 认得的扁平形状（它写回的字段由 POST 那侧分头落盘）。
             jid = store.safe_name(q.get("id", [""])[0])
             if not jid:
                 return self._send(400, {"ok": False, "error": "缺少岗位 id"})
+            rec = _job_in_ledger(jid)
+            if rec is None:
+                # 200 之外唯一正确的一支：404（表里没有这个岗位）
+                return self._send(404, {"ok": False, "error": "找不到岗位：%s" % jid})
             try:
-                view = outcome.application_of(jid)
+                view = _with_job_views(outcome.application_of, jid)
                 # has_ai 是给前端的一句话判断：outcome_ai 本身可能被手改坏，别让前端自己 typeof
                 has_ai = view.get("outcome_ai") is not None
-                return self._send(200, {"ok": True, "id": jid, "application": view,
+                return self._send(200, {"ok": True, "id": str(rec.get("jd_id") or jid),
+                                        "jd_id": str(rec.get("jd_id") or ""),
+                                        "application": view,
                                         "has_ai": has_ai,
                                         "statuses": store.STATUSES,
                                         "terminal": list(outcome.TERMINAL)})
@@ -1120,27 +1538,65 @@ class Handler(BaseHTTPRequestHandler):
         if p == "/api/jobs/update":
             # 走有效台账：已合并的记录在列表里看不到，写接口也不能悄悄改它
             # （改一条「不存在」的记录 = 用户以为改了，台账里却什么都没有）。
-            job = _job_in_ledger(store.safe_name(body.get("id")))
-            if not job:
+            # 阶段 4A：**改的是 JD 记录**（`jds.json`）—— 这里列的字段全是 JD 级，
+            # 写回 jobs.json 就会和 jds.json 各存一份（本阶段要根除的坑）。
+            jid = store.safe_name(body.get("id"))
+            jd, rec = _jd_view(jid)
+            # 已合并的分析不算「台账里还有这个岗位」（`rec` 为 None）：不能悄悄改一条
+            # 用户看不到的记录 —— 那等于「用户以为改了，台账里却什么都没有」。
+            if jd is None or rec is None:
                 return self._send(404, {"ok": False, "error": "找不到该岗位记录"})
+            jd_id = str((jd or {}).get("id") or (rec or {}).get("jd_id") or jid)
+            jd = dict(jd) if isinstance(jd, dict) else {"id": jd_id}
+            jd["id"] = jd_id
             fields = [k for k in ("company", "hr_name", "phone", "address", "job_category",
                                   "status", "notes", "source_link", "job_title") if k in body]
             for k in fields:
-                job[k] = str(body.get(k) or "")
-            if job.get("job_category") not in store.CATEGORIES:
-                job["job_category"] = "其他"
-            store.upsert_job(job)
-            log.log_event("job.update", id=job.get("id"), title=job.get("job_title"),
-                      fields=fields, status=job.get("status"))
-            return self._send(200, {"ok": True, "job": job})
+                jd[k] = str(body.get(k) or "")
+            if jd.get("job_category") not in store.CATEGORIES:
+                jd["job_category"] = "其他"
+            saved = jdid.upsert_jd(jd)
+            log.log_event("job.update", id=jd_id, title=saved.get("job_title"),
+                      fields=fields, status=saved.get("status"))
+            return self._send(200, {"ok": True, "job": _jd_row_of(jd_id) or saved})
+
+        if p == "/api/jd/id":
+            # 改 ID：重名 → **409** 并给出错误说明（规格 §4）；改成功后 `jdid.rename_jd`
+            # 会把 4 处引用（jds.json / 知识库 from_jds / 面试记录 job_id / jobs.json.jd_id）
+            # 一起改过去，失败自动回滚，**报告文件永不重命名**。
+            old_id = str(body.get("old_id") or "").strip()
+            new_id = str(body.get("new_id") or "").strip()
+            if not old_id or not new_id:
+                return self._send(400, {"ok": False, "error": "old_id 与 new_id 都要给"})
+            if jdid.find_jd(old_id) is None:
+                return self._send(404, {"ok": False, "error": "JD 库里没有这个 ID：%s" % old_id})
+            err = jdid.validate_id(new_id, jdid.load_jds()["jds"], exclude_id=old_id)
+            if err:
+                # 「占用」= 重名 → 409；其余（段数 / 空格 / 非法字符）→ 400。判据是任务 1
+                # 约定好的错误说明串，不另造一套校验（两套迟早分叉）。
+                taken = "占用" in err
+                log.log_event("jd.id_rejected", level="warn", old=old_id, new=new_id,
+                              status=409 if taken else 400, reason=err)
+                return self._send(409 if taken else 400, {"ok": False, "error": err})
+            try:
+                saved_id = jdid.rename_jd(old_id, new_id)
+            except Exception as e:
+                msg = str(e)
+                log.log_exc("jd.rename_error", e, old=old_id, new=new_id)
+                return self._send(409 if "占用" in msg else 400, {"ok": False, "error": msg})
+            log.log_event("jd.id_changed", old=old_id, new=saved_id)
+            return self._send(200, {"ok": True, "id": saved_id, "old_id": old_id,
+                                    "job": _jd_row_of(saved_id)})
 
         if p == "/api/job/result":
             # 记录结果：用户的字一个不改地存下来（转义是模板的事）。status 非法 → 400。
+            # 阶段 4A：结果属 **JD 级**（你在一个岗位上只投一次）→ 写 `jds.json`。
             jid = store.safe_name(body.get("id"))
             try:
                 # status 原样传进去（不做 safe_name/去空白）：词表比对必须是**精确**的，
                 # 顺手 trim 会把「已拒 」这种本该报错的输入悄悄改成合法的
-                view = outcome.save_result(jid, body.get("status"), body.get("reason"))
+                view = _with_job_views(outcome.save_result, jid, body.get("status"),
+                                       body.get("reason"))
                 return self._send(200, {"ok": True, "id": jid, "application": view})
             except LookupError as e:
                 return self._send(404, {"ok": False, "error": str(e)})
@@ -1155,8 +1611,14 @@ class Handler(BaseHTTPRequestHandler):
             if not jid:
                 return self._send(404, {"ok": False, "error": "找不到岗位：（空 id）"})
             try:
-                ai = outcome.attribute(jid, store.load_config())
-                report = outcome.render_report(ai, jid)
+                rec = _job_in_ledger(jid)
+                if rec is None:
+                    return self._send(404, {"ok": False, "error": "找不到岗位：%s" % jid})
+                ai = _with_job_views(outcome.attribute, jid, store.load_config())
+                # 复盘报告以 **JD id** 命名：`rename_jd` 改完 ID 也找得到（报告文件本身永不改名，
+                # 但这份「按岗位定位」的报告名跟的是身份 —— 身份变了就该定位到新的那份）。
+                # `render_report` 内部也读台账补「你写的原因」→ 同样要接视图（否则报告里是空的）。
+                report = _with_job_views(outcome.render_report, ai, str(rec.get("jd_id") or jid))
                 return self._send(200, {"ok": True, "id": jid, "outcome_ai": ai,
                                         "report": report, "url": "/reports/" + quote(report)})
             except LookupError as e:

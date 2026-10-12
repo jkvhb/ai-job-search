@@ -20,6 +20,7 @@ from urllib.parse import quote
 
 import app
 import interview
+import jdid
 import kb
 import outcome
 import store
@@ -881,8 +882,25 @@ class _OutcomeRouteCase(IsolatedCase):
         return self._handler("GET", path, b"", {})
 
     def _job(self, job_id="j1", **kw):
-        store.upsert_job(dict({"id": job_id, "job_title": "AI训练标注师",
-                               "job_category": "数据标注/质检"}, **kw))
+        """一条岗位：**JD 记录（`jds.json`）+ 分析记录（`jobs.json`）**，阶段 4A 的形状。
+
+        调用方仍然只传一个 id —— 两个文件都用它（真实数据迁移后 `jd_id` 是结构化 ID、
+        分析 id 是报告文件名，但那是迁移脚本的事；这里要的是「同一个 id 两边都指得到」）。
+        JD 级字段（job_title / job_category / status / notes / …）进 `jds.json`，
+        分析级字段（report / resume / score）进 `jobs.json`。
+        """
+        jd = {"id": job_id}
+        rec = {"id": job_id, "jd_id": job_id, "report": job_id + ".html", "score": 80.0}
+        for k, v in kw.items():
+            if k in app.ANALYSIS_FIELDS:
+                rec[k] = v
+            else:
+                jd[k] = v
+        jd.setdefault("job_title", "AI训练标注师")
+        jd.setdefault("job_category", "数据标注/质检")
+        jdid.upsert_jd(jd)
+        app._save_analysis(rec)
+        return rec
 
     def _report_path(self, job_id="j1"):
         return os.path.join(store.p_path("reports"), "oc_%s.html" % job_id)
@@ -904,18 +922,24 @@ class JobResultRouteTest(_OutcomeRouteCase):
         self.assertTrue(body.get("ok"))
         self.assertEqual(body["application"]["status"], "已拒")
         self.assertEqual(body["application"]["outcome_reason"], "HR 说预算冻结了")
-        # 落盘了才算真保存：重新读一遍 jobs.json（不信任内存里的返回值）
-        job = store.find_job("j1")
-        self.assertEqual(job.get("status"), "已拒")                       # 台账顶层镜像
-        self.assertEqual(job["application"]["outcome_reason"], "HR 说预算冻结了")
-        self.assertTrue(job["application"]["outcome_at"])
+        # 落盘了才算真保存：重新读一遍 **jds.json**（阶段 4A：结果属 JD 级）——不信任内存里的返回值
+        jd = jdid.find_jd("j1")
+        self.assertEqual(jd.get("status"), "已拒")                         # JD 记录上的状态
+        self.assertEqual(jd["application"]["outcome_reason"], "HR 说预算冻结了")
+        self.assertTrue(jd["application"]["outcome_at"])
+        # 反向：**jobs.json 里绝不能有这些 JD 级字段**（否则两个文件各存一份）
+        rec = store.find_job("j1")
+        for stolen in ("status", "notes", "job_title", "company", "application",
+                       "outcome_reason", "outcome_at"):
+            self.assertNotIn(stolen, rec, "JD 级字段 %s 漏回了 jobs.json" % stolen)
 
     def test_invalid_status_is_400_and_nothing_is_written(self):
         self._job()
         code, body = self._post_json("/api/job/result", {"id": "j1", "status": "胡说", "reason": "x"})
         self.assertEqual(code, 400)
         self.assertFalse(body.get("ok"))
-        self.assertEqual(store.find_job("j1").get("status"), None)        # 一个键都没写进去
+        self.assertNotIn("status", jdid.find_jd("j1"))                    # 一个键都没写进去
+        self.assertNotIn("application", jdid.find_jd("j1"))
 
     def test_unknown_job_is_404(self):
         code, body = self._post_json("/api/job/result",
@@ -943,7 +967,7 @@ class JobResultRouteTest(_OutcomeRouteCase):
         raw = "他说「你不合适」</script><b>x</b>"
         code, _ = self._post_json("/api/job/result", {"id": "j1", "status": "已拒", "reason": raw})
         self.assertEqual(code, 200)
-        self.assertEqual(store.find_job("j1")["application"]["outcome_reason"], raw)
+        self.assertEqual(jdid.find_jd("j1")["application"]["outcome_reason"], raw)
 
 
 class OutcomeQueryRouteTest(_OutcomeRouteCase):
@@ -1084,7 +1108,7 @@ class JobAttributeRouteTest(_OutcomeRouteCase):
         self._post_json("/api/job/attribute", {"id": "j1"})
         self._real_attribute(_fake_chat('{"verdict_summary":"第二次","outcome_reason":"又编一遍"}'))
         self._post_json("/api/job/attribute", {"id": "j1"})
-        job = store.find_job("j1")
+        job = jdid.find_jd("j1")                        # 阶段 4A：application 在 JD 记录上
         self.assertEqual(job["application"]["outcome_reason"], "我自己写的")
         self.assertNotIn("outcome_reason", job["application"]["outcome_ai"],
                          "outcome_reason 绝不能被复制进 outcome_ai")
@@ -1101,7 +1125,7 @@ class JobAttributeRouteTest(_OutcomeRouteCase):
         self.assertIn("归因失败", body.get("error", ""))
         self.assertFalse(os.path.exists(self._report_path()))     # 归因失败 → 不生成报告
         # 用户写的状态/原因已在保存时落盘：归因失败不会把它弄丢
-        self.assertEqual(store.find_job("j1")["application"]["status"], "已拒")
+        self.assertEqual(jdid.find_jd("j1")["application"]["status"], "已拒")
 
     def test_the_model_receives_the_users_reason_and_the_jd_basis(self):
         """归因必须把「用户写的原因」和 JD 拆解喂进去 —— 否则报告是凭空生成的。"""
@@ -1270,13 +1294,22 @@ class _AnalyzeRouteCase(IsolatedCase):
         return self._handler("GET", path, b"", {})
 
     def _old_job(self, job_id="j-old", text=None, **kw):
-        """已有的那条岗位 + 它的 JD 原文（形状照真实记录：id / report / jd_text_file 都在）。"""
-        store.upsert_job(dict({"id": job_id, "job_title": "语音/文本评测",
-                               "created_at": "2026-10-03 00:30",
-                               "report": job_id + ".html",
-                               "jd_text_file": job_id + ".txt",
-                               "score": 75.0}, **kw))
+        """已有的那条岗位 + 它的 JD 原文（阶段 4A 形状：JD 记录 + 分析记录 + jd/<id>.txt）。"""
+        jd = {"id": job_id, "job_title": "语音/文本评测", "jd_text_file": job_id + ".txt",
+              "salary": "13-26K", "company": "示例公司", "location": "北京",
+              "job_category": "数据标注/质检", "status": "未投递"}
+        rec = {"id": job_id, "jd_id": job_id, "report": job_id + ".html",
+               "created_at": "2026-10-03 00:30", "score": 75.0, "resume": "旧简历"}
+        for k, v in kw.items():
+            if k in app.ANALYSIS_FIELDS:
+                rec[k] = v
+            else:
+                jd[k] = v
+        jdid.upsert_jd(jd)
+        app._save_analysis(rec)
+        store.ensure_profile()
         store.write_text(store.p_path("jd", job_id + ".txt"), text or self.LONG)
+        return rec
 
     def _resume(self, name="我的简历.md"):
         store.ensure_profile()
@@ -1386,11 +1419,18 @@ class AnalyzeDedupTest(_AnalyzeRouteCase):
         self.assertEqual(len([i for i in jobs if i.startswith("j-old")]), 1)
         self.assertEqual(list(jobs), ["j-old"])
         self.assertEqual(body["report"], "j-old.html")
-        # 结果**写回了那条已有记录**：字段真的更新了（只断言「记录还在」会被平局掩盖）
+        # 结果**写回了那条已有记录**：分析级字段在 jobs.json，JD 级字段在 jds.json
+        # （只断言「记录还在」会被平局掩盖）
         self.assertEqual(jobs["j-old"]["report"], "j-old.html")           # 报告文件名 == 原 id
         self.assertEqual(jobs["j-old"]["score"], 91.5)                    # 新分数写上去了
-        self.assertEqual(jobs["j-old"]["job_title"], "语音数据质检（改后）")
         self.assertEqual(jobs["j-old"]["created_at"], "2026-10-03 00:30")  # 原始时间不丢
+        self.assertEqual(jobs["j-old"]["jd_id"], "j-old")                 # 还挂在同一个 JD 下
+        # JD 级字段（阶段 4A 之后只住在 jds.json）
+        jd = jdid.find_jd("j-old")
+        self.assertEqual(jd["job_title"], "语音数据质检（改后）")
+        self.assertNotIn("job_title", jobs["j-old"], "JD 级字段漏回了 jobs.json")
+        # JD 也是唯一那一个：覆盖不该建出第二个 JD
+        self.assertEqual([j["id"] for j in jdid.load_jds()["jds"]], ["j-old"])
         # 报告文件真的落在那个文件名上，且内容是新分析（不是旧文件没被覆盖）
         on_disk = store.read_text(self._report("j-old.html"))
         self.assertIn("语音数据质检（改后）", on_disk)
@@ -1442,30 +1482,388 @@ class LedgerFilterTest(_AnalyzeRouteCase):
     """§4：`merged_into` 非空的记录只是标记，不该再出现在台账列表里。"""
 
     def test_merged_jobs_are_hidden_from_the_ledger(self):
-        store.upsert_job({"id": "k", "job_title": "岗", "score": 80.0})
-        store.upsert_job({"id": "d", "job_title": "岗", "merged_into": "k", "score": 72.0})
+        self._old_job("k")
+        self._old_job("d", merged_into="k")
         code, body = self._get("/api/jobs")
         self.assertEqual(code, 200)
         self.assertEqual([j["id"] for j in body["jobs"]], ["k"])     # 细到「个体」那一层
         # 反证：过滤不是靠「整个列表被清空」蒙对的
         self.assertNotIn("d", [j["id"] for j in body["jobs"]])
+        # 记录本身**没被删**（只是打了标记），报告也还在
+        self.assertTrue(os.path.exists(store.jobs_path()))
+        self.assertIn("d", [j.get("id") for j in store.load_jobs()])
 
     def test_an_empty_merged_into_string_does_not_hide_a_record(self):
         """手改出的 `merged_into: ""` 是「没合并」，不能被当成合并过的（否则记录会凭空消失）。"""
-        store.upsert_job({"id": "k", "job_title": "岗"})
-        store.upsert_job({"id": "e", "job_title": "岗", "merged_into": ""})
+        self._old_job("k")
+        self._old_job("e", merged_into="")
         code, body = self._get("/api/jobs")
         self.assertEqual(code, 200)
         self.assertEqual(sorted(j["id"] for j in body["jobs"]), ["e", "k"])
 
     def test_job_update_refuses_a_merged_record(self):
         """台账里看不到的记录，写接口也不能悄悄改它。"""
-        store.upsert_job({"id": "k", "job_title": "岗"})
-        store.upsert_job({"id": "d", "job_title": "岗", "merged_into": "k"})
+        self._old_job("k")
+        self._old_job("d", merged_into="k")
         code, body = self._post_json("/api/jobs/update", {"id": "d", "job_title": "改一下"})
         self.assertEqual(code, 404)
         self.assertFalse(body.get("ok"))
-        self.assertEqual(store.find_job("d")["job_title"], "岗")     # 盘上确实没被改
+        self.assertEqual(jdid.find_jd("d")["job_title"], "语音/文本评测")   # 盘上确实没被改
+
+
+# ⚠️ 本块的核心不变量：**同一份 JD 分析两次 → 只有 1 个 JD、2 份分析**。
+# 「报告文件名 = 岗位身份」那个根因（文件名里嵌日期+分数）就是靠它根除的。
+# 断言必须细到「个体」那一层：逐条断言 jd_id 相同、jds.json 里只有 1 条 ——
+# 只断言「分析数是 2」会被「两个 JD 各挂一份」蒙混过去（那正是要防的旧行为）。
+class JdIdentityTest(_AnalyzeRouteCase):
+    """阶段 4A：新分析生成/复用 JD 并把分析挂在它下面（`app.do_analyze` 的接线）。"""
+
+    # 假模型回一份**字段齐全**的 JD 分析结果（ID 的六段要从这里派生）。
+    # 薪资用带括号的长表述：ID 里该是 `6-8K`，JD 记录里该是**原文**（Task 1 交接注意 1）。
+    FULL = json.dumps({
+        "job_title": "视频标注质检", "score": 82.0, "verdict": "建议投递",
+        "company": "四川金沙人力资源开发管理有限公司（金沙人力）",
+        "education": "统招公办本科及以上",
+        "job_category": "数据标注/质检", "location": "成都",
+        "address": "成都武侯区瑞鑫时代大厦-A座",
+        "salary": "6-8K（入职五险，提及一金7k+）",
+        "application": {"status": "未投递", "notes": "先看评测集"},
+        "scores": [{"name": "匹配度", "score": 82.0, "weight": 10}],
+    }, ensure_ascii=False)
+
+    def _patch_full_model(self, reply=None):
+        calls = self._patch_analyze_deps()
+        payload = reply or self.FULL
+
+        def fake_llm(base_url, api_key, model, messages, json_mode=False, **kw):
+            calls["llm"] += 1
+            return payload
+
+        self._patch(app.llm, "call_openai_compatible", fake_llm)
+        return calls
+
+    def _analyze(self, jd_text=None, resume="我的简历.md", **extra):
+        body = {"jd_text": jd_text or self.LONG, "resume_name": self._resume(resume)}
+        body.update(extra)
+        return self._post_json("/api/analyze", body)
+
+    def test_a_new_analysis_creates_a_jd_and_hangs_the_analysis_under_it(self):
+        self._patch_full_model()
+        code, body = self._analyze()
+        self.assertEqual(code, 200, body)
+        self.assertTrue(body.get("ok"), body)
+        store.ensure_profile()
+
+        jds = jdid.load_jds()["jds"]
+        self.assertEqual(len(jds), 1)
+        jd = jds[0]
+        # ① ID 是**归一化后**的六段 + 4 位编号
+        fields, seq = jdid.parse_id(jd["id"])
+        self.assertEqual(fields["education"], "本科")
+        self.assertEqual(fields["company"], "金沙人力")
+        self.assertEqual(fields["salary"], "6-8K")
+        self.assertEqual(fields["city"], "成都")
+        self.assertEqual(fields["domain"], "视频")
+        self.assertEqual(seq, 1)
+        # ② JD 记录里的**展示字段是原始值**（不是归一化后的短值）
+        self.assertEqual(jd["salary"], "6-8K（入职五险，提及一金7k+）")
+        self.assertEqual(jd["company"], "四川金沙人力资源开发管理有限公司（金沙人力）")
+        self.assertEqual(jd["job_title"], "视频标注质检")
+        self.assertEqual(jd["status"], "未投递")
+        self.assertEqual(jd["notes"], "先看评测集")
+        self.assertEqual(jd["verdict"], "建议投递")
+        self.assertTrue(jd["jd_text_file"])
+        self.assertEqual(jd["seq"], 1)
+        # ③ 分析记录只留分析级字段 + jd_id
+        rec = store.find_job(jd["id"] + "")       # 分析 id 未知，先按 jd_id 找
+        if rec is None:
+            rec = [j for j in store.load_jobs() if j.get("jd_id") == jd["id"]][0]
+        self.assertEqual(rec["jd_id"], jd["id"])
+        self.assertEqual(rec["score"], 82.0)
+        self.assertEqual(rec["resume"], "我的简历")
+        self.assertEqual(rec["report"], body["report"])
+        for stolen in ("job_title", "company", "salary", "status", "notes", "verdict",
+                       "job_category", "location", "source_type", "jd_text_file"):
+            self.assertNotIn(stolen, rec, "JD 级字段 %s 漏回了 jobs.json" % stolen)
+
+    def test_two_analyses_of_the_same_jd_share_one_jd(self):
+        """**核心不变量**：同一份 JD 两次分析 → 1 个 JD、2 份分析、两个 jd_id 相同、seq 不涨。
+
+        第二次带 `allow_duplicate`（用户在查重弹窗里选了「仍然新建」）—— 那是**跳过一次查重提示**，
+        **不是**「再建一个岗位身份」：`allow_duplicate` 只影响「要不要弹窗」，JD 身份照样由
+        指纹决定（这正是本阶段的根因修复）。
+        """
+        self._patch_full_model()
+        code1, body1 = self._analyze(resume="第一版.md")
+        self.assertEqual(code1, 200, body1)
+        # 第二份简历：文字略有出入（多一句），指纹仍然命中 → **必须复用**而不是新建
+        code2, body2 = self._analyze(jd_text=self.LONG + "加分项：有 TTS 评测集搭建经验。",
+                                     resume="第二版.md", allow_duplicate=True)
+        self.assertEqual(code2, 200, body2)
+
+        jds = jdid.load_jds()
+        self.assertEqual(len(jds["jds"]), 1, "同一份 JD 绝不能建出第二个 JD")
+        self.assertEqual(jds["seq"], 1, "复用已有 JD 时不该再消耗一个编号")
+        jd_id = jds["jds"][0]["id"]
+
+        jobs = store.load_jobs()
+        self.assertEqual(len(jobs), 2, "两次分析 = 两份分析记录")
+        # ⚠️ 逐条断言 jd_id 相同（不能只断言「分析数是 2」）
+        self.assertEqual([j["jd_id"] for j in jobs], [jd_id, jd_id])
+        self.assertEqual([j["resume"] for j in jobs], ["第二版", "第一版"])   # jobs.json 新的在前
+        self.assertEqual(sorted(j["score"] for j in jobs), [82.0, 82.0])
+        # 报告是两份（每份分析一个），但**JD 只有一个**
+        self.assertNotEqual(body1["report"], body2["report"])
+        self.assertEqual(sorted(f for f in os.listdir(store.p_path("reports"))
+                                if f.endswith(".html")), sorted([body1["report"], body2["report"]]))
+
+    def test_a_genuinely_different_jd_gets_its_own_jd(self):
+        """反向：无关 JD 必须建出**第二个** JD（否则「复用」就成了恒真）。"""
+        self._patch_full_model()
+        self.assertEqual(self._analyze()[0], 200)
+        self._patch_analyze_deps()
+        self._patch(app.llm, "call_openai_compatible",
+                    lambda *a, **kw: json.dumps({
+                        "job_title": "抖音直播运营", "score": 40.0,
+                        "job_category": "其他", "location": "上海", "salary": "10-15K",
+                    }, ensure_ascii=False))
+        code, body = self._analyze(jd_text=self.UNRELATED)
+        self.assertEqual(code, 200, body)
+        jds = jdid.load_jds()
+        self.assertEqual(len(jds["jds"]), 2)
+        self.assertEqual(jds["seq"], 2)
+
+    def test_the_knowledge_base_points_at_the_jd_id_not_the_report_name(self):
+        """知识库 `from_jds[].id` 必须是 **JD id** —— 指向报告文件名等于把身份绑回日期+分数。"""
+        self._patch_analyze_deps()
+        self._patch(app.knowledge, "build_for_jd",
+                    lambda jd_text, cfg: [{"term": "RLHF", "definition": "人类反馈强化学习"}])
+        self._patch(app.llm, "call_openai_compatible", lambda *a, **kw: self.FULL)
+        code, body = self._analyze()
+        self.assertEqual(code, 200, body)
+        kb_data = store.load_knowledge()
+        cards = [n for n in kb_data["nodes"] if kb.normalize_id(n.get("term")) == kb.normalize_id("RLHF")]
+        self.assertEqual(len(cards), 1)
+        ids = [x.get("id") for x in cards[0]["from_jds"]]
+        jd_id = jdid.load_jds()["jds"][0]["id"]
+        self.assertEqual(ids, [jd_id])
+        report_id = body["report"][:-5]
+        self.assertNotIn(report_id, ids, "from_jds 指到了报告文件名（身份又绑回日期+分数）")
+
+
+# ⚠️ 本块的另一组高风险假绿：
+#   ① `do_POST` 有外层 try → 异常会变成 500 的「服务器内部错误：…」；
+#   ② `/api/analyze` 那条路由自己 `except Exception` → **200 + {"ok": false}**。
+# 只断言「error 里有某个词」的话，实现被换成「抛异常」断言照样成立。
+# 所以每条用例都同时钉：**HTTP 状态码 + 具体字段 + 落盘事实**。
+class JdRouteTest(_AnalyzeRouteCase):
+    """`GET /api/jds` 与 `POST /api/jd/id`（阶段 4A 的新路由）。"""
+
+    def _two_analyses_one_jd(self, jd_id="JD-原"):
+        jdid.upsert_jd({"id": jd_id, "job_title": "语音/文本评测", "status": "未投递",
+                        "job_category": "数据标注/质检", "salary": "13-26K", "company": "示例公司",
+                        "jd_text_file": jd_id + ".txt"})
+        store.ensure_profile()
+        store.write_text(store.p_path("jd", jd_id + ".txt"), self.LONG)
+        app._save_analysis({"id": "a1", "jd_id": jd_id, "report": "a1.html", "score": 66.0,
+                            "resume": "第一版", "created_at": "2026-10-01 09:00"})
+        app._save_analysis({"id": "a2", "jd_id": jd_id, "report": "a2.html", "score": 75.0,
+                            "resume": "第二版", "created_at": "2026-10-05 09:00"})
+        # 报告文件真的存在（「改 ID 绝不重命名报告」那条断言才有意义：文件在才谈得上没被改名）
+        for name in ("a1.html", "a2.html"):
+            store.write_text(os.path.join(store.p_path("reports"), name), "<html>%s</html>" % name)
+        return jd_id
+
+    # ---------------- GET /api/jds
+    def test_jd_list_aggregates_analyses_of_one_jd_into_one_row(self):
+        jd_id = self._two_analyses_one_jd()
+        code, body = self._get("/api/jds")
+        self.assertEqual(code, 200)
+        self.assertTrue(body.get("ok"), body)
+        rows = body["jds"]
+        # ① 一行 = 一个 JD（**两份分析不能显示成两行**）
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row["id"], jd_id)
+        self.assertEqual(row["jd_id"], jd_id)
+        # ② 聚合出**具体份数与最高分**
+        self.assertEqual(row["analysis_count"], 2)
+        self.assertEqual(row["max_score"], 75.0)
+        # ③ 每份分析都在（细到简历名与分数那一层）
+        self.assertEqual([a["resume"] for a in row["analyses"]], ["第一版", "第二版"])
+        self.assertEqual([a["score"] for a in row["analyses"]], [66.0, 75.0])
+        self.assertEqual([a["id"] for a in row["analyses"]], ["a1", "a2"])
+        self.assertEqual([a["report"] for a in row["analyses"]], ["a1.html", "a2.html"])
+        # ④ JD 级字段来自 jds.json
+        self.assertEqual(row["job_title"], "语音/文本评测")
+        self.assertEqual(row["status"], "未投递")
+        self.assertEqual(row["salary"], "13-26K")
+
+    def test_jd_list_excludes_merged_analyses_from_the_counts(self):
+        jd_id = self._two_analyses_one_jd()
+        app._save_analysis({"id": "a1", "jd_id": jd_id, "report": "a1.html", "score": 66.0,
+                            "resume": "第一版", "created_at": "2026-10-01 09:00",
+                            "merged_into": "a2"})
+        code, body = self._get("/api/jds")
+        self.assertEqual(code, 200)
+        self.assertEqual(len(body["jds"]), 1)
+        self.assertEqual(body["jds"][0]["analysis_count"], 1)
+        self.assertEqual(body["jds"][0]["max_score"], 75.0)
+        self.assertEqual([a["id"] for a in body["jds"][0]["analyses"]], ["a2"])
+
+    def test_api_jobs_carries_the_same_jd_rows(self):
+        """`/api/jobs` 的字段来源也改到 jds.json（既有路由，字段来源换了但形状不变）。"""
+        jd_id = self._two_analyses_one_jd()
+        code, body = self._get("/api/jobs")
+        self.assertEqual(code, 200)
+        self.assertEqual(len(body["jobs"]), 1)
+        row = body["jobs"][0]
+        self.assertEqual(row["id"], jd_id)
+        self.assertEqual(row["job_title"], "语音/文本评测")
+        self.assertEqual(row["analysis_count"], 2)
+        self.assertEqual(row["max_score"], 75.0)
+
+    # ---------------- POST /api/jd/id
+    def test_id_change_renames_the_jd_and_db_references(self):
+        jd_id = self._two_analyses_one_jd()
+        store.save_knowledge({"nodes": [{"id": "rlhf", "term": "RLHF", "from_jds": [
+            {"id": jd_id, "job_title": "语音/文本评测", "date": "2026-10-01"}]}]})
+        new_id = "硕士_示例公司_语音评测_语音_北京_13-26K_0009"
+        code, body = self._post_json("/api/jd/id", {"old_id": jd_id, "new_id": new_id})
+        self.assertEqual(code, 200, body)
+        self.assertTrue(body.get("ok"), body)
+        self.assertEqual(body["id"], new_id)
+        # ① jds.json：id 换了、旧值进 id_history
+        self.assertIsNone(jdid.find_jd(jd_id))
+        jd = jdid.find_jd(new_id)
+        self.assertIsNotNone(jd)
+        self.assertEqual(jd["id_history"], [jd_id])
+        # ② jobs.json：每条分析的 jd_id 都跟着改
+        self.assertEqual(sorted(j["jd_id"] for j in store.load_jobs()), [new_id, new_id])
+        # ③ 知识库 from_jds 跟着改
+        card = [n for n in store.load_knowledge()["nodes"] if n.get("id") == "rlhf"][0]
+        self.assertEqual([x["id"] for x in card["from_jds"]], [new_id])
+        # ④ 报告文件**永不重命名**
+        self.assertTrue(os.path.exists(os.path.join(store.p_path("reports"), "a1.html")))
+        self.assertTrue(os.path.exists(os.path.join(store.p_path("reports"), "a2.html")))
+        # ⑤ 台账读得回来（新 ID 的那一行，份数还是 2）
+        code2, body2 = self._get("/api/jds")
+        self.assertEqual(code2, 200)
+        self.assertEqual([r["id"] for r in body2["jds"]], [new_id])
+        self.assertEqual(body2["jds"][0]["analysis_count"], 2)
+
+    def test_a_taken_id_is_409_and_nothing_is_saved(self):
+        jd_id = self._two_analyses_one_jd()
+        other = "本科_金沙人力_数据标注质检_视频_成都_6-8K_0002"
+        jdid.upsert_jd({"id": other, "job_title": "另一个岗位"})
+        code, body = self._post_json("/api/jd/id", {"old_id": jd_id, "new_id": other})
+        # ① 状态码必须是 409（不是 200、不是被外层 try 兜成的 500）
+        self.assertEqual(code, 409, body)
+        self.assertFalse(body.get("ok"))
+        # ② 具体字段：错误说明里必须点名「已被占用」
+        self.assertIn("占用", body.get("error", ""))
+        # ③ 落盘事实：两边都**没被改**
+        self.assertIsNotNone(jdid.find_jd(jd_id))
+        self.assertEqual(jdid.find_jd(other)["job_title"], "另一个岗位")
+        self.assertEqual(sorted(j["jd_id"] for j in store.load_jobs()), [jd_id, jd_id])
+
+    def test_a_structurally_invalid_id_is_400_and_nothing_is_saved(self):
+        jd_id = self._two_analyses_one_jd()
+        for bad in ("少一段_0003", "本科_有 空格_标注_文本_北京_6-8K_0004",
+                    "本科_含/斜杠_标注_文本_北京_6-8K_0005"):
+            with self.subTest(bad=bad):
+                code, body = self._post_json("/api/jd/id", {"old_id": jd_id, "new_id": bad})
+                self.assertEqual(code, 400, body)
+                self.assertFalse(body.get("ok"))
+                self.assertIsNotNone(jdid.find_jd(jd_id))
+                self.assertEqual(sorted(j["jd_id"] for j in store.load_jobs()), [jd_id, jd_id])
+
+    def test_unknown_old_id_is_404(self):
+        self._two_analyses_one_jd()
+        code, body = self._post_json("/api/jd/id", {"old_id": "没有这个JD",
+                                                    "new_id": "本科_示例_标注_文本_北京_6-8K_0006"})
+        self.assertEqual(code, 404)
+        self.assertFalse(body.get("ok"))
+        self.assertIn("没有这个", body.get("error", ""))
+
+    def test_missing_parameters_are_400(self):
+        for payload in ({"old_id": "x"}, {"new_id": "y"}, {}):
+            with self.subTest(payload=payload):
+                code, body = self._post_json("/api/jd/id", payload)
+                self.assertEqual(code, 400)
+                self.assertFalse(body.get("ok"))
+
+
+class JdLevelFieldsTest(_AnalyzeRouteCase):
+    """既有路由的字段来源改到 `jds.json`（`/api/jobs/update`、`/api/jd_text`、结果读回）。"""
+
+    def test_jobs_update_writes_the_jd_record_not_jobs_json(self):
+        jd_id = "本科_金沙人力_数据标注质检_视频_成都_6-8K_0001"
+        jdid.upsert_jd({"id": jd_id, "job_title": "旧标题", "job_category": "其他",
+                        "status": "未投递"})
+        app._save_analysis({"id": "r1", "jd_id": jd_id, "report": "r1.html", "score": 70.0,
+                            "resume": "我的简历"})
+        code, body = self._post_json("/api/jobs/update",
+                                     {"id": jd_id, "job_title": "新标题", "status": "已投",
+                                      "notes": "备注", "job_category": "数据标注/质检"})
+        self.assertEqual(code, 200, body)
+        self.assertTrue(body.get("ok"), body)
+        jd = jdid.find_jd(jd_id)
+        self.assertEqual(jd["job_title"], "新标题")
+        self.assertEqual(jd["status"], "已投")
+        self.assertEqual(jd["notes"], "备注")
+        # **jobs.json 里绝不能多出这些 JD 级字段**
+        rec = store.find_job("r1")
+        for stolen in ("job_title", "status", "notes", "job_category"):
+            self.assertNotIn(stolen, rec, "JD 级字段 %s 漏回了 jobs.json" % stolen)
+
+    def test_jd_text_is_served_from_the_jd_record(self):
+        jd_id = "本科_金沙人力_数据标注质检_视频_成都_6-8K_0001"
+        jdid.upsert_jd({"id": jd_id, "jd_text_file": jd_id + ".txt"})
+        store.ensure_profile()
+        store.write_text(store.p_path("jd", jd_id + ".txt"), "这是 JD 原文")
+        code, body = self._get("/api/jd_text?id=" + quote(jd_id))
+        self.assertEqual(code, 200)
+        self.assertEqual(body["text"], "这是 JD 原文")
+
+    def test_jd_text_falls_back_to_the_analysis_id_for_legacy_records(self):
+        """历史记录：分析 id 与 JD id 是同一个（迁移前身份 == 报告文件名）→ 也要读得到。"""
+        jdid.upsert_jd({"id": "旧岗位_66分", "jd_text_file": "旧岗位_66分.txt"})
+        store.ensure_profile()
+        store.write_text(store.p_path("jd", "旧岗位_66分.txt"), "老 JD 原文")
+        code, body = self._get("/api/jd_text?id=" + quote("旧岗位_66分"))
+        self.assertEqual(code, 200)
+        self.assertEqual(body["text"], "老 JD 原文")
+
+    def test_jd_text_404_when_there_is_no_source(self):
+        jdid.upsert_jd({"id": "本科_示例_标注_文本_北京_6-8K_0007"})
+        code, body = self._get("/api/jd_text?id=" + quote("本科_示例_标注_文本_北京_6-8K_0007"))
+        self.assertEqual(code, 404)
+        self.assertIn("没有保存", body.get("error", ""))
+
+    def test_outcome_read_comes_from_the_jd_record(self):
+        jd_id = "本科_金沙人力_数据标注质检_视频_成都_6-8K_0001"
+        jdid.upsert_jd({"id": jd_id, "status": "已拒", "job_title": "语音评测",
+                        "application": {"status": "已拒", "outcome_reason": "预算冻结"}})
+        app._save_analysis({"id": "r1", "jd_id": jd_id, "report": "r1.html", "score": 70.0})
+        code, body = self._get("/api/job/outcome?id=" + quote(jd_id))
+        self.assertEqual(code, 200, body)
+        self.assertEqual(body["application"]["status"], "已拒")
+        self.assertEqual(body["application"]["outcome_reason"], "预算冻结")
+
+    def test_job_result_is_written_to_the_jd_record(self):
+        jd_id = "本科_金沙人力_数据标注质检_视频_成都_6-8K_0001"
+        jdid.upsert_jd({"id": jd_id, "status": "未投递"})
+        app._save_analysis({"id": "r1", "jd_id": jd_id, "report": "r1.html", "score": 70.0})
+        code, body = self._post_json("/api/job/result",
+                                     {"id": jd_id, "status": "Offer", "reason": "HR 说恭喜"})
+        self.assertEqual(code, 200, body)
+        jd = jdid.find_jd(jd_id)
+        self.assertEqual(jd["status"], "Offer")
+        self.assertEqual(jd["application"]["outcome_reason"], "HR 说恭喜")
+        rec = store.find_job("r1")
+        self.assertNotIn("status", rec)
+        self.assertNotIn("application", rec)
 
 
 if __name__ == "__main__":
