@@ -251,18 +251,47 @@ class NormalizeFieldsTest(IsolatedCase):
         ids = [jdid.build_id({"company": s, "duty": "标注", "city": "北京"}, 1) for s in segs]
         self.assertEqual(len(set(ids)), len(companies), "整条 ID 撞了：%s" % ids)
 
-    def test_known_gap_bare_qualifier_bracket_still_takes_the_bracket_side(self):
-        """**已知残留缺口 —— 已上报等裁决，不是「设计如此」。**
+    def test_the_four_agreed_examples_stay_the_same(self):
+        """父代理裁决时点名的 4 个例子：加了限定词判据之后**结果一个都不能变**。"""
+        self.assertEqual(jdid._normalize_company("四川金沙人力资源开发管理有限公司（金沙人力）"),
+                         "金沙人力")
+        self.assertEqual(jdid._normalize_company("金沙人力（四川金沙人力资源开发管理有…）"),
+                         "金沙人力")
+        self.assertEqual(jdid._normalize_company("某 AI 科技公司（示例）"), "示例")
+        self.assertEqual(jdid._normalize_company("阿里巴巴（中国）有限公司"), "阿里巴巴")
 
-        `阿里巴巴（中国）` 这种写法括号就在**结尾**、后面没有字，所以按「取更短一侧」走 →
-        `中国`，于是它与 `腾讯（中国）` 又撞成同一段 —— 正是本轮要修的 bug 的另一种写法
-        （只是少了 `有限公司` 后缀）。
+    def test_bare_qualifier_bracket_no_longer_collapses_two_companies(self):
+        """**上一轮的缺口，本轮已修**：括号在**结尾**、里面是纯限定词时也要忽略。
 
-        修法建议：把 `中国` 与 `_KNOWN_CITIES` 里的城市名当「限定词」，无论括号在不在结尾都忽略。
-        裁决前先把现状钉住，免得它被悄悄改掉。
+        `阿里巴巴（中国）` 与 `腾讯（中国）` 按「取更短一侧」会双双变成 `中国`
+        （本轮之前它就是被钉住的那个缺口）→ 两个不同公司同一段 → 撞 ID。
         """
-        self.assertEqual(jdid._normalize_company("阿里巴巴（中国）"), "中国")
-        self.assertEqual(jdid._normalize_company("腾讯（中国）"), "中国")   # ← 缺口：撞了
+        self.assertEqual(jdid._normalize_company("阿里巴巴（中国）"), "阿里巴巴")
+        self.assertEqual(jdid._normalize_company("腾讯（中国）"), "腾讯")
+        self.assertNotEqual(jdid._normalize_company("阿里巴巴（中国）"),
+                            jdid._normalize_company("腾讯（中国）"))
+
+    def test_region_names_count_as_qualifiers(self):
+        """大区名（华东/华南/华北/华中/西南/西北/东北）与城市名同样是纯限定词。"""
+        self.assertEqual(jdid._normalize_company("阿里巴巴（华东）"), "阿里巴巴")
+        self.assertEqual(jdid._normalize_company("腾讯（华南）"), "腾讯")
+        self.assertEqual(jdid._normalize_company("百度（西南）有限公司"), "百度")
+        # 整串就是那个限定词时不能忽略（否则空段）——见下面的守卫测试
+        self.assertEqual(jdid._normalize_company("（华东）"), "华东")
+
+    def test_qualifier_ignoring_never_produces_an_empty_segment(self):
+        """**空段守卫**：忽略限定词后括号外什么都不剩 → 退回不忽略。
+
+        公司名就叫 `（北京）` 时，若照「忽略限定词」走会得到空串 → `build_id` 只好填
+        `【未知单位】`，等于把用户填过的公司名丢掉。
+        """
+        for raw, want in [("（北京）", "北京"), ("（中国）", "中国"), ("（华东）", "华东"),
+                          ("（成都）", "成都")]:
+            with self.subTest(raw=raw):
+                self.assertEqual(jdid._normalize_company(raw), want)
+        # 整条 ID 里也必须真的是那个公司名，不是【未知单位】
+        self.assertEqual(jdid.build_id(jdid.normalize_fields({"company": "（北京）"}), 1),
+                         "【未知学历】_北京_【未知职责】_【未知领域】_【未知城市】_【未知薪资】_0001")
 
     def test_company_empty_stays_none(self):
         for raw in ("", "   ", None, 7):
