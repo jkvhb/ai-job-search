@@ -1233,5 +1233,240 @@ class OutcomeTemplateTest(_OutcomeRouteCase):
         self.assertEqual(h._sent_file, path)
 
 
+# ------------------------------------------------- 分析前查重 + 台账过滤
+# 「同一份 JD 被分析两次」会把同一个概念记成「被 2 个岗位提到」，而 multi_jd 是复习优先级的
+# **乘性**因子。所以查重必须发生在**调模型/调搜索之前**：命中时一个额度都不花。
+#
+# ⚠️ 本文件最危险的假绿：_handle_post("/api/analyze") 自己 except Exception → **200**，
+# do_POST 还有一层外层 try → **500**。只断言「body 里某个词」的话，实现被换成「抛异常」
+# 照样成立（错误文本里那些词可能是异常类名）。所以每条用例都同时钉三样东西：
+#   ① HTTP 状态码 ② duplicate 字段的**具体内容** ③ 假模型/假搜索的**调用计数**
+class _AnalyzeRouteCase(IsolatedCase):
+    """POST /api/analyze 的沙箱化测试：绝不真调模型、绝不真调搜索。"""
+
+    LONG = ("数据质检验收把控：严格按评测标准对大模型语音通话数据质检验收；"
+            "熟悉ASR与TTS评测流程；能定位Bad Case并做归因分析；有标注规范落地经验。")
+    UNRELATED = "负责抖音电商直播运营，策划带货活动与达人矩阵，盯直播间转化率。"
+
+    # 假模型回一份**最小合法**的分析结果。job_title 刻意与旧记录不同：
+    # 「overwrite 到底写没写回那条记录」只能靠字段真的变了才证明得了（平局会掩盖）。
+    REPLY = json.dumps({
+        "job_title": "语音数据质检（改后）", "score": 91.5, "company": "",
+        "verdict": "建议投递",
+        "scores": [{"name": "匹配度", "score": 91.5, "weight": 10}],
+    }, ensure_ascii=False)
+
+    def _handler(self, method, path, body: bytes = b"", headers=None):
+        h = _sandbox_handler(method, path, body, headers)
+        return h._status, h._body
+
+    def _post_json(self, path, obj):
+        raw = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        return self._handler("POST", path, raw,
+                             {"Content-Length": str(len(raw)),
+                              "Content-Type": "application/json; charset=utf-8"})
+
+    def _get(self, path):
+        return self._handler("GET", path, b"", {})
+
+    def _old_job(self, job_id="j-old", text=None, **kw):
+        """已有的那条岗位 + 它的 JD 原文（形状照真实记录：id / report / jd_text_file 都在）。"""
+        store.upsert_job(dict({"id": job_id, "job_title": "语音/文本评测",
+                               "created_at": "2026-10-03 00:30",
+                               "report": job_id + ".html",
+                               "jd_text_file": job_id + ".txt",
+                               "score": 75.0}, **kw))
+        store.write_text(store.p_path("jd", job_id + ".txt"), text or self.LONG)
+
+    def _resume(self, name="我的简历.md"):
+        store.ensure_profile()
+        store.write_text(os.path.join(store.p_path("resumes"), name), "候选人简历正文")
+        return name
+
+    def _patch_analyze_deps(self):
+        """把**真正花钱的三个入口**换成计数替身（先读 do_analyze 看清它调谁）：
+        `llm.call_openai_compatible`（文本模型 + OCR 都走它）、`search.fetch_link`、
+        `knowledge.build_for_jd`（阶段 1 的知识点抽取，也调模型）。
+        """
+        calls = {"llm": 0, "search": 0, "knowledge": 0}
+
+        def fake_llm(base_url, api_key, model, messages, json_mode=False, **kw):
+            calls["llm"] += 1
+            return self.REPLY
+
+        def fake_search(link):
+            calls["search"] += 1
+            # 抓回来的正文就是**同一份 JD**（否则命中的是 URL 而不是 JD，就测不到查重）
+            return self.LONG
+
+        def fake_knowledge(jd_text, cfg):
+            calls["knowledge"] += 1
+            return []
+
+        self._patch(app.llm, "call_openai_compatible", fake_llm)
+        self._patch(app.search_mod, "fetch_link", fake_search)
+        self._patch(app.knowledge, "build_for_jd", fake_knowledge)
+        # 真 repair_json 会走网络。干净 JSON 走不到它，但坏 JSON 的路径必须被挡住 ——
+        # 挡住了才说明「模型替身真的被用上了」，而不是悄悄换了一条路。
+        self._patch(app.llm, "repair_json",
+                    mock.Mock(side_effect=AssertionError("测试里不该真去修 JSON")))
+        return calls
+
+    def _patch(self, obj, name, value):
+        p = mock.patch.object(obj, name, value)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _report(self, name):
+        return os.path.join(store.p_path("reports"), name)
+
+
+class AnalyzeDedupTest(_AnalyzeRouteCase):
+    """§6 分析前查重：409 命中 / allow_duplicate 放行 / overwrite 写回原记录 / 非法 overwrite 400。"""
+
+    def test_duplicate_returns_409_without_calling_the_model_or_search(self):
+        self._old_job()
+        calls = self._patch_analyze_deps()
+        code, body = self._post_json("/api/analyze",
+                                     {"jd_text": self.LONG, "source_type": "粘贴文本"})
+        # ① 状态码：409（不是 200 的 {"ok":false,"error":...}，更不是 500）
+        self.assertEqual(code, 409)
+        # ② 响应体的**具体内容**（不是「error 里有某个词」）
+        self.assertFalse(body.get("ok"))
+        dup = body.get("duplicate")
+        self.assertIsInstance(dup, dict)
+        self.assertEqual(dup["job_id"], "j-old")
+        self.assertEqual(dup["job_title"], "语音/文本评测")
+        self.assertEqual(dup["created_at"], "2026-10-03 00:30")
+        self.assertEqual(dup["score"], 75.0)
+        self.assertEqual(dup["suggestions"], ["overwrite", "new"])
+        self.assertGreaterEqual(dup["similarity"], 0.85)
+        self.assertLessEqual(dup["similarity"], 1.0)
+        # ③ 一个额度都没花：**在分析之前就返回**
+        self.assertEqual(calls["llm"], 0)
+        self.assertEqual(calls["search"], 0)
+        self.assertEqual(calls["knowledge"], 0)
+        # 台账没被动过（没多出第二个岗位）
+        self.assertEqual([j["id"] for j in store.load_jobs()], ["j-old"])
+
+    def test_a_genuinely_different_jd_is_not_a_duplicate(self):
+        """反向：无关 JD 必须照常分析（否则「命中」就成了恒真）。"""
+        self._old_job()
+        calls = self._patch_analyze_deps()
+        code, body = self._post_json("/api/analyze",
+                                     {"jd_text": self.UNRELATED, "resume_name": self._resume(),
+                                      "source_type": "粘贴文本"})
+        self.assertEqual(code, 200)
+        self.assertTrue(body.get("ok"), body)
+        self.assertGreaterEqual(calls["llm"], 1)
+
+    def test_allow_duplicate_proceeds_to_analyze(self):
+        self._old_job()
+        calls = self._patch_analyze_deps()
+        code, body = self._post_json("/api/analyze",
+                                     {"jd_text": self.LONG, "resume_name": self._resume(),
+                                      "source_type": "粘贴文本", "allow_duplicate": True})
+        self.assertNotEqual(code, 409)
+        self.assertEqual(code, 200)
+        self.assertTrue(body.get("ok"), body)
+        self.assertGreaterEqual(calls["llm"], 1)          # 放行 = 真的走了分析
+        self.assertEqual(len(store.load_jobs()), 2)       # 「仍然新建」= 真的多了一条
+
+    def test_overwrite_reuses_the_existing_job_id(self):
+        self._old_job()
+        calls = self._patch_analyze_deps()
+        code, body = self._post_json("/api/analyze",
+                                     {"jd_text": self.LONG, "resume_name": self._resume(),
+                                      "source_type": "粘贴文本", "overwrite": "j-old"})
+        self.assertEqual(code, 200)
+        self.assertTrue(body.get("ok"), body)
+        self.assertGreaterEqual(calls["llm"], 1)          # 分析照跑
+        jobs = {j["id"]: j for j in store.load_jobs()}
+        # 没新建第二个：id 前缀匹配的只有一条，且**没有**任何新 id
+        self.assertEqual(len([i for i in jobs if i.startswith("j-old")]), 1)
+        self.assertEqual(list(jobs), ["j-old"])
+        self.assertEqual(body["report"], "j-old.html")
+        # 结果**写回了那条已有记录**：字段真的更新了（只断言「记录还在」会被平局掩盖）
+        self.assertEqual(jobs["j-old"]["report"], "j-old.html")           # 报告文件名 == 原 id
+        self.assertEqual(jobs["j-old"]["score"], 91.5)                    # 新分数写上去了
+        self.assertEqual(jobs["j-old"]["job_title"], "语音数据质检（改后）")
+        self.assertEqual(jobs["j-old"]["created_at"], "2026-10-03 00:30")  # 原始时间不丢
+        # 报告文件真的落在那个文件名上，且内容是新分析（不是旧文件没被覆盖）
+        on_disk = store.read_text(self._report("j-old.html"))
+        self.assertIn("语音数据质检（改后）", on_disk)
+        # 没有第二个报告文件
+        html = sorted(f for f in os.listdir(store.p_path("reports")) if f.endswith(".html"))
+        self.assertEqual(html, ["j-old.html"])
+
+    def test_overwrite_with_unknown_or_unrelated_id_is_400(self):
+        self._old_job()
+        calls = self._patch_analyze_deps()
+        for bad, jd in (("不存在", self.LONG),                 # 台账里没有这个 id
+                        ("j-old", self.UNRELATED)):            # id 在，但这份 JD 与它不相似
+            with self.subTest(bad=bad, jd=jd[:8]):
+                code, body = self._post_json("/api/analyze",
+                                             {"jd_text": jd, "resume_name": self._resume(),
+                                              "overwrite": bad})
+                self.assertEqual(code, 400)
+                self.assertFalse(body.get("ok"))
+                self.assertNotIn("duplicate", body)
+        # 400 也发生在分析**之前**：一个额度都没花
+        self.assertEqual(calls["llm"], 0)
+        self.assertEqual(calls["search"], 0)
+        self.assertEqual(len(store.load_jobs()), 1)          # 没写坏台账
+
+    def test_overwrite_may_not_target_an_already_merged_job(self):
+        """已合并的记录只是标记：结果写上去等于写进一条「不在台账里」的记录。"""
+        self._old_job("k")
+        self._old_job("d", **{"merged_into": "k"})
+        calls = self._patch_analyze_deps()
+        code, body = self._post_json("/api/analyze",
+                                     {"jd_text": self.LONG, "resume_name": self._resume(),
+                                      "overwrite": "d"})
+        self.assertEqual(code, 400)
+        self.assertEqual(calls["llm"], 0)
+
+    def test_duplicate_detection_also_runs_for_linked_jds(self):
+        """带 link 也在分析之前查重：抓正文（1 次，这一步跑不掉）之后立刻命中，**模型 0 次**。"""
+        self._old_job(text=self.LONG)
+        calls = self._patch_analyze_deps()
+        code, body = self._post_json("/api/analyze", {"link": "https://example.com/jd"})
+        self.assertEqual(code, 409)
+        self.assertEqual(body["duplicate"]["job_id"], "j-old")
+        self.assertEqual(calls["search"], 1)          # 抓正文那次已经发生（命中是在拿到文本之后）
+        self.assertEqual(calls["llm"], 0)             # 但最贵的模型一次都没调
+        self.assertEqual(calls["knowledge"], 0)
+
+
+class LedgerFilterTest(_AnalyzeRouteCase):
+    """§4：`merged_into` 非空的记录只是标记，不该再出现在台账列表里。"""
+
+    def test_merged_jobs_are_hidden_from_the_ledger(self):
+        store.upsert_job({"id": "k", "job_title": "岗", "score": 80.0})
+        store.upsert_job({"id": "d", "job_title": "岗", "merged_into": "k", "score": 72.0})
+        code, body = self._get("/api/jobs")
+        self.assertEqual(code, 200)
+        self.assertEqual([j["id"] for j in body["jobs"]], ["k"])     # 细到「个体」那一层
+        # 反证：过滤不是靠「整个列表被清空」蒙对的
+        self.assertNotIn("d", [j["id"] for j in body["jobs"]])
+
+    def test_an_empty_merged_into_string_does_not_hide_a_record(self):
+        """手改出的 `merged_into: ""` 是「没合并」，不能被当成合并过的（否则记录会凭空消失）。"""
+        store.upsert_job({"id": "k", "job_title": "岗"})
+        store.upsert_job({"id": "e", "job_title": "岗", "merged_into": ""})
+        code, body = self._get("/api/jobs")
+        self.assertEqual(code, 200)
+        self.assertEqual(sorted(j["id"] for j in body["jobs"]), ["e", "k"])
+
+    def test_job_update_refuses_a_merged_record(self):
+        """台账里看不到的记录，写接口也不能悄悄改它。"""
+        store.upsert_job({"id": "k", "job_title": "岗"})
+        store.upsert_job({"id": "d", "job_title": "岗", "merged_into": "k"})
+        code, body = self._post_json("/api/jobs/update", {"id": "d", "job_title": "改一下"})
+        self.assertEqual(code, 404)
+        self.assertFalse(body.get("ok"))
+        self.assertEqual(store.find_job("d")["job_title"], "岗")     # 盘上确实没被改
+
+
 if __name__ == "__main__":
     unittest.main()

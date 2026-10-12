@@ -19,6 +19,7 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, unquote, quote
 
+import jobdup
 import kb
 import knowledge
 import interview
@@ -250,6 +251,112 @@ def render_report(d, fixed_id=None):
     return fname
 
 
+# ---------------------------------------------------------------- 分析前查重
+# 为什么必须插在**调模型/调搜索之前**：「同一份 JD 被分析两次」会把同一个概念在知识库里记成
+# 「被 2 个岗位提到」，而 multi_jd 是复习优先级的**乘性**因子 —— 已经在静默算错用户现在就能
+# 看到的排序，而且同一份 JD 反复重分析会越叠越多。命中时一个额度都不花才叫防住了。
+#
+# 判定参数（阈值 0.85 / 保守门槛）只有 jobdup 一份实现：这里**只调它**，绝不另抄一套。
+# 本块**刻意不用 jobdup._merged_into**（下划线是「模块私有」）：「已合并」这个语义在两侧都要用，
+# 抄成两个各自演化的小函数比反向 import 一个私有符号更不容易出错。
+ANALYZE_DUP_SUGGESTIONS = ["overwrite", "new"]
+
+
+class DuplicateSubmission(RuntimeError):
+    """提交的 JD 命中已有岗位（§6）→ 路由回 409。异常里带**完整**的重复信息。"""
+
+    def __init__(self, duplicate):
+        RuntimeError.__init__(self, "这份 JD 与已有岗位 %s 重复" % duplicate.get("job_id"))
+        self.duplicate = duplicate
+
+
+class BadOverwrite(RuntimeError):
+    """`overwrite` 指向不存在 / 已合并 / 不相似的岗位 → 路由回 400。
+
+    ⚠️ 必须严格区分于 DuplicateSubmission：**只认「这个 id 不能用」**。
+    否则前端传错 id 时用户看到的是没关系的一句「重复」，永远不知道结果没写回去。
+    """
+
+
+def _job_merged_into(job):
+    """记录上的 `merged_into`（只认非空字符串；手改出的 5 / [] / "" 一律当没合并）。"""
+    v = job.get("merged_into") if isinstance(job, dict) else None
+    return v.strip() if isinstance(v, str) else ""
+
+
+def _ledger_jobs():
+    """台账里**当前有效**的岗位记录：`merged_into` 非空的（已合并的标记记录）全部排除。
+
+    §4：合并只打标记不删记录，所以「列表」与「统计」都必须过滤，否则被并的那条
+    会一直躺在台账里，用户看到两个岗位。
+    """
+    return [j for j in store.load_jobs() if not _job_merged_into(j)]
+
+
+def _job_in_ledger(job_id):
+    """按 id 在**有效台账**里找一条记录（已合并的不算「台账里还有这个岗位」）。"""
+    jid = str(job_id or "")
+    if not jid:
+        return None
+    for j in _ledger_jobs():
+        if j.get("id") == jid:
+            return j
+    return None
+
+
+def _similar_saved_job(jd_text):
+    """在**有效台账**里找一条 JD 原文与新提交 JD 判定为重复的记录；找不到回 None。
+
+    只比较能读到 `jd/<id>.txt` 的岗位（缺原文的用 jobdup.jd_text_of 拿到空串 → 不判定）。
+    返回 `(job, similarity)`；命中时取相似度最高的那条。
+    """
+    best = None
+    for job in _ledger_jobs():
+        text = jobdup.jd_text_of(job.get("id"))
+        if not text.strip():
+            continue
+        score = jobdup.containment(jd_text, text)
+        if score >= jobdup.THRESHOLD and (best is None or score > best[1]):
+            best = (job, score)
+    return best
+
+
+def find_analyze_duplicate(jd_text, overwrite_id=""):
+    """分析前查重（§6）。**只读**：不写任何文件、不调模型、不调搜索。
+
+    - 返回 `None`  → 照常分析（未命中 / 带了 allow_duplicate / overwrite 已校验通过）
+    - 抛 `BadOverwrite`      → `overwrite` 不可用（不存在 / 已合并 / 不相似）→ 400
+    - 抛 `DuplicateSubmission` → 命中且没带任何选择 → 409
+
+    `overwrite_id` 非空时必须**真的**是相似的那一条（用 jobdup 复核一次）：
+    否则前端传错 id 就会把这次分析的结果写到一条**无关岗位**上。
+    """
+    overwrite_id = str(overwrite_id or "").strip()
+    if overwrite_id:
+        job = _job_in_ledger(overwrite_id)
+        if job is None:
+            raise BadOverwrite("要覆盖的岗位不存在或已被合并：%s" % overwrite_id)
+        saved = jobdup.jd_text_of(job.get("id"))
+        score = jobdup.containment(jd_text, saved)
+        if score < jobdup.THRESHOLD:
+            raise BadOverwrite(
+                "要覆盖的岗位（%s）与这次提交的 JD 不相似（相似度 %.3f）："
+                "拒绝把结果写到无关岗位上" % (overwrite_id, score))
+        return None
+    hit = _similar_saved_job(jd_text)
+    if hit is None:
+        return None
+    job, score = hit
+    return {
+        "job_id": job.get("id"),
+        "job_title": job.get("job_title") or "",
+        "created_at": job.get("created_at") or "",
+        "score": job.get("score"),
+        "similarity": score,
+        "suggestions": list(ANALYZE_DUP_SUGGESTIONS),
+    }
+
+
 # ---------------------------------------------------------------- 业务
 def save_jd_source(job_id, jd_text, image_data_url):
     """把 JD 原始文本/截图落盘，返回可访问的相对文件名"""
@@ -276,11 +383,21 @@ def save_jd_source(job_id, jd_text, image_data_url):
     return jd_text_file, jd_image_url
 
 
-def do_analyze(jd_text, image_data_url, resume_name, link=""):
+def do_analyze(jd_text, image_data_url, resume_name, link="", overwrite_id="", allow_duplicate=False):
+    """跑一次 JD 分析并出报告。`overwrite_id` 非空 = 「覆盖」：结果写回那条已有记录。
+
+    `allow_duplicate` 为真 = 用户已在查重提示里选过「仍然新建」→ **跳过查重**，照常新建。
+
+    ⚠️ 查重（`find_analyze_duplicate`）**必须在调模型/调搜索之前**跑：命中时抛
+    `DuplicateSubmission` / `BadOverwrite`，一个额度都不花 —— 这是本功能的全部意义。
+    位置只能在这一处：`jd_text` 若来自 OCR / 抓链接，那时才拿到文本；而**在拿到文本那一行
+    的下一条**就查重，保证了「拿到文本之后的第一件花钱的事」之前已经拦过。
+    """
     t_start = time.time()
     cfg = store.load_config()
     jd_text = (jd_text or "").strip()
     link = (link or "").strip()
+    overwrite_id = str(overwrite_id or "").strip()
 
     source_bits = []
     if jd_text:
@@ -291,7 +408,7 @@ def do_analyze(jd_text, image_data_url, resume_name, link=""):
         source_bits.append("分享链接")
 
     log.log_event("analyze.start", resume=resume_name, has_text=bool(jd_text), has_image=bool(image_data_url),
-              has_link=bool(link), text_model=cfg["text_model"]["model"],
+              has_link=bool(link), overwrite=overwrite_id, text_model=cfg["text_model"]["model"],
               vision_model=cfg["vision_model"]["model"])
     try:
         if not jd_text:
@@ -307,6 +424,27 @@ def do_analyze(jd_text, image_data_url, resume_name, link=""):
                 log.log_event("analyze.link_fetched", ms=int((time.time() - _t) * 1000), chars=len(jd_text))
             else:
                 raise RuntimeError("请提供 JD：粘贴文字、上传截图，或填分享链接（三者任一）")
+
+        # ---- 分析前查重（§6）：这里是「拿到 JD 文本」之后的第一行，下面才开始花钱 ----
+        # 命中且带 overwrite → 校验通过才继续（分析照跑，结果写回那条记录）；
+        # 命中且什么都没带 → DuplicateSubmission（路由回 409，模型与搜索一次都不调）。
+        # `allow_duplicate` 是用户已经看过提示后做出的选择：跳过判定（§6 表格第一行之外的那支）。
+        if not allow_duplicate:
+            dup = find_analyze_duplicate(jd_text, overwrite_id)
+            if dup is not None:
+                raise DuplicateSubmission(dup)
+
+        # 覆盖：沿用那条已有记录的身份（id 与报告文件名都不变）。
+        # 「报告文件名 == 原 id」是 §6 的契约（前端拿 id 去 /reports/<id>.html 就行），原始
+        # created_at 也留在记录上：覆盖是「同一条记录的新分析」，不是一条新记录 ——
+        # 把原始时间换成现在等于篡改台账历史（用户就是靠它认「这份 JD 我 10 月 3 日看过」）。
+        overwrite_job = _job_in_ledger(overwrite_id) if overwrite_id else None
+        fixed_id = ""
+        created_at_kept = ""
+        if overwrite_job is not None:
+            fixed_id = str(overwrite_job.get("id") or "")
+            created_at_kept = str(overwrite_job.get("created_at") or "")
+            log.log_event("analyze.overwrite", job=fixed_id, jd_chars=len(jd_text))
 
         rp = os.path.join(store.p_path("resumes"), store.safe_name(resume_name))
         if not os.path.exists(rp):
@@ -361,7 +499,9 @@ def do_analyze(jd_text, image_data_url, resume_name, link=""):
             d["knowledge_error"] = str(e)
         d["knowledge"] = know_nodes
 
-        fname = render_report(d)
+        # 覆盖时必须用**固定文件名**（fixed_id = 原 id）：报告文件名与岗位 id 都不变。
+        # 走的是与示例报告同一条「固定文件名」路径 —— 不另写一份写盘逻辑（否则两处迟早分叉）。
+        fname = render_report(d, fixed_id=fixed_id or None)
         job_id = fname[:-5]
 
         # ---- 知识库自动沉淀（阶段 3.1）：失败绝不影响出报告 ----
@@ -385,7 +525,8 @@ def do_analyze(jd_text, image_data_url, resume_name, link=""):
         rec = {
             "id": job_id,
             "report": fname,
-            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            # 覆盖：沿用原记录的 created_at（同一条记录的新分析，不是新记录）
+            "created_at": created_at_kept or datetime.now().strftime("%Y-%m-%d %H:%M"),
             "job_title": d.get("job_title") or "",
             "company": d.get("company") or "",
             "hr_name": d.get("hr_name") or "",
@@ -652,7 +793,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"reports": out})
 
         if p == "/api/jobs":
-            return self._send(200, {"jobs": store.load_jobs(), "categories": store.CATEGORIES, "statuses": store.STATUSES})
+            # §4：`merged_into` 非空的只是「已合并」标记，不该继续出现在列表里
+            # （否则用户台账里会同时看到被并的那条，等于合并没生效）。
+            return self._send(200, {"jobs": _ledger_jobs(), "categories": store.CATEGORIES, "statuses": store.STATUSES})
 
         if p == "/api/knowledge":
             def one(k, default=""):
@@ -975,7 +1118,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"ok": True, "name": name})
 
         if p == "/api/jobs/update":
-            job = store.find_job(store.safe_name(body.get("id")))
+            # 走有效台账：已合并的记录在列表里看不到，写接口也不能悄悄改它
+            # （改一条「不存在」的记录 = 用户以为改了，台账里却什么都没有）。
+            job = _job_in_ledger(store.safe_name(body.get("id")))
             if not job:
                 return self._send(404, {"ok": False, "error": "找不到该岗位记录"})
             fields = [k for k in ("company", "hr_name", "phone", "address", "job_category",
@@ -1141,10 +1286,26 @@ class Handler(BaseHTTPRequestHandler):
                                     "id": card.get("id"), "node": card})
 
         if p == "/api/analyze":
+            # 查重命中 → **409**（语义明确：这不是「分析失败」，是「要不要覆盖」的选择题）。
+            # `allow_duplicate: true` = 用户在弹窗里看过代价后选了「仍然新建」：跳过查重，
+            # 照常跑分析并**新建**一条记录（前端选「新建」时会重发一次请求带这个标记）。
+            # ⚠️ 这个 except 必须排在下面那个宽 except 之前：DuplicateSubmission / BadOverwrite
+            # 都是 RuntimeError，落进宽 except 就会变成 200 + 「分析失败：这份 JD 与已有岗位
+            # 20261003_… 重复」—— 前端拿不到 duplicate 字段，弹窗永远出不来。
             try:
                 fname = do_analyze(body.get("jd_text"), body.get("image"),
-                                   body.get("resume_name"), body.get("link"))
+                                   body.get("resume_name"), body.get("link"),
+                                   overwrite_id=body.get("overwrite") or "",
+                                   allow_duplicate=body.get("allow_duplicate"))
                 return self._send(200, {"ok": True, "report": fname})
+            except DuplicateSubmission as e:
+                log.log_event("analyze.duplicate", level="warn", job=e.duplicate.get("job_id"),
+                              similarity=round(e.duplicate.get("similarity") or 0, 4))
+                return self._send(409, {"ok": False, "duplicate": e.duplicate})
+            except BadOverwrite as e:
+                # 前端传错 id：结果**没有**被写进任何一条记录，必须说清（不能只回一句「重复」）
+                log.log_event("analyze.bad_overwrite", level="warn", error=str(e))
+                return self._send(400, {"ok": False, "error": str(e)})
             except Exception as e:
                 return self._send(200, {"ok": False, "error": str(e)})
 
