@@ -80,21 +80,36 @@ class TerminalGateTest(IsolatedCase):
 
 
 class NeverRecordedGateTest(IsolatedCase):
-    """「没记过结果」与「记了未投递」是两件事 —— 门槛只拦后者。
+    """没记过状态的岗位**也要拦** —— 终态门槛是严格版，没有例外。
 
-    为什么必须显式钉住：计划里的 EvidenceFilterTest / DegradedAttributionTest 直接对**裸岗位**
-    归因（`_job()` 不写任何状态），而 TerminalGateTest 又要求「记过非终态 → NotTerminal」。
-    两者同时成立，判门就只能认「记录过的状态」，而不是 application_of 的展示默认值「未投递」。
+    计划原稿里的 EvidenceFilterTest 直接对裸岗位归因、与本条冲突；**裁定按严格语义**（判据只有
+    `_recorded_status(job) in TERMINAL`，缺失/非法一律当非终态）。理由：畸形 / 手改 / 遗留记录若
+    被放行，AI 就会给一个「从未记录过结果」的岗位写「你为什么没拿到 offer」——
+    正是本设计要防的「没有依据却言之凿凿」。用户看到「还没有结果」→ 去记录结果 → 才能归因，
+    这恰好就是「先记结果，再复盘」的流程顺序。
     """
 
-    def test_a_job_with_no_recorded_result_is_not_gated(self):
+    def test_a_job_with_no_recorded_result_is_gated(self):
         _job()
-        self.assertTrue(outcome.can_attribute("j1"))
-        self.assertEqual(outcome.application_of("j1")["status"], "未投递")   # 只是展示默认值
+        self.assertFalse(outcome.can_attribute("j1"))
+        with self.assertRaises(outcome.NotTerminal) as cm:
+            outcome.attribute("j1", cfg={}, chat=fake_chat("{}"))
+        msg = str(cm.exception)
+        self.assertIn("还没有结果", msg)      # Task 2 的 400 文案靠这句
+        self.assertNotIn("未投递", msg)        # 不该谎报一个用户从没填过的状态
 
-    def test_recording_a_non_terminal_status_closes_the_gate(self):
+    def test_recording_a_non_terminal_status_also_closes_the_gate(self):
         _job()
         outcome.save_result("j1", "已投", "")
+        self.assertFalse(outcome.can_attribute("j1"))
+        with self.assertRaises(outcome.NotTerminal) as cm:
+            outcome.attribute("j1", cfg={}, chat=fake_chat("{}"))
+        self.assertIn("当前状态：已投", str(cm.exception))     # 记过就说真实状态
+
+    def test_junk_status_is_gated_like_never_recorded(self):
+        # 状态是垃圾类型（5）：与「没记过」等价 → 一律拦；展示默认值不参与判门
+        _job(application={"status": 5})
+        self.assertEqual(outcome.application_of("j1")["status"], "未投递")   # 只是展示默认值
         self.assertFalse(outcome.can_attribute("j1"))
         with self.assertRaises(outcome.NotTerminal):
             outcome.attribute("j1", cfg={}, chat=fake_chat("{}"))
@@ -103,6 +118,7 @@ class NeverRecordedGateTest(IsolatedCase):
 class EvidenceFilterTest(IsolatedCase):
     def test_reasons_without_evidence_are_dropped(self):
         _job()
+        outcome.save_result("j1", "已拒", "")      # 归因的前提：先记结果（终态）
         reply = json.dumps({"possible_reasons": [
             {"reason": "有依据的", "evidence": "面试里问了你 Kappa，你答成了准确率", "confidence": "高"},
             {"reason": "没依据的", "evidence": "", "confidence": "高"},
@@ -111,8 +127,34 @@ class EvidenceFilterTest(IsolatedCase):
         out = outcome.attribute("j1", cfg={}, chat=fake_chat(reply))
         self.assertEqual([r["reason"] for r in out["possible_reasons"]], ["有依据的"])
 
+    def test_missing_controllable_stays_unjudged(self):
+        """模型漏标 controllable → **None（未判断）**，绝不默认成「可控」。
+
+        默认 True 是在没有依据的情况下宣称「这事你能控制」——与「没有 evidence 的原因要丢弃」
+        是同一类错误。报告模板应把 None 单列成「未判断」。
+        """
+        _job()
+        outcome.save_result("j1", "已拒", "")
+        reply = json.dumps({"possible_reasons": [{"reason": "没标可控性的", "evidence": "面试里的某个点"}]},
+                           ensure_ascii=False)
+        out = outcome.attribute("j1", cfg={}, chat=fake_chat(reply))
+        self.assertIsNone(out["possible_reasons"][0]["controllable"])
+        self.assertIsNone(out["possible_reasons"][0].get("controllable"))
+
+    def test_controllable_is_kept_when_the_model_says_so(self):
+        # 反向对照：显式标了就必须原样保留，否则「漏标→None」可以靠「永远 None」蒙过
+        _job()
+        outcome.save_result("j1", "已拒", "")
+        reply = json.dumps({"possible_reasons": [
+            {"reason": "可控的", "evidence": "证据甲", "controllable": True},
+            {"reason": "不可控的", "evidence": "证据乙", "controllable": False},
+        ]}, ensure_ascii=False)
+        out = outcome.attribute("j1", cfg={}, chat=fake_chat(reply))
+        self.assertEqual([r["controllable"] for r in out["possible_reasons"]], [True, False])
+
     def test_all_dropped_is_marked_honestly(self):
         _job()
+        outcome.save_result("j1", "已拒", "")
         reply = json.dumps({"possible_reasons": [{"reason": "泛泛而谈"}]}, ensure_ascii=False)
         out = outcome.attribute("j1", cfg={}, chat=fake_chat(reply))
         self.assertEqual(out["possible_reasons"], [])
@@ -120,6 +162,7 @@ class EvidenceFilterTest(IsolatedCase):
 
     def test_missing_sections_get_empty_defaults(self):
         _job()
+        outcome.save_result("j1", "已拒", "")
         out = outcome.attribute("j1", cfg={}, chat=fake_chat('{"verdict_summary":"只有总评"}'))
         self.assertEqual(out["actions"], [])
         self.assertEqual(out["to_study"], [])
@@ -127,6 +170,7 @@ class EvidenceFilterTest(IsolatedCase):
 
     def test_to_study_never_creates_cards(self):
         _job()
+        outcome.save_result("j1", "已拒", "")
         before = len(store.load_knowledge()["nodes"])
         reply = json.dumps({"to_study": [{"term": "分层抽样", "definition": "按类别比例抽"}]},
                            ensure_ascii=False)
@@ -144,6 +188,7 @@ class DegradedAttributionTest(IsolatedCase):
 
     def test_with_interview_records_it_feeds_them(self):
         _job()
+        outcome.save_result("j1", "已拒", "")
         store.save_interview_json("iv1", "analysis.json", {"weak_concepts": [{"term": "Kappa"}]})
         store.save_interview_json("iv1", "status.json", {"state": "done", "job_id": "j1"})
         seen = {}
@@ -211,6 +256,7 @@ class AttributionStorageTest(IsolatedCase):
         所以排序兜底会把顺序反过来 —— 一旦有人加了 sort，这条立刻变红。
         """
         _job()
+        outcome.save_result("j1", "已拒", "")      # 归因的前提：先记结果（终态）
         reply = json.dumps({"possible_reasons": [
             {"reason": "甲原因", "evidence": "证据甲", "confidence": "高"},
             {"reason": "乙原因", "evidence": "证据乙", "confidence": "中"},
@@ -222,6 +268,7 @@ class AttributionStorageTest(IsolatedCase):
     def test_only_this_jobs_interviews_are_fed(self):
         _job(job_id="j1")
         _job(job_id="j2")
+        outcome.save_result("j1", "已拒", "")
         store.save_interview_json("iv1", "analysis.json", {"weak_concepts": [{"term": "Kappa"}]})
         store.save_interview_json("iv1", "status.json", {"job_id": "j1"})
         # 别的岗位的面试记录：喂进去就是把别人的面试当成你的（绝不能）
@@ -241,6 +288,7 @@ class AttributionStorageTest(IsolatedCase):
 
     def test_to_study_does_not_touch_the_knowledge_file(self):
         _job()
+        outcome.save_result("j1", "已拒", "")
         store.save_knowledge({"nodes": [{"id": "kb-existing", "term": "已有概念"}]})
         reply = json.dumps({"to_study": [{"term": "分层抽样", "definition": "按类别比例抽"}]},
                            ensure_ascii=False)
@@ -264,6 +312,7 @@ class AttributionStorageTest(IsolatedCase):
     def test_interviews_are_not_fed_twice_on_repeat_attribution(self):
         """重复归因允许（结果可能变），但每次只喂**一份**面试记录，绝不重复累加。"""
         _job()
+        outcome.save_result("j1", "已拒", "")
         store.save_interview_json("iv1", "analysis.json", {"weak_concepts": [{"term": "Kappa"}]})
         store.save_interview_json("iv1", "status.json", {"job_id": "j1"})
         seen = []

@@ -86,11 +86,12 @@ def _as_line(v):
     return _as_str(v)
 
 
-def _as_bool(v, default=True):
-    """可控/不可控的容错解析。
+def _as_bool(v, default=None):
+    """可控/不可控的容错解析：**读不出来就是 None（未判断）**。
 
-    缺失或读不出来时按 True（可控）：这一节的用途就是告诉用户「下次还能改什么」，
-    宁可给一条可执行的默认，也不要因为模型漏了一个字段就让原因没有色标。
+    绝不默认成 True：那等于在没有依据的情况下宣称「这事你能控制」—— 与「没有 evidence 的原因
+    要丢弃」是同一类错误。三态语义：True 可控 / False 不可控 / None 未判断；
+    报告模板应把 None 单列成「未判断」，不要混进「可控」。
     """
     if isinstance(v, bool):
         return v
@@ -134,10 +135,11 @@ def _raw_application(job):
 
 
 def _recorded_status(job):
-    """用户**记录过**的状态：台账顶层优先，`application` 镜像兜底；从没记过 → ""。
+    """用户**记录过**的状态：台账顶层优先，`application` 镜像兜底；从没记过/非法 → ""。
 
-    「没填」与「填了未投递」是两件事：前者连终态都无从谈起（老记录 / 手写记录），
-    后者必须被终态门槛拦住。application_of 显示的默认值「未投递」只用于展示，不参与判门。
+    判门**只看这个值**（严格版）："" 不在 TERMINAL 里，所以「没填」与「填了未投递」一样被拦。
+    `application_of` 显示的默认值「未投递」只用于展示，绝不参与判门 —— 否则一条从没记过结果的
+    记录会被放行去归因，AI 就会给一个「结果未知」的岗位写「你为什么没拿到 offer」。
     """
     app = _raw_application(job)
     return _clean_status(job.get("status")) or _clean_status(app.get("status"))
@@ -192,15 +194,27 @@ def save_result(job_id, status, reason, when=None):
 
 
 def can_attribute(job_id):
-    """能不能谈归因（只有到终态才谈得上）。
+    """只有到终态才谈得上归因 —— **严格版，没有例外**。
 
-    记过结果 → **只有 TERMINAL 放行**；状态从来没记过（`_recorded_status` 为空）→ 不拦：
-    这时连「还没到终态」都无从谈起，拦下来只会逼用户先编一个状态才能问一句「为什么」。
-    真实台账里几乎每个岗位都有顶层 status（analyze 写「未投递」），所以产品行为就是
-    「非终态一律不许归因」。这是本模块与计划文档措辞的一个显式取舍，见 tests/test_outcome.py。
+    判据只有一个：`_recorded_status(job) in TERMINAL`。状态**缺失或非法（不在词表里）也一律拦**，
+    当作非终态。
+
+    为什么不留「没记过状态就放行」的缝：真实台账里每个岗位都有 status，但畸形 / 手改 / 遗留记录
+    没有。放行那种记录，等于让 AI 给一个「从未记录过结果」的岗位写「你为什么没拿到 offer」——
+    正是本设计要防的「没有依据却言之凿凿」。用户看到「还没有结果」→ 去记录结果 → 才能归因，
+    这恰好就是「先记结果，再复盘」的流程顺序（计划原稿与这条冲突，按裁定采用严格语义）。
     """
-    status = _recorded_status(_require_job(job_id))
-    return (not status) or status in TERMINAL
+    return _recorded_status(_require_job(job_id)) in TERMINAL
+
+
+def _not_terminal_message(job):
+    """「为什么不能归因」必须说**真实**情况：绝不谎报一个用户从没填过的状态。"""
+    status = _recorded_status(job)
+    if not status:
+        return ("这个岗位还没有结果：没有记录过状态（空的或不在词表里）。"
+                "请先在「🏁 结果」里记录结果，到终态（%s）后再归因。" % "／".join(TERMINAL))
+    return ("这个岗位还没有结果（当前状态：%s）。只有到了 %s 才谈得上归因。"
+            % (status, "／".join(TERMINAL)))
 
 
 def report_data_of(job_id):
@@ -445,14 +459,12 @@ def _basis_of(job, facts):
 def attribute(job_id, cfg, chat=None):
     """一次模型调用产出归因，并写回 application.outcome_ai（**绝不碰 outcome_reason**）。
 
-    顺序是契约的一部分：先过终态门槛（没到终态 → NotTerminal），再收集依据，再问模型，
-    再做证据过滤 —— 门槛放在最前面，没结果时**一次模型调用都不发**。
+    顺序是契约的一部分：先过终态门槛（没到终态 / **没记过状态** → NotTerminal），再收集依据，
+    再问模型，再做证据过滤 —— 门槛放在最前面，没结果时**一次模型调用都不发**。
     """
-    if not can_attribute(job_id):
-        raise NotTerminal("这个岗位还没有结果（当前状态：%s）。只有到了 %s 才谈得上归因。"
-                          % (application_of(job_id).get("status"),
-                             "／".join(TERMINAL)))
-    job = _require_job(job_id)
+    job = _require_job(job_id)                  # 岗位不存在 → LookupError（路由映射 404）
+    if not can_attribute(job_id):               # 终态门槛：唯一判据（见 can_attribute）
+        raise NotTerminal(_not_terminal_message(job))
     view = _view_of(job)
     facts = _facts_of(job, view)
     reply = _call_model(chat, cfg, _DIRECTIVES, _build_prompt(job, facts))
