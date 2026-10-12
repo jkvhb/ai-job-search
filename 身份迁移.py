@@ -15,7 +15,8 @@
 安全保证：
   - `--试跑` 严格只读：不写库、不建 `jds.json`、不记日志、不取备份
     （`find_duplicate_jobs` 与 `kb.read_report_data` 都只读）
-  - `--执行` **第一步**就是 `data/profiles/<key>/` 的整目录备份（带时间戳，**保留不删**）；
+  - `--执行` **第一步**就是 `data/profiles/<key>/` 的整目录备份（带时间戳，**保留不删**；
+    拷备份时跳过旧备份目录，备份里不再套备份）；
     任一步失败 → 用备份恢复整目录，并把迁移新建的文件删掉（备份里没有的东西一律不留下）
   - **报告文件不改名、不删除**；`jd/<旧 id>.txt` 也不改名（`jd_text_file` 字段跟着指过去）
   - 幂等：JD id 由「指纹分组 + 报告派生字段 + 编号」决定，已建过的 JD 按 `migrated_from`
@@ -86,6 +87,10 @@ USAGE = """用法：
   python 身份迁移.py --试跑     # 只打印「迁移前 → 迁移后」对照表（严格只读）
   python 身份迁移.py --执行     # 先整目录备份，再迁移
 """
+
+# 备份目录名前缀（`data/profiles/迁移备份_<时间戳>/`）。**唯一一份定义**：
+# 备份命名与「拷备份时跳过旧备份」两处都用它，绝不会写歪成两个说法。
+BACKUP_PREFIX = "迁移备份"
 
 # 测试注入点（生产恒为空）：`--执行` 每写一个文件后把它的相对名 append 进来；
 # 测试往里面放一个「打开即抛错」的对象，就能在**事务中途**制造写盘失败，
@@ -631,6 +636,12 @@ def render_table(plan):
     after_kb = _from_jds_ids(plan["knowledge"])
     before_multi = kb.stats(store.load_knowledge())["multi_jd"]
     after_multi = kb.stats(plan["knowledge"])["multi_jd"]
+    # JD 数这一行必须是**真话**：`after` 取迁移后 jds.json 的**实际条数**，不靠算术猜。
+    # 之前写成 `before + groups`，于是二次执行时表头谎报 `3 → 6`（实际 3、且确实是幂等的）
+    # —— 这张表是用户决定「要不要执行」的唯一依据。
+    before_jds = plan["before_jds"]
+    after_jds = len(plan["jds_doc"]["jds"])
+    new_jds = after_jds - before_jds
 
     lines.append("身份迁移 · 试跑（严格只读，一个字节都不写）")
     lines.append("profile: %s" % store.current_profile())
@@ -642,7 +653,9 @@ def render_table(plan):
         "（其中 %d 份缺 JD 原文、%d 份原文过短，各自自成 1 个 JD）"
         % (skipped["no_text"], skipped["too_short"])
         if (skipped["no_text"] or skipped["too_short"]) else ""))
-    lines.append("  JD 数 %d → %d" % (plan["before_jds"], plan["before_jds"] + n_jd))
+    lines.append("  JD 数 %d → %d%s" % (before_jds, after_jds,
+                                      "（已迁移过，无新增）" if new_jds == 0
+                                      else ("（新增 %d 个）" % new_jds if new_jds > 0 else "")))
     lines.append("  知识库引用（distinct 来源 id）%d → %d" % (before_kb, after_kb))
     lines.append("  multi_jd %d → %d" % (before_multi, after_multi))
     lines.append("")
@@ -658,9 +671,10 @@ def render_table(plan):
         for rec in record["members"]:
             lines.append("    分析 %s | %s | 报告 %s" % (
                 rec.get("id"), _when(rec), rec.get("report") or "—"))
-        lines.append("  归组依据: %s | 分析 %d 份 | 报告 %d 个 | 编号 %s"
+        lines.append("  归组依据: %s | 分析 %d 份 | 报告 %d 个 | 编号 %s%s"
                      % (record["why"], len(record["members"]),
-                        len(record["reports"]), record["seq"]))
+                        len(record["reports"]), record["seq"],
+                        " | 这个 JD 已存在（沿用原 id/原编号）" if record["existing"] is not None else ""))
         if not record["report"]:
             lines.append("  ⚠ 这一组的报告都读不出 REPORT_DATA → ID 六段从台账记录派生（如实降级，不猜）")
         lines.append("")
@@ -713,24 +727,38 @@ def _profile_files(root):
     return out
 
 
+def _ignore_previous_backups(_dirpath, names):
+    """`shutil.copytree` 的 ignore：**备份里绝不套备份**。
+
+    ⚠ 实测澄清（别照抄上一版的猜测）：备份落在 `data/profiles/迁移备份_<ts>/`，
+    它是 `data/profiles/<key>/` 的**兄弟目录**，所以真布局下**根本拷不进去**嵌套
+    （已用隔离副本实测：新备份顶层没有 `迁移备份_*`）。这道闸门钉的是**不变量**：
+    只要备份根将来挪进 profile 目录（或用户手工把旧备份搬进来），也不会滚雪球。
+    `save_jds` / `_restore_profile` 都不依赖被跳过的那些目录。
+    """
+    return [n for n in names if n.startswith(BACKUP_PREFIX)]
+
+
 def _backup_profile():
     """把 `data/profiles/<key>/` **整目录拷贝**到 `data/profiles/迁移备份_<时间戳>/`。
 
     **拷贝而不是移动**：整目录移动虽然更快，但会让 `profile_dir()` 在迁移过程中不存在
-    （`session-15a8a711` 的测试与 `store` 的任何读路径都会当场坏掉），而且「备份」的语义
-    本来就该是「原地不动的那一份」——用户翻 `data/profiles/<key>/` 时报告仍然在那里。
+    （`store` 的任何读路径与测试都会当场坏掉），而且「备份」的语义本来就该是
+    「原地不动的那一份」——用户翻 `data/profiles/<key>/` 时报告仍然在那里。
     备份**保留不删**（确认无误后用户自行删除）。
+
+    拷贝时跳过 `迁移备份*`（见 `_ignore_previous_backups`）：备份里不再套备份。
     """
     src = os.path.abspath(store.profile_dir())
     if not os.path.isdir(src):
         raise RuntimeError("profile 目录不存在：%s" % src)
     dest = os.path.join(store.profiles_root(),
-                        "迁移备份_" + datetime.now().strftime("%Y%m%d_%H%M%S"))
+                        BACKUP_PREFIX + "_" + datetime.now().strftime("%Y%m%d_%H%M%S"))
     if os.path.exists(dest):
         dest = os.path.join(store.profiles_root(),
-                            "迁移备份_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f"))
+                            BACKUP_PREFIX + "_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f"))
     os.makedirs(store.profiles_root(), exist_ok=True)
-    shutil.copytree(src, dest)
+    shutil.copytree(src, dest, ignore=_ignore_previous_backups)
     return dest
 
 

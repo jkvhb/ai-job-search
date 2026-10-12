@@ -34,6 +34,9 @@ SHORT_JD = ("数据质检验收把控：严格按评测标准对大模型语音�
             "熟悉ASR与TTS评测流程；能定位Bad Case并做归因分析。")
 OTHER_JD = ("负责抖音电商直播运营，策划带货活动，管理达人矩阵与坑位排期，"
             "跟进直播间转化率与退货率，每周输出复盘报告并复盘投放ROI。")
+# 迁移完成之后新加的一份分析（**另一份 JD**）→ 表头必须是 `3 → 4（新增 1 个）`
+NEW_JD = ("负责图像标注平台的质检规则设计与抽检方案，跟踪标注员一致性（Kappa），"
+          "输出返修闭环报告并推动标注工具迭代。")
 
 
 def fingerprint(root):
@@ -353,6 +356,35 @@ class ExecuteTest(MigrationTestBase):
         self.assertEqual(len(before_jobs), 5)
         self.assertTrue(all("jd_id" not in j for j in before_jobs))
 
+    def test_backup_never_contains_a_previous_backup(self):
+        """备份里**不套备份**（拷一次就多 MB 级、再跑就滚雪球）。
+
+        ⚠ 实测澄清：真布局下备份落在 `data/profiles/迁移备份_<ts>/`，它是 profile 目录的
+        **兄弟**，本来就拷不进去（我在隔离副本上实测过：新备份顶层没有 `迁移备份_*`）。
+        这条钉的是**不变量** —— 只要备份根将来挪进 profile，或用户手工把旧备份搬进来，
+        也绝不会把备份拷成备份。
+        """
+        old = os.path.join(store.profile_dir(), "迁移备份_20200101_000000")
+        os.makedirs(old)
+        store.write_text(os.path.join(old, "jobs.json"), "旧备份，不该被拷进新备份")
+
+        code, _text, _reports = self._execute()
+
+        self.assertEqual(code, 0)
+        backups = glob.glob(os.path.join(store.profiles_root(), "迁移备份_*"))
+        self.assertEqual(len(backups), 1)
+        new = backups[0]
+        self.assertFalse(os.path.exists(os.path.join(new, "迁移备份_20200101_000000")),
+                         "新备份里套了上一次的备份：%s" % sorted(os.listdir(new)))
+        # 闸门只挡备份：正常内容一个都不能少（别做成「什么都不拷」而假绿）
+        self.assertTrue(os.path.exists(os.path.join(new, "jobs.json")))
+        self.assertTrue(os.path.exists(os.path.join(new, "knowledge.json")))
+        self.assertTrue(os.path.exists(os.path.join(new, "reports", "分析A.html")))
+        self.assertTrue(os.path.isdir(os.path.join(new, "jd")))
+        # 旧备份原地不动、内容一个字节没动（**绝不删除**）
+        self.assertTrue(os.path.isdir(old))
+        self.assertEqual(store.read_text(os.path.join(old, "jobs.json")), "旧备份，不该被拷进新备份")
+
 
 class IdempotenceTest(MigrationTestBase):
     """④ 跑两次，第二次一个字节都不改（jds.json / jobs.json / knowledge.json 字节级相同）。"""
@@ -370,6 +402,56 @@ class IdempotenceTest(MigrationTestBase):
                          len(backups_before) + 1)      # 备份照常加一份，但库内容不变
         self.assertEqual(len(jdid.load_jds()["jds"]), 3)   # 没重复建 JD
         self.assertEqual(jdid.load_jds()["seq"], 3)        # seq 也没再涨
+
+    def test_dry_run_header_after_migration_says_no_new_jds(self):
+        """**表头不能说假话**：二次执行的预览曾写成 `3 → 6`（实际 3、且执行确实幂等）。
+
+        这张表是用户决定「要不要执行」的**唯一依据**。
+        """
+        _c, first = self.run_cli(["--试跑"])
+        self.assertIn("JD 数 0 → 3（新增 3 个）", first)
+        self.assertNotIn("已迁移过", first)
+        first_ids = DryRunTest._jd_blocks(first)
+        self.assertEqual(len(first_ids), 3)
+
+        self.assertEqual(self.run_cli(["--执行"])[0], 0)
+
+        _c2, second = self.run_cli(["--试跑"])
+        self.assertIn("JD 数 3 → 3（已迁移过，无新增）", second)
+        self.assertNotIn("3 → 6", second)
+        self.assertNotIn("0 → 3", second)
+        # 列出来的还是同样那三个 id（顺序也一样）
+        heads = [b.splitlines()[0] for b in DryRunTest._jd_blocks(second)]
+        self.assertEqual(heads, [b.splitlines()[0] for b in first_ids])
+        # 每个 JD 都标出「沿用」——用户能看出表头为什么是 3 → 3
+        self.assertEqual(second.count("这个 JD 已存在（沿用原 id/原编号）"), 3)
+
+    def test_dry_run_header_counts_only_new_jds_when_some_already_exist(self):
+        """迁移后新加一份**另一份 JD** 的分析 → `3 → 4（新增 1 个）`；老三个标「沿用」。"""
+        self.assertEqual(self.run_cli(["--执行"])[0], 0)
+        store.upsert_job({"id": "分析F", "report": "分析F.html", "created_at": "2026-10-01 10:00",
+                          "job_title": "图像标注质检", "company": "某图像公司",
+                          "job_category": "数据标注/质检", "location": "深圳", "salary": "12-18K",
+                          "score": 66.0, "jd_text_file": "分析F.txt", "resume": "周汉钦-母版",
+                          "status": "未投递"})
+        store.write_text(store.p_path("jd", "分析F.txt"), NEW_JD)
+        write_report(os.path.join(store.p_path("reports"), "分析F.html"),
+                     _report_data("图像标注质检", "12-18K", "数据标注/质检", "深圳", "本科", 66.0,
+                                  company="某图像公司"))
+
+        before = fingerprint(store.DATA_ROOT)
+        code, text = self.run_cli(["--试跑"])
+
+        self.assertEqual(code, 0)
+        self.assertEqual(fingerprint(store.DATA_ROOT), before)      # 仍然严格只读
+        self.assertIn("JD 数 3 → 4（新增 1 个）", text)
+        blocks = DryRunTest._jd_blocks(text)
+        self.assertEqual(len(blocks), 4)
+        new_block = [b for b in blocks if "分析F" in b]
+        self.assertEqual(len(new_block), 1, "分析F 必须只出现在一个 JD 块里：\n" + text)
+        self.assertNotIn("已存在", new_block[0])                     # 新的那个不该标「沿用」
+        self.assertIn("分析F | 2026-10-01 10:00", new_block[0])
+        self.assertEqual(text.count("这个 JD 已存在（沿用原 id/原编号）"), 3)
 
 
 class RestoreTest(MigrationTestBase):
