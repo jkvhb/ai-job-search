@@ -126,6 +126,147 @@ class DeriveFieldsTest(IsolatedCase):
             self.assertIsNone(v, "%s 应该是 None，实际 %r" % (k, v))
 
 
+class NormalizeFieldsTest(IsolatedCase):
+    def test_education_keeps_only_one_short_tier(self):
+        for raw, want in [("统招公办本科及以上", "本科"), ("本科", "本科"),
+                          ("大专及以上", "大专"), ("硕士", "硕士"),
+                          ("博士研究生", "博士"), ("不限", "不限"), ("学历不限", "不限"),
+                          ("本科及以上，硕士优先", "硕士"),   # 取出现的最高档
+                          ("中专或高中", "中专")]:
+            with self.subTest(raw=raw):
+                self.assertEqual(jdid._normalize_education(raw), want)
+
+    def test_education_that_cannot_be_pinned_stays_none(self):
+        for raw in ("", "  ", None, "看能力", 5, ["本科"]):
+            with self.subTest(raw=raw):
+                self.assertIsNone(jdid._normalize_education(raw))
+
+    def test_salary_keeps_only_the_range(self):
+        for raw, want in [("6-8K（入职五险，提及一金7k+）", "6-8K"),
+                          ("6-8K（一金7k+）", "6-8K"),
+                          ("13-26K", "13-26K"),
+                          ("13–26K", "13-26K"),          # 全角破折号 → 半角
+                          ("20—30K", "20-30K"),
+                          ("6至8K", "6-8K")]:
+            with self.subTest(raw=raw):
+                self.assertEqual(jdid._normalize_salary(raw), want)
+
+    def test_salary_without_a_range_stays_none(self):
+        for raw in ("", "面议", "20K", "13薪", None, 8):
+            with self.subTest(raw=raw):
+                self.assertIsNone(jdid._normalize_salary(raw))
+
+    def test_company_prefers_the_shorter_of_bracket_and_prefix(self):
+        for raw, want in [("四川金沙人力资源开发管理有限公司（金沙人力）", "金沙人力"),
+                          ("金沙人力（四川金沙人力资源开发管理有…）", "金沙人力"),
+                          ("某 AI 科技公司（示例）", "示例"),
+                          ("（示例）", "示例")]:
+            with self.subTest(raw=raw):
+                self.assertEqual(jdid._normalize_company(raw), want)
+
+    def test_company_without_brackets_is_truncated_to_twelve_chars(self):
+        self.assertEqual(jdid._normalize_company("四川金沙人力资源开发管理有限公司"),
+                         "四川金沙人力资源开发管理")          # 16 → 12
+        self.assertEqual(jdid._normalize_company("字节跳动"), "字节跳动")   # 短的照旧
+        # 截断不能留半个括号（未闭合的括号也要砍在它前面）
+        self.assertEqual(jdid._normalize_company("某某某某某某某某某某（简称"),
+                         "某某某某某某某某某某")
+
+    def test_company_empty_stays_none(self):
+        for raw in ("", "   ", None, 7):
+            with self.subTest(raw=raw):
+                self.assertIsNone(jdid._normalize_company(raw))
+
+    def test_normalize_fields_touches_only_the_three_long_segments(self):
+        got = jdid.normalize_fields({"education": "统招公办本科及以上", "company": "",
+                                     "duty": "数据标注/质检", "domain": "视频",
+                                     "city": "成都", "salary": "6-8K（一金7k+）"})
+        self.assertEqual(got, {"education": "本科", "company": None, "duty": "数据标注/质检",
+                               "domain": "视频", "city": "成都", "salary": "6-8K"})
+
+
+# 6 份真实报告的字段（逐字抄自 `data/profiles/default/reports/*.html` 里的 REPORT_DATA）。
+# 归一化 + build_id 出来的完整 ID 见 REAL_IDS（**手算出来的期望值，不是从实现里抄的**）。
+REAL_REPORTS = [
+    ("20260919_统本标注（视频标注AI训练标注师）_69分",
+     {"job_title": "统本标注（视频标注/AI训练标注师）",
+      "company": "四川金沙人力资源开发管理有限公司（金沙人力）",
+      "job_category": "数据标注/质检", "location": "成都",
+      "salary": "6-8K（入职五险，提及一金7k+）", "education": "统招公办本科及以上"}),
+    ("20260919_统本标注（视频标注）_66分",
+     {"job_title": "统本标注（视频标注）",
+      "company": "四川金沙人力资源开发管理有限公司",
+      "job_category": "数据标注/质检", "location": "成都",
+      "salary": "6-8K（一金7k+）", "education": "统招公办本科及以上"}),
+    ("20260919_统本标注（视频标注）_69分",
+     {"job_title": "统本标注（视频标注）",
+      "company": "金沙人力（四川金沙人力资源开发管理有…）",
+      "job_category": "数据标注/质检", "location": "成都",
+      "salary": "6-8K（入职五险，一金7k+）", "education": "统招公办本科及以上"}),
+    ("20261003_语音文本评测_75分",
+     {"job_title": "语音/文本评测", "company": "",
+      "job_category": "数据标注/质检", "location": "北京",
+      "salary": "13-26K", "education": "本科"}),
+    ("20261008_语音文本评测_72分",
+     {"job_title": "语音/文本评测", "company": "",
+      "job_category": "数据标注/质检", "location": "北京",
+      "salary": "13-26K", "education": "本科"}),
+    ("示例_语音文本评测_80分",
+     {"job_title": "语音/文本评测", "company": "某 AI 科技公司（示例）",
+      "job_category": "数据标注/质检", "location": "北京",
+      "salary": "13–26K", "education": "本科"}),
+]
+
+REAL_IDS = [
+    "本科_金沙人力_数据标注质检_视频_成都_6-8K_0001",
+    "本科_四川金沙人力资源开发管理_数据标注质检_视频_成都_6-8K_0002",
+    "本科_金沙人力_数据标注质检_视频_成都_6-8K_0003",
+    "本科_【未知单位】_数据标注质检_语音_北京_13-26K_0004",
+    "本科_【未知单位】_数据标注质检_语音_北京_13-26K_0005",
+    "本科_示例_数据标注质检_语音_北京_13-26K_0006",
+]
+
+
+class RealReportIdTest(IsolatedCase):
+    """拿**全部 6 份真实报告**的字段跑派生 + 归一化 + 拼接，逐条比全文。"""
+
+    def test_each_real_report_makes_the_expected_id(self):
+        self.assertEqual(len(REAL_REPORTS), len(REAL_IDS))
+        for seq, ((name, data), want) in enumerate(zip(REAL_REPORTS, REAL_IDS), 1):
+            with self.subTest(report=name):
+                self.assertEqual(jdid.build_id(jdid.derive_fields(data), seq), want)
+
+    def test_every_real_id_stays_under_forty_chars(self):
+        """可读性底线：ID 要当文件名、要在台账里显示。一条超标就说明归一化没做到位。"""
+        for seq, ((name, data), want) in enumerate(zip(REAL_REPORTS, REAL_IDS), 1):
+            with self.subTest(report=name):
+                jd_id = jdid.build_id(jdid.derive_fields(data), seq)
+                self.assertLessEqual(len(jd_id), 40, "ID 太长了（%d 字）：%s" % (len(jd_id), jd_id))
+                self.assertEqual(len(jd_id), len(want))
+
+    def test_no_real_id_contains_a_bracket_or_illegal_char(self):
+        for seq, (name, data) in enumerate(REAL_REPORTS, 1):
+            with self.subTest(report=name):
+                jd_id = jdid.build_id(jdid.derive_fields(data), seq)
+                for ch in "（()）" + jdid.BAD_CHARS:
+                    self.assertNotIn(ch, jd_id)
+                self.assertIsNone(jdid.validate_id(jd_id, []))
+
+    def test_the_two_analyses_of_the_same_real_jd_now_share_one_identity(self):
+        """**这就是本块要修的根因**：`20261003` 与 `20261008` 是同一份 JD 的两次分析。
+
+        旧方案里它们的身份是报告文件名（`…_75分` / `…_72分`），必然不同 → 知识库
+        `from_jds` 越叠越多、`multi_jd` 虚高（真实数据里 6 个概念中招）。
+        新方案下两份分析派生出的字段**完全相同**，只差全局编号 → 同一份 JD 一个身份。
+        """
+        f1 = jdid.derive_fields(REAL_REPORTS[3][1])
+        f2 = jdid.derive_fields(REAL_REPORTS[4][1])
+        self.assertEqual(f1, f2)
+        id1 = jdid.build_id(f1, 1)
+        id2 = jdid.build_id(f2, 1)
+        self.assertEqual(id1, id2)
+
+
 class ValidateIdTest(IsolatedCase):
     def test_duplicate_is_rejected(self):
         jdid.upsert_jd({"id": "本科_字节_标注_文本_北京_6-8K_0001"})

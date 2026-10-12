@@ -57,6 +57,24 @@ _KNOWN_CITIES = (
 )
 _CITY_MAX = 6
 
+# ---------- 字段归一化（ID 要短到能当文件名、能在台账里一眼读）----------
+# 为什么必须归一化：`REPORT_DATA` 里的原始字段是**给人读的说明**，不是身份。
+# 用真实数据举例，不归一化的话 ID 是 70 个字符：
+#   统招公办本科及以上_四川金沙人力资源开发管理有限公司（金沙人力）_数据标注质检_视频_成都_6-8K（入职五险，提及一金7k+）_0001
+# 而用户要的形态是 30 个字符：本科_金沙人力_数据标注质检_视频_成都_6-8K_0001。
+# 归一化只做「三段」（学历 / 单位 / 薪资）—— 职责、领域、城市本来就是短的。
+_EDU_TIERS = ("博士", "硕士", "本科", "大专", "中专", "高中", "不限")
+# 学历档位按「高 → 低」排：取**出现的最高档**（「统招公办本科及以上」是本科，
+# 「本科及以上，硕士优先」按最高档算硕士）。`不限` 垫底。
+_COMPANY_MAX = 12
+# 单位截断上限。真实数据里最长的那条（`四川金沙人力资源开发管理有限公司`，16 字）
+# 截到 12 字后整条 ID 是 38 字，仍在「≤40 字」这条可读性底线内。
+_SALARY_RE = re.compile(r"(\d+(?:\.\d+)?)\s*[-–—－~～至到]\s*(\d+(?:\.\d+)?)\s*[kK]")
+# 只认 `x-yK` 区间；破折号把半角/全角/波浪/「至」「到」都算上
+# （真实数据里 `13–26K` 用的是**全角破折号** U+2013，不归一化会和 `13-26K` 变成两个身份）。
+_BRACKET_RE = re.compile(r"[（(]([^（）()]*)[）)]")
+_BRACKET_OPEN_RE = re.compile(r"[（(]")
+
 # 本模块的整体互斥：`upsert_jd` / `rename_jd` 都是「读 jds.json → 改内存 → 写盘」多步写，
 # 多步之间必须串行（`rename_jd` 还要再改知识库/面试记录/台账，跨度更大）。
 # 用 RLock 而不是 Lock：写路径之间将来可能互相调用，普通 Lock 会直接死锁。
@@ -191,6 +209,88 @@ def _domain_of(data):
     return None
 
 
+def normalize_fields(fields):
+    """把派生出来的字段归一化成「能进 ID 的简短身份值」。只动**学历 / 单位 / 薪资**三段。
+
+    归一化后的 ID 从 70 字缩到 30 字左右（见文件里 `_EDU_TIERS` 上面那段注释），
+    所以 `derive_fields` 末尾会直接调它 —— `build_id(derive_fields(data), seq)` 拿到的就是短 ID。
+
+    职责 / 领域 / 城市原样带出：它们本来就是短的，`build_id` 只负责清洗非法字符。
+    归一化不出的值一律 **None**（由 `build_id` 填 `【未知xx】`），绝不猜。
+    """
+    data = fields if isinstance(fields, dict) else {}
+    out = dict(data)
+    out["education"] = _normalize_education(data.get("education"))
+    out["company"] = _normalize_company(data.get("company"))
+    out["salary"] = _normalize_salary(data.get("salary"))
+    return out
+
+
+def _normalize_education(value):
+    """冗长的学历表述 → 一个短档位：`统招公办本科及以上` → `本科`。
+
+    取**出现的最高档**（`_EDU_TIERS` 已是高→低序）：`本科及以上` 是本科；
+    `大专及以上` 是大专；提不出任何档位 → None（绝不把整句话塞进 ID）。
+    """
+    text = _text(value)
+    if not text:
+        return None
+    for tier in _EDU_TIERS:
+        if tier in text:
+            return tier
+    return None
+
+
+def _normalize_salary(value):
+    """只留 `x-yK` 区间：`6-8K（入职五险，提及一金7k+）` → `6-8K`。
+
+    破折号统一成半角 `-`（真实数据里 `13–26K` 是全角破折号，不统一就会与 `13-26K`
+    变成两个不同的身份 —— 正是本模块要根除的那类「同一件事两处不同写法」）。
+    提不出区间 → None（由 `build_id` 填 `【未知薪资】`）。
+    """
+    text = _text(value)
+    if not text:
+        return None
+    m = _SALARY_RE.search(text)
+    if not m:
+        return None
+    return "%s-%sK" % (m.group(1), m.group(2))
+
+
+def _normalize_company(value):
+    """单位取「简短身份」：优先括号里的简称，否则全名截断到 12 字。
+
+    真实数据里的三种形态（全部来自 6 份真实报告）：
+
+        # 括号在末尾、里面是简称
+        "四川金沙人力资源开发管理有限公司（金沙人力）"      -> "金沙人力"
+        # 括号在开头、里面是**全名**（前缀才是简称）
+        "金沙人力（四川金沙人力资源开发管理有…）"           -> "金沙人力"
+        # 括号在末尾、里面是示例注解
+        "某 AI 科技公司（示例）"                          -> "示例"
+        # 没有括号 → 全名截断
+        "四川金沙人力资源开发管理有限公司"                 -> "四川金沙人力资源开发管理"
+
+    判据是**取括号内与括号前更短的那一个**：上面第 2 种若一律「优先括号内」，
+    会拿到那个又长又被截断的全名。截断时按 `_BRACKET_OPEN_RE` 砍掉半个括号。
+    空 → None（由 `build_id` 填 `【未知单位】`）。
+    """
+    text = _text(value)
+    if not text:
+        return None
+    m = _BRACKET_RE.search(text)
+    if m:
+        inner = m.group(1).strip()
+        prefix = text[:m.start()].strip()
+        cands = [c for c in (inner, prefix) if c]
+        if cands:
+            text = min(cands, key=len)      # 同长时保留括号内那条（"优先括号里的简称"）
+    text = text.strip()
+    if len(text) > _COMPANY_MAX:
+        text = _BRACKET_OPEN_RE.split(text[:_COMPANY_MAX])[0].rstrip("）) ")
+    return text or None
+
+
 def derive_fields(report_data):
     """从一份 `REPORT_DATA` 派生 ID 的六个字段。**缺的字段值为 None**（由 `build_id` 填占位符）。
 
@@ -200,6 +300,12 @@ def derive_fields(report_data):
 
     这里**刻意不清洗**（职责原样带出，例如 `数据标注/质检`）——清洗是 `build_id` 的活，
     这样 `derive_fields` 的结果仍然可以拿去展示/手改，不会把 `/` 静默吃掉。
+
+    **末尾会过一遍 `normalize_fields`**：学历 / 单位 / 薪资 归一化成简短身份值
+    （原始的长表述会让 ID 长到 70 字，没法当文件名）。
+    注意：归一化会**丢掉原始表述**（`6-8K（入职五险，提及一金7k+）` → `6-8K`）。
+    要把原始值存进 JD 记录（`jds.json`）的话，得另外从 `REPORT_DATA` 读，
+    或者直接调下面的 `normalize_fields` 之前那份原始 dict。
     """
     data = report_data if isinstance(report_data, dict) else {}
     company = _text(data.get("company"))
@@ -209,14 +315,14 @@ def derive_fields(report_data):
         addr = _text(data.get("address"))
         if addr:
             city = _city_from_address(addr)
-    return {
+    return normalize_fields({
         "education": _education_of(data),
         "company": company,
         "duty": duty,
         "domain": _domain_of(data),
         "city": city,
         "salary": _text(data.get("salary")),
-    }
+    })
 
 
 # ---------- 拼接 / 解析 / 校验 ----------
