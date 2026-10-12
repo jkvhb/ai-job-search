@@ -204,10 +204,65 @@ class NormalizeFieldsTest(IsolatedCase):
         self.assertEqual(jdid.build_id(jdid.normalize_fields({"company": "有限公司"}), 1),
                          "【未知学历】_有限公司_【未知职责】_【未知领域】_【未知城市】_【未知薪资】_0001")
 
-    def test_bracketed_company_still_uses_the_shorter_side_rule(self):
-        """带括号的**不受**剥后缀影响，仍走「取更短一侧」——
-        `阿里巴巴（中国）有限公司` 取括号内的 `中国`（先匹配括号，就不会去剥 `有限公司`）。"""
-        self.assertEqual(jdid._normalize_company("阿里巴巴（中国）有限公司"), "中国")
+    def test_bracketed_company_uses_the_shorter_side_when_the_bracket_is_at_the_end(self):
+        """括号**在结尾** → 取更短一侧（括号里是简称 / 注解）。"""
+        self.assertEqual(jdid._normalize_company("四川金沙人力资源开发管理有限公司（金沙人力）"),
+                         "金沙人力")
+        self.assertEqual(jdid._normalize_company("某 AI 科技公司（示例）"), "示例")
+
+    def test_midfix_bracket_is_a_qualifier_and_gets_dropped(self):
+        """括号**后面还有字** → 括号里是 `（中国）`/`（北京）` 这类**限定词**，整段去掉。
+
+        这条修的是一个真 bug：`阿里巴巴（中国）有限公司` 与 `腾讯（中国）有限公司`
+        若都按「取更短一侧」走，会双双归成 `中国` → 两个不同的公司同一段 → 撞 ID →
+        用户看到莫名其妙的「ID 已被占用」。
+        """
+        self.assertEqual(jdid._normalize_company("阿里巴巴（中国）有限公司"), "阿里巴巴")
+        self.assertEqual(jdid._normalize_company("腾讯（中国）有限公司"), "腾讯")
+        self.assertEqual(jdid._normalize_company("百度（中国）有限公司"), "百度")
+        # 去掉括号后外面还带别的后缀形态：**我的判断** —— `某公司分公司` 再剥 `分公司`，
+        # 留 `某公司`（只认 `公司` 会剥成 `某公司分`，吊着一个 `分`，所以 `分公司` 也进了后缀表）
+        self.assertEqual(jdid._normalize_company("某公司（北京）分公司"), "某公司")
+        self.assertEqual(jdid._normalize_company("四川金沙（成都）分公司"), "四川金沙")
+        # 多个限定词括号一起去掉
+        self.assertEqual(jdid._normalize_company("阿里巴巴（中国）（北京）有限公司"), "阿里巴巴")
+        # 中缀括号 + 结尾括号混在一起：限定词与注解都不要，剩下的当全名剥后缀
+        self.assertEqual(jdid._normalize_company("某公司（北京）分公司（简称）"), "某公司")
+
+    def test_two_different_companies_never_share_a_company_segment(self):
+        """**本次的核心不变量**：两家不同的公司，公司段必须不同。
+
+        没有这条，`（中国）` 那类限定词就会把不同公司压成同一段，其余段再相同就撞 ID。
+        """
+        companies = [
+            "阿里巴巴（中国）有限公司",
+            "腾讯（中国）有限公司",
+            "百度（中国）有限公司",
+            "四川金沙人力资源开发管理有限公司（金沙人力）",
+            "某 AI 科技公司（示例）",
+            "北京字节跳动科技有限公司",
+            "北京字节跳动网络技术有限公司",
+            "某公司（北京）分公司",
+        ]
+        segs = [jdid._normalize_company(c) for c in companies]
+        self.assertEqual(len(set(segs)), len(companies),
+                         "两家不同的公司拿到了同一个公司段：%s" % segs)
+        # 其余段相同的前提下，整条 ID 也必须不同（否则用户会看到「ID 已被占用」）
+        ids = [jdid.build_id({"company": s, "duty": "标注", "city": "北京"}, 1) for s in segs]
+        self.assertEqual(len(set(ids)), len(companies), "整条 ID 撞了：%s" % ids)
+
+    def test_known_gap_bare_qualifier_bracket_still_takes_the_bracket_side(self):
+        """**已知残留缺口 —— 已上报等裁决，不是「设计如此」。**
+
+        `阿里巴巴（中国）` 这种写法括号就在**结尾**、后面没有字，所以按「取更短一侧」走 →
+        `中国`，于是它与 `腾讯（中国）` 又撞成同一段 —— 正是本轮要修的 bug 的另一种写法
+        （只是少了 `有限公司` 后缀）。
+
+        修法建议：把 `中国` 与 `_KNOWN_CITIES` 里的城市名当「限定词」，无论括号在不在结尾都忽略。
+        裁决前先把现状钉住，免得它被悄悄改掉。
+        """
+        self.assertEqual(jdid._normalize_company("阿里巴巴（中国）"), "中国")
+        self.assertEqual(jdid._normalize_company("腾讯（中国）"), "中国")   # ← 缺口：撞了
 
     def test_company_empty_stays_none(self):
         for raw in ("", "   ", None, 7):
