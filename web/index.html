@@ -74,6 +74,26 @@
   .meta .k{color:var(--muted);margin-right:4px}
   .acts{display:flex;gap:6px;flex-wrap:wrap;align-items:center;padding-top:9px;border-top:1px dashed var(--line)}
   .acts a{text-decoration:none}
+  /* 阶段 4A：一行 = 一个岗位 JD（身份串 / 份数 / 展开后的子报告 / ID 编辑框） */
+  .jidline{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:12.5px;color:var(--sub);margin-bottom:9px}
+  .jidline .k{color:var(--muted);flex:none}
+  /* JD 身份串可能很长（公司全名 + 薪资），让它自己换行，别把卡片撑破 */
+  .jidcode{background:#f1f4fa;border:1px solid var(--line);padding:2px 8px;border-radius:7px;font-size:12.5px;word-break:break-all;color:var(--ink)}
+  .jidcnt{font-size:12.3px;font-weight:600;color:var(--sub);flex:none}
+  .subs{margin:2px 0 0;padding:9px 0 0;border-top:1px dashed var(--line)}
+  .sub{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:7px 10px;border:1px solid var(--line);border-radius:9px;margin-bottom:7px;background:#fff}
+  .sub .rn{font-size:13.5px;font-weight:600;min-width:110px}
+  .sub .sc{font-weight:700;font-size:13px;color:var(--sub)}
+  .sub .sc.g{color:var(--green)} .sub .sc.a{color:var(--amber)} .sub .sc.r{color:var(--red)}
+  .sub .dt{font-size:12.3px;color:var(--muted)}
+  .sub a{margin-left:auto}
+  .subacts{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:2px}
+  .idedit{margin-top:11px;padding-top:11px;border-top:1px dashed var(--line)}
+  .segs{display:flex;gap:6px;flex-wrap:wrap}
+  .seg{display:inline-flex;align-items:center;gap:4px;font-size:12.3px;padding:2px 8px;border-radius:7px;background:#f1f4fa;border:1px solid var(--line)}
+  .seg b{color:var(--muted);font-weight:600}
+  .idmsg{font-size:12.5px;margin-top:7px}
+  .idmsg.err{color:var(--red)} .idmsg.ok{color:var(--green)} .idmsg.info{color:var(--sub)}
   .editbox{display:none;margin-top:12px;padding-top:12px;border-top:1px dashed var(--line)}
   .editbox.on{display:block}
   .egrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:10px}
@@ -402,16 +422,68 @@ $('#img').addEventListener('change', e=>{
   r.readAsDataURL(f);
 });
 
-/* ---------------- 岗位台账 ---------------- */
+/* ---------------- 岗位台账（阶段 4A：一行 = 一个岗位 JD） ----------------
+   身份不再是报告文件名，而是稳定的 **JD 身份串**（7 段：学历_单位_职责_领域_城市_薪资_编号）。
+   于是台账的形态是「一行 = 一个 JD」的大卡片：卡片上是身份串 / 状态 / **分析份数** / **最高分**，
+   展开看这个 JD 下**每一份**简历分析（子报告）—— 这就是「一个大块下面可以点开好几份小报告」。
+
+   数据源用 `/api/jds`（JD 列表 + 聚合同一份数据；`/api/jobs` 也返回同样的行，
+   但 JD 库是新概念的正式入口）。**已合并（merged_into）的记录后端已过滤，不会出现在这里。**
+*/
+const JID_SEGS = ['学历','单位','职责','领域','城市','薪资','编号'];
+let JD_OPEN = {};                       // 展开状态：搜索 / 排序重渲染后不莫名收起
+
 async function loadJobs(){
-  const r = await fetch('/api/jobs').then(x=>x.json());
-  JOBS = r.jobs || []; CATS = r.categories || []; STATS = r.statuses || [];
+  let r = null;
+  try{
+    r = await fetch('/api/jds').then(x=>x.json());
+    if(!r || r.ok === false || !Array.isArray(r.jds)) throw new Error((r && r.error) || '返回里没有 jds 列表');
+  }catch(e){
+    // 读失败绝不当成「你没有岗位」空着：明说读失败、日志留证据（否则用户以为台账被清空了）
+    logUI('jobs.load_failed', {error: e.message}, 'error');
+    toast('台账读取失败：' + e.message);
+    r = null;
+  }
+  JOBS = (r && r.jds) || []; CATS = (r && r.categories) || []; STATS = (r && r.statuses) || [];
   ivCacheClear();                       // 台账重载 = 面试记录也可能变了，缓存作废重取
   $('#jobCount').textContent = JOBS.length;
   const fc = $('#fCat'), fs = $('#fStatus');
   if(fc.options.length<=1) CATS.forEach(c=>fc.add(new Option(c,c)));
   if(fs.options.length<=1) STATS.forEach(s=>fs.add(new Option(s,s)));
   renderJobs();
+}
+
+function jdById(id){
+  const want = String(id == null ? '' : id);
+  return JOBS.filter(j=>String((j && j.id) || '') === want)[0] || null;
+}
+function jdAnalyses(j){
+  const a = (j && Array.isArray(j.analyses)) ? j.analyses : [];
+  return a.filter(x=>x && typeof x === 'object');
+}
+/* 最高分从**实际挂着的分析**里现算（不直接信顶层的 max_score）。
+   这样卡片上的「最高分」与展开后看到的每一份分数**永远一致** —— 两处各算一次迟早分叉。 */
+function jdMaxScore(j){
+  let best = null;
+  jdAnalyses(j).forEach(a=>{
+    const v = (a.score === null || a.score === undefined || a.score === '') ? NaN : Number(a.score);
+    if(!isNaN(v) && (best === null || v > best)) best = v;
+  });
+  if(best === null){
+    const top = (j && j.max_score !== null && j.max_score !== undefined && j.max_score !== '')
+      ? Number(j.max_score) : ((j && j.score !== null && j.score !== undefined && j.score !== '') ? Number(j.score) : NaN);
+    if(!isNaN(top)) best = top;
+  }
+  return best;
+}
+function jidSegs(id){
+  return String(id == null ? '' : id).split('_')
+    .map((v,i)=>({name: JID_SEGS[i] || ('段'+(i+1)), value: v}));
+}
+function jdIsOpen(j){
+  const id = String((j && j.id) || '');
+  if(Object.prototype.hasOwnProperty.call(JD_OPEN, id)) return !!JD_OPEN[id];
+  return jdAnalyses(j).length > 1;      // 有多份分析就默认展开：这正是用户要看的「好几份小报告」
 }
 function scoreCls(v){ return v>=60?'g':(v>=45?'a':'r'); }
 function stCls(s){
@@ -424,11 +496,12 @@ function renderJobs(){
   const q = $('#q').value.trim().toLowerCase();
   const fc = $('#fCat').value, fs = $('#fStatus').value, sort = $('#fSort').value;
   let list = JOBS.slice();
-  if(q) list = list.filter(j => ['job_title','company','hr_name','phone','address','notes','location','job_category','salary']
+  // 搜 JD 身份串也支持：用户记得的常常是「成都 6-8K」这种片段，而不是报告标题
+  if(q) list = list.filter(j => ['job_title','company','hr_name','phone','address','notes','location','job_category','salary','id','jd_id']
       .some(k => String(j[k]||'').toLowerCase().includes(q)));
   if(fc) list = list.filter(j => (j.job_category||'其他')===fc);
   if(fs) list = list.filter(j => (j.status||'未投递')===fs);
-  if(sort==='score') list.sort((a,b)=>(b.score||0)-(a.score||0));
+  if(sort==='score') list.sort((a,b)=>((jdMaxScore(b)===null?-1:jdMaxScore(b)) - (jdMaxScore(a)===null?-1:jdMaxScore(a))));
   else if(sort==='status') list.sort((a,b)=>String(a.status||'').localeCompare(String(b.status||'')));
   else list.sort((a,b)=>String(b.created_at||'').localeCompare(String(a.created_at||'')));
 
@@ -437,63 +510,121 @@ function renderJobs(){
   if(!list.length){ box.innerHTML = '<div class="empty">'+(JOBS.length?'没有匹配的岗位，换个关键词试试':'台账还是空的，去「① 分析岗位」生成第一份报告')+'</div>'; return; }
 
   box.innerHTML = list.map(j=>{
+    const id = String(j.id || '');
+    const ans = jdAnalyses(j);
+    const best = jdMaxScore(j);
+    const open = jdIsOpen(j);
     const phone = j.phone || '';
     const addr = j.address || j.location || '';
     const links = [];
-    links.push('<a class="btn gray sm" href="/reports/'+encodeURIComponent(j.report)+'" target="_blank">📊 打开报告</a>');
-    if(j.source_link) links.push('<a class="btn gray sm" href="'+esc(j.source_link)+'" target="_blank">🔗 原岗位链接</a>');
-    if(j.jd_image) links.push('<a class="btn gray sm" href="/jd/'+encodeURIComponent(j.jd_image)+'" target="_blank">🖼 原截图</a>');
-    if(j.jd_text_file) links.push('<button class="btn gray sm" data-jdtext="'+esc(j.id)+'">📄 JD原文</button>');
+    if(j.report) links.push('<a class="btn gray sm" href="/reports/'+encodeURIComponent(j.report)+'" target="_blank" rel="noopener">📊 打开最新报告 ↗</a>');
+    if(j.source_link) links.push('<a class="btn gray sm" href="'+esc(j.source_link)+'" target="_blank" rel="noopener">🔗 原岗位链接</a>');
+    if(j.jd_image) links.push('<a class="btn gray sm" href="/jd/'+encodeURIComponent(j.jd_image)+'" target="_blank" rel="noopener">🖼 原截图</a>');
+    if(j.jd_text_file) links.push('<button class="btn gray sm" data-jdtext="'+esc(id)+'">📄 JD原文</button>');
     if(phone) links.push('<button class="btn ghost sm" data-copy="'+esc(phone)+'">📞 复制电话</button>');
     // 🎤 面试复盘入口：先放一个占位按钮，等 /api/interview/list 回来再由 ivPaintStats() 换成
     // 「📊 打开最近复盘 ↗」真链接（有记录且已完成时）——报告必须走 HTTP 地址，不能用 file://
-    const ivSlot = '<span id="ivbox-'+esc(j.id)+'"><button class="btn gray sm" data-iv="'+esc(j.id)+'">🎤 面试复盘</button></span>';
+    const ivSlot = '<span id="ivbox-'+esc(id)+'"><button class="btn gray sm" data-iv="'+esc(id)+'">🎤 面试复盘</button></span>';
     links.push(ivSlot);
-    // 🏁 结果入口：保存结果后**只就地更新**这一行的徽章与「已复盘」标记（见 ocPaintRow），
+    // 🏁 结果入口：保存结果后**只就地更新**这一张卡片的徽章与「已复盘」标记（见 ocPaintRow），
     // 不整页重渲染 —— 重渲染会把用户正在输入的原因覆盖掉
-    links.push('<button class="btn gray sm" data-oc="'+esc(j.id)+'">🏁 结果</button>');
-    links.push('<button class="btn gray sm" data-edit="'+esc(j.id)+'">✏️ 编辑</button>');
-    links.push('<button class="btn danger sm" data-del="'+esc(j.id)+'">🗑 删除</button>');
+    links.push('<button class="btn gray sm" data-oc="'+esc(id)+'">🏁 结果</button>');
+    links.push('<button class="btn gray sm" data-edit="'+esc(id)+'">✏️ 编辑</button>');
+    // ⚠️ 本阶段**不提供删除入口**：`DELETE /api/jobs` 还是老语义（按**分析 id** 从 jobs.json 删），
+    // 而卡片上的 id 已经是 JD id —— 传过去只会 404（或者删错一条）。
+    // 真删除（不可恢复）是下一阶段 D 的事，所以这里只给一个禁用的占位按钮 + 说明。
+    links.push('<button class="btn gray sm" id="jddel-'+esc(id)+'" disabled'
+      + ' title="删岗位功能下一阶段做（真删除）：现在 DELETE /api/jobs 还是按分析 id 删 jobs.json 的记录，传 JD id 会 404">🗑 删除（暂不可用）</button>');
 
-    return '<div class="job" id="job-'+esc(j.id)+'">'+
-      '<div class="h">'+
-        '<span class="t">'+esc(j.job_title||'(未命名岗位)')+'</span>'+
-        '<span class="pill">'+esc(j.job_category||'其他')+'</span>'+
-        '<span class="score '+scoreCls(j.score||0)+'">'+esc(j.score||0)+' 分</span>'+
-        // id 是给 ocPaintRow 就地改状态用的（行内徽章读的始终是台账顶层的扁平 status）
-        '<span class="'+stCls(j.status)+'" id="stbadge-'+esc(j.id)+'">'+esc(j.status||'未投递')+'</span>'+
-        // 「已复盘」标记：数据源是 /api/jobs 里那条记录的 application.outcome_ai（见 ocHasAi）
-        '<span class="ocstat" id="ocstat-'+esc(j.id)+'"></span>'+
-        '<span class="sp"><span class="mt" style="font-size:12px;color:var(--muted)">'+esc(j.created_at||'')+'</span></span>'+
-      '</div>'+
-      '<div class="meta">'+
-        '<div><span class="k">🏢 公司</span><b>'+esc(j.company||'—')+'</b></div>'+
-        '<div><span class="k">👤 HR</span><b>'+esc(j.hr_name||'—')+'</b></div>'+
-        '<div><span class="k">📞 电话</span><b>'+esc(phone||'—')+'</b></div>'+
-        '<div><span class="k">📍 地址</span><b>'+esc(addr||'—')+'</b></div>'+
-        '<div><span class="k">💰 薪资</span><b>'+esc(j.salary||'—')+'</b></div>'+
-        '<div><span class="k">🗂 来源</span><b>'+esc(j.source_type||'—')+'</b></div>'+
-        (j.notes? '<div style="grid-column:1/-1"><span class="k">📝 备注</span><b>'+esc(j.notes)+'</b></div>':'')+
-      '</div>'+
-      '<div class="acts"><span class="ivstat" id="ivstat-'+esc(j.id)+'"></span>'+links.join(' ')+'</div>'+
-      '<div class="editbox" id="edit-'+esc(j.id)+'">'+
-        '<div class="egrid">'+
-          '<div><label>公司</label><input data-f="company" value="'+esc(j.company||'')+'"></div>'+
-          '<div><label>HR 姓名</label><input data-f="hr_name" value="'+esc(j.hr_name||'')+'"></div>'+
-          '<div><label>电话 / 微信</label><input data-f="phone" value="'+esc(phone)+'"></div>'+
-          '<div><label>地址</label><input data-f="address" value="'+esc(j.address||'')+'"></div>'+
-          '<div><label>分类</label><select data-f="job_category">'+CATS.map(c=>'<option '+(c===(j.job_category||'其他')?'selected':'')+'>'+esc(c)+'</option>').join('')+'</select></div>'+
-          '<div><label>状态</label><select data-f="status">'+STATS.map(s=>'<option '+(s===(j.status||'未投递')?'selected':'')+'>'+esc(s)+'</option>').join('')+'</select></div>'+
-          '<div><label>原岗位链接</label><input data-f="source_link" value="'+esc(j.source_link||'')+'"></div>'+
-          '<div><label>岗位名称</label><input data-f="job_title" value="'+esc(j.job_title||'')+'"></div>'+
-          '<div style="grid-column:1/-1"><label>备注（面试反馈 / 联系人 / 谈判要点）</label><input data-f="notes" value="'+esc(j.notes||'')+'"></div>'+
-        '</div>'+
-        '<div class="row" style="margin-top:12px">'+
-          '<button class="btn sm" data-save="'+esc(j.id)+'">💾 保存</button>'+
-          '<button class="btn gray sm" data-cancel="'+esc(j.id)+'">取消</button>'+
-        '</div>'+
-      '</div>'+
-    '</div>';
+    let h = '<div class="job jd" id="jd-'+esc(id)+'" data-jd="'+esc(id)+'">';
+    h += '<div class="h">';
+    h +=   '<span class="t">'+esc(j.job_title||'(未命名岗位)')+'</span>';
+    h +=   '<span class="pill">'+esc(j.job_category||'其他')+'</span>';
+    h +=   '<span class="score '+scoreCls(best===null?0:best)+'" id="jidmax-'+esc(id)+'">'
+        +     (best===null?'暂无分数':'最高 '+esc(best)+' 分')+'</span>';
+    h +=   '<span class="'+stCls(j.status)+'" id="stbadge-'+esc(id)+'">'+esc(j.status||'未投递')+'</span>';
+    // 「已复盘」标记：JD 级真相在 jds.json（台账行给的就是 outcome_ai 本身，见 ocHasAi）
+    h +=   '<span class="ocstat" id="ocstat-'+esc(id)+'"></span>';
+    h +=   '<span class="sp"><span class="mt" style="font-size:12px;color:var(--muted)">'+esc(j.created_at||'')+'</span></span>';
+    h += '</div>';
+    // JD 身份串 + 份数：这是这张卡片的「身份」，可点开手改（AI 会认错）
+    h += '<div class="jidline">';
+    h +=   '<span class="k">🆔 JD 身份</span>';
+    h +=   '<code class="jidcode" id="jidcode-'+esc(id)+'">'+esc(id)+'</code>';
+    h +=   '<span class="jidcnt" id="acount-'+esc(id)+'">'+esc(ans.length)+' 份分析</span>';
+    h +=   '<button class="btn gray sm" id="jdopen-'+esc(id)+'" data-jdopen="'+esc(id)+'">'
+        +     (open?'📂 收起分析 ▴':'📂 展开分析 ▾')+'</button>';
+    h +=   '<button class="btn gray sm" data-jdedit="'+esc(id)+'">✏️ 改 ID</button>';
+    h += '</div>';
+    h += '<div class="meta">';
+    h +=   '<div><span class="k">🏢 公司</span><b>'+esc(j.company||'—')+'</b></div>';
+    h +=   '<div><span class="k">👤 HR</span><b>'+esc(j.hr_name||'—')+'</b></div>';
+    h +=   '<div><span class="k">📞 电话</span><b>'+esc(phone||'—')+'</b></div>';
+    h +=   '<div><span class="k">📍 地址</span><b>'+esc(addr||'—')+'</b></div>';
+    h +=   '<div><span class="k">💰 薪资</span><b>'+esc(j.salary||'—')+'</b></div>';
+    h +=   '<div><span class="k">🗂 来源</span><b>'+esc(j.source_type||'—')+'</b></div>';
+    h +=   (j.notes? '<div style="grid-column:1/-1"><span class="k">📝 备注</span><b>'+esc(j.notes)+'</b></div>':'');
+    h += '</div>';
+    h += '<div class="acts"><span class="ivstat" id="ivstat-'+esc(id)+'"></span>'+links.join(' ')+'</div>';
+    // ---- 子报告：这个 JD 下**每一份**分析（简历名 / 分数 / 日期 / 报告链接），一份都不少
+    h += '<div class="subs" id="subs-'+esc(id)+'"'+(open?'':' hidden')+'>';
+    if(!ans.length){
+      h += '<div class="sub" id="subnone-'+esc(id)+'"><span class="dt">这个 JD 还没有分析报告，点下面「＋ 用另一份简历分析」生成第一份</span></div>';
+    } else {
+      ans.forEach(a=>{
+        const aid = String(a.id || '');
+        const hasScore = !(a.score === null || a.score === undefined || a.score === '');
+        h += '<div class="sub" id="sub-'+esc(aid)+'" data-sub="'+esc(aid)+'">';
+        h +=   '<span class="rn">'+esc(a.resume||'(未知简历)')+'</span>';
+        h +=   '<span class="sc '+(hasScore?scoreCls(a.score):'')+'">'+(hasScore?esc(a.score)+' 分':'无分数')+'</span>';
+        h +=   '<span class="dt">'+esc(a.created_at||'')+'</span>';
+        // 报告链接必须是**真 HTTP 地址的真链接**（target=_blank）：弹窗会被浏览器拦掉，
+        // file:// 在报告里点不动（面试复盘那一块已经踩过这个边界）
+        h +=   (a.report
+          ? '<a class="btn gray sm" href="/reports/'+encodeURIComponent(a.report)+'" target="_blank" rel="noopener">📊 打开报告 ↗</a>'
+          : '<span class="dt">没有报告文件</span>');
+        h += '</div>';
+      });
+    }
+    h +=   '<div class="subacts">';
+    h +=     '<button class="btn ghost sm" data-another="'+esc(id)+'">＋ 用另一份简历分析</button>';
+    h +=     '<span class="hintline" style="margin:0">本阶段仍是完整分析（B 段才会只重跑简历那一段）</span>';
+    h +=   '</div>';
+    h += '</div>';
+    // ---- 改 ID：7 段都看得见、可手改；重名 → 当场报警且**不保存**（输入框保持原值）
+    h += '<div class="idedit" id="idedit-'+esc(id)+'" hidden>';
+    h +=   '<div class="segs" id="segs-'+esc(id)+'">';
+    h +=     jidSegs(id).map((s,i)=>'<span class="seg" data-seg="'+(i+1)+'" title="'+esc(s.name)
+            +'"><b>'+esc(s.name)+'</b>'+esc(s.value)+'</span>').join('');
+    h +=   '</div>';
+    h +=   '<div class="row" style="margin-top:8px">';
+    h +=     '<input type="text" id="idin-'+esc(id)+'" value="'+esc(id)+'" spellcheck="false" autocomplete="off">';
+    h +=     '<button class="btn sm" id="idsave-'+esc(id)+'" data-idsave="'+esc(id)+'">💾 保存 ID</button>';
+    h +=     '<button class="btn gray sm" data-idcancel="'+esc(id)+'">取消</button>';
+    h +=   '</div>';
+    h +=   '<div class="idmsg" id="idmsg-'+esc(id)+'"></div>';
+    h +=   '<div class="hintline">7 段：学历_单位_职责_领域_城市_薪资_编号（分隔符是下划线，因为薪资本身带 -）。'
+        +     '段里不能有空格和 \\ / : * ? " &lt; &gt; | 这些字符；和库里别的 JD 重名会被拒绝保存。</div>';
+    h += '</div>';
+    h += '<div class="editbox" id="edit-'+esc(id)+'">';
+    h +=   '<div class="egrid">';
+    h +=     '<div><label>公司</label><input data-f="company" value="'+esc(j.company||'')+'"></div>';
+    h +=     '<div><label>HR 姓名</label><input data-f="hr_name" value="'+esc(j.hr_name||'')+'"></div>';
+    h +=     '<div><label>电话 / 微信</label><input data-f="phone" value="'+esc(phone)+'"></div>';
+    h +=     '<div><label>地址</label><input data-f="address" value="'+esc(j.address||'')+'"></div>';
+    h +=     '<div><label>分类</label><select data-f="job_category">'+CATS.map(c=>'<option '+(c===(j.job_category||'其他')?'selected':'')+'>'+esc(c)+'</option>').join('')+'</select></div>';
+    h +=     '<div><label>状态</label><select data-f="status">'+STATS.map(s=>'<option '+(s===(j.status||'未投递')?'selected':'')+'>'+esc(s)+'</option>').join('')+'</select></div>';
+    h +=     '<div><label>原岗位链接</label><input data-f="source_link" value="'+esc(j.source_link||'')+'"></div>';
+    h +=     '<div><label>岗位名称</label><input data-f="job_title" value="'+esc(j.job_title||'')+'"></div>';
+    h +=     '<div style="grid-column:1/-1"><label>备注（面试反馈 / 联系人 / 谈判要点）</label><input data-f="notes" value="'+esc(j.notes||'')+'"></div>';
+    h +=   '</div>';
+    h +=   '<div class="row" style="margin-top:12px">';
+    h +=     '<button class="btn sm" data-save="'+esc(id)+'">💾 保存</button>';
+    h +=     '<button class="btn gray sm" data-cancel="'+esc(id)+'">取消</button>';
+    h +=   '</div>';
+    h += '</div>';
+    h += '</div>';
+    return h;
   }).join('');
 
   box.querySelectorAll('[data-edit]').forEach(b=>b.addEventListener('click',()=>{
@@ -504,30 +635,125 @@ function renderJobs(){
     document.getElementById('edit-'+b.dataset.cancel).classList.remove('on');
   }));
   box.querySelectorAll('[data-save]').forEach(b=>b.addEventListener('click',()=>saveJob(b.dataset.save)));
-  box.querySelectorAll('[data-del]').forEach(b=>b.addEventListener('click',()=>delJob(b.dataset.del)));
   box.querySelectorAll('[data-copy]').forEach(b=>b.addEventListener('click',()=>copyText(b.dataset.copy)));
   box.querySelectorAll('[data-jdtext]').forEach(b=>b.addEventListener('click',()=>showJdText(b.dataset.jdtext)));
   box.querySelectorAll('[data-iv]').forEach(b=>b.addEventListener('click',()=>ivOpen(b.dataset.iv)));
   box.querySelectorAll('[data-oc]').forEach(b=>b.addEventListener('click',()=>ocOpen(b.dataset.oc)));
+  // 展开 / 收起子报告、改 ID、换一份简历重分析（都绑在**这次新建的**节点上，innerHTML 换掉即失效，
+  // 所以不会像常驻元素那样累积监听器）
+  box.querySelectorAll('[data-jdopen]').forEach(b=>b.addEventListener('click',()=>jdToggle(b.dataset.jdopen)));
+  box.querySelectorAll('[data-jdedit]').forEach(b=>b.addEventListener('click',()=>jdIdToggle(b.dataset.jdedit, true)));
+  box.querySelectorAll('[data-idcancel]').forEach(b=>b.addEventListener('click',()=>jdIdToggle(b.dataset.idcancel, false)));
+  box.querySelectorAll('[data-idsave]').forEach(b=>b.addEventListener('click',()=>saveJdId(b.dataset.idsave)));
+  box.querySelectorAll('[data-another]').forEach(b=>b.addEventListener('click',()=>anotherResume(b.dataset.another)));
   ivPaintStats();       // 先用缓存里的面试统计把行内文字填上（没缓存就等 ivLoadStats 回来再填）
-  ocPaintStats();       // 行内「已复盘」标记：数据就在 /api/jobs 的记录里，不需要额外请求
+  ocPaintStats();       // 行内「已复盘」标记：数据就在台账行里，不需要额外请求
   ivLoadStats();        // 每个岗位问一次 /api/interview/list（没有「列出全部面试」的接口）
 }
+
+/* 展开 / 收起某个 JD 的子报告；状态记在 JD_OPEN 里，重渲染后不丢 */
+function jdToggle(id){
+  const sub = document.getElementById('subs-' + id);
+  if(!sub) return;
+  const open = !!sub.hidden;                 // 当前是收起的 → 这次要展开
+  sub.hidden = !open;
+  JD_OPEN[String(id)] = open;
+  const b = document.getElementById('jdopen-' + id);
+  if(b) b.textContent = open ? '📂 收起分析 ▴' : '📂 展开分析 ▾';
+  logUI('jobs.toggle', {job: id, open: open});
+}
+
+/* 改 ID 编辑框的开 / 关（取消时顺手清掉上一次的错误提示） */
+function jdIdToggle(id, on){
+  const box = document.getElementById('idedit-' + id);
+  if(box) box.hidden = !on;
+  if(on){
+    const inp = document.getElementById('idin-' + id);
+    if(inp) inp.focus();
+  } else {
+    const m = document.getElementById('idmsg-' + id);
+    if(m){ m.textContent = ''; m.className = 'idmsg'; }
+  }
+}
+
+/* 保存手改的 JD ID。**重名 → 后端 409 → 当场报警且不保存**：
+   输入框保持用户敲的值、绝不重新加载台账（重新加载会把用户刚敲的 ID 冲掉，看起来像保存成功了）。 */
+async function saveJdId(oldId){
+  const inp = document.getElementById('idin-' + oldId);
+  const msg = document.getElementById('idmsg-' + oldId);
+  const btn = document.getElementById('idsave-' + oldId);
+  if(!inp) return;
+  const typed = String(inp.value == null ? '' : inp.value);       // 用户敲的**原样**值
+  const newId = typed.trim();
+  const show = (cls, text)=>{ if(msg){ msg.className = 'idmsg ' + cls; msg.textContent = text; } };
+  if(!newId) return show('err', 'ID 不能为空');
+  if(newId === oldId) return show('info', 'ID 没改动');
+  if(btn) btn.disabled = true;
+  show('info', '正在保存 ID……');
+  logUI('jd.id_save', {old_id: oldId, new_id: newId});
+  let d = null, err = '';
+  try{
+    d = await fetch('/api/jd/id', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({old_id: oldId, new_id: newId})}).then(x=>x.json());
+  }catch(e){ err = (e && e.message) || '网络中断（服务没在跑？）'; }
+  if(btn) btn.disabled = false;
+  if(err || !d || d.ok !== true){
+    const why = err || (d && d.error) || '服务无响应';
+    show('err', '没有保存：' + why);                // 后端的错误说明（含「已被占用」）原样给人看
+    inp.value = typed;                             // 输入框保持原值
+    logUI('jd.id_save_failed', {old_id: oldId, new_id: newId, error: why}, 'error');
+    toast('ID 没保存：' + why);
+    return;
+  }
+  show('ok', '已保存：' + (d.id || newId));
+  toast('ID 已更新 ✓');
+  loadJobs();                                      // 成功才重载：大卡片上的身份串跟着更新
+}
+
+/* 「＋ 用另一份简历分析」：把这份 JD 已存的原文填回分析页，让用户换一份简历再跑。
+   本阶段仍然是**完整分析**（JD 段也只算一次的实现放 B 段）。 */
+async function anotherResume(jdId){
+  logUI('jobs.another_resume', {job: jdId});
+  try{
+    const r = await fetch('/api/jd_text?id=' + encodeURIComponent(jdId)).then(x=>x.json());
+    if(r && r.text){
+      $('#jd').value = r.text;                     // 赋值给 textarea.value：不经过 HTML 解析，无需转义
+      toast('已把这份 JD 的原文填好，换一份简历再点「开始分析」');
+    } else {
+      toast('这份 JD 没有存原文，请重新粘贴 JD 再分析' + ((r && r.error) ? '：' + r.error : ''));
+    }
+  }catch(e){
+    logUI('jobs.another_resume_failed', {job: jdId, error: e.message}, 'error');
+    toast('读取 JD 原文失败：' + e.message);
+  }
+  switchTab('analyze');
+}
+
 async function saveJob(id){
   const box = document.getElementById('edit-'+id);
   const body = {id};
   box.querySelectorAll('[data-f]').forEach(el=>{ body[el.dataset.f] = el.value; });
-  const r = await fetch('/api/jobs/update', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)}).then(x=>x.json());
-  if(r.ok){ toast('已保存 ✓'); loadJobs(); } else { toast('保存失败：'+(r.error||'')); }
+  let r = null;
+  try{
+    r = await fetch('/api/jobs/update', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)}).then(x=>x.json());
+  }catch(e){
+    logUI('jobs.save_failed', {job: id, error: e.message}, 'error');
+    return toast('保存失败：' + e.message);
+  }
+  if(r && r.ok){ toast('已保存 ✓'); loadJobs(); } else { toast('保存失败：'+((r && r.error)||'服务无响应')); }
 }
-async function delJob(id){
-  if(!confirm('删除这条岗位记录？\n（同时会删掉它的报告、原截图和 JD 原文）')) return;
-  const r = await fetch('/api/jobs?id='+encodeURIComponent(id), {method:'DELETE'}).then(x=>x.json());
-  if(r.ok){ toast('已删除'); loadJobs(); } else { toast('删除失败：'+(r.error||'')); }
-}
+/* ⚠️ 这里**没有** delJob：本阶段刻意不提供「删岗位」入口。
+   岗位身份已经改成 JD id，而 `DELETE /api/jobs` 还是老语义（按**分析 id** 从 jobs.json 删一条），
+   拿 JD id 去调只会 404 —— 真删除（不可恢复）放下一阶段 D。卡片上只有一个禁用的占位按钮。 */
 async function showJdText(id){
-  const r = await fetch('/api/jd_text?id='+encodeURIComponent(id)).then(x=>x.json());
-  if(r.error) return toast(r.error);
+  let r = null;
+  try{
+    r = await fetch('/api/jd_text?id='+encodeURIComponent(id)).then(x=>x.json());
+  }catch(e){
+    logUI('jobs.jd_text_failed', {job: id, error: e.message}, 'error');
+    return toast('读 JD 原文失败：' + e.message);
+  }
+  if(!r || r.error) return toast((r && r.error) || '没有保存 JD 原文');
   const w = window.open('', '_blank');
   w.document.write('<meta charset="utf-8"><title>JD 原文</title><pre style="white-space:pre-wrap;font:14px/1.7 -apple-system,\'Microsoft YaHei\',sans-serif;padding:24px;max-width:820px;margin:auto">'+esc(r.text)+'</pre>');
   w.document.close();
@@ -1061,12 +1287,15 @@ async function ivRefreshStats(){
 */
 let OC = {seq:0, job:null, app:null, statuses:[], terminal:[], live:null, msg:null, hasAi:false};
 
-// 行内「已复盘」的唯一判据：/api/jobs 那条记录里的 application.outcome_ai。
-// 后端 `_view_of` 的规矩是「非字典一律当没有」→ 这里也一样，手改坏的字段绝不谎报成已复盘。
+// 行内「已复盘」的判据：JD 级真相里的 outcome_ai（手改坏的字段绝不谎报成已复盘）。
+// 阶段 4A 之后台账行给的是 **JD 记录**（`outcome_ai` 直接挂在行上），不再是 `application` 视图
+// —— 两种形状都认，否则这个标记会在数据搬家后**永远不显示**（看起来像「没复盘过」）。
 function ocHasAi(job){
   const app = (job && typeof job.application === 'object' && job.application) || {};
   const ai = app.outcome_ai;
-  return !!(ai && typeof ai === 'object' && !Array.isArray(ai));
+  if(ai && typeof ai === 'object' && !Array.isArray(ai)) return true;
+  const jdAi = job && job.outcome_ai;
+  return !!(jdAi && typeof jdAi === 'object' && !Array.isArray(jdAi));
 }
 
 // 行内标记（纯 DOM 更新，不重渲染整行）
