@@ -1866,5 +1866,104 @@ class JdLevelFieldsTest(_AnalyzeRouteCase):
         self.assertNotIn("application", rec)
 
 
+class JobViewWindowTest(_AnalyzeRouteCase):
+    """`_job_view_window` 必须是**按线程**的窗口。
+
+    原来的实现是「进窗口时替换模块级全局、退出时换回来」，窗口里含**一次几十秒的模型调用**
+    （`/api/job/attribute`）—— 那几十秒里**别的线程**读到的也是视图版（另一个世界的记录）。
+    现在改成「打一次补丁 + `threading.local()` 分发」：只有主动进窗口的那个线程看到视图。
+
+    线程同步一律用 `threading.Event`（确定性），**绝不用 sleep 猜时序**。
+    """
+
+    JID = "本科_金沙人力_数据标注质检_视频_成都_6-8K_0001"
+    AID = "20261012_视频标注质检_82分"
+
+    def _records(self):
+        """分析记录**只有分析级字段**（没有 job_title）；JD 级字段在 jds.json。"""
+        app._ensure_store_patch()
+        jdid.upsert_jd({"id": self.JID, "job_title": "视频标注质检", "status": "未投递"})
+        app._save_analysis({"id": self.AID, "jd_id": self.JID, "report": self.AID + ".html",
+                            "score": 82.0, "resume": "我的简历"})
+
+    def test_the_view_window_is_per_thread(self):
+        """① A 在窗口里 → A 看到视图；**B 同时调 `store.find_job` 拿到原实现的结果**。"""
+        self._records()
+        raw = store.find_job                                    # 窗口之外 = 原实现
+        self.assertEqual(raw(self.AID).get("jd_id"), self.JID)  # 原实现按分析 id 找得到
+
+        in_a, leave_a, b_done = (threading.Event(), threading.Event(), threading.Event())
+        seen = {}
+
+        def thread_a():
+            with app._job_view_window():
+                seen["a"] = store.find_job(self.AID)            # 视图：JD 级字段拼进来
+                in_a.set()
+                leave_a.wait(10)                               # 保持窗口开着，等 B 读完
+            seen["a_after"] = store.find_job(self.AID)          # 窗口退出后：原实现
+            b_done.set()
+
+        def thread_b():
+            in_a.wait(10)                                       # A 已在窗口内
+            seen["b"] = store.find_job(self.AID)
+            seen["b_active_flag"] = bool(getattr(app._VIEW_LOCAL, "active", False))
+            leave_a.set()
+            b_done.wait(10)
+
+        ta, tb = threading.Thread(target=thread_a), threading.Thread(target=thread_b)
+        ta.start(); tb.start(); ta.join(10); tb.join(10)
+        self.assertFalse(ta.is_alive(), "线程 A 没跑完（死等超时）")
+        self.assertFalse(tb.is_alive(), "线程 B 没跑完（死等超时）")
+
+        # A：视图 —— 拿到了 jds.json 里的岗位背景
+        self.assertEqual(seen["a"]["job_title"], "视频标注质检")
+        self.assertEqual(seen["a"]["id"], self.AID)
+        # B：**原实现** —— 同一个 id 在 jobs.json 里就是分析记录（没有 job_title 这些 JD 级字段）
+        self.assertNotIn("job_title", seen["b"])
+        self.assertEqual(seen["b"].get("jd_id"), self.JID)
+        # ⚠️ `store.find_job` **函数对象**在补丁之后是恒定的（补丁只打一次），所以「是不是同一个
+        # 函数对象」证明不了任何事 —— 真正的证据是**同一时刻同一个 id 两个线程拿到不同结果**：
+        # 上面对 A/B 返回值的那两条断言就是它。再补一条「窗口标记只对 A 为真」。
+        self.assertFalse(seen["b_active_flag"], "线程 B 也被当成在窗口里了（分发没按线程）")
+        # 窗口退出后 A 也恢复原实现
+        self.assertNotIn("job_title", seen["a_after"])
+
+    def test_the_window_does_not_leak_out_of_the_context(self):
+        """② 窗口退出后当前线程立刻恢复原实现 —— 复用的线程不会把窗口带进下一个请求。"""
+        self._records()
+        with app._job_view_window():
+            self.assertTrue(getattr(app._VIEW_LOCAL, "active", False))
+            self.assertEqual(store.find_job(self.AID)["job_title"], "视频标注质检")
+        self.assertFalse(getattr(app._VIEW_LOCAL, "active", False))
+        self.assertNotIn("job_title", store.find_job(self.AID))
+
+    def test_an_exception_inside_the_window_still_clears_it(self):
+        """③ 窗口里抛异常（真实现里＝模型挂了）也不能残留标记 —— `try/finally` 必须兜住。"""
+        self._records()
+        raw = store.find_job
+        self.assertIsNotNone(raw)                 # 补丁版也在，但它按线程分发 —— 断言的是**行为**
+
+        def boom():
+            raise RuntimeError("模型挂了")
+
+        with self.assertRaises(RuntimeError):
+            app._with_job_views(boom)
+        self.assertNotIn("job_title", store.find_job(self.AID))
+        self.assertFalse(getattr(app._VIEW_LOCAL, "active", False),
+                         "窗口标记残留：下一个请求会被当成还在窗口里")
+        # 同一个线程再进一次窗口依然正常（没有残留状态）
+        with app._job_view_window():
+            self.assertEqual(store.find_job(self.AID)["job_title"], "视频标注质检")
+
+    def test_nested_windows_restore_the_outer_one(self):
+        """嵌套（窗口里再开一个窗口）时内层退出不能把外层的窗口关掉。"""
+        self._records()
+        with app._job_view_window():
+            with app._job_view_window():
+                self.assertEqual(store.find_job(self.AID)["job_title"], "视频标注质检")
+            self.assertEqual(store.find_job(self.AID)["job_title"], "视频标注质检")   # 外层还在
+        self.assertFalse(getattr(app._VIEW_LOCAL, "active", False))
+
+
 if __name__ == "__main__":
     unittest.main()

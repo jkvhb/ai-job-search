@@ -681,5 +681,95 @@ class VidkitProbeTest(unittest.TestCase):
         self.assertIsNone(interview.find_vidkit({"vidkit_dir": "D:/definitely/not/here"}))
 
 
+# ⚠️ 阶段 4A 的真回归：岗位背景（job_title / company / job_category）搬进了 `jds.json`，
+# 而 `interview._job_of()` 原来只在 `jobs.json` 里按 id 找 —— 于是面试分析的提示词
+# **静默少掉「岗位：…」「公司：…」两行**（不报错、不抛异常，只是模型少看了背景）。
+# 所以这里每一条都断言到**提示词字符串**，不是只断言函数返回值。
+class JobBackgroundTest(IsolatedCase):
+    """岗位背景必须穿过 `jobs.json → jd_id → jds.json` 到达面试提示词。"""
+
+    JID = "本科_金沙人力_数据标注质检_视频_成都_6-8K_0001"
+
+    def _jd(self, **kw):
+        import jdid
+        jd = {"id": self.JID, "job_title": "视频标注质检", "company": "四川金沙人力资源开发管理有限公司",
+              "job_category": "数据标注/质检", "status": "面试中"}
+        jd.update(kw)
+        jdid.upsert_jd(jd)
+
+    def _analysis(self, analysis_id="20261012_视频标注质检_82分", **kw):
+        """分析记录：**阶段 4A 之后它没有 job_title / company / job_category**。"""
+        import app
+        rec = {"id": analysis_id, "jd_id": self.JID, "report": analysis_id + ".html",
+               "resume": "我的简历", "score": 82.0}
+        rec.update(kw)
+        app._save_analysis(rec)
+        return analysis_id
+
+    def _reply(self):
+        return json.dumps({"summary": "s"}, ensure_ascii=False)
+
+    def test_job_of_returns_the_jd_background_when_the_analysis_has_none(self):
+        """① 分析记录里已无岗位背景 → `_job_of` 仍返回正确的 title/company/category。"""
+        self._jd()
+        aid = self._analysis()
+        # 先钉住前提：分析记录里**真的没有**这些字段（否则这条用例什么都没验证）
+        self.assertNotIn("job_title", store.find_job(aid))
+        self.assertNotIn("company", store.find_job(aid))
+        job = interview._job_of(aid)
+        self.assertEqual(job["job_title"], "视频标注质检")
+        self.assertEqual(job["company"], "四川金沙人力资源开发管理有限公司")
+        self.assertEqual(job["job_category"], "数据标注/质检")
+        # 分析级字段也要在（返回的是「一条岗位记录」这个既有形状，不是 JD 记录本身）
+        self.assertEqual(job["id"], aid)
+        self.assertEqual(job["score"], 82.0)
+
+    def test_the_prompt_really_carries_the_job_and_company_lines(self):
+        """② 面试提示词里**真的出现**「岗位：…」「公司：…」（断言字符串，不是只断言返回值）。"""
+        self._jd()
+        aid = self._analysis()
+        chat = fake_chat_factory([self._reply()])
+        interview.run_pipeline(aid, "iv1", {}, kind="text", deps={
+            "runner": None,
+            "chat": chat,
+            "render": lambda *a, **k: "f.html",
+        })
+        self.assertEqual(len(chat.calls), 1)
+        prompt = chat.calls[0]
+        self.assertIn("岗位：视频标注质检", prompt)
+        self.assertIn("公司：四川金沙人力资源开发管理有限公司", prompt)
+
+    def test_missing_jd_record_falls_back_to_the_flat_fields_and_never_crashes(self):
+        """③ 没有 JD 记录（还没迁移 / 老记录）→ 退回扁平字段；两条都缺 → 空串，不崩。"""
+        store.upsert_job({"id": "老岗位_66分", "job_title": "老岗位", "company": "老公司"})
+        job = interview._job_of("老岗位_66分")
+        self.assertEqual((job["job_title"], job["company"]), ("老岗位", "老公司"))
+        self.assertEqual(interview._job_of("根本不存在"), {})
+        # 两条路都读不到时：提示词里不出现岗位/公司两行，但流水线照跑
+        chat = fake_chat_factory([self._reply()])
+        store.save_interview_json("iv2", "source.txt", {"x": 1})
+        store.save_stream("iv2", "source.txt", io.BytesIO("你好".encode("utf-8")), max_bytes=10_000)
+        interview.run_pipeline("根本不存在", "iv2", {}, kind="text",
+                               deps={"chat": chat, "render": lambda *a, **k: "f.html"})
+        self.assertNotIn("岗位：", chat.calls[0])
+        self.assertEqual(store.load_interview_json("iv2", "status.json")["state"], "done")
+
+    def test_interview_feedback_lands_on_the_jd_id_not_the_report_name(self):
+        """反哺知识库必须记在 **JD id** 上（喂报告文件名 = 一次面试又被算成一个新岗位）。"""
+        import kb
+        self._jd()
+        aid = self._analysis()
+        kb.absorb([{"term": "RLHF"}], {"id": self.JID})
+        interview.run_pipeline(aid, "iv1", {}, kind="text", deps={
+            "chat": fake_chat_factory([json.dumps({"summary": "s"}, ensure_ascii=False)]),
+            "render": lambda *a, **k: "f.html",
+        })
+        card = {n["term"]: n for n in store.load_knowledge()["nodes"]}["RLHF"]
+        self.assertEqual([x.get("id") for x in card["from_jds"]], [self.JID])
+        self.assertNotIn(aid, [x.get("id") for x in card["from_jds"]])
+        # 幂等标记也记在 JD id 上（否则重试会再算一次）
+        self.assertEqual(store.load_interview_json("iv1", "feedback.json")[self.JID]["applied"], True)
+
+
 if __name__ == "__main__":
     unittest.main()

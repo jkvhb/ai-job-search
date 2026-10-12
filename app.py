@@ -8,6 +8,7 @@ AI 求职助手 · 本地工具（Python 标准库，零第三方依赖）
           --no-browser  不自动打开浏览器
 """
 import base64
+import contextlib
 import json
 import os
 import re
@@ -298,10 +299,22 @@ JD_FIELDS = ("job_title", "job_category", "location", "salary", "company", "hr_n
              "source_link", "outcome_at", "outcome_reason", "outcome_ai")
 ANALYSIS_FIELDS = ("id", "jd_id", "resume", "score", "report", "created_at", "merged_into")
 
-# `_with_job_views` 换 `store.find_job` / `store.upsert_job` 期间的互斥（模块级全局，服务器是多线程的）
-_STORE_VIEW_LOCK = threading.RLock()
-# `store.upsert_job` 的**原函数**（`_write_analysis` 用它，绝不用模块属性 —— 会被换成视图版 → 递归）
-_STORE_UPSERT = store.upsert_job
+# 视图窗口（见 `_job_view_window`）：惰性打一次补丁，之后按线程分发。
+# `_STORE_PATCH_LOCK` 只保护「打补丁」这一步（幂等，不在窗口期持有）。
+_STORE_PATCH_LOCK = threading.RLock()
+_STORE_PATCHED = False
+_STORE_ORIGINALS = {}
+
+
+def _original_upsert_job():
+    """补丁**之前**的 `store.upsert_job`（分析记录写盘唯一的真出口，绝不用模块属性：
+
+    模块属性在窗口里是视图版 —— 用它就会无限递归（实测踩到 `maximum recursion depth exceeded`）。
+    没打过补丁时直接用模块属性（那时它就是原函数）。
+    """
+    if _STORE_PATCHED:
+        return _STORE_ORIGINALS["upsert_job"]
+    return store.upsert_job
 
 
 def _analysis_fields(rec):
@@ -320,17 +333,15 @@ def _analysis_fields(rec):
 
 
 def _write_analysis(rec, key=None):
-    """真正写 `jobs.json` 的那一层。
+    """真正写 `jobs.json` 的那一层（分析记录只留分析级字段 + `jd_id`）。
 
-    ⚠️ 必须走 `store.upsert_job` 的**模块级原函数**：`_with_job_views` 会把
-    `store.upsert_job` 换成视图版，而视图版内部要写分析记录 —— 直接调模块属性会
-    无限递归（实测踩到过 `maximum recursion depth exceeded`）。
+    ⚠️ 永远走 `_original_upsert_job()`：窗口里 `store.upsert_job` 是视图版，
+    直接调模块属性会无限递归（实测踩到 `maximum recursion depth exceeded`）。
     """
     clean = _analysis_fields(rec)
     if not clean.get("id"):
         raise ValueError("分析记录必须有 id")
-    with _STORE_VIEW_LOCK:
-        return _STORE_UPSERT(clean, key)
+    return _original_upsert_job()(clean, key)
 
 
 def _save_analysis(rec, key=None):
@@ -552,74 +563,120 @@ def _similar_saved_jd(jd_text):
     return best
 
 
+def _job_view_of(job_id, key=None):
+    """「扁平视图」：把一条记录拼成 `outcome` 认得的形状（JD 级 + 分析级）。"""
+    rec = _job_in_ledger(job_id)
+    if rec is not None:
+        return _analysis_view(rec)
+    jd = jdid.find_jd(job_id)
+    if jd is not None:
+        rows = _analysis_records_of(jd.get("id"))
+        base = dict(rows[-1]) if rows else {"id": jd.get("id"), "jd_id": jd.get("id")}
+        # 手改坏的 JD 记录也要让 outcome 走它的容错分支（它是纯数据模块）
+        return dict(list(_analysis_view(base).items()) + list(jd.items()))
+    return None
+
+
+def _job_view_upsert(record, key=None):
+    """视图版的「保存一条岗位记录」：**分头落盘**（JD 级 → `jds.json`；分析级 → `jobs.json`）。
+
+    这是本层存在的全部意义 —— 不做这一步，`outcome` 的一次保存就会把 JD 级字段
+    写回 `jobs.json`，「两个文件各存一份」立刻复活。
+    """
+    if not isinstance(record, dict):
+        raise ValueError("记录必须是字典")
+    jd_id = str(record.get("jd_id") or "")
+    rec = None
+    if jd_id:
+        rows = _analysis_records_of(jd_id)
+        rec = rows[-1] if rows else None
+    if rec is None:
+        rec = _job_in_ledger(record.get("id"))
+    if rec is None:
+        # 没有对应的分析记录（不该发生）：至少别把 JD 级字段写进 jobs.json
+        return _save_analysis(record)
+    merged = dict(_analysis_fields(rec))
+    merged.update(_analysis_fields(record))
+    merged["jd_id"] = str(merged.get("jd_id") or jd_id or rec.get("jd_id") or "")
+    merged["id"] = str(rec.get("id") or record.get("id") or "")
+    if jd_id:
+        jd = dict(record)
+        jd["id"] = jd_id
+        jdid.upsert_jd(jd)
+    # ⚠️ 用 `_write_analysis`（内部走 `_original_upsert_job()`，即**补丁之前的**原函数）：
+    # 直接调 `store.upsert_job` 会再落到这个被换掉的实现上 → 无限递归（实测踩到过）。
+    _write_analysis(merged)
+    # 返回**视图**（JD 级 + 分析级拼起来的扁平形状）：调用方 `outcome.save_result`
+    # 会拿返回值去做 `_view_of(...)` —— 只回分析记录的话状态永远是「未投递」。
+    out = _job_view_of(merged.get("id"))
+    return out if isinstance(out, dict) else merged
+
+
+# 线程本地窗口：只有**主动进入窗口的那个线程**看到视图，别的线程一律走原实现。
+# 阶段 4A 之后 JD 级真相住在 `jds.json`（键是 `jd_id`），而 `outcome` 那份实现假设
+# 「一条扁平记录 = 一个文件」。翻译层放在这里；**绝不能让它影响别的线程** ——
+# `/api/job/attribute` 的窗口里含**一次几十秒的模型调用**，改全局的话其他请求
+# 会在这几十秒里读到「另一个世界」的记录。
+_VIEW_LOCAL = threading.local()
+
+
+def _ensure_store_patch():
+    """把 `store.find_job` / `store.upsert_job` 换成「按线程分发」的版本（**只换一次**）。
+
+    原实现备份在**替换之前**抓住：窗口里分发给原实现时若再去读 `store.find_job`
+    就会无限递归。补丁是**惰性**的（第一次进窗口才打），不在导入期打下 —— 导入期
+    打补丁会在「测试先 mock `store.find_job` 再触发第一次窗口」时把 mock 抓成原实现。
+    """
+    global _STORE_PATCHED
+    with _STORE_PATCH_LOCK:
+        if _STORE_PATCHED:
+            return
+        _STORE_ORIGINALS["find_job"] = store.find_job
+        _STORE_ORIGINALS["upsert_job"] = store.upsert_job
+
+        def find_job(job_id, key=None):
+            if getattr(_VIEW_LOCAL, "active", False):
+                return _job_view_of(job_id, key)
+            return _STORE_ORIGINALS["find_job"](job_id, key)
+
+        def upsert_job(record, key=None):
+            if getattr(_VIEW_LOCAL, "active", False):
+                return _job_view_upsert(record, key)
+            return _STORE_ORIGINALS["upsert_job"](record, key)
+
+        store.find_job, store.upsert_job = find_job, upsert_job
+        _STORE_PATCHED = True
+
+
+@contextlib.contextmanager
+def _job_view_window():
+    """当前线程进入「视图窗口」：窗口内 `store.find_job` / `store.upsert_job` 走视图。
+
+    **可以安全地包住一次模型调用**（几十秒也没关系）：分发是按线程查的
+    （`_VIEW_LOCAL.active`），别的线程读到的一直是原实现。退出时（含异常）清标记 ——
+    线程被复用（`ThreadingHTTPServer` 的线程池）也不会把窗口带进下一个请求。
+    """
+    _ensure_store_patch()
+    previous = getattr(_VIEW_LOCAL, "active", False)
+    _VIEW_LOCAL.active = True
+    try:
+        yield
+    finally:
+        # 还原成「进入之前」的值而不是 False：将来嵌套调用（窗口里再开一个窗口）
+        # 不会因为内层退出就把外层的窗口关掉。
+        _VIEW_LOCAL.active = previous
+
+
 def _with_job_views(fn, *args, **kw):
-    """在「id = JD id」的请求里跑 `fn`，期间把 `store.find_job` / `store.upsert_job`
-    接到**扁平视图**上（读拼起来、写分头落盘）。
+    """在「视图窗口」里跑 `fn`（见 `_job_view_window`）：读拼起来、写分头落盘。
 
     为什么必须有这一层：`outcome` 模块的读写接口收的是「一条岗位记录的 id」，内部走
     `store.find_job(id)` / `store.upsert_job(job)`。阶段 4A 之后 JD 级字段住在 `jds.json`
     （键是 `jd_id`），`jobs.json` 里按分析 id 才找得到 —— 不接这一层，`outcome` 会对着一个
     JD id 说「找不到岗位」（404），结果面板与归因全线失效。
-
-    写回时**分头落盘**（这是本层存在的全部意义）：
-      * JD 级字段 → `jdid.upsert_jd`（`jds.json`）
-      * 分析级字段 → `_save_analysis`（`jobs.json`，JD 级字段在这里被剥掉）
-    这样「两处各存一份」不会因为 outcome 的一次保存就复活。
-
-    ⚠️ **线程安全**：两个函数都是模块级全局（服务器是多线程的）。这里用模块锁 +
-    try/finally 保证「改回去」一定发生；窗口只覆盖一次同步调用（含一次模型调用）。
-    这是**明确的取舍**：把 JD 级真相搬进 `jds.json` 之后，`outcome` 那份「单文件记录」的
-    假设必须有人来翻译，而本任务只允许改 `app.py`。
     """
-    with _STORE_VIEW_LOCK:
-        original_find, original_upsert = store.find_job, store.upsert_job
-
-        def view_of(job_id, key=None):
-            rec = _job_in_ledger(job_id)
-            if rec is not None:
-                return _analysis_view(rec)
-            jd = jdid.find_jd(job_id)
-            if jd is not None:
-                rows = _analysis_records_of(jd.get("id"))
-                base = dict(rows[-1]) if rows else {"id": jd.get("id"), "jd_id": jd.get("id")}
-                # 手改坏的 JD 记录也要让 outcome 走它的容错分支（它是纯数据模块）
-                return dict(list(_analysis_view(base).items()) + list(jd.items()))
-            return None
-
-        def upsert(record, key=None):
-            if not isinstance(record, dict):
-                raise ValueError("记录必须是字典")
-            jd_id = str(record.get("jd_id") or "")
-            rec = None
-            if jd_id:
-                rows = _analysis_records_of(jd_id)
-                rec = rows[-1] if rows else None
-            if rec is None:
-                rec = _job_in_ledger(record.get("id"))
-            if rec is None:
-                # 没有对应的分析记录（不该发生）：至少别把 JD 级字段写进 jobs.json
-                return _save_analysis(record)
-            merged = dict(_analysis_fields(rec))
-            merged.update(_analysis_fields(record))
-            merged["jd_id"] = str(merged.get("jd_id") or jd_id or rec.get("jd_id") or "")
-            merged["id"] = str(rec.get("id") or record.get("id") or "")
-            if jd_id:
-                jd = dict(record)
-                jd["id"] = jd_id
-                jdid.upsert_jd(jd)
-            # ⚠️ 用 `_write_analysis`（内部走**模块级原函数**）：直接调 `_save_analysis`
-            # 会再落到这个被换掉的 `store.upsert_job` 上 → 无限递归（实测踩到过）。
-            _write_analysis(merged)
-            # 返回**视图**（JD 级 + 分析级拼起来的扁平形状）：调用方 `outcome.save_result`
-            # 会拿返回值去做 `_view_of(...)` —— 只回分析记录的话状态永远是「未投递」。
-            out = view_of(merged.get("id"))
-            return out if isinstance(out, dict) else merged
-
-        store.find_job, store.upsert_job = view_of, upsert
-        try:
-            return fn(*args, **kw)
-        finally:
-            store.find_job, store.upsert_job = original_find, original_upsert
+    with _job_view_window():
+        return fn(*args, **kw)
 
 
 def _seq_of_id(jd_id):

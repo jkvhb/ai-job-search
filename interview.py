@@ -519,12 +519,63 @@ def analyze(transcript, job, cfg, chat=None):
 
 
 # ---------------------------------------------------------------- 流水线
-def _job_of(jd_id):
-    """岗位台账里的一条记录（找不到就给空 dict —— 分析照样能跑，只是少点背景）。"""
+def _jd_identity_of(jd_id):
+    """这个 id 对应的 **JD id**。分析记录挂在 JD 下（阶段 4A），`jobs.json` 里的
+    `jd_id` 才是岗位身份；拿不到就退回原 id（迁移前的记录里身份 == 报告文件名）。"""
+    want = str(jd_id or "")
+    if not want:
+        return ""
+    rec = _job_record(want)
+    return str(rec.get("jd_id") or want)
+
+
+def _job_record(jd_id):
+    """按 id 找一条岗位记录（`jobs.json` 优先，找不到回空 dict）。
+
+    **两种 id 都认**：迁移后 `jd_id` 是结构化 JD id，而历史调用（含前端 `X-Job-Id`）
+    传的可能是分析 id / 报告文件名 —— 两种都要能找到，否则面试分析会静默丢掉岗位背景。
+    """
+    want = str(jd_id or "")
+    if not want:
+        return {}
     for j in store.load_jobs():
-        if isinstance(j, dict) and str(j.get("id") or "") == str(jd_id or ""):
+        if not isinstance(j, dict):
+            continue
+        if str(j.get("id") or "") == want or str(j.get("jd_id") or "") == want:
             return j
     return {}
+
+
+def _job_of(jd_id):
+    """岗位台账里的一条记录（找不到就给空 dict —— 分析照样能跑，只是少点背景）。
+
+    阶段 4A 之后**岗位背景（job_title / company / job_category）住在 `jds.json`**：
+    分析记录里已经没有这几个字段了（它们属 JD 级）。所以这里要
+    `jobs.json` 记录 → `jd_id` → `jds.json` JD 记录 **合并**起来给调用方。
+
+    为什么必须合并而不是只回 JD 记录：返回的是「一条岗位记录」这个既有形状，
+    调用方（`analyze(tr, job, …)` / 提示词 / 报告 meta）会读 `id`、`score` 等分析级字段。
+    只回 JD 记录会让那些字段消失（静默退化正是这次要修的毛病）。
+
+    `jds.json` 不存在（还没迁移）时退回 `jobs.json` 里的扁平字段 —— **迁移前后都不丢背景**。
+    """
+    rec = _job_record(jd_id)
+    if not rec:
+        return {}
+    jid = str(rec.get("jd_id") or rec.get("id") or "")
+    jd = {}
+    if jid:
+        # 延迟 import：`jdid` 会 import kb / store，模块顶部互相 import 有循环风险
+        import jdid
+        got = jdid.find_jd(jid)
+        if isinstance(got, dict):
+            jd = got
+    if not jd:
+        return rec
+    # ⚠️ **分析记录覆盖 JD 记录**（`dict(jd, **rec)`，顺序不能反）：两者都有 `id`，
+    # 而这里返回的是「一条**分析**记录 + 它的岗位背景」—— `id` 必须是分析 id，
+    # 否则调用方（提示词里的岗位背景、报告 meta）拿到的身份会悄悄变成 JD id。
+    return dict(jd, **rec)
 
 
 def _find_audio(interview_id):
@@ -671,7 +722,9 @@ def run_pipeline(jd_id, interview_id, cfg, kind="audio", deps=None):
         _set_status(interview_id, "analyzing")
         ana = analyze(tr, _job_of(jd_id), cfg, chat=deps.get("chat"))
         store.save_interview_json(interview_id, "analysis.json", ana)
-        _apply_feedback(jd_id, tr, ana, interview_id)     # 见 Task 3 的 record_interview（幂等）
+        # 反哺知识库必须记在**岗位身份**（JD id）上：喂分析 id / 报告文件名的话，
+        # 一次面试就会被记成另一个「岗位」，`from_jds` 又开始虚增（阶段 4A 的根因）。
+        _apply_feedback(_jd_identity_of(jd_id), tr, ana, interview_id)
         out = dict(ana, kind="interview", meta=_meta_of(interview_id, tr))
         (deps.get("render") or render_report)(out, jd_id, interview_id)
         _set_status(interview_id, "done")
