@@ -158,6 +158,13 @@
   .ivrec .m{font-size:12.3px;color:var(--sub);margin-top:3px;word-break:break-all}
   .ivrec .m.err{color:var(--red)}
   .ivrec input[type=file]{margin-top:9px;font-size:13px;width:100%}
+  /* 🏁 结果与复盘（记录结果 + AI 归因） */
+  /* :empty → 没复盘过的岗位连这个 span 都不占位（否则每一行的状态徽章都会被推开一点） */
+  .ocstat{font-size:12px;font-weight:600;color:var(--green)}
+  .ocstat:empty{display:none}
+  .ocbox{border:1px solid var(--line);border-radius:10px;padding:12px 14px;margin-top:14px;background:#fcfdff}
+  .ochint{font-size:12.3px;color:var(--muted)}
+  .ocwhy{font-size:12.3px;color:var(--red);line-height:1.5}
 </style>
 </head>
 <body>
@@ -334,6 +341,17 @@
   </div>
 </div>
 
+<!-- 🏁 结果与复盘：记录结果 + AI 归因（覆盖层）。内容全部由 JS 渲染，见下方 oc* 函数 -->
+<div class="ivmodal" id="ocModal" hidden>
+  <div class="ivbox">
+    <div class="ivhd">
+      <div class="t" id="ocTitle">🏁 记录结果</div>
+      <button class="btn gray sm" id="ocClose">✕ 关闭</button>
+    </div>
+    <div id="ocBody"></div>
+  </div>
+</div>
+
 <script>
 const $ = s => document.querySelector(s);
 const $$ = s => document.querySelectorAll(s);
@@ -370,6 +388,8 @@ $$('nav button').forEach(b=>b.addEventListener('click',()=>{
   if(b.dataset.tab==='know') initKnowTab();
   // 切走 tab 就把面试面板收掉：否则它会在后台一直轮询（面板本身的轮询只该在看得见时跑）
   if($('#ivModal') && !$('#ivModal').hidden) ivClose('tab');
+  // 结果面板同理：关掉它，在途的归因响应就随代次作废，不会在后台改行内徽章
+  if($('#ocModal') && !$('#ocModal').hidden) ocClose('tab');
   logUI('tab.switch', {tab: b.dataset.tab});
 }));
 
@@ -429,6 +449,9 @@ function renderJobs(){
     // 「📊 打开最近复盘 ↗」真链接（有记录且已完成时）——报告必须走 HTTP 地址，不能用 file://
     const ivSlot = '<span id="ivbox-'+esc(j.id)+'"><button class="btn gray sm" data-iv="'+esc(j.id)+'">🎤 面试复盘</button></span>';
     links.push(ivSlot);
+    // 🏁 结果入口：保存结果后**只就地更新**这一行的徽章与「已复盘」标记（见 ocPaintRow），
+    // 不整页重渲染 —— 重渲染会把用户正在输入的原因覆盖掉
+    links.push('<button class="btn gray sm" data-oc="'+esc(j.id)+'">🏁 结果</button>');
     links.push('<button class="btn gray sm" data-edit="'+esc(j.id)+'">✏️ 编辑</button>');
     links.push('<button class="btn danger sm" data-del="'+esc(j.id)+'">🗑 删除</button>');
 
@@ -437,7 +460,10 @@ function renderJobs(){
         '<span class="t">'+esc(j.job_title||'(未命名岗位)')+'</span>'+
         '<span class="pill">'+esc(j.job_category||'其他')+'</span>'+
         '<span class="score '+scoreCls(j.score||0)+'">'+esc(j.score||0)+' 分</span>'+
-        '<span class="'+stCls(j.status)+'">'+esc(j.status||'未投递')+'</span>'+
+        // id 是给 ocPaintRow 就地改状态用的（行内徽章读的始终是台账顶层的扁平 status）
+        '<span class="'+stCls(j.status)+'" id="stbadge-'+esc(j.id)+'">'+esc(j.status||'未投递')+'</span>'+
+        // 「已复盘」标记：数据源是 /api/jobs 里那条记录的 application.outcome_ai（见 ocHasAi）
+        '<span class="ocstat" id="ocstat-'+esc(j.id)+'"></span>'+
         '<span class="sp"><span class="mt" style="font-size:12px;color:var(--muted)">'+esc(j.created_at||'')+'</span></span>'+
       '</div>'+
       '<div class="meta">'+
@@ -482,7 +508,9 @@ function renderJobs(){
   box.querySelectorAll('[data-copy]').forEach(b=>b.addEventListener('click',()=>copyText(b.dataset.copy)));
   box.querySelectorAll('[data-jdtext]').forEach(b=>b.addEventListener('click',()=>showJdText(b.dataset.jdtext)));
   box.querySelectorAll('[data-iv]').forEach(b=>b.addEventListener('click',()=>ivOpen(b.dataset.iv)));
+  box.querySelectorAll('[data-oc]').forEach(b=>b.addEventListener('click',()=>ocOpen(b.dataset.oc)));
   ivPaintStats();       // 先用缓存里的面试统计把行内文字填上（没缓存就等 ivLoadStats 回来再填）
+  ocPaintStats();       // 行内「已复盘」标记：数据就在 /api/jobs 的记录里，不需要额外请求
   ivLoadStats();        // 每个岗位问一次 /api/interview/list（没有「列出全部面试」的接口）
 }
 async function saveJob(id){
@@ -1015,6 +1043,305 @@ async function ivRefreshStats(){
   if(seq !== ivSeq || !weak) return;    // 拿不到就保持原样（不把 M 清零冒充「一个都没答砸」）
   IV_WEAK = weak;
   ivPaintStats();
+}
+
+/* ---------------- 🏁 结果与复盘（记录结果 + AI 归因） ----------------
+   这一块守住规格 §5 的三条：
+
+   1. **只有记录到终态才允许归因**：判据是接口回的 `terminal` 列表（绝不自己写死状态表），
+      非终态、以及「还没记录过结果」一律 disabled 并说明原因。放行的话 AI 会给一个结果未知的
+      岗位写「你为什么没拿到 offer」—— 没有依据却言之凿凿。
+   2. **归因失败绝不画成完成**：只有 `ok===true` 且真拿到报告地址才渲染 <a>；失败给错误 + 「重试」，
+      并且**不留**任何「打开复盘报告」的链接。你写的原因在保存时已落盘，不会因归因失败而丢。
+   3. **用户的字不被覆盖**：原因输入框只在**用户没改过**时才回写；归因成功只更新 AI 那一块，
+      一个字都不碰输入框。
+
+   面板报告是**真 `<a href="/reports/oc_<id>.html" target="_blank">`**，不用 window.open
+   （弹窗会被浏览器拦掉 —— 上一块的面试复盘报告已踩过这个边界）。
+*/
+let OC = {seq:0, job:null, app:null, statuses:[], terminal:[], live:null, msg:null, hasAi:false};
+
+// 行内「已复盘」的唯一判据：/api/jobs 那条记录里的 application.outcome_ai。
+// 后端 `_view_of` 的规矩是「非字典一律当没有」→ 这里也一样，手改坏的字段绝不谎报成已复盘。
+function ocHasAi(job){
+  const app = (job && typeof job.application === 'object' && job.application) || {};
+  const ai = app.outcome_ai;
+  return !!(ai && typeof ai === 'object' && !Array.isArray(ai));
+}
+
+// 行内标记（纯 DOM 更新，不重渲染整行）
+function ocPaintRow(job){
+  if(!job || !job.id) return;
+  const b = document.getElementById('stbadge-' + job.id);
+  if(b){
+    const s = String(job.status || '未投递');
+    b.textContent = s;
+    b.className = stCls(s);
+  }
+  const el = document.getElementById('ocstat-' + job.id);
+  if(el) el.textContent = ocHasAi(job) ? '· 已复盘' : '';
+}
+function ocPaintStats(){
+  JOBS.forEach(ocPaintRow);
+}
+
+// 判门：**只看接口回的 terminal 列表**。
+// 判据用「已记录的状态」（OC.app.status），不是下拉框里还没保存的选择 ——
+// 后端也是按落盘状态判的，两边不一致就会出现「按钮能点，点了 400」。
+function ocGate(){
+  const terminal = Array.isArray(OC.terminal) ? OC.terminal : [];
+  const list = terminal.join('／');
+  if(OC.live && OC.live.phase === 'running') return {allowed:false, why:'归因中……请等这次跑完'};
+  if(!OC.app) return {allowed:false, why:'正在读取结果……'};
+  if(!terminal.length) return {allowed:false, why:'没读到终态词表（服务没响应？），暂时不能归因'};
+  const status = String(OC.app.status || '');
+  if(terminal.indexOf(status) < 0){
+    return {allowed:false, why:'还没有结果（当前状态：' + (status || '未记录') + '）。'
+      + '先把状态记成「' + list + '」中的一种并保存，再来归因。'};
+  }
+  return {allowed:true, why:OC.hasAi ? '已经复盘过：可以重新归因（会覆盖上一次的 AI 归因）' : ''};
+}
+
+function ocPaintGate(){
+  const btn = $('#ocAttrBtn'), why = $('#ocAttrWhy');
+  const g = ocGate();
+  if(btn) btn.disabled = !g.allowed;
+  if(why) why.textContent = g.why;
+}
+
+function ocPaintMsg(){
+  const el = $('#ocMsg'); if(!el) return;
+  const m = OC.msg;
+  if(!m){ el.className = ''; el.textContent = ''; return; }
+  el.className = 'status on ' + m.cls;
+  el.textContent = m.text;
+}
+function ocSetMsg(cls, text){ OC.msg = text ? {cls:cls, text:text} : null; ocPaintMsg(); }
+
+function ocPaintSaved(){
+  const at = $('#ocSavedAt'); if(!at) return;
+  const app = OC.app || {};
+  const sel = $('#ocStatus'), ta = $('#ocReason');
+  const dirty = !!((sel && sel.value !== String(app.status || ''))
+                || (ta && ta.value !== String(app.outcome_reason || '')));
+  const bits = [];
+  if(app.outcome_at) bits.push('上次记录：' + String(app.outcome_at));
+  if(dirty) bits.push('有改动未保存');
+  at.textContent = bits.join(' · ');
+  at.className = dirty ? 'ocwhy' : 'ochint';
+}
+
+// AI 那块的三种状态：归因中 / 完成（给真链接）/ 失败（给错误 + 重试，**绝不出现报告链接**）
+function ocPaintAI(){
+  const el = $('#ocAttrLive'); if(!el) return;
+  const L = OC.live;
+  if(!L){ el.innerHTML = ''; return; }
+  if(L.phase === 'running'){
+    el.innerHTML = '<div class="status on info" id="ocAttrMsg">⏳ 归因中……（一次模型调用，通常 10–60 秒，请勿关闭本页）</div>';
+  } else if(L.phase === 'done'){
+    el.innerHTML = '<div class="status on ok" id="ocAttrMsg">✅ 归因完成，复盘报告已生成</div>'
+      + '<div class="row" style="margin-top:6px">'
+      + '<a class="btn" id="ocAttrReport" href="' + esc(L.url) + '" target="_blank" rel="noopener">📊 打开复盘报告 ↗</a>'
+      + '</div>';
+  } else {
+    el.innerHTML = '<div class="status on err" id="ocAttrMsg">' + esc(L.err || '归因失败') + '</div>'
+      + '<div class="row" style="margin-top:6px"><button class="btn sm" id="ocAttrRetry">🔁 重试</button>'
+      + '<span class="ochint">你写的原因保存时已落盘，不会因为归因失败而丢。</span></div>';
+  }
+  const rb = $('#ocAttrRetry');
+  if(rb) rb.addEventListener('click', ocAttribute);
+}
+
+// 骨架只在打开面板时搭一次。之后一律**局部更新**（ocPaintMsg/Gate/Saved/AI）——
+// 整体重渲染会把用户正在输入的原因覆盖掉，那正是这一块最不能犯的错。
+function ocPanelHtml(){
+  const app = OC.app || {};
+  const statuses = Array.isArray(OC.statuses) ? OC.statuses : [];
+  const cur = String(app.status || '');
+  const sel = statuses.indexOf(cur) >= 0 ? cur : (statuses[0] || '');
+  return '<div id="ocMsg"></div>'
+    + '<label class="fld">结果状态</label>'
+    + '<select id="ocStatus">' + statuses.map(s=>
+        '<option value="' + esc(s) + '"' + (s === sel ? ' selected' : '') + '>' + esc(s) + '</option>').join('') + '</select>'
+    + '<label class="fld">原因（你自己写的；AI 归因不会覆盖它）</label>'
+    + '<textarea id="ocReason" placeholder="比如：三面过了但 HC 冻结；或：薪资没谈拢">'
+      + esc(app.outcome_reason || '') + '</textarea>'
+    + '<div id="ocSavedAt" class="ochint"></div>'
+    + '<div class="row" style="margin-top:10px"><button class="btn" id="ocSave">💾 保存结果</button></div>'
+    + '<div class="ocbox">'
+      + '<div class="hintline" style="margin-top:0">归因 = 让 AI 结合这份 JD、你的面试复盘和上面写的原因，'
+      + '推测这次结果的原因并生成一份复盘报告。<b>没到终态时不归因</b>，免得它凭空编原因。</div>'
+      + '<div class="row" style="margin-top:9px">'
+        + '<button class="btn" id="ocAttrBtn" disabled>🔍 让 AI 归因</button>'
+        + '<span class="ocwhy" id="ocAttrWhy"></span>'
+      + '</div>'
+      + '<div id="ocAttrLive"></div>'
+    + '</div>';
+}
+
+function ocRenderPanel(){
+  const box = $('#ocBody'); if(!box) return;
+  box.innerHTML = ocPanelHtml();
+  const sel = $('#ocStatus'), ta = $('#ocReason'), sv = $('#ocSave'), ab = $('#ocAttrBtn');
+  // 只是「有改动未保存」的提示 + 判门说明：判门不看下拉框的值（那还没落盘）
+  if(sel) sel.addEventListener('change', ()=>{ ocPaintSaved(); ocPaintGate(); });
+  if(ta) ta.addEventListener('input', ocPaintSaved);
+  if(sv) sv.addEventListener('click', ocSave);
+  if(ab) ab.addEventListener('click', ocAttribute);
+  ocPaintMsg(); ocPaintSaved(); ocPaintGate(); ocPaintAI();
+}
+
+function ocLoadError(msg){
+  const box = $('#ocBody'); if(!box) return;
+  // 读失败就**不给**任何归因入口（连禁用的按钮都不给）：读不到结果时没有可判门的依据
+  box.innerHTML = '<div class="status on err" id="ocMsg">' + esc(msg) + '</div>'
+    + '<div class="row" style="margin-top:10px"><button class="btn" id="ocReload">🔁 重试</button></div>';
+  const rb = $('#ocReload');
+  if(rb) rb.addEventListener('click', ()=>{
+    const seq = ++OC.seq;
+    box.innerHTML = '<div class="status on info" id="ocMsg">正在读取结果……</div>';
+    ocLoad(seq);
+  });
+  toast(msg);
+}
+
+async function ocLoad(seq){
+  let d = null, err = '';
+  try{
+    d = await (await fetch('/api/job/outcome?id=' + encodeURIComponent(OC.job.id))).json();
+  }catch(e){
+    err = '结果读取失败：' + ((e && e.message) || '网络中断（服务没在跑？）');
+  }
+  if(seq !== OC.seq) return;              // 面板已关闭 / 换了岗位：这次响应作废
+  if(err || !d || d.ok !== true || !d.application){
+    const why = err || (d && d.error) || '结果读取失败（服务无响应）';
+    logUI('oc.load_failed', {job: OC.job.id, error: why}, 'error');
+    ocLoadError(why);
+    return;
+  }
+  OC.app = d.application;
+  OC.statuses = Array.isArray(d.statuses) ? d.statuses : [];   // 词表只信接口，绝不前端硬编码
+  OC.terminal = Array.isArray(d.terminal) ? d.terminal : [];
+  OC.hasAi = d.has_ai === true;
+  OC.live = null; OC.msg = null;
+  ocRenderPanel();
+}
+
+// 只绑一次：initKnowTab / ivInit 同款守卫（点 tab、反复开关面板都会走到这里，
+// 重复绑定会让一次 Esc / 一次点遮罩关出 N 次，日志里也跟着刷 N 条）
+function ocInit(){
+  if(ocInit.done) return;
+  ocInit.done = true;
+  $('#ocClose').addEventListener('click', ()=>ocClose('button'));
+  $('#ocModal').addEventListener('click', e=>{ if(e.target === $('#ocModal')) ocClose('backdrop'); });
+  document.addEventListener('keydown', e=>{
+    if(e.key === 'Escape' && !$('#ocModal').hidden) ocClose('esc');
+  });
+}
+
+function ocOpen(jobId){
+  ocInit();
+  const job = JOBS.filter(j=>j.id === jobId)[0] || {id: jobId, job_title: ''};
+  OC.seq++;                                   // 新代次：上一个面板的在途响应当场作废
+  const seq = OC.seq;
+  OC.job = job; OC.app = null; OC.statuses = []; OC.terminal = [];
+  OC.live = null; OC.msg = null; OC.hasAi = ocHasAi(job);
+  $('#ocTitle').innerHTML = '🏁 记录结果 · ' + esc(job.job_title || job.id || '未命名岗位');
+  $('#ocBody').innerHTML = '<div class="status on info" id="ocMsg">正在读取结果……</div>';
+  $('#ocModal').hidden = false;
+  logUI('oc.open', {job: jobId});
+  ocLoad(seq);
+}
+
+function ocClose(reason){
+  OC.seq++;                                   // 代次前进一步：在途的归因响应不再改任何东西
+  OC.app = null; OC.live = null; OC.msg = null;
+  const m = $('#ocModal'); if(m) m.hidden = true;
+  const b = $('#ocBody'); if(b) b.innerHTML = '';
+  logUI('oc.close', {reason: reason || ''});
+}
+
+async function ocSave(){
+  const sel = $('#ocStatus'), ta = $('#ocReason'), btn = $('#ocSave');
+  const status = sel ? String(sel.value || '') : '';
+  const reason = ta ? String(ta.value || '') : '';     // 用户的字一个字都不动
+  const seq = OC.seq;
+  if(btn) btn.disabled = true;
+  ocSetMsg('info', '正在保存结果……');
+  logUI('oc.result_save', {job: OC.job.id, status: status, has_reason: !!reason.trim()});
+  let d = null, err = '';
+  try{
+    d = await (await fetch('/api/job/result', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({id: OC.job.id, status: status, reason: reason})})).json();
+  }catch(e){
+    err = (e && e.message) || '网络中断（服务没在跑？）';
+  }
+  if(seq !== OC.seq) return;
+  if(btn) btn.disabled = false;
+  if(err || !d || d.ok !== true || !d.application){
+    const why = err || (d && d.error) || '服务无响应';
+    ocSetMsg('err', '保存失败：' + why);
+    toast('保存失败：' + why);
+    return;
+  }
+  OC.app = d.application;                     // status 已落盘（后端同时同步了台账顶层 status）
+  if(OC.job){
+    OC.job.status = String(OC.app.status || status);
+    OC.job.application = Object.assign({}, OC.job.application || {}, {
+      status: OC.app.status, outcome_reason: OC.app.outcome_reason});
+    ocPaintRow(OC.job);                       // 行内徽章立即更新，不等下一次 /api/jobs
+  }
+  // 保存期间用户又敲了字 → **不回写**（回写就是拿旧值覆盖用户的新输入）；提示他还没保存
+  if(ta && ta.value === reason) ta.value = String(OC.app.outcome_reason || '');
+  const stale = !!(ta && ta.value !== String(OC.app.outcome_reason || ''));
+  ocSetMsg('ok', stale ? '已保存 ✓（输入框里还有没保存的改动）' : '已保存 ✓');
+  ocPaintSaved(); ocPaintGate();
+  toast('已保存 ✓');
+}
+
+async function ocAttribute(){
+  const g = ocGate();
+  if(!g.allowed){                             // 兜底重申一遍门槛：按钮被改活也不行（后端同样会拦）
+    ocSetMsg('err', '还不能归因：' + g.why);
+    return;
+  }
+  const seq = OC.seq, btn = $('#ocAttrBtn');
+  OC.live = {phase:'running'};
+  if(btn) btn.disabled = true;
+  ocPaintAI(); ocPaintGate();                 // 立刻显示「归因中…」：点了没反应是最糟的反馈
+  logUI('oc.attribute_click', {job: OC.job.id, status: String((OC.app || {}).status || '')});
+  let d = null, err = '';
+  try{
+    d = await (await fetch('/api/job/attribute', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({id: OC.job.id})})).json();
+  }catch(e){
+    err = '归因请求失败：' + ((e && e.message) || '网络中断（服务没在跑？）');
+  }
+  if(seq !== OC.seq) return;                  // 面板已关闭 / 换了岗位：丢弃这次结果，不改任何 DOM
+  if(err){
+    OC.live = {phase:'error', err: err};
+  } else if(!d || d.ok !== true || !d.url){
+    OC.live = {phase:'error', err: '归因失败：' + ((d && d.error) || '服务无响应（没有拿到报告地址）')};
+  } else if(!d.outcome_ai){
+    // ok 但没有 AI 结果 → 报告地址不可信，按失败处理（绝不给一个点开是空的报告链接）
+    OC.live = {phase:'error', err: '归因失败：服务没有返回归因结果'};
+  } else {
+    OC.live = {phase:'done', url: String(d.url)};
+    OC.hasAi = true;
+    OC.app = Object.assign({}, OC.app || {}, {outcome_ai: d.outcome_ai});
+    if(OC.job){                               // JOBS 里就是同一个对象：行内「已复盘」跟着亮
+      OC.job.application = Object.assign({}, OC.job.application || {}, {outcome_ai: d.outcome_ai});
+      ocPaintRow(OC.job);
+    }
+  }
+  ocPaintAI(); ocPaintGate();
+  if(OC.live.phase === 'done'){
+    logUI('oc.attribute_done', {job: OC.job.id, report: String(d.report || '')});
+    toast('归因完成 ✓');
+  } else {
+    logUI('oc.attribute_failed', {job: OC.job.id, error: OC.live.err}, 'error');
+    toast('归因失败，可重试');
+  }
 }
 
 /* ---------------- 简历 ---------------- */
