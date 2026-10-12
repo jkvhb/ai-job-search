@@ -857,10 +857,13 @@ class SingleFlightTest(IsolatedCase):
                          % (len(calls), len(calls)))
         n1, s1 = results["t1"]
         n2, s2 = results["t2"]
-        # 等待者拿的是**领导者刚算出来的那份**：source 是 computed 而不是 cache ——
-        # 只有真的走了「加入在飞的那一次」才会是它（走了缓存会是 "cache"）。
-        self.assertEqual((s1, s2), ("computed", "computed"),
-                         "第二个线程没拿到领导者的结果：%r" % ((s1, s2),))
+        # 等待者拿的是**领导者刚算出来的那份**（不是空地图、不是又一次真算）；但它的 `source`
+        # 按**复用**报：那一行小字的全部意义是「本次有没有重新搜索」，而等待者确实没有重新
+        # 搜索 —— 报「本次新算」会让用户以为烧了两遍 53 次搜索额度（而那正是这一行要传达的
+        # 信息）。「这是等待者」由下面的 `analyze.knowledge_joined` 事件分辨。
+        self.assertEqual((s1, s2), ("computed", "cache"),
+                         "第二个线程没按「等待复用」报：%r" % ((s1, s2),))
+        self.assertEqual(s2, jdfacts.SOURCE_CACHE)
         self.assertEqual(_jdump(n2), _jdump(n1), "两个线程拿到的不是同一份知识地图")
         self.assertEqual(_jdump(n1), _jdump(_nodes("once")))
         self.assertIsNot(n1, n2,

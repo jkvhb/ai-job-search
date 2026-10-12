@@ -1478,6 +1478,151 @@ class AnalyzeDedupTest(_AnalyzeRouteCase):
         self.assertEqual(calls["knowledge"], 0)
 
 
+class AnalyzeFlagTruthinessTest(_AnalyzeRouteCase):
+    """`allow_duplicate` / `refresh_jd_facts` 的真值口径**只有一处**（`app._as_bool`）。
+
+    手写 API（curl / 自己的脚本 / 别的客户端）最容易把布尔写成字符串：
+    `{"refresh_jd_facts": "false"}`。改之前两个参数都直接吃 Python 的 `bool(value)` ——
+    `bool("false") is True` → **白烧一次真算**（206 秒 + ~53 次搜索），
+    `{"allow_duplicate": "false"}` 同理 → 悄悄跳过查重。
+
+    **现状钉住**（改之前逐个输入实测）：两个参数都是 `bool(value)` ——
+      为真：`True / 1 / "1" / "true" / "yes" / "false" / "0" / "no" / "   " / "maybe" / 2 / [1]`
+      为假：`False / 0 / 0.0 / None / "" / [] / {}`
+    改之后**只有「字符串假值」这一类翻面**：`"false" / "0" / "no"`（含大小写、首尾空白、
+    以及纯空白串）；认不出的（`"maybe" / 2 / [1]`）保持原语义 —— 把 `2` 从真改成假同样是
+    行为变化，会打破「只改一类」这条纪律。见下面 `FALSY` / `TRUTHY` 两张表的差集。
+    """
+
+    NODE = {"id": "n1", "term": "语音识别", "definition": "d", "layer": 0, "sources": [],
+            "timeline": [], "related": [], "interview_questions": [], "confidence": "guess"}
+
+    # ⚠️ **现状钉住用的两张表**（改之前的口径 = `bool(value)`）。它们留在这里是为了让
+    # 「只改了字符串假值这一类」这句话**可被测试证明**（见 test_only_string_false_values_flipped）。
+    OLD_FALSY = (None, False, 0, 0.0, "", [], {})
+    OLD_TRUTHY = (True, 1, "1", "true", "yes", "false", "0", "no", "   ", "FALSE", " false ",
+                  " no ", "maybe", 2, [1])
+
+    # 改**之后**的口径（`_as_bool`）：差集只有 `"0" / "false" / "no"`（含大小写与空白变体）。
+    FALSY = OLD_FALSY + ("0", "false", "no", "FALSE", " no ", "   ")
+    TRUTHY = (True, 1, "1", "true", "TRUE", " yes ", "maybe", 2, [1], 0.5)
+
+    def _deps(self):
+        """三个花钱入口的计数替身。知识地图回**非空**节点：空列表不算可用缓存
+        （`jdfacts._as_nodes(...) or None`），那种替身会让「有没有重算」永远分不出来（假绿）。
+        """
+        calls = {"llm": 0, "search": 0, "knowledge": 0}
+
+        def fake_llm(base_url, api_key, model, messages, json_mode=False, **kw):
+            calls["llm"] += 1
+            return self.REPLY
+
+        def fake_search(link):
+            calls["search"] += 1
+            return self.LONG
+
+        def fake_knowledge(jd_text, cfg):
+            calls["knowledge"] += 1
+            return [dict(self.NODE)]
+
+        self._patch(app.llm, "call_openai_compatible", fake_llm)
+        self._patch(app.search_mod, "fetch_link", fake_search)
+        self._patch(app.knowledge, "build_for_jd", fake_knowledge)
+        self._patch(app.llm, "repair_json",
+                    mock.Mock(side_effect=AssertionError("测试里不该真去修 JSON")))
+        return calls
+
+    def _prime(self):
+        """先真算一次把缓存落上（没有缓存时「真假」都只是「没缓存要算」，分不出真值口径）。"""
+        calls = self._deps()
+        code, body = self._post_json("/api/analyze",
+                                     {"jd_text": self.LONG, "resume_name": self._resume(),
+                                      "source_type": "粘贴文本"})
+        self.assertEqual((code, body.get("ok")), (200, True), body)
+        self.assertEqual(calls["knowledge"], 1)
+        return calls
+
+    def _refresh_body(self, value, resume="第二版.md"):
+        return {"jd_text": self.LONG, "resume_name": self._resume(resume),
+                "source_type": "粘贴文本", "allow_duplicate": True,
+                "refresh_jd_facts": value}
+
+    def test_as_bool_is_the_single_truthiness_judgement(self):
+        """`_as_bool` 的真值表（逐个输入，含垃圾值）。"""
+        table = [(True, True), (1, True), ("1", True), ("true", True), ("TRUE", True),
+                 (" yes ", True), ("yes", True),
+                 (False, False), (0, False), (0.0, False), ("0", False), ("false", False),
+                 ("FALSE", False), (" false ", False), ("no", False), (" no ", False),
+                 (None, False), ("", False), ("   ", False), ([], False), ({}, False),
+                 # 认不出的：按**原语义** `bool(value)`（只有字符串假值这一类翻面）
+                 ("maybe", True), (2, True), ([1], True), (0.5, True)]
+        for value, want in table:
+            with self.subTest(value=value):
+                self.assertIs(app._as_bool(value), want)
+
+    def test_only_string_false_values_flipped(self):
+        """**现状 → 现在**的差集必须**只有字符串假值**这一类（既有语义不能悄悄翻面）。
+
+        两个都漏过：把 `2` 从真改成假（「垃圾值也一律当假」）同样是一种行为变化 —— 那会把
+        手写客户端里 `refresh_jd_facts: 2` 的意思从「刷新」改成「不刷新」。
+        """
+        flipped = [(v, bool(v)) for v in self.OLD_FALSY + self.OLD_TRUTHY
+                   if app._as_bool(v) is not bool(v)]
+        self.assertEqual([v for v, _ in flipped],
+                         ["false", "0", "no", "   ", "FALSE", " false ", " no "],
+                         "翻面的不止「字符串假值」这一类：%r" % (flipped,))
+        for value, before in flipped:
+            self.assertIsInstance(value, str, "非字符串的值也翻面了：%r" % (value,))
+            self.assertIn(value.strip().lower(), ("", "0", "false", "no"))
+
+    def test_refresh_jd_facts_falsy_values_reuse_the_cache(self):
+        """手写 API 的 `"refresh_jd_facts": "false"` 曾经 = **真** → 白烧一次真算。"""
+        calls = self._prime()
+        for value in self.FALSY:
+            with self.subTest(value=value):
+                before = calls["knowledge"]
+                code, body = self._post_json("/api/analyze", self._refresh_body(value))
+                self.assertEqual((code, body.get("ok")), (200, True), body)
+                self.assertEqual(calls["knowledge"], before,
+                                 "`refresh_jd_facts`=%r 被当成了真 → 白烧 206 秒" % (value,))
+
+    def test_refresh_jd_facts_truthy_values_recompute(self):
+        calls = self._prime()
+        for value in self.TRUTHY:
+            with self.subTest(value=value):
+                before = calls["knowledge"]
+                code, body = self._post_json("/api/analyze", self._refresh_body(value))
+                self.assertEqual((code, body.get("ok")), (200, True), body)
+                self.assertEqual(calls["knowledge"], before + 1,
+                                 "`refresh_jd_facts`=%r 没被当成真（刷新没透传）" % (value,))
+
+    def test_allow_duplicate_falsy_values_still_hit_the_duplicate_check(self):
+        """`"allow_duplicate": "false"` 曾经 = **真** → 悄悄跳过查重（该 409 的没 409）。"""
+        self._old_job()
+        calls = self._deps()
+        for value in self.FALSY:
+            with self.subTest(value=value):
+                code, body = self._post_json("/api/analyze",
+                                             {"jd_text": self.LONG, "resume_name": self._resume(),
+                                              "source_type": "粘贴文本", "allow_duplicate": value})
+                self.assertEqual(code, 409, "`allow_duplicate`=%r 被当成了真" % (value,))
+                self.assertEqual(body["duplicate"]["job_id"], "j-old")
+                # 查重命中时**一个额度都不花**（这批假值全都在调模型/搜索之前返回）
+                self.assertEqual((calls["llm"], calls["search"], calls["knowledge"]), (0, 0, 0))
+
+    def test_allow_duplicate_truthy_values_proceed(self):
+        self._old_job()
+        calls = self._deps()
+        for value in self.TRUTHY:
+            with self.subTest(value=value):
+                before = calls["llm"]
+                code, body = self._post_json("/api/analyze",
+                                             {"jd_text": self.LONG, "resume_name": self._resume(),
+                                              "source_type": "粘贴文本", "allow_duplicate": value})
+                self.assertEqual((code, body.get("ok")), (200, True), body)
+                self.assertGreater(calls["llm"], before, "`%r` 没有被放行" % (value,))
+
+
 class LedgerFilterTest(_AnalyzeRouteCase):
     """§4：`merged_into` 非空的记录只是标记，不该再出现在台账列表里。"""
 

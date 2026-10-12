@@ -800,6 +800,85 @@ def save_jd_source(job_id, jd_text, image_data_url):
     return jd_text_file, jd_image_url
 
 
+# ---------------------------------------------------------------- 入参口径
+_BOOL_TRUE_WORDS = ("1", "true", "yes")
+_BOOL_FALSE_WORDS = ("", "0", "false", "no")
+
+
+def _as_bool(value):
+    """布尔入参的**唯一**真值口径（HTTP body 里的值什么类型都可能）。
+
+    ⚠️ 为什么不能直接 `bool(value)`：手写 API（curl / 自己的脚本 / 别的客户端）把布尔写成
+    字符串是常态，而 `bool("false") is True`、`bool("0") is True` —— 于是一句
+    `"refresh_jd_facts": "false"` 会**白烧一次真算**（206 秒 + ~53 次搜索额度），
+    `"allow_duplicate": "false"` 会悄悄跳过查重（本该 409）。
+
+    **认不出的值（`"maybe"` / `2` / `[1]` …）按原语义 `bool(value)`**：这个转换只负责修
+    「字符串假值」这一类 —— `2` 从真改成假同样是行为变化，既有语义不能悄悄翻面。
+    字符串先 `strip().lower()`：`"FALSE"` / `" false "` / 纯空白串都算假（那都是明确的「没开」）。
+
+    ⚠️ 与 `outcome._as_bool` **不是**同一个契约：那个是**三态**解析（读不出来＝`None`「未判断」，
+    认不出的走 `default`），用在「可控/不可控」那种不该乱下结论的地方。这里要的是把 HTTP body
+    里的字符串按真值读成布尔、认不出就保持原语义 —— 两者别合并（合并必然改掉一边的语义）。
+    """
+    if isinstance(value, str):
+        word = value.strip().lower()
+        if word in _BOOL_TRUE_WORDS:
+            return True
+        if word in _BOOL_FALSE_WORDS:
+            return False
+        return bool(value)              # 认不出的字符串：原语义（非空即真）
+    return bool(value)                  # 非字符串：原语义（True/1/2 → 真；0/None/[]/{} → 假）
+
+
+def _discard_orphan_jd(jd_id):
+    """删掉**本次这次调用刚建、却什么也没落上**的那条 JD 记录（善后；不删任何文件）。
+
+    什么时候会有这种记录：`do_analyze` 为了给知识地图缓存一个挂靠点，会在「定下 JD 身份」
+    之后**先落一条只有 id 的记录**，而真正那份带展示字段的记录在报告之后才写。若异常落在这
+    中间，盘上就留下一条**没有 `jd_facts`、也没有任何分析挂在它下面**的孤儿：台账里看不见它
+    （台账的行来自 `jobs.json`），但 `_similar_saved_jd` 会通过 `jd/<id>.txt` 命中它
+    （similarity 1.0）→ 用户重提同一份 JD 只会得到 **409**，而前端**没有**
+    `allow_duplicate` 入口 → 「失败：未知错误」且无法继续。
+
+    **为什么只敢删这一种（代价不对称）**：
+      * 善后只动 `jds.json` 里**这一条**记录，**绝不删文件** —— 用户贴过的原文照旧留在
+        `jd/` 下（那是「这个 JD 我提交过」的痕迹，删文件才是真的数据损失）；
+      * 只删**同时满足**两个条件的：没有 `jd_facts`，且 `jdid.analyses_of` 为空。已经有分析
+        挂在它下面的记录**绝不碰**（那已经是用户的台账）；不是本次刚建的记录也**绝不碰**
+        （调用方只在「这条 id 是这次调用建的」时才调本函数，空 id 直接返回）；
+      * 留着孤儿的代价只是「下一次同 JD 分析会换一个新身份」；删错的代价是用户数据丢失。
+    真的删掉了一条时记一条 `analyze.jd_orphan_cleaned`（事后查得到），返回 True。
+    """
+    want = str(jd_id or "")
+    if not want:
+        return False
+    try:
+        # 与 jdid / jdfacts 用同一把锁，读-改-写是一个临界区（锁顺序仍恒为 _JD_LOCK → _KB_LOCK）
+        with jdid._JD_LOCK:
+            data = jdid.load_jds()
+            rec, rest = None, []
+            for r in data["jds"]:
+                if r.get("id") == want:
+                    rec = r
+                else:
+                    rest.append(r)
+            if rec is None:
+                return False
+            if rec.get("jd_facts"):
+                return False            # 有缓存 = 知识地图已经落上，这不是「什么也没落下」
+            if jdid.analyses_of(want):
+                return False            # 已经有分析挂在它下面 = 用户的台账
+            data["jds"] = rest
+            jdid.save_jds(data)
+    except Exception as e:
+        # 善后失败绝不能盖掉真正的那个异常（调用方正在 except 里）
+        log.log_exc("analyze.jd_orphan_cleanup_error", e, jd=want)
+        return False
+    log.log_event("analyze.jd_orphan_cleaned", jd=want)
+    return True
+
+
 def do_analyze(jd_text, image_data_url, resume_name, link="", overwrite_id="", allow_duplicate=False,
                refresh_jd_facts=False):
     """跑一次 JD 分析并出报告。`overwrite_id` 非空 = 「覆盖」：结果写回那条已有记录。
@@ -808,6 +887,10 @@ def do_analyze(jd_text, image_data_url, resume_name, link="", overwrite_id="", a
 
     `refresh_jd_facts` 为真 = 用户要求**重算 JD 级事实**（目前只有知识地图）→ 忽略缓存
     （`jdfacts.resolve(..., refresh=True)`）。不传 = 有缓存就复用（这是本阶段的全部收益）。
+
+    ⚠️ 两个布尔参数都过 **`_as_bool`**（唯一的真值口径）：HTTP body 里它们是字符串是常态
+    （`"false"` / `"0"`），而 `bool("false") is True` → 白烧一次真算（206 秒 + ~53 次搜索）
+    或悄悄跳过查重。直接在 Python 里调本函数也走同一口径，绝不出现两套语义。
 
     ⚠️ 查重（`find_analyze_duplicate`）**必须在调模型/调搜索之前**跑：命中时抛
     `DuplicateSubmission` / `BadOverwrite`，一个额度都不花 —— 这是本功能的全部意义。
@@ -819,6 +902,8 @@ def do_analyze(jd_text, image_data_url, resume_name, link="", overwrite_id="", a
     jd_text = (jd_text or "").strip()
     link = (link or "").strip()
     overwrite_id = str(overwrite_id or "").strip()
+    allow_duplicate = _as_bool(allow_duplicate)
+    refresh_jd_facts = _as_bool(refresh_jd_facts)
 
     source_bits = []
     if jd_text:
@@ -831,6 +916,9 @@ def do_analyze(jd_text, image_data_url, resume_name, link="", overwrite_id="", a
     log.log_event("analyze.start", resume=resume_name, has_text=bool(jd_text), has_image=bool(image_data_url),
               has_link=bool(link), overwrite=overwrite_id, text_model=cfg["text_model"]["model"],
               vision_model=cfg["vision_model"]["model"])
+    # 本次调用**刚建**的那条 JD 记录（没建就一直是空串）。异常时按孤儿善后：见
+    # `_discard_orphan_jd` —— 它绝不能碰到不是本次建的记录。
+    created_jd_id = ""
     try:
         if not jd_text:
             if image_data_url:
@@ -942,6 +1030,7 @@ def do_analyze(jd_text, image_data_url, resume_name, link="", overwrite_id="", a
         # **合并**（同一 id），`jd_facts`（缓存）与 JD 级展示字段各写各的键，谁也冲不掉谁。
         if jd_base is None:
             jdid.upsert_jd({"id": jd_id, "seq": _seq_of_id(jd_id)})
+            created_jd_id = str(jd_id)      # 这条是**这次调用建的** → 异常时按孤儿善后
 
         # 三级回退（规格 §4）：① 缓存 → ② 该 JD 自己旧报告的播种 → ③ 真算（builder）。
         # 真算那一步（= 206 秒 + 53 次搜索）**只有这一个入口**，所以这是本阶段收益的全部来源。
@@ -957,11 +1046,15 @@ def do_analyze(jd_text, image_data_url, resume_name, link="", overwrite_id="", a
                           nodes=len(know_nodes), source=know_source)
             # 报告里的来源标记（模板 report_template.html 的 knowMetaLine 读它）。
             # `at` 是**这份缓存生成于**（不是「首次生成于」：用户强制刷新后它就是刷新时间）。
-            d["knowledge_meta"] = {
-                "reused": know_source != jdfacts.SOURCE_COMPUTED,
-                "at": str(jdfacts.get(jd_id).get("knowledge_at") or ""),
-                "source": know_source,
-            }
+            # ⚠️ **只透传真字符串**（口径与模板的 `typeof m.at === 'string'` 守卫一致）：`str()`
+            # 一上那道守卫就形同虚设 —— 手改坏的 `knowledge_at: 5`（用户真会改坏这个文件）会渲染
+            # 成「复用该岗位 **5** 生成的那份」，那是句**不真实**的话。非字符串/空 → **不传**
+            # 这个键，模板退回「复用该岗位已缓存的那份」（真话）。
+            meta = {"reused": know_source != jdfacts.SOURCE_COMPUTED, "source": know_source}
+            at = jdfacts.get(jd_id).get("knowledge_at")
+            if isinstance(at, str) and at.strip():
+                meta["at"] = at
+            d["knowledge_meta"] = meta
         except Exception as e:
             # 明确区分「管线失败」与「真的没有知识点」，避免静默变成空模块。
             # 这里也**不写 knowledge_meta**：模板只在有它时才渲染来源那一行，
@@ -1022,6 +1115,11 @@ def do_analyze(jd_text, image_data_url, resume_name, link="", overwrite_id="", a
                   source=jd_rec["source_type"], jd_chars=len(jd_text))
         return fname
     except Exception as e:
+        # 善后：这次调用为挂靠知识地图缓存**先落的那条 JD 记录**，如果后来什么也没落上
+        # （没有 `jd_facts`、也没有分析挂在它下面），就清掉它 —— 否则用户重提同一份 JD 会
+        # 永远 409 且前端没有出口（详见 `_discard_orphan_jd` 的代价说明）。
+        # `created_jd_id` 为空（不是本次建的）时它什么都不做；**绝不**碰已有记录。
+        _discard_orphan_jd(created_jd_id)
         log.log_exc("analyze.error", e, ms=int((time.time() - t_start) * 1000), resume=resume_name,
                 has_text=bool(jd_text), has_image=bool(image_data_url), has_link=bool(link))
         raise
@@ -1843,9 +1941,11 @@ class Handler(BaseHTTPRequestHandler):
                 fname = do_analyze(body.get("jd_text"), body.get("image"),
                                    body.get("resume_name"), body.get("link"),
                                    overwrite_id=body.get("overwrite") or "",
-                                   allow_duplicate=body.get("allow_duplicate"),
+                                   # 两个布尔一律过 `_as_bool`：手写 JSON 里的 `"false"` / `"0"`
+                                   # 绝不能被 `bool()` 当**真**（那会白烧 206 秒 / 悄悄跳过查重）
+                                   allow_duplicate=_as_bool(body.get("allow_duplicate")),
                                    # 用户想更新知识地图时带 true → 忽略缓存重算（透传给 jdfacts.resolve）
-                                   refresh_jd_facts=bool(body.get("refresh_jd_facts")))
+                                   refresh_jd_facts=_as_bool(body.get("refresh_jd_facts")))
                 return self._send(200, {"ok": True, "report": fname})
             except DuplicateSubmission as e:
                 log.log_event("analyze.duplicate", level="warn", job=e.duplicate.get("job_id"),

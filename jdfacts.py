@@ -35,7 +35,8 @@ JD 文本，所以「同一个 JD 只算一次、换简历直接复用」是白�
      `ThreadingHTTPServer` —— 双击 / 双标签页 / 重试都会让两个线程同时看到「没有缓存」。
      等待者**绝不各算一遍**，也不许死等：领导者失败时它自己再算一次。
      单飞登记表由 `_INFLIGHT_LOCK` 护着，**绝不用 `_JD_LOCK` 跨 `builder`**
-     （那会让所有 JD 的写入一起停 206 秒）。
+     （那会让所有 JD 的写入一起停 206 秒）。等待者拿到领导者的结果后按 **`cache`** 报
+     （它没有重新搜索），日志里用 `analyze.knowledge_joined` 分辨「这是等待者」。
 
 数据模型与接口见 `docs/superpowers/specs/2026-10-12-知识地图缓存-design.md` §3 / §5。
 """
@@ -328,7 +329,12 @@ def _compute_once(jd_id, jd_text, cfg, builder, refresh):
             if not nodes:
                 nodes = list(other.nodes or [])   # 空地图（`[]` 不算可用缓存）：结果就是它那份
             log.log_event(EVENT_JOINED, jd=jd_id, nodes=len(nodes), ms=int(waited * 1000))
-            return nodes, other.source
+            # ⚠️ 按**复用**报，不报 `other.source`（产品裁定）：报告里那一行小字的全部意义是
+            # 「**本次有没有重新搜索**」（模板原文：「复用该岗位 <日期> 生成的那份（本次没有
+            # 重新搜索）」）。等待者确实没有重新搜索 —— 它只是在旁边等领导者的那一次。
+            # 报 `computed` 会让用户以为这次又烧了一遍 ~53 次搜索额度，而那正是这一行要传达
+            # 的信息。「这是等待者（不是缓存命中）」由上面的 `analyze.knowledge_joined` 分辨。
+            return nodes, SOURCE_CACHE
 
         result = None
         try:
@@ -360,7 +366,8 @@ def resolve(jd_id, jd_text, cfg, refresh=False, builder=None):
     `knowledge_at` 改成本次时间（用户明确要了一份新的）。
 
     ③ 那一步是**单飞**的：同一个 JD 的并发请求只烧一次（206 秒 + ~53 次搜索额度），
-    等待者拿的正是领导者的结果（`source` 同样是 `computed`）。
+    等待者拿的正是领导者的结果，但按**复用**报（`source="cache"`）—— 它没有重新搜索，
+    报「本次新算」会让用户以为又烧了一遍额度（日志里 `analyze.knowledge_joined` 分辨得出）。
     """
     if jdid.find_jd(jd_id) is None:
         # 身份先校验：否则「强制刷新」会在一个不存在的岗位上空烧 53 次搜索，最后才写盘失败

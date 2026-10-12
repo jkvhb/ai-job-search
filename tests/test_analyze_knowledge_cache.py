@@ -23,6 +23,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -137,6 +138,17 @@ class _AnalyzeCase(IsolatedCase):
         self.assertTrue(isinstance(h._body, dict) and h._body.get("ok"), h._body)
         return h._body["report"]
 
+    def _raw(self, **body):
+        """发一次 `/api/analyze`，**不做任何断言**（失败场景要自己看状态码与 body）。"""
+        payload = {"jd_text": body.pop("jd_text", self.LONG),
+                   "resume_name": self._resume(body.pop("resume_name", self.RESUME)),
+                   "source_type": "粘贴文本"}
+        payload.update(body)
+        raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        return _sandbox_handler("POST", "/api/analyze", raw,
+                                {"Content-Length": str(len(raw)),
+                                 "Content-Type": "application/json; charset=utf-8"})
+
     def _data_of(self, report):
         data = _report_data_on_disk(report)
         self.assertIsInstance(data, dict, "报告 %s 里抽不出 REPORT_DATA" % report)
@@ -228,6 +240,44 @@ class AnalyzeKnowledgeCacheTest(_AnalyzeCase):
         self.assertEqual(meta2["source"], "cache")
         self.assertEqual(meta2["reused"], True)
         self.assertEqual(meta2["at"], CACHE_TIME, "复用时显示的生成时间不是缓存那份的")
+
+    def test_the_at_shape_production_sends_matches_the_template_guard(self):
+        """**生产与测试同一个口径**：报告里的 `at` 要么是真字符串、要么干脆没有。
+
+        为什么必须断在**落盘的那份报告**上：模板里 `typeof m.at === 'string'` 那道守卫只有在
+        生产**不**把 `5` / `{}` 之流 `str()` 成 `"5"` / `"{'a': 1}"` 时才有意义。`str()` 一上，
+        守卫就形同虚设 —— 报告会说出「复用该岗位 **5** 生成的那份」这种**不真实**的话
+        （`tests/...::test_a_cache_meta_without_a_usable_at_still_says_reuse` 喂原始类型，
+        生产到不了那个形状，所以那条测试的不变量在生产里根本不成立）。
+
+        用户手改坏 `jds.json`（`knowledge_at: 5`）是真会发生的：那时生产必须**不送** `at`，
+        由模板退回「复用该岗位已缓存的那份」—— 而不是把 `5` 当日期显示。
+        """
+        with mock.patch("jdfacts._now", return_value=CACHE_TIME):
+            self._inject_builder(_nodes("first"))
+            r1 = self._run()
+        at = self._meta_of(r1).get("at")
+        self.assertTrue(at is None or isinstance(at, str),
+                        "生产送出的 `at` 不是字符串也不是缺失：%r" % (at,))
+        self.assertEqual(at, CACHE_TIME)
+
+        # 手改坏缓存时间戳（用户真会这么干）→ 重分析走复用，`at` 必须**缺失**
+        jd_id = jdid.load_jds()["jds"][0]["id"]
+        facts = dict(jdid.find_jd(jd_id)["jd_facts"])
+        facts["knowledge_at"] = 5
+        jdid.upsert_jd({"id": jd_id, "jd_facts": facts})
+        self._inject_builder(_nodes("绝不该出现"))
+        r2 = self._run(resume="第二版.md", allow_duplicate=True)
+        meta2 = self._meta_of(r2)
+        self.assertEqual(meta2["source"], "cache")
+        self.assertNotIn("at", meta2,
+                         "生产把非字符串的 knowledge_at 送进了报告（模板守卫形同虚设）：%r" % (meta2,))
+        if NODE:      # 没有 Node 的机器上跳过渲染那半句（口径断言上面已经钉过）
+            self.assertEqual(_know_meta_text(self._data_of(r2)),
+                             "📚 知识地图：复用该岗位已缓存的那份（本次没有重新搜索）",
+                             "`5` 被当成日期显示出来了（说了不真实的话）")
+        else:
+            print("  [skip] 本机没有 Node，跳过 `at` 的渲染断言")
 
     def test_seeding_from_the_jds_own_report_does_not_call_the_builder(self):
         """该 JD 已有报告里有知识地图 → 免费播种，builder **0 次**，source == seeded:<报告id>。
@@ -423,6 +473,280 @@ class ResolveOrderTest(_AnalyzeCase):
         self.assertEqual(b.calls, [], "身份都没定下来就真算知识地图了")
 
 
+# ---------------------------------------------------------------- 孤儿 JD（崩溃窗口的善后）
+class AnalyzeOrphanJdTest(_AnalyzeCase):
+    """异常落在「落 `jd/<id>.txt`」与「写 JD 记录」之间时，绝不留下一条卡死用户的孤儿。
+
+    孤儿长这样：`jds.json` 里只有 `id/seq/created_at/updated_at/id_history` —— **没有
+    `jd_facts`**，也**没有任何分析挂在它下面**。它在台账里根本看不见，但 `_similar_saved_jd`
+    会通过盘上那份 `<id>.txt` 命中它（similarity 1.0、`job_title=""`、`score=None`）→
+    用户重提同一份 JD 只会拿到 **409**，而前端**没有** `allow_duplicate` 入口 → 看到
+    「失败：未知错误」且无法继续。提交前同一局面下没有 `jds.json` 记录，重试本可成功。
+
+    善后的代价（**为什么只删「本次刚建、且一无所有」的那一条**）：只删 `jds.json` 里那一条
+    记录，**绝不删任何文件**（用户贴过的原文照旧留在 `jd/` 下）；**绝不动**不是本次刚建的
+    记录，也绝不删「已经有分析挂在下面」的记录 —— 那已经是用户的台账了。孤儿留在盘上的
+    代价只是下一次同 JD 分析会换个新身份（多一份报告），比「用户被卡死」小得多。
+    """
+
+    OTHER = "j-别的岗位"
+    OTHER_TEXT = ("负责线下门店的陈列与库存盘点：每周巡店、核对进销存、"
+                  "输出盘点差异报告并与仓配协同处理异常。")
+
+    def _other_jd(self):
+        """一条**正常的**别的 JD（含分析记录与原文）：清理时一条都不许少。"""
+        jdid.upsert_jd({"id": self.OTHER, "job_title": "陈列盘点", "seq": 7,
+                        "jd_text_file": self.OTHER + ".txt"})
+        store.write_text(store.p_path("jd", self.OTHER + ".txt"), self.OTHER_TEXT)
+        store.upsert_job({"id": "j-别的分析", "jd_id": self.OTHER, "resume": "旧简历",
+                          "score": 60.0, "report": "j-别的分析.html",
+                          "created_at": "2026-10-01 09:00"})
+        return jdid.find_jd(self.OTHER)
+
+    def _crash_while_writing_the_jd_record(self):
+        """在「原文已落盘、JD 记录还没写」那一刻炸 —— 审查者实测的那个窗口。
+
+        **知识地图那一步也失败**（`builder` 抛异常）：这正是审查者实测到的孤儿形状
+        （`id/seq/created_at/updated_at/id_history`，没有 `jd_facts`）。知识地图成功的话记录上
+        会有 `jd_facts` —— 那种按裁定**不删**（不是「什么也没落上」，见 `_discard_orphan_jd`）。
+        """
+        self._patch(app.knowledge, "build_for_jd",
+                    lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("知识地图炸了")))
+        with mock.patch.object(app, "_jd_record_of",
+                               side_effect=RuntimeError("写 JD 记录之前炸了")):
+            h = self._raw()
+        self.assertEqual(h._status, 200, "路由层该把它当普通失败回 200：%r" % (h._body,))
+        self.assertFalse(h._body.get("ok"), h._body)
+        self.assertIn("写 JD 记录之前炸了", str(h._body.get("error")))
+        return h
+
+    def _orphan_id(self):
+        """孤儿那条 JD 的 id。记录清掉之后就只剩事件日志认得它。"""
+        ident = _events("analyze.jd_identity")
+        self.assertEqual(len(ident), 1, "没有 analyze.jd_identity 事件，这条测试没验证到东西")
+        return ident[0]["data"]["jd"]
+
+    def test_the_reviewers_repro_is_exactly_this_shape(self):
+        """先把**审查者实测的那个局面**原样钉住（关掉善后）：孤儿 + 重提 409。
+
+        没有这条，「修好了」就只是一个说法 —— 它同时证明：孤儿真的长成
+        `id/seq/created_at/updated_at/id_history`（没有 `jd_facts`、没有分析），
+        而重提同一份 JD 真的会 409（前端没有 `allow_duplicate` 出口 = 用户被卡死）。
+        """
+        self._other_jd()
+        self._patch(app, "_discard_orphan_jd", lambda jd_id: False)   # 关掉善后，看原始局面
+        self._crash_while_writing_the_jd_record()
+        orphan_id = self._orphan_id()
+        orphan = jdid.find_jd(orphan_id)
+        self.assertIsInstance(orphan, dict, "审查者说的孤儿没复现出来")
+        self.assertEqual(sorted(orphan), ["created_at", "id", "id_history", "seq", "updated_at"],
+                         "孤儿形状与审查者报告的不一样：%r" % (sorted(orphan),))
+        self.assertEqual(orphan["id"], orphan_id)
+        # 重提同一份 JD → 409（命中这个只有原文、没有身份的孤儿）
+        h = self._raw()
+        self.assertEqual(h._status, 409, "重提居然没 409？那这条测试没复现出问题：%r" % (h._body,))
+        self.assertEqual(h._body["duplicate"]["job_id"], orphan_id)
+        self.assertEqual(h._body["duplicate"]["job_title"], "")
+        self.assertIsNone(h._body["duplicate"]["score"])
+
+    def test_a_crash_between_the_text_and_the_record_leaves_no_orphan(self):
+        other = self._other_jd()
+        self._crash_while_writing_the_jd_record()
+        orphan_id = self._orphan_id()
+        self.assertNotEqual(orphan_id, self.OTHER)
+
+        # ① 本次刚建的那条：清干净了
+        self.assertIsNone(jdid.find_jd(orphan_id), "孤儿 JD 记录还在 jds.json 里")
+        cleaned = _events("analyze.jd_orphan_cleaned")
+        self.assertEqual([e["data"]["jd"] for e in cleaned], [orphan_id],
+                         "清理没有留下证据（日志），事后无从查起")
+        # ② 反假绿：**别的 JD 记录一条都没少**（逐字比较整条记录，不只是数个数）
+        self.assertEqual([j["id"] for j in jdid.load_jds()["jds"]], [self.OTHER])
+        self.assertEqual(_jdump(jdid.find_jd(self.OTHER)), _jdump(other))
+        self.assertEqual([j["id"] for j in store.load_jobs()], ["j-别的分析"])
+        # ③ 「绝不删文件」：只删 `jds.json` 里那一条，用户的原文照旧在盘上
+        self.assertTrue(os.path.exists(os.path.join(store.p_path("jd"), orphan_id + ".txt")),
+                        "清理孤儿时把用户的原文文件删了")
+
+    def test_the_same_jd_can_be_submitted_again_after_the_crash(self):
+        """**用户可见的效果**：修掉之后重提同一份 JD **不再 409**，而是照常重新分析。"""
+        self._other_jd()
+        self._crash_while_writing_the_jd_record()
+        b = self._inject_builder(_nodes("second"))
+        report = self._run()                       # `_run` 自己断言 200 + ok（409 会在这里红）
+        self.assertEqual(len(b.calls), 1, "重提没有真的重新跑一次分析")
+        self.assertEqual(_jdump(self._data_of(report)["knowledge"]), _jdump(_nodes("second")))
+        self.assertEqual(len(jdid.load_jds()["jds"]), 2, "别的岗位 + 这次新建的，一条都不能少")
+
+    def test_an_existing_jd_record_is_never_touched(self):
+        """**绝不动不是本次刚建的记录**：重提一个已有 JD 时炸在同一个窗口 → 它原样保留。"""
+        jdid.upsert_jd({"id": JD_A, "job_title": "语音数据质检", "seq": 3,
+                        "jd_text_file": JD_A + ".txt"})
+        store.write_text(store.p_path("jd", JD_A + ".txt"), self.LONG)
+        store.upsert_job({"id": "j-旧分析", "jd_id": JD_A, "resume": "旧简历", "score": 75.0,
+                          "report": "j-旧分析.html", "created_at": "2026-10-03 00:30"})
+        before = jdid.find_jd(JD_A)
+        self._inject_builder(_nodes("已有岗位的新分析"))
+        with mock.patch.object(app, "_jd_record_of", side_effect=RuntimeError("炸在写记录之前")):
+            h = self._raw(allow_duplicate=True)     # 命中相似 JD：不带它会在查重那一步先 409
+        self.assertEqual(h._status, 200)
+        self.assertFalse(h._body.get("ok"), h._body)
+
+        after = jdid.find_jd(JD_A)
+        self.assertIsNotNone(after, "本次**没有**新建 JD，却把已有那条记录删了")
+        self.assertEqual(after["job_title"], "语音数据质检")
+        self.assertEqual(after["jd_text_file"], JD_A + ".txt")
+        self.assertEqual(_jdump(after.get("id_history")), _jdump(before.get("id_history")))
+        self.assertEqual([j["id"] for j in jdid.analyses_of(JD_A)], ["j-旧分析"])
+        self.assertEqual(_events("analyze.jd_orphan_cleaned"), [],
+                         "清掉了不是本次刚建的记录")
+
+    def test_a_pre_existing_empty_jd_record_is_never_touched(self):
+        """**绝不动不是本次刚建的记录**：判据只能是「这条 id 是本次这次调用建的吗」。
+
+        一条已经存在、同样没有 `jd_facts`、也没有分析的 JD 记录（迁移残留 / 用户手建的）
+        在**同一个崩溃窗口**里必须原样保留 —— 否则「看起来像孤儿就删」会把用户的记录删掉。
+        """
+        jdid.upsert_jd({"id": JD_B, "seq": 9, "job_title": "", "jd_text_file": JD_B + ".txt"})
+        store.write_text(store.p_path("jd", JD_B + ".txt"), self.LONG)   # 相似度 1.0 → 复用它
+        before = jdid.find_jd(JD_B)
+        self.assertFalse(before.get("jd_facts"), "这条记录居然有 jd_facts（没测到该测的东西）")
+        self.assertEqual(jdid.analyses_of(JD_B), [])
+        self._patch(app.knowledge, "build_for_jd",
+                    lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("知识地图炸了")))
+        with mock.patch.object(app, "_jd_record_of", side_effect=RuntimeError("炸在写记录之前")):
+            h = self._raw(allow_duplicate=True)      # 命中已有 JD_B → 走复用分支（不是本次建的）
+        self.assertEqual(h._status, 200)
+        self.assertFalse(h._body.get("ok"), h._body)
+
+        after = jdid.find_jd(JD_B)
+        self.assertIsNotNone(after, "把一条不是本次刚建的记录当成孤儿删了")
+        self.assertEqual(_jdump(after), _jdump(before))
+        self.assertEqual(_events("analyze.jd_orphan_cleaned"), [])
+
+    def test_a_fresh_jd_with_an_analysis_on_it_is_kept_even_without_facts(self):
+        """守卫②：本次刚建、**已经有分析挂在它下面**的记录绝不删（那已经是用户的台账了）。"""
+        self._patch(app.knowledge, "build_for_jd",
+                    lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("知识地图炸了")))
+        real_save = app._save_analysis
+
+        def save_then_boom(rec, key=None):
+            real_save(rec, key)                 # 分析记录**真的写下去了**，然后才炸
+            raise RuntimeError("分析记录写完之后炸了")
+
+        self._patch(app, "_save_analysis", save_then_boom)
+        h = self._raw()
+        self.assertEqual(h._status, 200)
+        self.assertFalse(h._body.get("ok"), h._body)
+
+        jds = jdid.load_jds()["jds"]
+        self.assertEqual(len(jds), 1, "把一条已经有分析挂着的 JD 记录删了")
+        self.assertFalse(jds[0].get("jd_facts"), "这条记录居然有 jd_facts（没测到守卫②）")
+        self.assertEqual(len(jdid.analyses_of(jds[0]["id"])), 1)
+        self.assertEqual(_events("analyze.jd_orphan_cleaned"), [])
+
+
+# ---------------------------------------------------------------- 并发：等待者按「复用」报
+class AnalyzeConcurrentKnowledgeTest(_AnalyzeCase):
+    """父亲的裁定：并发的第二个请求**等**领导者的那 206 秒（额度只烧一次），
+    而它报告的那一行必须说「复用…（本次没有重新搜索）」—— 它确实没有重新搜索。
+
+    为什么要在 `/api/analyze` 这一层再测一遍（`jdfacts` 那层已经测过等待者的返回值）：
+    报告里那行小字读的是 `knowledge_meta`，它是**路由层**用
+    `source != SOURCE_COMPUTED` 算出来的 —— jdfacts 返回什么，用户就看到什么。
+
+    两次请求的分析结果只差 `score` → 报告文件名不同。同分同标题的话第二份报告会覆盖第一份，
+    「第二个请求的报告」读出来可能是任意一份（那是真正的假绿）。
+    """
+
+    def _prime(self):
+        """先跑一次把 JD 身份 + 原文 + 一条分析落好；知识地图**故意算成空的**。
+
+        空列表既不算可用缓存（`_as_nodes([]) or None`），也播种不出东西（`if not nodes:
+        continue`）—— 于是并发那两个请求必然走到 ③ 真算（单飞那一步）。用一份非空地图的话，
+        第二个请求会从「该 JD 自己的报告」里**播种**成功，单飞根本不会被碰到（这是假绿）。
+        """
+        self._inject_builder([])
+        self._run(resume="第零版.md")
+        jd_id = jdid.load_jds()["jds"][0]["id"]
+        self.assertIsNone(jdfacts.knowledge_of(jd_id),
+                          "缓存还在：两个请求都会走缓存，这条测试就看不到单飞")
+        self.assertEqual(_events("analyze.knowledge_seeded"), [],
+                         "播种成功了：两个请求根本不会被单飞拦住")
+        return jd_id
+
+    def _score_by_resume(self):
+        def fake_llm(base_url, api_key, model, messages, json_mode=False, **kw):
+            score = 80.0 if "第二版" in messages[-1]["content"] else 91.5
+            return json.dumps({"job_title": "语音数据质检", "score": score, "company": "",
+                               "verdict": "建议投递", "job_category": "数据标注/质检",
+                               "location": "北京", "salary": "13-26K",
+                               "scores": [{"name": "匹配度", "score": score, "weight": 10}]},
+                              ensure_ascii=False)
+        self._patch(app.llm, "call_openai_compatible", fake_llm)
+
+    def test_the_second_concurrent_request_reports_reuse_and_logs_the_join(self):
+        jd_id = self._prime()
+        store.write_text(log.LOG_FILE, "")           # 只断并发这一段的事件
+        entered, release, waiting = threading.Event(), threading.Event(), threading.Event()
+        calls = []
+
+        def builder(jd_text, cfg):
+            calls.append(threading.current_thread().name)
+            entered.set()
+            self.assertTrue(release.wait(30), "测试自己没放行 builder")
+            return json.loads(json.dumps(_nodes("once"), ensure_ascii=False))
+
+        self._patch(app.knowledge, "build_for_jd", builder)
+        self._score_by_resume()
+        results, errors = {}, {}
+
+        def worker(name, resume):
+            try:
+                results[name] = self._raw(resume_name=resume, allow_duplicate=True)
+            except BaseException as e:                # noqa: BLE001 - 线程里的异常要能被断言看到
+                errors[name] = e
+
+        real_join = jdfacts._join_inflight
+
+        def watch_join(flight):
+            waiting.set()
+            return real_join(flight)
+
+        with mock.patch.object(jdfacts, "_join_inflight", watch_join):
+            t1 = threading.Thread(target=worker, args=("first", "第一版.md"), name="first")
+            t1.start()
+            self.assertTrue(entered.wait(30), "第一个请求没进 builder：%r / %r" % (errors, results))
+            t2 = threading.Thread(target=worker, args=("second", "第二版.md"), name="second")
+            t2.start()
+            self.assertTrue(waiting.wait(30), "第二个请求没有进入单飞等待（它自己又去算了一遍）")
+            release.set()
+            t1.join(60)
+            t2.join(60)
+        self.assertFalse(t1.is_alive() or t2.is_alive(), "有请求没跑完（死等）")
+        self.assertEqual(errors, {})
+        self.assertEqual(calls, ["first"], "同一个 JD 被真算了 %d 次" % len(calls))
+
+        h1, h2 = results["first"], results["second"]
+        self.assertEqual((h1._status, h2._status), (200, 200), (h1._body, h2._body))
+        self.assertTrue(h1._body.get("ok") and h2._body.get("ok"), (h1._body, h2._body))
+        r1, r2 = h1._body["report"], h2._body["report"]
+        self.assertNotEqual(r1, r2, "两个请求写出了同一份报告，读回来的可能不是各自那份")
+        meta1, meta2 = self._meta_of(r1), self._meta_of(r2)
+        self.assertEqual((meta1["source"], meta1["reused"]), ("computed", False))
+        # ★ 等待者：它确实没有重新搜索 → 必须按**复用**报（写「本次新算」会让用户以为烧了两次额度）
+        self.assertEqual((meta2["source"], meta2["reused"]), ("cache", True),
+                         "等待者被报成了「本次新算」：%r" % (meta2,))
+        self.assertEqual(_jdump(self._data_of(r2)["knowledge"]), _jdump(_nodes("once")))
+        # 日志里仍然分辨得出「这是等待者」（不是缓存命中）
+        joined = _events("analyze.knowledge_joined")
+        self.assertEqual(len(joined), 1, "等待者没留下 knowledge_joined（分不清等来的还是缓存）")
+        self.assertEqual(joined[0]["data"]["jd"], jd_id)
+        self.assertEqual(len(_events("analyze.knowledge_computed")), 1)
+        self.assertEqual(len(_events("analyze.knowledge_reused")), 0,
+                         "等待者走的是单飞等待，不该记成缓存命中")
+
+
 # ---------------------------------------------------------------- 模板：Node 探针
 NODE = shutil.which("node")
 
@@ -611,8 +935,14 @@ class KnowledgeMetaTemplateTest(IsolatedCase):
         self.assertNotIn("<b>", got)
 
     def test_a_cache_meta_without_a_usable_at_still_says_reuse(self):
-        """`at` 缺失/垃圾时**不能显示错话**（不能说「复用 X 生成的那份」而 X 是空的）。"""
-        for at in (None, "", "   ", 5, []):
+        """`at` 缺失/垃圾时**不能显示错话**（不能说「复用 X 生成的那份」而 X 是空的）。
+
+        这条是**模板自己的**脏数据防线（手改坏的 `jds.json` / 旧报告里什么都可能有），
+        不是「生产会送出这些形状」的断言：生产只送真字符串或不送 `at`
+        （见 `AnalyzeKnowledgeCacheTest.test_the_at_shape_production_sends_matches_the_template_guard`）。
+        所以这里喂原始 JSON 类型是有意的 —— 模板必须自己扛住 `5` / `[]` / `"   "`。
+        """
+        for at in (None, "", "   ", 5, [], {}, True):
             with self.subTest(at=at):
                 got = self._html({"reused": True, "at": at, "source": "cache"})
                 self.assertIsNotNone(got)
