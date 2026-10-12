@@ -139,6 +139,8 @@
   .klegend span{display:flex;align-items:center;gap:5px}
   .klegend i{width:11px;height:11px;border-radius:50%;display:inline-block}
   .klegend i.ring{background:#fff;border:3px solid var(--line);width:13px;height:13px}
+  /* 知识地图来源标记（复用/新算）：一行小字，就在那一段卡片上方 */
+  .know-meta{font-size:12px;color:var(--muted);margin:0 0 7px 2px}
   .klmeta{font-size:12.5px;color:var(--muted);margin-bottom:10px}
   .klist{display:flex;flex-direction:column;gap:10px;max-height:520px;overflow:auto;padding-right:4px}
   .klgrp{border:1px solid var(--line);border-radius:10px;padding:10px 12px;background:#fcfdff}
@@ -378,6 +380,33 @@ let kView = 'card';        // 'card' | 'list' | 'graph'
 
 function kNode(id){ return KNOW.find(n => n.id === id); }
 
+/* 知识地图的来源标记（阶段 4B）：只在**有来源可报**时渲染那一行小字。
+   缺失 / 垃圾一律回空 —— 老报告（快照里根本没有 knowledge_meta）绝不能因此崩，
+   更不能凭空显示一句「复用/新算」的谎。`at` 是**这份缓存生成于**（不是「首次生成于」：
+   用户强制刷新之后它就是刷新时间）。所有字段过 esc()。 */
+function knowMetaLine(){
+  const m = (REPORT_DATA && REPORT_DATA.knowledge_meta) || null;
+  if(!m || typeof m !== 'object' || Array.isArray(m)) return '';
+  const src = (typeof m.source === 'string') ? m.source : '';
+  if(!src) return '';
+  let text;
+  if(src === 'cache'){
+    const raw = (typeof m.at === 'string') ? m.at.trim() : '';
+    // 只显示日期那一段（缓存时间戳是 "2026-10-03 00:35"）；形状不对就整串照显示，
+    // 绝不猜一个「看起来像日期」的东西出来。两种情形都过 esc()。
+    const at = /^\d{4}-\d{2}-\d{2} /.test(raw) ? raw.slice(0, 10) : raw;
+    text = at ? ('📚 知识地图：复用该岗位 '+esc(at)+' 生成的那份（本次没有重新搜索）')
+              : '📚 知识地图：复用该岗位已缓存的那份（本次没有重新搜索）';
+  } else if(src.indexOf('seeded:') === 0){
+    text = '📚 知识地图：复用该岗位已有报告里的那份（本次没有重新搜索）';
+  } else if(src === 'computed'){
+    text = '📚 知识地图：本次新算';
+  } else {
+    return '';
+  }
+  return '<div class="know-meta" id="knowMeta">'+text+'</div>';
+}
+
 function renderKnowledge(){
   const err = (REPORT_DATA && REPORT_DATA.knowledge_error) || '';
   if(!KNOW.length){
@@ -386,7 +415,7 @@ function renderKnowledge(){
                 '<div class="note">⚠️ 知识地图生成失败：'+esc(err)+'</div>', 'knowledge');
   }
   if(!kStack.length) kStack = [KNOW[0].id];
-  return card('📚','知识学习地图',
+  return knowMetaLine() + card('📚','知识学习地图',
               '<div id="knowBox">'+knowInner()+'</div>', 'knowledge');
 }
 

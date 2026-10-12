@@ -21,6 +21,7 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, unquote, quote
 
+import jdfacts
 import jdid
 import jobdup
 import kb
@@ -799,10 +800,14 @@ def save_jd_source(job_id, jd_text, image_data_url):
     return jd_text_file, jd_image_url
 
 
-def do_analyze(jd_text, image_data_url, resume_name, link="", overwrite_id="", allow_duplicate=False):
+def do_analyze(jd_text, image_data_url, resume_name, link="", overwrite_id="", allow_duplicate=False,
+               refresh_jd_facts=False):
     """跑一次 JD 分析并出报告。`overwrite_id` 非空 = 「覆盖」：结果写回那条已有记录。
 
     `allow_duplicate` 为真 = 用户已在查重提示里选过「仍然新建」→ **跳过查重**，照常新建。
+
+    `refresh_jd_facts` 为真 = 用户要求**重算 JD 级事实**（目前只有知识地图）→ 忽略缓存
+    （`jdfacts.resolve(..., refresh=True)`）。不传 = 有缓存就复用（这是本阶段的全部收益）。
 
     ⚠️ 查重（`find_analyze_duplicate`）**必须在调模型/调搜索之前**跑：命中时抛
     `DuplicateSubmission` / `BadOverwrite`，一个额度都不花 —— 这是本功能的全部意义。
@@ -902,19 +907,6 @@ def do_analyze(jd_text, image_data_url, resume_name, link="", overwrite_id="", a
             raise RuntimeError("模型返回的 JSON 无法解析，自动修复也未成功：%s" % last_err)
         d = normalize(data, resume_name, " + ".join(source_bits) or "文本输入")
 
-        # ---- 知识学习地图（阶段 1）----
-        know_nodes = []
-        try:
-            _t = time.time()
-            know_nodes = knowledge.build_for_jd(jd_text, cfg)
-            log.log_event("analyze.knowledge_done", ms=int((time.time() - _t) * 1000),
-                          nodes=len(know_nodes))
-        except Exception as e:
-            # 明确区分「管线失败」与「真的没有知识点」，避免静默变成空模块
-            log.log_exc("analyze.knowledge_error", e)
-            d["knowledge_error"] = str(e)
-        d["knowledge"] = know_nodes
-
         # ---- JD 稳定身份（阶段 4A）：分析挂在 JD 下，不再挂在报告文件名下 ----
         # 顺序是契约的一部分：**先定 JD 身份（可能复用已有 JD），再出报告、再写记录** ——
         # `jobs.json` 里的 `jd_id` 必须指向一条已存在的 JD（绝不写悬空引用）。
@@ -941,6 +933,42 @@ def do_analyze(jd_text, image_data_url, resume_name, link="", overwrite_id="", a
             raise RuntimeError("无法为这次分析确定 JD 身份")
         log.log_event("analyze.jd_identity", jd=jd_id, reused=jd_base is not None,
                       similarity=round(jd_hit[1], 4) if jd_hit else 0)
+
+        # ---- 知识学习地图（阶段 1 + 阶段 4B：按 JD 缓存，同一岗位只真算一次）----
+        # ⚠️ **位置是契约**：必须在「定 JD 身份」**之后**。`jdfacts.resolve` 对不存在的 JD
+        # 抛 `LookupError`（在真算之前 —— 否则强制刷新会在一个不存在的岗位上空烧 53 次搜索），
+        # 而缓存只能挂在一条真的 JD 记录上。新建 JD 时盘上那条记录还不存在（`next_seq()` 只推
+        # 编号、`upsert_jd` 在报告之后），所以这里先落一次身份 —— 后来的那次 `upsert_jd` 是
+        # **合并**（同一 id），`jd_facts`（缓存）与 JD 级展示字段各写各的键，谁也冲不掉谁。
+        if jd_base is None:
+            jdid.upsert_jd({"id": jd_id, "seq": _seq_of_id(jd_id)})
+
+        # 三级回退（规格 §4）：① 缓存 → ② 该 JD 自己旧报告的播种 → ③ 真算（builder）。
+        # 真算那一步（= 206 秒 + 53 次搜索）**只有这一个入口**，所以这是本阶段收益的全部来源。
+        know_nodes = []
+        try:
+            _t = time.time()
+            know_nodes, know_source = jdfacts.resolve(
+                jd_id, jd_text, cfg, refresh=refresh_jd_facts,
+                builder=knowledge.build_for_jd)
+            # 「复用/播种/真算」各自的事件由 jdfacts 记（analyze.knowledge_reused / _seeded /
+            # _computed）；这一条留着是为了**耗时**（复用时应接近 0，真算时 206 秒）。
+            log.log_event("analyze.knowledge_done", ms=int((time.time() - _t) * 1000),
+                          nodes=len(know_nodes), source=know_source)
+            # 报告里的来源标记（模板 report_template.html 的 knowMetaLine 读它）。
+            # `at` 是**这份缓存生成于**（不是「首次生成于」：用户强制刷新后它就是刷新时间）。
+            d["knowledge_meta"] = {
+                "reused": know_source != jdfacts.SOURCE_COMPUTED,
+                "at": str(jdfacts.get(jd_id).get("knowledge_at") or ""),
+                "source": know_source,
+            }
+        except Exception as e:
+            # 明确区分「管线失败」与「真的没有知识点」，避免静默变成空模块。
+            # 这里也**不写 knowledge_meta**：模板只在有它时才渲染来源那一行，
+            # 「没有地图」时绝不显示一句「复用/新算」的谎。
+            log.log_exc("analyze.knowledge_error", e)
+            d["knowledge_error"] = str(e)
+        d["knowledge"] = know_nodes
 
         # 覆盖时必须用**固定文件名**（fixed_id = 原 id）：报告文件名与岗位 id 都不变。
         # 走的是与示例报告同一条「固定文件名」路径 —— 不另写一份写盘逻辑（否则两处迟早分叉）。
@@ -1815,7 +1843,9 @@ class Handler(BaseHTTPRequestHandler):
                 fname = do_analyze(body.get("jd_text"), body.get("image"),
                                    body.get("resume_name"), body.get("link"),
                                    overwrite_id=body.get("overwrite") or "",
-                                   allow_duplicate=body.get("allow_duplicate"))
+                                   allow_duplicate=body.get("allow_duplicate"),
+                                   # 用户想更新知识地图时带 true → 忽略缓存重算（透传给 jdfacts.resolve）
+                                   refresh_jd_facts=bool(body.get("refresh_jd_facts")))
                 return self._send(200, {"ok": True, "report": fname})
             except DuplicateSubmission as e:
                 log.log_event("analyze.duplicate", level="warn", job=e.duplicate.get("job_id"),
