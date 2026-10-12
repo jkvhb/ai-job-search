@@ -1,0 +1,521 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>__TITLE__</title>
+<style>
+  :root{
+    --bg:#f4f6fb; --card:#fff; --line:#e5e9f2; --ink:#1a2233; --sub:#6b7488; --muted:#9aa3b5;
+    --accent:#2563eb; --accent-soft:#eef3ff; --green:#16a34a; --green-soft:#e9f9ef;
+    --amber:#d97706; --amber-soft:#fdf3e3; --red:#dc2626; --red-soft:#fdeaea;
+    --violet:#7c3aed; --violet-soft:#f5f3ff;
+    --radius:14px; --shadow:0 1px 3px rgba(16,24,40,.06),0 8px 24px rgba(16,24,40,.05);
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html{scroll-behavior:smooth}
+  body{background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;line-height:1.65;padding:26px 16px;-webkit-font-smoothing:antialiased}
+  .wrap{max-width:880px;margin:0 auto}
+  /* 工具栏 */
+  .toolbar{display:flex;align-items:center;gap:10px;margin-bottom:14px;flex-wrap:wrap}
+  .toolbar button{background:var(--card);color:var(--ink);border:1px solid var(--line);border-radius:9px;padding:8px 14px;font-size:13.5px;cursor:pointer;font-weight:600;box-shadow:0 1px 2px rgba(16,24,40,.04);transition:.15s;font-family:inherit}
+  .toolbar button:hover{border-color:var(--accent);color:var(--accent)}
+  .toolbar .hint{font-size:12px;color:var(--muted);margin-left:auto}
+  .offline{display:none;background:var(--amber-soft);border:1px solid #f3d9a4;color:#92400e;border-radius:10px;padding:9px 14px;font-size:13px;font-weight:600;margin-bottom:14px}
+  /* 目录 */
+  .toc{position:sticky;top:8px;z-index:50;display:flex;gap:6px;flex-wrap:wrap;background:linear-gradient(135deg,#f0fdfa,#effcfb);backdrop-filter:blur(10px);border:1px solid #c9ece6;border-radius:12px;padding:9px 11px;margin-bottom:16px;box-shadow:0 2px 10px rgba(13,148,136,.10)}
+  .toc a{font-size:12.6px;color:#0f766e;text-decoration:none;padding:5px 11px;border-radius:8px;font-weight:600;white-space:nowrap;transition:.15s;cursor:pointer}
+  .toc a:hover{background:#ccfbf1;color:#0f766e}
+  .toc a.active{background:#0d9488;color:#fff;box-shadow:0 2px 6px rgba(13,148,136,.28)}
+  .toc .top{margin-left:auto;color:#4ba69d;font-weight:600}
+  /* 页头 */
+  .hero{background:linear-gradient(135deg,#0f766e 0%,#2563eb 100%);color:#fff;border-radius:var(--radius);padding:30px 34px;box-shadow:var(--shadow);margin-bottom:18px}
+  .hero .kicker{font-size:12.5px;letter-spacing:.5px;opacity:.85;margin-bottom:9px}
+  .hero h1{font-size:28px;font-weight:700;margin-bottom:10px}
+  .hero .tags{display:flex;flex-wrap:wrap;gap:8px;margin-top:6px}
+  .hero .tags span{background:rgba(255,255,255,.16);border:1px solid rgba(255,255,255,.22);padding:3px 12px;border-radius:999px;font-size:12.5px}
+  .hero .meta-line{margin-top:14px;font-size:12.5px;opacity:.82}
+  /* 卡片 */
+  .card{background:var(--card);border-radius:var(--radius);box-shadow:var(--shadow);padding:24px 26px;margin-bottom:16px;border:1px solid var(--line);border-top:3px solid var(--c,var(--line));scroll-margin-top:74px}
+  .card h2{font-size:17.5px;font-weight:700;margin-bottom:15px;display:flex;align-items:center;gap:10px;padding-bottom:10px;border-bottom:1px solid var(--line)}
+  .card h2 .num{display:inline-flex;align-items:center;justify-content:center;width:26px;height:26px;background:var(--cbg,var(--accent-soft));color:var(--c,var(--accent));border-radius:8px;font-size:12.5px;font-weight:700;flex:none}
+  .card h3{font-size:14.5px;font-weight:700;margin:17px 0 9px}
+  .card p{color:var(--sub);font-size:13.8px;margin-bottom:7px}
+  .m-mine{--c:#0891b2;--cbg:#ecfeff}
+  .m-degraded{--c:#d97706;--cbg:#fdf3e3}
+  .m-verdict{--c:#2563eb;--cbg:#eef3ff}
+  .m-reasons{--c:#7c3aed;--cbg:#f5f3ff}
+  .m-notcontrollable{--c:#64748b;--cbg:#f1f5f9}
+  .m-actions{--c:#059669;--cbg:#ecfdf5}
+  .m-study{--c:#10b981;--cbg:#ecfdf5}
+  .m-next{--c:#0d9488;--cbg:#f0fdfa}
+  .m-basis{--c:#475569;--cbg:#f1f5f9}
+  /* 标签 */
+  .pill{display:inline-block;padding:2px 10px;border-radius:999px;font-size:11.8px;font-weight:600;white-space:nowrap}
+  .ok{background:var(--green-soft);color:var(--green)} .warn{background:var(--amber-soft);color:var(--amber)}
+  .bad{background:var(--red-soft);color:var(--red)} .info{background:var(--accent-soft);color:var(--accent)}
+  .pill.gray{background:#eef1f6;color:#5b6577}
+  .pill.violet{background:var(--violet-soft);color:var(--violet)}
+  /* 你写的原因 */
+  .mine{background:#ecfeff;border-left:4px solid #0891b2;border-radius:8px;padding:14px 18px;font-size:14.6px;color:var(--ink);white-space:pre-wrap;word-break:break-word}
+  .mine.empty{background:#f7f8fb;border-left-color:#cbd5e1;color:var(--muted);font-style:normal}
+  .summary{background:var(--accent-soft);border-left:4px solid var(--accent);border-radius:8px;padding:14px 18px;font-size:14.2px;color:var(--ink);white-space:pre-wrap}
+  .note{background:#fffaf0;border:1px solid #f3e3bb;color:#8a6d1a;border-radius:8px;padding:10px 14px;font-size:12.8px;margin:11px 0}
+  /* 可能原因 */
+  .reason{border:1px solid var(--line);border-left:3px solid var(--c,var(--accent));border-radius:10px;padding:13px 16px;margin-bottom:11px;background:#fcfdff}
+  .reason .rh{display:flex;align-items:flex-start;gap:9px;flex-wrap:wrap}
+  .reason .rt{font-size:14.5px;font-weight:700;color:var(--ink);flex:1;min-width:200px}
+  .reason .evi{margin-top:9px;background:#f5f7fc;border-left:3px solid #c7d2fe;border-radius:7px;padding:8px 12px;font-size:12.9px;color:#3f4a63;white-space:pre-wrap;word-break:break-word}
+  .reason .evi b{color:#334155}
+  /* 不可控 / 列表 */
+  ul,ol{margin:5px 0 5px 2px;padding-left:20px}
+  li{font-size:13.6px;color:var(--sub);margin-bottom:5px}
+  li b{color:var(--ink)}
+  /* 改进动作（按 area 分组） */
+  .act{border:1px solid var(--line);border-radius:10px;padding:12px 15px;margin-bottom:10px;background:#fcfdff}
+  .act .at{font-size:14px;font-weight:600;color:var(--ink)}
+  .act .aw{font-size:12.6px;color:var(--muted);margin-top:6px}
+  /* 要补的知识点 */
+  .term{border:1px solid var(--line);border-radius:10px;padding:12px 15px;margin-bottom:10px;background:#fcfdff}
+  .term .th{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .term .tt{font-size:14.5px;font-weight:700;color:var(--ink)}
+  .term .td{font-size:13.4px;color:var(--sub);margin-top:7px}
+  .term .tw{font-size:12.3px;color:var(--muted);margin-top:5px}
+  .kbadd{font-family:inherit;font-size:12.5px;font-weight:700;color:#065f46;background:var(--green-soft);border:1px solid #b7e4c7;border-radius:8px;padding:5px 12px;cursor:pointer;transition:.15s;white-space:nowrap}
+  .kbadd:hover:not(:disabled){background:#d1fae5;border-color:var(--green)}
+  .kbadd:disabled{cursor:default;opacity:.85;color:var(--muted);background:#f1f5f9;border-color:var(--line)}
+  .kbadd.done{color:var(--green);background:var(--green-soft);border-color:#b7e4c7;opacity:1}
+  .kbhint{font-size:12.2px;color:var(--muted);margin-top:9px}
+  /* 下次怎么调 */
+  .nextc{background:#f0fdfa;border-left:4px solid #0d9488;border-radius:8px;padding:14px 18px;font-size:14px;color:var(--ink);white-space:pre-wrap}
+  /* 折叠 */
+  details{border:1px solid var(--line);border-radius:10px;margin:8px 0;background:#fcfdff;overflow:hidden}
+  details summary{padding:11px 14px;cursor:pointer;font-size:13.8px;font-weight:600;display:flex;align-items:center;gap:9px;list-style:none}
+  details summary::-webkit-details-marker{display:none}
+  details summary::before{content:"▸";color:var(--c,var(--accent));font-size:12px;transition:.2s}
+  details[open] summary::before{transform:rotate(90deg)}
+  details .body{padding:11px 15px 13px 36px;font-size:13.4px;color:var(--sub);border-top:1px dashed var(--line);margin-top:2px}
+  details .body h4{font-size:13.2px;font-weight:700;color:var(--ink);margin:10px 0 5px}
+  pre.trtext{white-space:pre-wrap;word-break:break-word;font-family:inherit;font-size:13.1px;color:var(--sub);max-height:420px;overflow:auto;border-top:1px dashed var(--line);padding:12px 15px;line-height:1.75}
+  footer{text-align:center;color:var(--muted);font-size:12px;padding:12px 0 28px}
+  @media print{
+    body{background:#fff;padding:0}
+    .toolbar{display:none}
+    .toc{display:none}
+    .card,.hero{box-shadow:none;border:1px solid #ddd;break-inside:avoid}
+    /* 打印时去掉「加入知识库」按钮（纸面上点不了），但状态是「已加入」的保留成一行字 */
+    .kbadd{display:none !important}
+    .kbadd.done{display:block !important;border:none;background:none;padding:0}
+    details{border-color:#ddd;break-inside:avoid}
+    details > summary{display:none}
+    details > .body,details > pre.trtext{display:block !important;max-height:none;overflow:visible}
+  }
+  @media (max-width:640px){.hero h1{font-size:22px}.toc .top{display:none}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="toolbar">
+    <button onclick="window.print()">📤 导出 PDF</button>
+    <button onclick="toggleAll(true)">展开全部</button>
+    <button onclick="toggleAll(false)">收起全部</button>
+    <span class="hint" id="hint">这份复盘由本机模型生成；「加入知识库」需要工具在运行</span>
+  </div>
+  <div class="offline" id="offline" style="display:none"></div>
+  <header class="hero" id="hero"></header>
+  <nav class="toc" id="toc"></nav>
+  <main id="main"></main>
+  <footer id="foot"></footer>
+</div>
+<script>
+/* 结果复盘报告（kind="outcome"）。数据由 app._render_report_page 注入（与 JD / 面试复盘同一套约定：
+   __TITLE__ 占位 + REPORT_DATA 赋值），模板自包含、零外部资源。
+
+   ⚠️ 这份模板里区分「人说的」与「机器猜的」是底线：
+     * `data.outcome_reason`（**数据顶层**，由 outcome.render_report 从台账补齐）= 用户原话，排在最前；
+     * `data.outcome_ai.*` = AI 推断，一律标注来源，绝不和用户的话混在一段里；
+     * `outcome_reason` 绝不会被复制进 outcome_ai（Python 侧保证），模板也不去 AI 段里找它。
+   ⚠️ 别在任何注释/文案里再抄一遍那行赋值的前缀（把它当普通文字写出来也不行）：
+   kb.read_report_data 取的是**第一次**出现的位置，多一处就会让所有报告的快照都读不出来。 */
+const REPORT_DATA = __REPORT_DATA__;
+const KB_API = '/api/knowledge/add';
+const OFFLINE_KB_MSG = '未连接到工具，无法入库';
+const OFFLINE_BANNER = '⚠️ 未连接到工具，无法入库 —— 请从工具里打开这份报告（或在能访问 127.0.0.1 的浏览器里打开）。';
+let HINT_TEXT = '这份复盘由本机模型生成；「加入知识库」需要工具在运行';
+
+function esc(s){
+  return String(s==null?'':s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+function flash(msg, bad){
+  const h = document.getElementById('hint'); if(!h) return;
+  h.textContent = msg || '已保存 ✓';
+  h.style.color = bad ? 'var(--red)' : 'var(--green)';
+  clearTimeout(window.__ft);
+  window.__ft = setTimeout(()=>{ h.textContent = HINT_TEXT; h.style.color=''; }, 2400);
+}
+function showOffline(msg){
+  const el = document.getElementById('offline');
+  if(el){ el.textContent = msg || OFFLINE_BANNER; el.style.display = 'block'; }
+}
+function toggleAll(open){
+  document.querySelectorAll('#main details').forEach(d => { d.open = open; });
+}
+function isFileProtocol(){
+  try { return String((window.location && window.location.protocol) || '') === 'file:'; }
+  catch(e){ return false; }
+}
+/* 注入的字符串全部来自模型：数值先归一，文本一律 esc()，绝不直接拼。 */
+function num(v, dflt){
+  const n = Number(v);
+  return isFinite(n) ? n : (dflt==null?0:dflt);
+}
+function arr(v){ return Array.isArray(v) ? v : []; }
+function obj(v){ return (v && typeof v === 'object' && !Array.isArray(v)) ? v : {}; }
+/* 列表项归一：模型偶尔把 [{"term":"X"}] 写成 ["X"]（Python 侧已经补过一轮，这里再兜一次底）。 */
+function rows(v, key){
+  return arr(v).map(x => (typeof x === 'string' ? {[key]: x} : obj(x)));
+}
+function txt(v){ return String(v==null?'':v); }
+function firstOf(o, keys){
+  for(const k of keys){ const v = txt(o[k]).trim(); if(v) return v; }
+  return '';
+}
+/* ---------- 可控性：**三态**，null 是「未判断」，绝不并进「可控」 ----------
+   outcome._as_bool 对读不出来的值给 None（语义「未判断」），Python 侧已归一成真布尔或 null；
+   这里再兜一次字符串写法（模型时不时给 "true"/"可控"），仍读不出来的**留在未判断**。 */
+function controllableOf(v){
+  if(v === true || v === false) return v;
+  if(typeof v === 'number') return v !== 0;
+  const t = txt(v).trim().toLowerCase();
+  if(t === 'true' || t === 'yes' || t === '1' || t === '可控' || t === '是') return true;
+  if(t === 'false' || t === 'no' || t === '0' || t === '不可控' || t === '否') return false;
+  return null;                                  // 没给 / 读不出来 = 未判断（**不是**可控）
+}
+/* 把可能原因分成三桶：可控 / 不可控 / 未判断。顺序按模型给的优先级（绝不排序）。 */
+function bucketReasons(list){
+  const out = {yes:[], no:[], unknown:[]};
+  rows(list, 'reason').forEach(r=>{
+    if(!txt(r.reason).trim()) return;
+    const c = controllableOf(r.controllable);
+    (c === true ? out.yes : (c === false ? out.no : out.unknown)).push(r);
+  });
+  return out;
+}
+/* 按 area 分组，且**保持模型给的顺序**：分组头只在第一次遇到该 area 时出现。 */
+function groupActions(list){
+  const order = [], groups = {};
+  rows(list, 'action').forEach(a=>{
+    const act = txt(a.action).trim();
+    if(!act) return;
+    const area = txt(a.area).trim() || '其他';
+    if(!groups[area]){ groups[area] = []; order.push(area); }
+    groups[area].push({area: area, action: act, why: txt(a.why).trim()});
+  });
+  return order.map(area => ({area: area, items: groups[area]}));
+}
+function confidencePill(c){
+  const t = txt(c).trim();
+  if(t.indexOf('高') >= 0) return 'ok';
+  if(t.indexOf('中') >= 0) return 'warn';
+  if(t.indexOf('低') >= 0) return 'bad';
+  return 'info';
+}
+function card(num, title, body, anchor){
+  if(!body) return '';
+  return '<section class="card m-'+anchor+'" id="sec-'+anchor+'" data-label="'+esc(num+' '+title)+'">'
+    + '<h2><span class="num">'+esc(num)+'</span>'+esc(title)+'</h2>'+body+'</section>';
+}
+function note(msg){ return '<div class="note">'+esc(msg)+'</div>'; }
+
+/* ---------- 页头：岗位 / 公司 / 状态 / 时间 ---------- */
+function renderHero(){
+  const d = obj(REPORT_DATA);
+  const title = firstOf(d, ['job_title','job']) || '结果复盘';
+  const tags = [];
+  if(txt(d.company).trim()) tags.push('🏢 '+txt(d.company).trim());
+  if(txt(d.status).trim()) tags.push('🏁 '+txt(d.status).trim());
+  if(txt(d.job_category).trim()) tags.push('🗂 '+txt(d.job_category).trim());
+  if(txt(d.outcome_at).trim()) tags.push('🕒 '+txt(d.outcome_at).trim());
+  document.getElementById('hero').innerHTML =
+    '<div class="kicker">AI 求职 SOP · 结果复盘报告</div>'
+    + '<h1>'+esc(title)+'</h1>'
+    + '<div class="tags">'+tags.map(t=>'<span>'+esc(t)+'</span>').join('')+'</div>'
+    + '<div class="meta-line">报告 id：'+esc(firstOf(d, ['report_id']) || '—')+'</div>';
+}
+
+/* ---------- 00 你写的原因（**排在最前、原样呈现**） ---------- */
+function renderMine(){
+  const reason = txt(obj(REPORT_DATA).outcome_reason);
+  const body = reason.trim()
+    ? '<div class="mine">'+esc(reason)+'</div>'
+    : '<div class="mine empty">你没有填写原因（记录结果时那一栏是空的）。下面 AI 的推断只能靠 JD，'
+      + '结论会明显更糙 —— 补一句「你听到的说法 / 自己的判断」再重新归因会准很多。</div>';
+  return card('01','你写的原因', body, 'mine');
+}
+
+/* ---------- 降级说明（仅当本次没有面试记录） ---------- */
+function renderDegraded(){
+  const ai = obj(obj(REPORT_DATA).outcome_ai);
+  if(!ai.degraded_no_interview) return '';
+  const n = num(ai.interview_count, 0);
+  return card('02','降级说明',
+    note('本次没有面试记录'+(n ? '（记录了 ' + n + ' 场，但都取不到要点）' : '')
+         + '，归因只基于 JD 与你写的原因：AI 没有看到任何面试过程，'
+         + '涉及「面试表现」的推断都属于从 JD 反推，别当成它真的看过你的面试。'), 'degraded');
+}
+
+/* ---------- 03 AI 总评 ---------- */
+function renderVerdict(){
+  const v = txt(obj(obj(REPORT_DATA).outcome_ai).verdict_summary).trim();
+  const body = v ? '<div class="summary">'+esc(v)+'</div>'
+                 : note('这次归因没有给出总评（模型输出里缺这一段）。');
+  return card('03','AI 总评（机器推断）', body, 'verdict');
+}
+
+/* ---------- 04 可能原因：证据 + 置信度 + 可控/不可控/未判断 ---------- */
+function reasonBlock(r, tone){
+  const reason = txt(r.reason).trim();
+  const evi = txt(r.evidence).trim();
+  const conf = txt(r.confidence).trim();
+  const ctrl = controllableOf(r.controllable);
+  const label = ctrl === true ? '可控' : (ctrl === false ? '不可控' : '未判断');
+  const pill = ctrl === true ? 'ok' : (ctrl === false ? 'gray' : 'warn');
+  return '<div class="reason m-'+esc(tone)+'"><div class="rh">'
+    + '<div class="rt">'+esc(reason)+'</div>'
+    + '<span class="pill '+pill+'">'+esc(label)+'</span>'
+    + (conf ? '<span class="pill '+confidencePill(conf)+'">置信度 '+esc(conf)+'</span>' : '')
+    + '</div>'
+    + (evi ? '<div class="evi"><b>依据：</b>'+esc(evi)+'</div>'
+           : note('这一条没有带依据（正常情况下不会出现 —— 没有 evidence 的条目会被丢掉）。'))
+    + '</div>';
+}
+function renderReasons(){
+  const ai = obj(obj(REPORT_DATA).outcome_ai);
+  const list = arr(ai.possible_reasons);
+  const b = bucketReasons(list);
+  if(ai.reasons_all_dropped === true){
+    // 宁可这一节空着如实说，也**绝不用泛泛之谈把它填满**（这是本设计的硬要求）
+    return card('04','可能原因',
+      note('模型这次没有给出带依据的原因，可以重试：'+
+           '它给的原因全都没有引用具体依据（被问到的题 / 答砸的点 / JD 里的条款），'
+           + '这些条目按规则被丢弃了。'
+           + (list.length ? '（原始条目 '+list.length+' 条，全部缺依据）' : '（这次模型一条都没给）')
+           + ' 不做归因也好过给你一堆「可能沟通能力不足」这种放之四海皆准的废话。'), 'reasons');
+  }
+  if(!b.yes.length && !b.no.length && !b.unknown.length){
+    return card('04','可能原因', note('这次归因没有给出可能原因（模型输出里这一段是空的）。'), 'reasons');
+  }
+  const group = (title, items, tone) => items.length
+    ? '<h3>'+esc(title)+'（'+items.length+' 条）</h3>' + items.map(r=>reasonBlock(r, tone)).join('')
+    : '';
+  const tail = b.yes.length + b.no.length
+    ? '<div class="kbhint">「可控」= 下次能自己改的；「不可控」= 换谁来都改不了的（别为它自责）。'
+      + (b.unknown.length ? '「未判断」是模型没标注的那几条，不是「可控」——想让它标可以重新归因。' : '')
+      + '</div>'
+    : '';
+  return card('04','可能原因（复盘结论：为什么是这个结果）',
+    group('✅ 可控的原因', b.yes, 'reasons')
+    + group('🚫 不可控的原因', b.no, 'notcontrollable')
+    + group('❔ 未判断的原因（模型没有标注可控性）', b.unknown, 'degraded')
+    + tail, 'reasons');
+}
+
+/* ---------- 05 不可控因素（模型单独列的） ---------- */
+function renderNotControllable(){
+  const list = arr(obj(obj(REPORT_DATA).outcome_ai).not_controllable)
+    .map(x => (typeof x === 'string' ? x : firstOf(obj(x), ['reason','item','text','name','why'])))
+    .map(x => txt(x).trim()).filter(Boolean);
+  if(!list.length) return '';
+  return card('05','不可控因素',
+    '<ul>'+list.map(x=>'<li>'+esc(x)+'</li>').join('')+'</ul>'
+    + '<div class="kbhint">这些不归你管，列出来是为了让你别在自己身上找原因。</div>', 'notcontrollable');
+}
+
+/* ---------- 06 具体改进动作（按 area 分组，每条带 why） ---------- */
+function renderActions(){
+  const groups = groupActions(obj(obj(REPORT_DATA).outcome_ai).actions);
+  if(!groups.length) return '';
+  const body = groups.map(g=>'<h3>'+esc(g.area)+'</h3>'+g.items.map(a=>
+      '<div class="act"><div class="at">'+esc(a.action)+'</div>'
+      + (a.why ? '<div class="aw">为什么：'+esc(a.why)+'</div>' : '')+'</div>').join('')
+    ).join('');
+  return card('06','具体改进动作', body, 'actions');
+}
+
+/* ---------- 「➕ 加入知识库」 ---------- */
+function kbButton(term, definition, category){
+  return '<button class="kbadd" data-term="'+esc(term)+'" data-definition="'+esc(definition||'')+'"'
+    + ' data-category="'+esc(category||'')+'">➕ 加入知识库</button>';
+}
+function disableAllKbButtons(reason){
+  document.querySelectorAll('.kbadd').forEach(b=>{
+    b.disabled = true;
+    if(b.dataset.done !== '1') b.textContent = reason || OFFLINE_KB_MSG;
+  });
+}
+/* 成功 → 变「已加入」并禁用；失败 → 明确提示且**按钮仍可用**；fetch 抛错 → 未连接、禁用。 */
+async function addTerm(btn){
+  if(!btn || btn.disabled) return;
+  const term = txt(btn.getAttribute('data-term')).trim();
+  if(!term) return;
+  const payload = {term: term,
+                   definition: txt(btn.getAttribute('data-definition')).trim(),
+                   category: txt(btn.getAttribute('data-category')).trim()};
+  btn.disabled = true;                       // 防连点（失败时下面会放开）
+  let r = null;
+  try{
+    const resp = await fetch(KB_API, {method:'POST',
+      headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+    r = await resp.json();
+  }catch(e){
+    // fetch 抛错 = 根本没连上工具（双击 file:// 打开就是这种）→ 说清 + 禁用，绝不假装成功
+    showOffline(OFFLINE_BANNER);
+    disableAllKbButtons();
+    return;
+  }
+  if(!r || r.ok !== true){
+    const msg = (r && r.error) ? txt(r.error) : '服务器没有返回成功';
+    btn.disabled = false;                    // 失败必须还能再点
+    btn.textContent = '➕ 加入知识库（失败，可重试）';
+    flash('⚠️ 入库失败：'+msg, true);
+    return;
+  }
+  btn.dataset.done = '1';
+  btn.disabled = true;
+  btn.classList.add('done');
+  btn.textContent = '✓ 已加入知识库';
+  flash('已加入知识库：'+term);
+}
+
+/* ---------- 07 要补的知识点（**只列不建卡**：按钮由用户点） ---------- */
+function renderStudy(){
+  const list = rows(obj(obj(REPORT_DATA).outcome_ai).to_study, 'term')
+    .filter(t => txt(t.term).trim());
+  if(!list.length) return '';
+  const body = list.map(t=>{
+    const term = txt(t.term).trim();
+    const def = firstOf(t, ['definition','plain_explanation']);
+    return '<div class="term"><div class="th"><div class="tt">'+esc(term)+'</div>'
+      + kbButton(term, def, '') + '</div>'
+      + (def ? '<div class="td">'+esc(def)+'</div>' : '')
+      + (txt(t.why).trim() ? '<div class="tw">为什么要补：'+esc(txt(t.why))+'</div>' : '')
+      + '</div>';
+  }).join('');
+  return card('07','要补的知识点',
+    body + '<div class="kbhint">这些术语**只列不自动建卡**：点「➕ 加入知识库」才会进复习队列'
+    + '（状态「待学习」）。不想让知识库被灌爆就别全点。</div>', 'study');
+}
+
+/* ---------- 08 下次怎么调 ---------- */
+function renderNext(){
+  const t = txt(obj(obj(REPORT_DATA).outcome_ai).next_time).trim();
+  if(!t) return '';
+  return card('08','下次怎么调', '<div class="nextc">'+esc(t)+'</div>', 'next');
+}
+
+/* ---------- 09 原始依据（折叠：直接用这次喂进模型的那份 basis） ---------- */
+function renderBasis(){
+  const ai = obj(obj(REPORT_DATA).outcome_ai);
+  const b = obj(ai.basis);
+  const jd = obj(b.jd);
+  const lines = [];
+  if(txt(b.status).trim()) lines.push('记录的状态：'+txt(b.status).trim());
+  if(txt(b.outcome_reason).trim()) lines.push('你写的原因：'+txt(b.outcome_reason).trim());
+  const ivs = arr(b.interviews).map(x=>obj(x));
+  let ivHtml = '';
+  ivs.forEach((iv, i)=>{
+    const weak = arr(iv.weak_concepts).map(x=>txt(x)).filter(Boolean);
+    const qs = arr(iv.questions).map(q=>obj(q)).filter(q => txt(q.q).trim());
+    const focus = arr(iv.focus_areas).map(f=>obj(f)).filter(f => txt(f.area).trim());
+    ivHtml += '<h4>面试复盘 '+(i+1)+'（'+esc(firstOf(iv,['id']) || '—')+'）</h4><ul>';
+    if(focus.length) ivHtml += '<li>考察重点：'+esc(focus.map(f=>txt(f.area)+(txt(f.share).trim() ? '（'+txt(f.share)+'%）' : '')).join('、'))+'</li>';
+    if(weak.length) ivHtml += '<li>答砸/答不上来：'+esc(weak.join('、'))+'</li>';
+    qs.forEach(q=>{
+      const detail = [txt(q.answer_quality).trim(), txt(q.comment).trim()].filter(Boolean).join('：');
+      ivHtml += '<li>被问到：'+esc(txt(q.q).trim())+(detail ? '（'+esc(detail)+'）' : '')+'</li>';
+    });
+    ivHtml += '</ul>';
+  });
+  if(!ivs.length) ivHtml = '<p>没有面试记录：这次归因只喂了 JD 与你写的原因。</p>';
+  const jdBits = [];
+  if(txt(jd.job_profile).trim()) jdBits.push('<li>岗位画像：'+esc(txt(jd.job_profile).trim())+'</li>');
+  arr(jd.hard_gates).forEach(g=>jdBits.push('<li>硬门槛：'+esc(txt(g))+'</li>'));
+  arr(jd.scores).forEach(s=>jdBits.push('<li>匹配打分：'+esc(txt(s))+'</li>'));
+  arr(jd.gaps).forEach(g=>jdBits.push('<li>能力差距：'+esc(txt(g))+'</li>'));
+  arr(jd.keywords).forEach(k=>jdBits.push('<li>JD 关键词：'+esc(txt(k))+'</li>'));
+  const jdText = txt(jd.jd_text).trim();
+  const at = txt(ai.attributed_at).trim();
+  const body =
+    (lines.length ? '<ul>'+lines.map(x=>'<li>'+esc(x)+'</li>').join('')+'</ul>' : '')
+    + '<h4>面试复盘要点（'+(ivs.length ? ivs.length+' 场' : '没有记录')+'）</h4>' + ivHtml
+    + '<h4>JD 要点</h4>' + (jdBits.length ? '<ul>'+jdBits.join('')+'</ul>' : '<p>没有可用的 JD 拆解。</p>')
+    + (jdText ? '<h4>JD 原文（节选）</h4><pre class="trtext">'+esc(jdText)+'</pre>' : '')
+    + (at ? '<div class="kbhint">归因时间：'+esc(at)+'</div>' : '');
+  return card('09','原始依据（这次实际喂给模型的东西）',
+    '<details><summary>🔍 展开原始依据</summary><div class="body">'+body+'</div></details>', 'basis');
+}
+
+/* ---------- 目录：点击跳转 + 滚动高亮 ---------- */
+function buildToc(){
+  const secs = Array.prototype.slice.call(document.querySelectorAll('#main .card[id]'));
+  const toc = document.getElementById('toc');
+  if(!toc) return;
+  if(!secs.length){ toc.style.display = 'none'; return; }
+  toc.innerHTML = secs.map(s=>'<a href="#'+s.id+'" data-target="'+s.id+'">'+esc(s.dataset.label)+'</a>').join('')
+    + '<a class="top" href="#hero">↑ 顶部</a>';
+  const links = Array.prototype.slice.call(toc.querySelectorAll('a[data-target]'));
+  function onScroll(){
+    const y = window.scrollY + 96;
+    let idx = 0;
+    secs.forEach((s,i)=>{ if(s && s.offsetTop <= y) idx = i; });
+    links.forEach((a,i)=>a.classList.toggle('active', i===idx && window.scrollY > 60));
+  }
+  window.addEventListener('scroll', onScroll, {passive:true});
+  onScroll();
+}
+
+/* 打印：把折叠区全展开（否则纸上只有一行 summary），打完再还原 */
+let __printOpened = null;
+window.addEventListener('beforeprint', ()=>{
+  const ds = Array.prototype.slice.call(document.querySelectorAll('#main details'));
+  __printOpened = ds.map(d=>d.open);
+  ds.forEach(d=>{ d.open = true; });
+});
+window.addEventListener('afterprint', ()=>{
+  const ds = Array.prototype.slice.call(document.querySelectorAll('#main details'));
+  if(__printOpened && __printOpened.length === ds.length){
+    ds.forEach((d,i)=>{ d.open = __printOpened[i]; });
+  }
+  __printOpened = null;
+});
+
+/* ---------- 启动 ---------- */
+function render(){
+  const main = document.getElementById('main');
+  renderHero();
+  main.innerHTML = renderMine()+renderDegraded()+renderVerdict()+renderReasons()
+    + renderNotControllable()+renderActions()+renderStudy()+renderNext()+renderBasis();
+  const foot = document.getElementById('foot');
+  if(foot){
+    const d = obj(REPORT_DATA);
+    foot.textContent = '由 AI 求职 SOP 生成 · 结果复盘 · '
+      + (firstOf(d,['report_id']) || '') + ' · ' + (txt(d.outcome_at).trim() || '');
+  }
+  // 事件委托：#main 每次 render 都被重建内容，但 #main 本身一直在
+  main.addEventListener('click', ev=>{
+    const b = ev.target && ev.target.closest ? ev.target.closest('.kbadd') : null;
+    if(b) addTerm(b);
+  });
+  buildToc();
+}
+function boot(){
+  render();
+  if(isFileProtocol()){                 // 双击打开：入库 API 根本不可达，先说清再禁用
+    showOffline(OFFLINE_BANNER);
+    disableAllKbButtons();
+  }
+}
+boot();
+</script>
+</body>
+</html>

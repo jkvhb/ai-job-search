@@ -21,6 +21,7 @@ from urllib.parse import quote
 import app
 import interview
 import kb
+import outcome
 import store
 
 from tests.base import IsolatedCase
@@ -773,6 +774,463 @@ class TemplateKindTest(IsolatedCase):
         code, body = self._get("/reports/iv_2.html")
         self.assertEqual(code, 200)
         self.assertIn(INTERVIEW_TEMPLATE_MARKER, body)
+
+
+# ------------------------------------------------------------ 结果 / 复盘：3 条路由 + 模板
+# 模板金丝雀：**只可能**来自 outcome_template.html 的稳定文案。刻意避开两个坑：
+#   ① 不能选两个模板共有的注入点 kb.REPORT_MARK；
+#   ② 不能选「岗位匹配分析报告」——那是 JD 模板的 kicker，与 kind 判定无关；
+#      也**不能靠 <title> 里的措辞**：真报告的标题由 app.render_report 拼，
+#      JD / 复盘 / 结果复盘三种标题都可能是同一批字眼（上一轮踩过）。
+OUTCOME_TEMPLATE_MARKER = "复盘结论：为什么是这个结果"
+# 结果复盘模板的**静态**哨兵（头部 kicker 那一行，原样躺在模板文件里）。
+# 与上面那个动态标记一起断言，才能排除「两份模板凑出同一句话」的巧合。
+OUTCOME_TEMPLATE_STATIC = "AI 求职 SOP · 结果复盘报告"
+
+
+class _OutcomeRouteCase(IsolatedCase):
+    """3 条结果/复盘路由的沙箱化测试（写法照 InterviewRouteTest / TemplateKindTest）。
+
+    **绝不真调模型**：`outcome.llm.repair_json` 一律 patch 成抛错 —— 真实现会走网络；
+    归因成功路径全部注入假 `chat`。报告只写进隔离根的 reports/。
+    """
+
+    # **类定义时**就把真函数抓在手里：setUp 会把 outcome.attribute / render_report 换成替身，
+    # 想走真链路的用例（`_real_attribute`）这时再去 `outcome.attribute` 拿到的已经是替身了
+    # —— 那会让「注入假 chat」变成「注入一个替身」，看起来像实现坏了。
+    _TRUE_ATTRIBUTE = staticmethod(outcome.attribute)
+    _TRUE_REAL_RENDER = staticmethod(outcome.render_report)
+
+    @staticmethod
+    def _TRUE_RENDER(payload, job_id):
+        """替身版的 render_report：**写盘时用结果复盘模板**，但**不经过 `report_template_for`**。
+
+        「选哪个模板」是路由那条用例的测点；只把模板选择留在这里，是为了让
+        `OutcomeTemplateTest` 能**单独**证明 kind=outcome 的判定（改坏那一条只会让那边变红，
+        不会把两边一起弄红，取证才能定位到根因）。
+        """
+        import app as _app
+        data = dict(payload) if isinstance(payload, dict) else {}
+        data["kind"] = "outcome"
+        data["report_id"] = "oc_" + str(job_id)
+        fname = "oc_%s.html" % job_id
+        store.ensure_profile()
+        store.write_text(os.path.join(store.p_path("reports"), fname),
+                         store.read_text(_app.OUTCOME_TEMPLATE_PATH)
+                         .replace("__TITLE__", "结果复盘")
+                         .replace("__REPORT_DATA__", json.dumps(data, ensure_ascii=False)))
+        return fname
+
+    def setUp(self):
+        super().setUp()
+        # 归因里 llm.repair_json 那条路径**不可注入**（outcome._parse_reply 直接调模块属性），
+        # 只能在这里挡住：干净 JSON 走不到它，坏 JSON 的用例会覆盖成自己要的假实现。
+        self._patch(outcome.llm, "repair_json",
+                    mock.Mock(side_effect=AssertionError("测试里不该真去修 JSON")))
+        self.attribute_calls = []
+        self._patch(outcome, "attribute", self._recording_attribute)
+
+    def _patch(self, obj, name, value):
+        p = mock.patch.object(obj, name, value)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _recording_attribute(self, job_id, cfg, chat=None):
+        """默认替身：记录调用参数后抛错（用例想走成功路径必须自己注入假 chat）。
+
+        抛的是 AssertionError —— 归因路由的兜底 `except Exception` 会把它变成 500，
+        于是「忘了注入假实现」在用例里表现为醒目的 500 而不是意外 200，不会静默假绿。
+        """
+        self.attribute_calls.append({"job_id": job_id, "cfg": cfg, "chat": chat})
+        raise AssertionError("本用例没有注入假的 attribute 实现")
+
+    def _real_attribute(self, chat, cfg=None, real_render=False):
+        """还原**真实现**并注入假模型 —— 只有走真链路的用例才调它。
+
+        `real_render=True` 时才把 `outcome.render_report` 还原成真函数（真选模板）；
+        默认装的是 `_TRUE_RENDER` 替身，它**只写盘不选模板**。
+        """
+        real = self._TRUE_ATTRIBUTE
+        calls = {"n": 0, "prompt": ""}
+
+        def spy(prompt, _cfg):
+            calls["n"] += 1
+            calls["prompt"] = prompt
+            return chat(prompt, _cfg)
+
+        def patched(job_id, _cfg, chat=None):
+            return real(job_id, cfg or {}, chat=spy)
+
+        self.attribute_calls = []
+        self._patch(outcome, "attribute", patched)
+        self._patch(outcome, "render_report",
+                    self._TRUE_REAL_RENDER if real_render else self._TRUE_RENDER)
+        return calls
+
+    def _handler(self, method, path, body: bytes = b"", headers=None):
+        h = _sandbox_handler(method, path, body, headers)
+        return h._status, h._body
+
+    def _post_json(self, path, obj):
+        raw = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        return self._handler("POST", path, raw,
+                             {"Content-Length": str(len(raw)),
+                              "Content-Type": "application/json; charset=utf-8"})
+
+    def _get(self, path):
+        return self._handler("GET", path, b"", {})
+
+    def _job(self, job_id="j1", **kw):
+        store.upsert_job(dict({"id": job_id, "job_title": "AI训练标注师",
+                               "job_category": "数据标注/质检"}, **kw))
+
+    def _report_path(self, job_id="j1"):
+        return os.path.join(store.p_path("reports"), "oc_%s.html" % job_id)
+
+
+def _fake_chat(text):
+    """与 interview.analyze / outcome.attribute 同一约定：`chat(prompt, cfg)`。"""
+    return lambda prompt, cfg: text
+
+
+class JobResultRouteTest(_OutcomeRouteCase):
+    """POST /api/job/result —— 保存结果（status 非法 → 400；岗位不存在 → 404）。"""
+
+    def test_saves_a_valid_result_and_returns_the_view(self):
+        self._job()
+        code, body = self._post_json("/api/job/result",
+                                     {"id": "j1", "status": "已拒", "reason": "HR 说预算冻结了"})
+        self.assertEqual(code, 200)
+        self.assertTrue(body.get("ok"))
+        self.assertEqual(body["application"]["status"], "已拒")
+        self.assertEqual(body["application"]["outcome_reason"], "HR 说预算冻结了")
+        # 落盘了才算真保存：重新读一遍 jobs.json（不信任内存里的返回值）
+        job = store.find_job("j1")
+        self.assertEqual(job.get("status"), "已拒")                       # 台账顶层镜像
+        self.assertEqual(job["application"]["outcome_reason"], "HR 说预算冻结了")
+        self.assertTrue(job["application"]["outcome_at"])
+
+    def test_invalid_status_is_400_and_nothing_is_written(self):
+        self._job()
+        code, body = self._post_json("/api/job/result", {"id": "j1", "status": "胡说", "reason": "x"})
+        self.assertEqual(code, 400)
+        self.assertFalse(body.get("ok"))
+        self.assertEqual(store.find_job("j1").get("status"), None)        # 一个键都没写进去
+
+    def test_unknown_job_is_404(self):
+        code, body = self._post_json("/api/job/result",
+                                     {"id": "没有这个岗位", "status": "已拒", "reason": "x"})
+        self.assertEqual(code, 404)
+        self.assertFalse(body.get("ok"))
+        # 光看状态码不行：通用的「未匹配路由」也是 404，会把这条用例白送成绿
+        self.assertIn("找不到岗位", body.get("error", ""))
+
+    def test_missing_id_is_404(self):
+        code, body = self._post_json("/api/job/result", {"status": "已拒", "reason": "x"})
+        self.assertEqual(code, 404)
+        self.assertFalse(body.get("ok"))
+        self.assertIn("找不到岗位", body.get("error", ""))
+
+    def test_empty_reason_is_allowed(self):
+        self._job()
+        code, body = self._post_json("/api/job/result", {"id": "j1", "status": "放弃", "reason": ""})
+        self.assertEqual(code, 200, body)
+        self.assertEqual(body["application"]["outcome_reason"], "")
+
+    def test_reason_with_markup_survives_verbatim(self):
+        """用户写的原因要**原样**存下来（转义是报告模板的事，不是存储的事）。"""
+        self._job()
+        raw = "他说「你不合适」</script><b>x</b>"
+        code, _ = self._post_json("/api/job/result", {"id": "j1", "status": "已拒", "reason": raw})
+        self.assertEqual(code, 200)
+        self.assertEqual(store.find_job("j1")["application"]["outcome_reason"], raw)
+
+
+class OutcomeQueryRouteTest(_OutcomeRouteCase):
+    """GET /api/job/outcome?id= —— 读回 application（含「是否已复盘」）供前端渲染。"""
+
+    def test_returns_the_view_without_any_attribution_yet(self):
+        self._job()
+        code, body = self._get("/api/job/outcome?id=j1")
+        self.assertEqual(code, 200)
+        self.assertTrue(body.get("ok"))
+        self.assertEqual(body["application"]["status"], "未投递")
+        self.assertIsNone(body["application"]["outcome_ai"])
+        self.assertFalse(body["has_ai"])                          # 前端据此画「未复盘」
+        self.assertIsInstance(body["statuses"], list)             # 状态下拉直接用 store.STATUSES
+        self.assertEqual(body["statuses"], store.STATUSES)
+        self.assertEqual(body["terminal"], list(outcome.TERMINAL))
+
+    def test_reflects_a_saved_result_and_an_existing_attribution(self):
+        self._job()
+        self._post_json("/api/job/result", {"id": "j1", "status": "已拒", "reason": "预算冻结"})
+        self._real_attribute(_fake_chat('{"verdict_summary":"总评"}'))
+        code, _ = self._post_json("/api/job/attribute", {"id": "j1"})
+        self.assertEqual(code, 200)
+        code, body = self._get("/api/job/outcome?id=j1")
+        self.assertEqual(code, 200)
+        self.assertEqual(body["application"]["outcome_reason"], "预算冻结")
+        self.assertTrue(body["has_ai"])
+        self.assertEqual(body["application"]["outcome_ai"]["verdict_summary"], "总评")
+
+    def test_unknown_job_is_404(self):
+        code, body = self._get("/api/job/outcome?id=nope")
+        self.assertEqual(code, 404)
+        self.assertFalse(body.get("ok"))
+        self.assertIn("找不到岗位", body.get("error", ""))
+
+    def test_missing_id_is_400(self):
+        code, body = self._get("/api/job/outcome")
+        self.assertEqual(code, 400)
+        self.assertFalse(body.get("ok"))
+        self.assertIn("缺少岗位 id", body.get("error", ""))
+
+    def test_corrupt_job_record_returns_a_structured_500_not_a_bare_disconnect(self):
+        """`do_GET` **没有外层 try**：路由自己不兜底 → 真实世界里客户端只看到 RemoteDisconnected。
+
+        手改坏 jobs.json（这里用 patch 模拟）时必须是结构化 500 —— 前端才有东西可显示。
+        """
+        self._job()
+        self._patch(outcome, "application_of", mock.Mock(side_effect=TypeError("坏记录")))
+        code, body = self._get("/api/job/outcome?id=j1")
+        self.assertEqual(code, 500)
+        self.assertFalse(body.get("ok"))
+        self.assertIn("读取失败", body.get("error", ""))
+
+
+class JobAttributeRouteTest(_OutcomeRouteCase):
+    """POST /api/job/attribute —— 归因 + 生成报告（未到终态 → 400 且说明「还没有结果」）。"""
+
+    def test_not_terminal_job_is_400_with_an_honest_message(self):
+        """**走真实现**（不是替身）：严格门槛下裸岗位必须被 `outcome.NotTerminal` 拦在模型调用之前。"""
+        self._job()
+        calls = self._real_attribute(_fake_chat("{}"), cfg={})
+        code, body = self._post_json("/api/job/attribute", {"id": "j1"})
+        self.assertEqual(code, 400, body)
+        self.assertFalse(body.get("ok"))
+        self.assertIn("还没有结果", body.get("error", ""))
+        self.assertEqual(calls["n"], 0, "没到终态时一次模型调用都不该发出去")
+        self.assertFalse(os.path.exists(self._report_path()))     # 没生成报告
+
+    def test_recording_a_non_terminal_status_also_gets_400(self):
+        self._job()
+        self._post_json("/api/job/result", {"id": "j1", "status": "已投", "reason": ""})
+        calls = self._real_attribute(_fake_chat("{}"), cfg={})
+        code, body = self._post_json("/api/job/attribute", {"id": "j1"})
+        self.assertEqual(code, 400, body)
+        self.assertIn("还没有结果", body.get("error", ""))
+        self.assertIn("已投", body.get("error", ""))              # 说真实状态，不谎报
+        self.assertEqual(calls["n"], 0)
+
+    def test_unknown_job_is_404(self):
+        calls = self._real_attribute(_fake_chat("{}"), cfg={})
+        code, body = self._post_json("/api/job/attribute", {"id": "nope"})
+        self.assertEqual(code, 404)
+        self.assertFalse(body.get("ok"))
+        self.assertIn("找不到岗位", body.get("error", ""))
+        self.assertEqual(calls["n"], 0)                           # 岗位都没有，更不该调模型
+
+    def test_terminal_job_attribution_writes_the_report_and_returns_its_url(self):
+        """成功路径：**必须先记录终态结果**（严格门槛下裸岗位直接 NotTerminal）。"""
+        self._job()
+        self._post_json("/api/job/result", {"id": "j1", "status": "已拒", "reason": "预算冻结"})
+        self._real_attribute(_fake_chat(json.dumps({
+            "verdict_summary": "总评独有句",
+            "possible_reasons": [{"reason": "答不上来", "evidence": "被问到 RLHF 时卡住",
+                                  "confidence": "高", "controllable": True}],
+            "actions": [{"area": "知识", "action": "补 RLHF", "why": "被问到"}],
+            "to_study": [{"term": "RLHF", "why": "被问到", "definition": "人类反馈强化学习"}],
+            "next_time": "下次先复习 RLHF",
+        }, ensure_ascii=False)))
+
+        code, body = self._post_json("/api/job/attribute", {"id": "j1"})
+        self.assertEqual(code, 200, body)
+        self.assertTrue(body.get("ok"))
+        self.assertEqual(body["report"], "oc_j1.html")
+        self.assertEqual(body["url"], "/reports/oc_j1.html")
+        self.assertEqual(body["outcome_ai"]["verdict_summary"], "总评独有句")
+        # ① 报告文件**真被写出**
+        path = self._report_path()
+        self.assertTrue(os.path.exists(path))
+        # ② **通过路由 serve 出来的那份**也是结果复盘版式（route 写盘 + serve 共用一条 kind 规则）
+        code2, served = self._get("/reports/oc_j1.html")
+        self.assertEqual(code2, 200)
+        self.assertIn(OUTCOME_TEMPLATE_MARKER, served)
+        self.assertNotIn(JD_TEMPLATE_MARKER, served)
+        self.assertNotIn(INTERVIEW_TEMPLATE_MARKER, served)
+        # ③ 快照读得回来（写成注释/多一处 REPORT_MARK 会让整批报告静默降级）
+        data = kb.read_report_data(path)
+        self.assertIsInstance(data, dict)
+        self.assertEqual(data.get("kind"), "outcome")
+
+    def test_the_report_renders_the_users_own_words_not_a_paraphrase(self):
+        """报告里的「你写的原因」必须是用户**原话**（由 outcome.render_report 从台账补齐）。
+
+        这条刻意走**真 render_report**：替身不负责补台账字段，补进去的断言就没有意义了。
+        """
+        self._job()
+        self._post_json("/api/job/result", {"id": "j1", "status": "Offer", "reason": "HR 说恭喜"})
+        self._real_attribute(_fake_chat('{"verdict_summary":"总评"}'), real_render=True)
+        self._post_json("/api/job/attribute", {"id": "j1"})
+        data = kb.read_report_data(self._report_path())
+        self.assertEqual(data.get("outcome_reason"), "HR 说恭喜")
+        self.assertEqual(data.get("status"), "Offer")
+
+    def test_attribution_never_overwrites_the_users_reason(self):
+        """分清「人说的」与「机器猜的」是本设计的底线：重复归因也不许覆盖。"""
+        self._job()
+        self._post_json("/api/job/result", {"id": "j1", "status": "已拒", "reason": "我自己写的"})
+        self._real_attribute(_fake_chat('{"verdict_summary":"第一次","outcome_reason":"AI 编的"}'))
+        self._post_json("/api/job/attribute", {"id": "j1"})
+        self._real_attribute(_fake_chat('{"verdict_summary":"第二次","outcome_reason":"又编一遍"}'))
+        self._post_json("/api/job/attribute", {"id": "j1"})
+        job = store.find_job("j1")
+        self.assertEqual(job["application"]["outcome_reason"], "我自己写的")
+        self.assertNotIn("outcome_reason", job["application"]["outcome_ai"],
+                         "outcome_reason 绝不能被复制进 outcome_ai")
+        self.assertEqual(job["application"]["outcome_ai"]["verdict_summary"], "第二次")
+
+    def test_unparseable_model_reply_is_a_structured_500(self):
+        self._job()
+        self._post_json("/api/job/result", {"id": "j1", "status": "已拒", "reason": ""})
+        self._patch(outcome.llm, "repair_json", mock.Mock(side_effect=RuntimeError("修不动")))
+        self._real_attribute(_fake_chat("这不是 JSON"))
+        code, body = self._post_json("/api/job/attribute", {"id": "j1"})
+        self.assertEqual(code, 500, body)
+        self.assertFalse(body.get("ok"))
+        self.assertIn("归因失败", body.get("error", ""))
+        self.assertFalse(os.path.exists(self._report_path()))     # 归因失败 → 不生成报告
+        # 用户写的状态/原因已在保存时落盘：归因失败不会把它弄丢
+        self.assertEqual(store.find_job("j1")["application"]["status"], "已拒")
+
+    def test_the_model_receives_the_users_reason_and_the_jd_basis(self):
+        """归因必须把「用户写的原因」和 JD 拆解喂进去 —— 否则报告是凭空生成的。"""
+        self._job(report="r.html", jd_text_file="j1.txt")
+        store.ensure_profile()
+        store.write_text(os.path.join(store.p_path("jd"), "j1.txt"), "我们要求熟悉 RLHF 与评测集构建")
+        store.write_text(os.path.join(store.p_path("reports"), "r.html"),
+                         "<html><body><script>%s%s;\n</script></body></html>"
+                         % (kb.REPORT_MARK, json.dumps({"job_profile": "标注岗画像"},
+                                                       ensure_ascii=False)))
+        self._post_json("/api/job/result", {"id": "j1", "status": "已拒", "reason": "他说我表达不清楚"})
+        calls = self._real_attribute(_fake_chat('{"verdict_summary":"总评"}'))
+        code, _ = self._post_json("/api/job/attribute", {"id": "j1"})
+        self.assertEqual(code, 200)
+        self.assertEqual(calls["n"], 1, "同步归因只调用模型一次")
+        self.assertIn("他说我表达不清楚", calls["prompt"])
+        self.assertIn("标注岗画像", calls["prompt"])
+        self.assertIn("RLHF", calls["prompt"])
+
+    def test_attribution_route_uses_the_configured_cfg(self):
+        """route 必须把设置里的 cfg 传给 attribute（不传就等于没配模型）。"""
+        self._job()
+        self._post_json("/api/job/result", {"id": "j1", "status": "已拒", "reason": ""})
+        seen = {}
+        self._patch(outcome, "attribute",
+                    lambda job_id, cfg, chat=None: seen.update(job_id=job_id, cfg=cfg) or {})
+        store.save_config({"text_model": {"model": "假模型"}})
+        code, _ = self._post_json("/api/job/attribute", {"id": "j1"})
+        self.assertEqual(code, 200)
+        self.assertEqual(seen["job_id"], "j1")
+        self.assertEqual((seen["cfg"] or {}).get("text_model", {}).get("model"), "假模型")
+
+
+class OutcomeTemplateTest(_OutcomeRouteCase):
+    """结果复盘模板本身：标记唯一、快照可读、kind 三分支各走对模板。"""
+
+    def _write_report(self, name, payload):
+        store.ensure_profile()
+        path = os.path.join(store.p_path("reports"), name)
+        store.write_text(path, "<html><head><title>T</title></head><body><script>\n%s%s;\n</script></body></html>"
+                         % (kb.REPORT_MARK, json.dumps(payload, ensure_ascii=False)))
+        return path
+
+    def test_markers_are_template_exclusive(self):
+        """金丝雀自检：三个标记各自只在自己那个模板里 —— 否则下面的断言全靠巧合。"""
+        jd = store.read_text(app.TEMPLATE_PATH)
+        iv = store.read_text(app.INTERVIEW_TEMPLATE_PATH)
+        oc = store.read_text(app.OUTCOME_TEMPLATE_PATH)
+        self.assertIn(OUTCOME_TEMPLATE_MARKER, oc)
+        self.assertNotIn(OUTCOME_TEMPLATE_MARKER, jd)
+        self.assertNotIn(OUTCOME_TEMPLATE_MARKER, iv)
+        self.assertIn(JD_TEMPLATE_MARKER, jd)
+        self.assertNotIn(JD_TEMPLATE_MARKER, oc)
+        self.assertIn(INTERVIEW_TEMPLATE_MARKER, iv)
+        self.assertNotIn(INTERVIEW_TEMPLATE_MARKER, oc)
+
+    def test_outcome_template_contains_the_report_marker_exactly_once(self):
+        """模板里多抄一处那行赋值（哪怕写在注释里）→ 所有报告的快照都读不出来。"""
+        for path in (app.TEMPLATE_PATH, app.INTERVIEW_TEMPLATE_PATH, app.OUTCOME_TEMPLATE_PATH):
+            text = store.read_text(path)
+            self.assertEqual(text.count(kb.REPORT_MARK), 1,
+                             "%s 里 %r 出现了 %d 次"
+                             % (os.path.basename(path), kb.REPORT_MARK, text.count(kb.REPORT_MARK)))
+
+    def test_kind_outcome_selects_the_outcome_template(self):
+        self.assertEqual(app.report_template_for({"kind": "outcome"}), app.OUTCOME_TEMPLATE_PATH)
+
+    def test_the_other_two_kinds_are_untouched(self):
+        """老 JD 报告与面试复盘报告都不受影响（缺省仍 JD）。"""
+        self.assertEqual(app.report_template_for({"kind": "interview"}), app.INTERVIEW_TEMPLATE_PATH)
+        self.assertEqual(app.report_template_for({"kind": "jd"}), app.TEMPLATE_PATH)
+        self.assertEqual(app.report_template_for({}), app.TEMPLATE_PATH)
+        self.assertEqual(app.report_template_for(None), app.TEMPLATE_PATH)
+        self.assertEqual(app.report_template_for({"kind": "something-else"}), app.TEMPLATE_PATH)
+
+    def test_outcome_report_is_served_with_the_outcome_template(self):
+        self._write_report("oc_x.html", {"kind": "outcome", "verdict_summary": "s"})
+        code, body = self._get("/reports/oc_x.html")
+        self.assertEqual(code, 200)
+        self.assertIn(OUTCOME_TEMPLATE_MARKER, body)
+        self.assertNotIn(JD_TEMPLATE_MARKER, body)
+        self.assertNotIn(INTERVIEW_TEMPLATE_MARKER, body)
+        self.assertNotIn("__REPORT_DATA__", body)
+        self.assertNotIn("__TITLE__", body)
+
+    def test_old_jd_and_interview_reports_still_use_their_own_templates(self):
+        self._write_report("x_岗位.html", {"job_title": "岗"})
+        code, body = self._get("/reports/" + quote("x_岗位.html"))
+        self.assertEqual(code, 200)
+        self.assertIn(JD_TEMPLATE_MARKER, body)
+        self.assertNotIn(OUTCOME_TEMPLATE_MARKER, body)
+        self._write_report("iv_9.html", {"kind": "interview", "summary": "s"})
+        code, body = self._get("/reports/iv_9.html")
+        self.assertEqual(code, 200)
+        self.assertIn(INTERVIEW_TEMPLATE_MARKER, body)
+        self.assertNotIn(OUTCOME_TEMPLATE_MARKER, body)
+
+    def test_report_written_by_the_real_pipeline_is_the_outcome_template(self):
+        """真实现写出来那份（不是手写的 <title>T</title>）也必须走结果复盘版式。
+
+        `OUTCOME_TEMPLATE_MARKER` 是个**动态渲染**产物（卡片标题由 JS 拼），所以这里再钉一个
+        **静态哨兵**：结果复盘模板头部那句 kicker 必须原样出现在文件里 —— 两份东西一起断言，
+        才排除掉「标记恰好被别的模板凑出来」这种巧合。
+        """
+        self._job()
+        self._post_json("/api/job/result", {"id": "j1", "status": "已拒", "reason": "预算冻结"})
+        self._real_attribute(_fake_chat('{"verdict_summary":"总评独有句"}'), real_render=True)
+        self._post_json("/api/job/attribute", {"id": "j1"})
+        on_disk = store.read_text(self._report_path())
+        self.assertIn(OUTCOME_TEMPLATE_MARKER, on_disk)                  # 动态产物
+        self.assertIn(OUTCOME_TEMPLATE_STATIC, on_disk)                  # 静态骨架
+        self.assertNotIn(JD_TEMPLATE_MARKER, on_disk)
+        self.assertNotIn(INTERVIEW_TEMPLATE_MARKER, on_disk)
+        self.assertIn("预算冻结", on_disk)              # 用户原话在磁盘文件里（file:// 也看得见）
+        served = self._get("/reports/oc_j1.html")[1]
+        self.assertIn(OUTCOME_TEMPLATE_MARKER, served)
+        self.assertIn(OUTCOME_TEMPLATE_STATIC, served)
+        self.assertNotIn(JD_TEMPLATE_MARKER, served)
+
+    def test_missing_outcome_template_falls_back_to_the_raw_file(self):
+        """结果复盘模板缺失 → 退回文件本身（与 JD/访谈同款兜底），绝不偷偷改用 JD 版式。"""
+        path = self._write_report("oc_z.html", {"kind": "outcome", "verdict_summary": "s"})
+        real = app.OUTCOME_TEMPLATE_PATH
+        self.addCleanup(setattr, app, "OUTCOME_TEMPLATE_PATH", real)
+        app.OUTCOME_TEMPLATE_PATH = os.path.join(store.p_path("reports"), "不存在.html")
+        self.assertIsNone(app._render_report_page(path))
+        h = _sandbox_handler("GET", "/reports/oc_z.html", b"")
+        self.assertEqual(h._status, 200)
+        self.assertEqual(h._sent_file, path)
 
 
 if __name__ == "__main__":

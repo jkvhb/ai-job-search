@@ -24,6 +24,7 @@ import knowledge
 import interview
 import llm
 import log
+import outcome
 import search as search_mod
 import store
 
@@ -37,6 +38,7 @@ ROOT = store.ROOT
 WEB = os.path.join(ROOT, "web")
 TEMPLATE_PATH = os.path.join(WEB, "report_template.html")
 INTERVIEW_TEMPLATE_PATH = os.path.join(WEB, "interview_template.html")   # 面试复盘报告版式
+OUTCOME_TEMPLATE_PATH = os.path.join(WEB, "outcome_template.html")       # 结果复盘报告版式
 DEMO_PATH = os.path.join(WEB, "demo_data.json")
 DEMO_ID = "示例_语音文本评测_80分"   # 示例报告固定文件名，避免重复点击产生 (2)(3) 副本
 SOP_FILES = ["00-求职SOP总纲.md", "02-预筛与打分.md", "03-JD拆解.md", "04-简历大纲.md", "05-面试准备.md"]
@@ -156,10 +158,15 @@ def report_template_for(data):
     就是「老报告用不上新前端」那类不一致的复发 —— 更糟的是会出现「磁盘上是 JD 骨架、
     服务里打开是复盘版式」的割裂（双击打开的那份永远是错的）。
 
-    缺省必须是 JD 模板：`kind` 是后加的字段，**所有老 JD 报告都没有它**。
+    三条分支的顺序不重要，**缺省才重要**：kind 是后加的字段，所有老 JD 报告都没有它，
+    所以认不出来的 kind 一律回 JD 模板（否则上线当天老报告会集体变成别的版式）。
     """
     kind = data.get("kind") if isinstance(data, dict) else None
-    return INTERVIEW_TEMPLATE_PATH if kind == "interview" else TEMPLATE_PATH
+    if kind == "interview":
+        return INTERVIEW_TEMPLATE_PATH
+    if kind == "outcome":
+        return OUTCOME_TEMPLATE_PATH
+    return TEMPLATE_PATH
 
 
 def _attach_transcript(data):
@@ -187,7 +194,8 @@ def _attach_transcript(data):
 def _render_report_page(path):
     """用**当前模板** + 报告里的 REPORT_DATA 渲染。kind 决定用哪个模板（report_template_for）。
 
-    kind="interview" → interview_template.html；其它/缺失 → report_template.html。
+    kind="interview" → interview_template.html；"outcome" → outcome_template.html；
+    其它/缺失 → report_template.html。
 
     读不出 REPORT_DATA（旧格式 / 文件被改坏）、模板缺失、或拼装时出任何意外时返回 None，
     由调用方退回 _send_file 原样发送 —— 报告绝不能因此打不开。
@@ -230,6 +238,10 @@ def render_report(d, fixed_id=None):
     if tpl_path == INTERVIEW_TEMPLATE_PATH:
         # 复盘报告不能顶着「岗位匹配分析 · 0分」的标题出现在浏览器标签页 / 打印页眉上
         title = ("%s · 面试复盘 · %s" % (d.get("job_title") or "面试", d.get("date") or "")).rstrip(" ·")
+    elif tpl_path == OUTCOME_TEMPLATE_PATH:
+        # 同理：结果复盘顶着 JD 那句「岗位匹配分析 · 0分 · 」既不真（复盘不打分）又会被误解成
+        # 一份匹配度报告。**绝不复用 `岗位匹配分析` 这几个字** —— 那也是测试里区分版式的标记。
+        title = ("%s · 结果复盘 · %s" % (d.get("job_title") or "岗位", d.get("outcome_at") or "")).rstrip(" ·")
     else:
         title = "%s · 岗位匹配分析 · %s分 · %s" % (d.get("job_title") or "岗位", score_disp, d.get("verdict") or "")
     payload = json.dumps(d, ensure_ascii=False).replace("</", "<\\/")
@@ -695,6 +707,28 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(404, {"error": "没有保存 JD 原文"})
             return self._send(200, {"text": store.read_text(os.path.join(store.p_path("jd"), job["jd_text_file"]))})
 
+        if p == "/api/job/outcome":
+            # 结果面板的读接口：读回 application（含「是否已复盘」）供前端渲染。
+            jid = store.safe_name(q.get("id", [""])[0])
+            if not jid:
+                return self._send(400, {"ok": False, "error": "缺少岗位 id"})
+            try:
+                view = outcome.application_of(jid)
+                # has_ai 是给前端的一句话判断：outcome_ai 本身可能被手改坏，别让前端自己 typeof
+                has_ai = view.get("outcome_ai") is not None
+                return self._send(200, {"ok": True, "id": jid, "application": view,
+                                        "has_ai": has_ai,
+                                        "statuses": store.STATUSES,
+                                        "terminal": list(outcome.TERMINAL)})
+            except LookupError as e:
+                return self._send(404, {"ok": False, "error": str(e)})
+            except Exception as e:
+                # do_GET **没有外层 try**（见 /api/knowledge 的注释）：手改坏的岗位记录会让
+                # application_of 抛出来，服务器直接关连接 —— 前端只看到 RemoteDisconnected，
+                # 连 500 都拿不到，只能永远转圈。必须在这里兜成结构化错误。
+                log.log_exc("outcome.api_error", e, job=jid)
+                return self._send(500, {"ok": False, "error": "结果读取失败：%s" % e})
+
         if p == "/api/interview/status":
             iid = store.safe_name(q.get("id", [""])[0])
             if not iid:
@@ -954,6 +988,49 @@ class Handler(BaseHTTPRequestHandler):
             log.log_event("job.update", id=job.get("id"), title=job.get("job_title"),
                       fields=fields, status=job.get("status"))
             return self._send(200, {"ok": True, "job": job})
+
+        if p == "/api/job/result":
+            # 记录结果：用户的字一个不改地存下来（转义是模板的事）。status 非法 → 400。
+            jid = store.safe_name(body.get("id"))
+            try:
+                # status 原样传进去（不做 safe_name/去空白）：词表比对必须是**精确**的，
+                # 顺手 trim 会把「已拒 」这种本该报错的输入悄悄改成合法的
+                view = outcome.save_result(jid, body.get("status"), body.get("reason"))
+                return self._send(200, {"ok": True, "id": jid, "application": view})
+            except LookupError as e:
+                return self._send(404, {"ok": False, "error": str(e)})
+            except ValueError as e:
+                return self._send(400, {"ok": False, "error": str(e)})
+
+        if p == "/api/job/attribute":
+            # 归因是**同步**的（一次模型调用，与 JD 分析同量级）：直接调，不做后台任务。
+            # do_POST 已有外层 try（见 do_POST 的 except），但那样只能给一句「服务器内部错误」；
+            # 这里的用例需要 404 / 400 / 500 各自的语义，所以逐类接住。
+            jid = store.safe_name(body.get("id"))
+            if not jid:
+                return self._send(404, {"ok": False, "error": "找不到岗位：（空 id）"})
+            try:
+                ai = outcome.attribute(jid, store.load_config())
+                report = outcome.render_report(ai, jid)
+                return self._send(200, {"ok": True, "id": jid, "outcome_ai": ai,
+                                        "report": report, "url": "/reports/" + quote(report)})
+            except LookupError as e:
+                return self._send(404, {"ok": False, "error": str(e)})
+            except outcome.NotTerminal as e:
+                # 文案直接用异常的 str(e)：里面那句「还没有结果」是判门拒绝的唯一说法
+                return self._send(400, {"ok": False, "error": str(e)})
+            except ValueError as e:
+                return self._send(400, {"ok": False, "error": str(e)})
+            except RuntimeError as e:
+                # 模型 JSON 修不动：报告不生成，用户写的 outcome_reason 早在保存时就落盘了
+                log.log_exc("outcome.attribute_failed", e, job=jid)
+                return self._send(500, {"ok": False, "error": "归因失败：%s" % e})
+            except Exception as e:
+                # 兜底（do_POST 的外层 try 只能给一句「服务器内部错误」）：
+                # 上面四类之外的东西（岗位记录被改坏 → KeyError/TypeError）也要给前端一句人话 + 500。
+                log.log_exc("outcome.attribute_error", e, job=jid)
+                return self._send(500, {"ok": False,
+                                        "error": "归因失败（%s）：%s" % (type(e).__name__, e)})
 
         if p == "/api/knowledge/state":
             ok, msg = kb.set_state(str(body.get("id") or ""), str(body.get("state") or ""))
