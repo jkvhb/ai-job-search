@@ -1,0 +1,468 @@
+# -*- coding: utf-8 -*-
+"""`身份迁移.py`（岗位身份：报告文件名 → JD 稳定 ID）的测试。
+
+夹具思路：造**三份同一 JD 文本**的分析 + **一份不同**的 + **一份没有 JD 原文**的
+（正是用户真实数据的形状：统本三件套 / 语音那一对 / 示例无原文）。
+期望：5 份活跃分析 → **3 个 JD**（前 3 份并成 1 个、第 4 份自成 1 个、第 5 份自成 1 个）。
+
+所有测试都在 `IsolatedCase` 的隔离根里跑，**绝不碰真实 data/**。
+"""
+import contextlib
+import glob
+import hashlib
+import importlib
+import io
+import json
+import os
+import sys
+import unittest
+from unittest import mock
+
+import jdid
+import kb
+import store
+
+from tests.base import IsolatedCase
+
+CLI = importlib.import_module("身份迁移")
+
+# 同一份 JD 的两次粘贴：SHORT 是 LONG 的截断（真实验测形状 0.965；jobdup 的测试里钉过）
+LONG_JD = ("数据质检验收把控：严格按评测标准对大模型语音通话数据质检验收；"
+           "熟悉ASR与TTS评测流程；能定位Bad Case并做归因分析；有标注规范落地经验；"
+           "每周输出质量周报，推动标注工具迭代与规范落地。")
+SHORT_JD = ("数据质检验收把控：严格按评测标准对大模型语音通话数据质检验收；"
+            "熟悉ASR与TTS评测流程；能定位Bad Case并做归因分析。")
+OTHER_JD = ("负责抖音电商直播运营，策划带货活动，管理达人矩阵与坑位排期，"
+            "跟进直播间转化率与退货率，每周输出复盘报告并复盘投放ROI。")
+
+
+def fingerprint(root):
+    """整个数据根的指纹：{相对路径: sha256 或 '<目录>'}（新增 / 删除 / 改动都逃不掉）"""
+    out = {}
+    for dirpath, dirnames, filenames in os.walk(root):
+        for d in dirnames:
+            out[os.path.relpath(os.path.join(dirpath, d), root)] = "<目录>"
+        for fn in filenames:
+            p = os.path.join(dirpath, fn)
+            with open(p, "rb") as f:
+                out[os.path.relpath(p, root)] = hashlib.sha256(f.read()).hexdigest()
+    return out
+
+
+def write_report(path, data):
+    """造一份能被 `kb.read_report_data` 读出来的报告（模板骨架 + REPORT_DATA）。"""
+    store.write_text(path, "<html><body><script>\nconst REPORT_DATA = %s;\n</script></body></html>"
+                     % json.dumps(data, ensure_ascii=False))
+
+
+def _report_data(title, salary, category, location, education, score, company=""):
+    return {"job_title": title, "company": company, "job_category": category,
+            "location": location, "salary": salary, "education": education,
+            "score": score, "verdict": "建议投递", "resume": "周汉钦-母版",
+            "source": "粘贴文本", "application": {"status": "未投递", "outcome_reason": "",
+                                              "outcome_at": ""}}
+
+
+class MigrationTestBase(IsolatedCase):
+    """三份同一 JD（A/B/C）+ 一份不同（D）+ 一份无原文（E）；外加知识库与一条面试记录。"""
+
+    def setUp(self):
+        IsolatedCase.setUp(self)
+        reports, jd_dir = store.p_path("reports"), store.p_path("jd")
+        for sub in ("reports", "jd"):
+            os.makedirs(store.p_path(sub), exist_ok=True)
+
+        # A/B/C：同一份 JD 的三次分析（B、C 是 A 的截断粘贴）
+        for jid, date, text in (("分析A", "2026-09-01 10:00", LONG_JD),
+                                ("分析B", "2026-09-02 10:00", SHORT_JD),
+                                ("分析C", "2026-09-03 10:00", SHORT_JD)):
+            store.upsert_job({"id": jid, "report": jid + ".html", "created_at": date,
+                              "job_title": "语音/文本评测", "company": "",
+                              "job_category": "数据标注/质检", "location": "北京",
+                              "salary": "13-26K", "score": 70.0, "verdict": "建议投递",
+                              "source_type": "粘贴文本", "jd_text_file": jid + ".txt",
+                              "resume": "周汉钦-母版", "status": "未投递"})
+            store.write_text(os.path.join(jd_dir, jid + ".txt"), text)
+            write_report(os.path.join(reports, jid + ".html"),
+                         _report_data("语音/文本评测", "13-26K", "数据标注/质检", "北京",
+                                      "本科", 70.0))
+
+        # D：一份完全不同的 JD
+        store.upsert_job({"id": "分析D", "report": "分析D.html", "created_at": "2026-09-04 10:00",
+                          "job_title": "电商直播运营", "company": "某电商公司",
+                          "job_category": "AI数据运营", "location": "上海", "salary": "10-15K",
+                          "score": 55.0, "jd_text_file": "分析D.txt", "resume": "周汉钦-母版",
+                          "status": "未投递"})
+        store.write_text(os.path.join(jd_dir, "分析D.txt"), OTHER_JD)
+        write_report(os.path.join(reports, "分析D.html"),
+                     _report_data("电商直播运营", "10-15K", "AI数据运营", "上海", "本科", 55.0,
+                                  company="某电商公司"))
+
+        # E：没有 JD 原文（真实数据里的「示例」那条）→ 自成 1 个 JD
+        store.upsert_job({"id": "分析E", "report": "分析E.html", "created_at": "2026-09-05 10:00",
+                          "job_title": "语音/文本评测（示例）", "company": "某 AI 科技公司（示例）",
+                          "job_category": "数据标注/质检", "location": "北京", "salary": "13–26K",
+                          "score": 80.4, "jd_text_file": "", "resume": "周汉钦-母版",
+                          "status": "未投递"})
+        write_report(os.path.join(reports, "分析E.html"),
+                     _report_data("语音/文本评测（示例）", "13–26K", "数据标注/质检", "北京",
+                                  "本科", 80.4, company="某 AI 科技公司（示例）"))
+
+        # 知识库：卡 1 同时提到 A / B / C（迁移后必须并成**一条** JD 引用）
+        kb.absorb([{"term": "语音识别", "layer": 0, "sources": [], "timeline": [],
+                    "related": [], "interview_questions": []}],
+                  {"id": "分析A", "job_title": "语音/文本评测", "company": "", "date": "2026-09-01"})
+        kb.absorb([{"term": "语音识别", "layer": 0, "sources": [], "timeline": [],
+                    "related": [], "interview_questions": []}],
+                  {"id": "分析B", "job_title": "语音/文本评测", "company": "", "date": "2026-09-02"})
+        kb.absorb([{"term": "语音识别", "layer": 0, "sources": [], "timeline": [],
+                    "related": [], "interview_questions": []}],
+                  {"id": "分析C", "job_title": "语音/文本评测", "company": "", "date": "2026-09-03"})
+        kb.absorb([{"term": "质量周报", "layer": 0, "sources": [], "timeline": [],
+                    "related": [], "interview_questions": []}],
+                  {"id": "分析D", "job_title": "电商直播运营", "company": "某电商公司",
+                   "date": "2026-09-04"})
+
+        # 面试记录：job_id 现在指向分析 id
+        store.save_interview_json("iv1", "status.json", {"state": "done", "job_id": "分析A"})
+
+    # ---- 小工具 ----
+    def run_cli(self, argv):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(sys, "argv", ["身份迁移.py"] + argv):
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = CLI.main()
+        return code, out.getvalue()
+
+    def jobs_by_id(self):
+        return {j["id"]: j for j in store.load_jobs()}
+
+    def jds_by_id(self):
+        return {j["id"]: j for j in jdid.load_jds()["jds"]}
+
+
+class DryRunTest(MigrationTestBase):
+    """① `--试跑` 必须**严格只读**（逐文件 sha256 指纹一致）。"""
+
+    def test_dry_run_writes_nothing_and_prints_the_mapping(self):
+        before = fingerprint(store.DATA_ROOT)
+        code, text = self.run_cli(["--试跑"])
+        self.assertEqual(code, 0)
+        self.assertEqual(fingerprint(store.DATA_ROOT), before)      # 一个字节都没写
+        self.assertFalse(os.path.exists(store.p_path("jds.json")))   # 没建 JD 库
+        # 对照表要点（细到个体）
+        self.assertIn("活跃分析 5 份 → 3 个 JD", text)
+        self.assertIn("分析A", text)
+        self.assertIn("分析B", text)
+        self.assertIn("分析C", text)
+        self.assertIn("分析D", text)
+        self.assertIn("分析E", text)
+        self.assertIn("报告文件不改名、不删除", text)
+        self.assertIn("跳过了 1 个", text)
+        self.assertIn("未改动任何文件", text)
+
+    def test_bad_args_return_usage_and_write_nothing(self):
+        before = fingerprint(store.DATA_ROOT)
+        for bad in ([], ["--执行", "extra"], ["--乱写"]):
+            out, err = io.StringIO(), io.StringIO()
+            with mock.patch.object(sys, "argv", ["身份迁移.py"] + bad):
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    code = CLI.main()
+            self.assertEqual(code, 2, bad)
+            self.assertIn("--试跑", err.getvalue())      # 用法里点名了两种模式
+            self.assertIn("--执行", err.getvalue())
+        self.assertEqual(fingerprint(store.DATA_ROOT), before)
+        self.assertFalse(os.path.exists(store.p_path("jds.json")))
+
+    def test_dry_run_groups_by_fingerprint_not_by_report_filename(self):
+        _code, text = self.run_cli(["--试跑"])
+        blocks = self._jd_blocks(text)
+        # 具体哪几份归到一组：个体粒度
+        group_a = [b for b in blocks if "分析A" in b]
+        group_d = [b for b in blocks if "分析D" in b]
+        group_e = [b for b in blocks if "分析E" in b]
+        self.assertEqual(len(group_a), 1, "分析A 必须只出现在一个 JD 块里：\n" + text)
+        self.assertEqual(len(group_d), 1)
+        self.assertEqual(len(group_e), 1)
+        group_a, group_d, group_e = group_a[0], group_d[0], group_e[0]
+        self.assertIn("分析B", group_a)                   # A/B/C 同一份 JD → 同一块
+        self.assertIn("分析C", group_a)
+        self.assertIn("归组依据: 指纹", group_a)
+        self.assertNotIn("分析D", group_a)
+        self.assertNotIn("分析E", group_a)
+        self.assertNotIn("分析A", group_d)
+        self.assertNotIn("分析E", group_d)
+        self.assertIn("缺 JD 原文", group_e)
+        # 三个 JD 的 id 互不相同
+        heads = [b.splitlines()[0] for b in blocks]
+        self.assertEqual(len({h.split("→")[1].strip() for h in heads}), 3)
+
+    @staticmethod
+    def _jd_blocks(text):
+        """把对照表切成「一个 JD 一块」（头行是 `JD <序号>  →  <id>`）"""
+        blocks, cur = [], None
+        for line in text.splitlines():
+            if line.startswith("JD ") and line[3:4].isdigit() and "→" in line:
+                if cur is not None:
+                    blocks.append("\n".join(cur))
+                cur = [line]
+            elif cur is not None:
+                if line.strip():
+                    cur.append(line)
+                else:
+                    blocks.append("\n".join(cur))
+                    cur = None
+        if cur is not None:
+            blocks.append("\n".join(cur))
+        return blocks
+
+
+class ExecuteTest(MigrationTestBase):
+    """③ `--执行` 之后：无悬空引用 / 报告数不变 / 知识库与面试记录改指 JD id / JD 数 == 分组数。"""
+
+    def _execute(self):
+        reports_before = sorted(os.path.basename(p)
+                                for p in glob.glob(os.path.join(store.p_path("reports"), "*.html")))
+        code, text = self.run_cli(["--执行"])
+        return code, text, reports_before
+
+    def test_every_analysis_has_a_jd_id_that_exists(self):
+        code, _text, _ = self._execute()
+        self.assertEqual(code, 0)
+        jobs = store.load_jobs()
+        self.assertEqual(len(jobs), 5)
+        jds = self.jds_by_id()
+        # 活跃分析：条条必须有 jd_id 且指向真实存在的 JD（无悬空引用）
+        for j in jobs:
+            self.assertTrue(str(j.get("jd_id") or ""), "分析 %s 没有 jd_id" % j.get("id"))
+            self.assertIn(j["jd_id"], jds, "悬空 jd_id：%s" % j["jd_id"])
+        # 逐条钉住「迁移后 jobs.json 只剩下这 6 个键」（JD 级字段整体搬走）
+        for j in jobs:
+            self.assertEqual(sorted(j), ["created_at", "id", "jd_id", "report", "resume", "score"],
+                             "分析 %s 的键不对：%s" % (j["id"], sorted(j)))
+        # A/B/C 必须**同一个** jd_id（个体粒度，不是「有 id 就算」）
+        by_id = self.jobs_by_id()
+        self.assertEqual(by_id["分析A"]["jd_id"], by_id["分析B"]["jd_id"])
+        self.assertEqual(by_id["分析A"]["jd_id"], by_id["分析C"]["jd_id"])
+        self.assertNotEqual(by_id["分析A"]["jd_id"], by_id["分析D"]["jd_id"])
+        self.assertNotEqual(by_id["分析A"]["jd_id"], by_id["分析E"]["jd_id"])
+
+    def test_jd_level_fields_do_not_stay_in_jobs_json(self):
+        """JD 级字段只存 `jds.json`（两个文件各存一份是本项目反复栽的坑）。"""
+        self._execute()
+        for j in store.load_jobs():
+            for key in ("job_title", "company", "salary", "location", "status", "verdict",
+                        "notes", "jd_text_file", "source_type", "source_link",
+                        "job_category", "address", "hr_name", "phone", "outcome_at",
+                        "outcome_reason", "outcome_ai"):
+                self.assertNotIn(key, j, "jobs.json 里还留着 JD 级字段 %s：%s" % (key, j.get("id")))
+        jd = self.jds_by_id()[self.jobs_by_id()["分析A"]["jd_id"]]
+        self.assertEqual(jd["job_category"], "数据标注/质检")     # 原始值，不是 ID 里的归一化值
+        self.assertEqual(jd["salary"], "13-26K")
+        self.assertEqual(jd["location"], "北京")
+        self.assertEqual(jd["created_at"], "2026-09-01 10:00")
+        self.assertEqual(jd["migrated_from"], ["分析A", "分析B", "分析C"])
+        self.assertEqual(jd["id_history"], [])
+        # ID 的六段与 JD 级字段是**两套值**：ID 归一化（`示例` / `13-26K`），
+        # JD 级字段保留原始表述（`某 AI 科技公司（示例）`）——混在一起就是用户看到被截短的名字
+        jd_e = self.jds_by_id()[self.jobs_by_id()["分析E"]["jd_id"]]
+        self.assertEqual(jd_e["company"], "某 AI 科技公司（示例）")
+        self.assertEqual(jd_e["salary"], "13–26K")               # 全角破折号，原样保留
+        self.assertIn("示例", jd_e["id"])
+        self.assertNotIn("某 AI 科技公司（示例）", jd_e["id"])
+
+    def test_group_count_matches_fingerprint_groups(self):
+        self._execute()
+        self.assertEqual(len(jdid.load_jds()["jds"]), 3)
+        self.assertEqual(jdid.load_jds()["seq"], 3)
+        # ID 是 7 段、编号 4 位，末段编号 == 记录的 seq（逐条，不是只看总数）
+        for jd in jdid.load_jds()["jds"]:
+            fields, seq = jdid.parse_id(jd["id"])
+            self.assertEqual(seq, jd["seq"])
+            self.assertEqual(fields["city"], jd["location"] or "【未知城市】")
+            self.assertEqual(jd["id"], jdid.build_id(fields, seq))     # 自洽：能原样拼回去
+
+    def test_report_files_are_untouched(self):
+        code, _text, reports_before = self._execute()
+        self.assertEqual(code, 0)
+        reports_after = sorted(os.path.basename(p)
+                               for p in glob.glob(os.path.join(store.p_path("reports"), "*.html")))
+        self.assertEqual(reports_after, reports_before)
+        for name in reports_before:
+            self.assertTrue(os.path.exists(os.path.join(store.p_path("reports"), name)))
+        # JD 原文也不改名（jd_text_file 跟着指向它）
+        for jid in ("分析A", "分析B", "分析C", "分析D"):
+            self.assertTrue(os.path.exists(store.p_path("jd", jid + ".txt")),
+                            "JD 原文 %s.txt 不见了" % jid)
+
+    def test_knowledge_references_point_to_jd_ids(self):
+        self._execute()
+        data = store.load_knowledge()
+        jds = self.jds_by_id()
+        nodes = {n["term"]: n for n in data["nodes"]}
+        self.assertEqual(len(nodes), 2)
+        # 细到个体：三条旧引用并成一条，值就是那个 JD 的 id
+        frm = nodes["语音识别"]["from_jds"]
+        self.assertEqual(len(frm), 1, "A/B/C 应并成 1 条引用：%s" % frm)
+        self.assertIn(frm[0]["id"], jds)
+        self.assertEqual(frm[0]["id"], self.jobs_by_id()["分析A"]["jd_id"])
+        self.assertEqual(frm[0]["job_title"], "语音/文本评测")
+        other = nodes["质量周报"]["from_jds"][0]["id"]
+        self.assertIn(other, jds)
+        self.assertEqual(other, self.jobs_by_id()["分析D"]["jd_id"])
+        # 全库无悬空：每条引用都必须在 jds.json 里
+        for n in data["nodes"]:
+            for x in n.get("from_jds") or []:
+                self.assertIn(x["id"], jds, "知识库悬空引用：%s" % x)
+
+    def test_knowledge_reference_with_no_title_gets_one_from_the_jd(self):
+        """引用项缺 `job_title` / `company` 时要**从 JD 记录补上**（另一条独立分支）。"""
+        kb.absorb([{"term": "无标题引用", "layer": 0, "sources": [], "timeline": [],
+                    "related": [], "interview_questions": []}], {"id": "分析D"})
+        data = store.load_knowledge()                       # 清掉那条引用的展示字段
+        for node in data["nodes"]:
+            if node["term"] == "无标题引用":
+                for item in node["from_jds"]:
+                    item["job_title"] = ""
+                    item["company"] = ""
+        store.save_knowledge(data)
+        self._execute()
+        node = [n for n in store.load_knowledge()["nodes"] if n["term"] == "无标题引用"][0]
+        item = node["from_jds"][0]
+        jd = self.jds_by_id()[self.jobs_by_id()["分析D"]["jd_id"]]
+        self.assertEqual(item["id"], jd["id"])
+        self.assertEqual(item["job_title"], "电商直播运营")     # 从 JD 记录补回来
+        self.assertEqual(item["company"], "某电商公司")
+
+    def test_interview_job_id_points_to_a_jd_id(self):
+        self._execute()
+        st = store.load_interview_json("iv1", "status.json")
+        self.assertEqual(st["job_id"], self.jobs_by_id()["分析A"]["jd_id"])
+        self.assertIn(st["job_id"], self.jds_by_id())
+
+    def test_backup_directory_is_created_and_kept(self):
+        self._execute()
+        backups = glob.glob(os.path.join(store.profiles_root(), "迁移备份_*"))
+        self.assertEqual(len(backups), 1)
+        self.assertTrue(os.path.isdir(backups[0]))
+        self.assertTrue(os.path.exists(os.path.join(backups[0], "jobs.json")))
+        self.assertTrue(os.path.exists(os.path.join(backups[0], "knowledge.json")))
+        self.assertFalse(os.path.exists(os.path.join(backups[0], "jds.json")))  # 迁移前它不存在
+        # 备份里是**迁移前**的内容，且没被就地改动
+        before_jobs = json.loads(store.read_text(os.path.join(backups[0], "jobs.json")))
+        self.assertEqual(len(before_jobs), 5)
+        self.assertTrue(all("jd_id" not in j for j in before_jobs))
+
+
+class IdempotenceTest(MigrationTestBase):
+    """④ 跑两次，第二次一个字节都不改（jds.json / jobs.json / knowledge.json 字节级相同）。"""
+
+    def test_second_execute_changes_nothing(self):
+        self.assertEqual(self.run_cli(["--执行"])[0], 0)
+        snap = {name: store.read_text(store.p_path(name))
+                for name in ("jds.json", "jobs.json", "knowledge.json")}
+        backups_before = glob.glob(os.path.join(store.profiles_root(), "迁移备份_*"))
+        code, _text = self.run_cli(["--执行"])
+        self.assertEqual(code, 0)
+        for name, text in snap.items():
+            self.assertEqual(store.read_text(store.p_path(name)), text, "%s 被改动了" % name)
+        self.assertEqual(len(glob.glob(os.path.join(store.profiles_root(), "迁移备份_*"))),
+                         len(backups_before) + 1)      # 备份照常加一份，但库内容不变
+        self.assertEqual(len(jdid.load_jds()["jds"]), 3)   # 没重复建 JD
+        self.assertEqual(jdid.load_jds()["seq"], 3)        # seq 也没再涨
+
+
+class RestoreTest(MigrationTestBase):
+    """⑤ 注入写盘失败 → 用备份恢复（三个文件字节级还原）。
+
+    注入点是 `store.write_json` 的**第二次**调用（第一次写 `jds.json` 成功、第二次写
+    `jobs.json` 炸）—— 失败落在「已经有文件被改过」之后，才能验证「从备份恢复」这条路，
+    而不是「还没开始就退出」。`save_jobs` 打不着：本脚本走的是 `store.write_json` 原子写。
+    """
+
+    def test_injected_write_failure_restores_from_backup(self):
+        original = {name: store.read_text(store.p_path(name))
+                    for name in ("jobs.json", "knowledge.json", "jds.json")
+                    if os.path.exists(store.p_path(name))}
+        original[os.path.join("interviews", "iv1", "status.json")] = \
+            store.read_text(store.interview_file("iv1", "status.json"))
+        self.assertFalse(os.path.exists(store.p_path("jds.json")))
+
+        boom = OSError("disk full (注入)")
+        real = store.write_json
+        calls = {"n": 0}
+
+        def flaky(path, obj):
+            calls["n"] += 1
+            if calls["n"] == 2:                      # jds.json 已落盘，jobs.json 炸
+                raise boom
+            return real(path, obj)
+
+        with mock.patch.object(store, "write_json", side_effect=flaky):
+            code, text = self.run_cli(["--执行"])
+
+        self.assertEqual(calls["n"], 2)
+        self.assertEqual(code, 1)
+        self.assertIn("已用备份恢复", text)
+        # 迁移新建的 jds.json 必须被清掉（它不在备份里）
+        self.assertFalse(os.path.exists(store.p_path("jds.json")))
+        for rel, content in original.items():
+            self.assertEqual(store.read_text(store.p_path(rel)), content,
+                             "%s 没被还原" % rel)
+        st = store.load_interview_json("iv1", "status.json")
+        self.assertEqual(st["job_id"], "分析A")               # 面试记录也还原
+        self.assertEqual(self.jobs_by_id()["分析A"].get("jd_id"), None)
+        self.assertEqual(glob.glob(os.path.join(store.p_path(), ".tmp-*")), [])   # 不留临时文件
+        # 备份保留不删
+        backups = glob.glob(os.path.join(store.profiles_root(), "迁移备份_*"))
+        self.assertEqual(len(backups), 1)
+        self.assertTrue(os.path.exists(os.path.join(backups[0], "jobs.json")))
+
+    def test_failure_does_not_leave_a_temp_backup_root_behind(self):
+        with mock.patch.object(store, "write_json", side_effect=OSError("disk full (注入)")):
+            self.run_cli(["--执行"])
+        self.assertEqual(glob.glob(os.path.join(store.DATA_ROOT, ".迁移临时*")), [])
+
+
+class MergedRecordTest(IsolatedCase):
+    """**决策证据**：已 `merged_into` 的记录**保留原样**（策略 A），不参与建 JD。
+
+    它本来就该被隐藏（台账过滤掉它），给它新造一个 JD 会凭空多出一个只属于已删记录的卡片。
+    代价：它的旧 id 继续存在（知识库/面试记录里指向它的引用会改指它 `merged_into` 的 JD）。
+    """
+
+    def setUp(self):
+        IsolatedCase.setUp(self)
+        os.makedirs(store.p_path("reports"), exist_ok=True)
+        for jid, date in (("分析A", "2026-09-01 10:00"), ("分析B", "2026-09-02 10:00")):
+            store.upsert_job({"id": jid, "report": jid + ".html", "created_at": date,
+                              "job_title": "语音/文本评测", "job_category": "数据标注/质检",
+                              "location": "北京", "salary": "13-26K", "score": 70.0,
+                              "jd_text_file": jid + ".txt", "status": "未投递"})
+            store.write_text(store.p_path("jd", jid + ".txt"), LONG_JD)
+            write_report(os.path.join(store.p_path("reports"), jid + ".html"),
+                         _report_data("语音/文本评测", "13-26K", "数据标注/质检", "北京", "本科", 70.0))
+        jobdup = importlib.import_module("jobdup")
+        jobdup.merge_jobs("分析A", "分析B")           # B 标记 merged_into=A
+        kb.absorb([{"term": "语音识别", "layer": 0, "sources": [], "timeline": [],
+                    "related": [], "interview_questions": []}], {"id": "分析B"})
+
+    def test_merged_record_keeps_its_identity_and_its_own_id_is_not_a_jd(self):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(sys, "argv", ["身份迁移.py", "--执行"]):
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = CLI.main()
+        text = out.getvalue()
+        self.assertEqual(code, 0)
+        jobs = {j["id"]: j for j in store.load_jobs()}
+        self.assertEqual(jobs["分析B"]["merged_into"], "分析A")
+        self.assertNotIn("jd_id", jobs["分析B"], "已合并记录不该被挂到新 JD 上")
+        self.assertEqual(len(jdid.load_jds()["jds"]), 1)      # B 不产生自己的 JD
+        # 但知识库里指向 B 的引用必须改指 A 所在的 JD（不留悬空引用）
+        card = store.load_knowledge()["nodes"][0]
+        self.assertEqual([x["id"] for x in card["from_jds"]], [jobs["分析A"]["jd_id"]])
+        self.assertIn("保留原样", text)
+
+
+if __name__ == "__main__":
+    unittest.main()
