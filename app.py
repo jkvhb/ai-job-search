@@ -22,6 +22,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, unquote, quote
 
 import jdfacts
+import jddelete
 import jdid
 import jobdup
 import kb
@@ -579,8 +580,27 @@ def _jd_view(job_id):
     return jd, rec
 
 
+def _purge_target_id(raw):
+    """把前端传来的一个 id 解析成「要删的那个岗位」的 JD id（认不出回空串）。
+
+    与别的写接口**同一口径**（`_jd_view`）：JD id 优先；老前端 / 历史链接传**分析 id**
+    或**报告文件名**也认（`_job_in_ledger` 两种都查）。解析不出就原样返回去空白后的值 ——
+    预演会据此回 404（"JD 库里没有这个 ID，也没有挂在它下面的分析"），**绝不猜一个**。
+    """
+    want = str(raw or "").strip()
+    if not want:
+        return ""
+    jd, rec = _jd_view(want)
+    if isinstance(jd, dict) and str(jd.get("id") or ""):
+        return str(jd["id"])
+    if isinstance(rec, dict):
+        return _jd_id_of_row(rec)
+    return want
+
+
 def _jd_text_path(jd):
     """JD 原文的磁盘路径；没有原文回空串。
+
     新记录：`jd_text_file` 是 `<jd_id>.txt`；迁移前的老记录 `jd_text_file` 可能是
     `<报告文件名>.txt` —— 两种都按字段走，字段空时才退回 `<jd_id>.txt`（Task 2 之前的
     记录根本没有 `jd_text_file` 指向 JD id 这一说）。
@@ -1763,6 +1783,31 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(404, {"error": "没有保存 JD 原文"})
             return self._send(200, {"text": store.read_text(path, "")})
 
+        if p == "/api/jd/purge_preview":
+            # 阶段 D：**真删除**的只读预演（先列清单 + 两次确认里的第一次）。
+            # 前端把清单逐条念给用户听 —— 所以这里**只读**、且绝不"算不出就猜"：
+            # 读不出的东西都进 `advisories` 如实说。id 与别的写接口同一口径（JD id 优先，
+            # 老前端传分析 id / 报告名也认）；参数名收 `jd`（用户可见的契约）与 `id`（别名）。
+            jd_id = _purge_target_id(q.get("jd", q.get("id", [""]))[0])
+            if not jd_id:
+                return self._send(400, {"ok": False, "error": "缺少 id（要删哪个岗位？）"})
+            try:
+                preview = jddelete.preview_purge(jd_id)
+            except Exception as e:
+                log.log_exc("jd.purge_preview_error", e, jd=jd_id)
+                return self._send(500, {"ok": False, "error": "预演失败：%s" % e})
+            if not preview.get("found"):
+                # 200 之外唯一正确的一支：404（表里没有这个岗位，**不是**崩）
+                return self._send(404, {"ok": False, "id": jd_id,
+                                        "error": preview.get("not_found") or "找不到该岗位"})
+            # 内部键（`_analyses` / `_files` / …）是 `jddelete` 的内部形状：**不出网**，
+            # 前端只看摊平后的那份（多一份内部数据就多一份"前端依赖了不该依赖的东西"的机会）。
+            out = {k: v for k, v in preview.items() if not k.startswith("_")}
+            log.log_event("jd.purge_preview", jd=jd_id,
+                          analyses=preview["summary"]["analyses"],
+                          files=preview["summary"]["files"], kb_hits=preview["summary"]["kb_hits"])
+            return self._send(200, out)
+
         if p == "/api/job/outcome":
             # 结果面板的读接口：读回 application（含「是否已复盘」）供前端渲染。
             # 阶段 4A：**JD 级真相在 `jds.json`** —— 这里把该 JD 的记录与分析记录拼成
@@ -2117,6 +2162,45 @@ class Handler(BaseHTTPRequestHandler):
             log.log_event("jd.id_changed", old=old_id, new=saved_id)
             return self._send(200, {"ok": True, "id": saved_id, "old_id": old_id,
                                     "job": _jd_row_of(saved_id)})
+
+        if p == "/api/jd/purge":
+            # 阶段 D：**真删除**（不可恢复是它的语义）。前端必须已经跑过
+            # `GET /api/jd/purge_preview` 并**两次确认**；`confirm_fingerprint` 就是
+            # 用户确认的那份清单的指纹 —— 对不上（预演之后数据被改过）→ 409 拒绝执行，
+            # 绝不"按旧清单删一份新数据"。
+            jd_id = _purge_target_id(body.get("id") or body.get("jd"))
+            if not jd_id:
+                return self._send(400, {"ok": False, "error": "缺少 id（要删哪个岗位？）"})
+            try:
+                res = jddelete.purge_jd(jd_id,
+                                        expect_fingerprint=str(body.get("confirm_fingerprint") or ""))
+            except jddelete.JdPurgeError as e:
+                msg = str(e)
+                # 状态码取异常上的 **code**（不解析文案）：not_found → 404；
+                # stale（用户确认的清单已经变了）→ 409；备份/删除/回滚失败 → 500。
+                status = {"not_found": 404, "stale": 409}.get(getattr(e, "code", ""), 500)
+                log.log_event("jd.purge_rejected", level="warn", jd=jd_id,
+                              status=status, error=msg)
+                return self._send(status, {"ok": False, "id": jd_id, "error": msg})
+            log.log_event("jd.purge_done", jd=jd_id, backup=os.path.basename(res["backup"]),
+                          files=len(res["removed_files"]), analyses=len(res["analyses"]),
+                          skipped=len(res["skipped_files"]))
+            # 顺手把刷新后的台账端回去（前端 loadJobs() 之外少一次往返）。
+            # ⚠️ 它**必须**在自己的 try 里：删除**已经成功**，一次台账渲染失败绝不能
+            # 让前端收到 5xx —— 那会让用户以为没删掉，从而再删一次（那时已经找不到了）。
+            try:
+                rows = _ledger_rows()
+            except Exception as e:
+                log.log_exc("jd.purge_ledger_error", e, jd=jd_id)
+                rows = []
+            return self._send(200, {"ok": True, "id": jd_id, "backup": res["backup"],
+                                    "backup_note": res["backup_note"],
+                                    "removed_files": res["removed_files"],
+                                    "skipped_files": res["skipped_files"],
+                                    "analyses": res["analyses"],
+                                    "kb_nodes": res["kb_nodes"],
+                                    "interviews": res["interviews"],
+                                    "jobs": rows})
 
         if p == "/api/job/result":
             # 记录结果：用户的字一个不改地存下来（转义是模板的事）。status 非法 → 400。

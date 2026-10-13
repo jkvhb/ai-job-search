@@ -4166,5 +4166,344 @@ class ResumeFilePickRejectTest(IsolatedCase):
                       "读文件之前没有按扩展名显式判断")
 
 
+class JdPurgeRouteTest(LedgerWithReportsCase):
+    """阶段 D 的两条新路由：`GET /api/jd/purge_preview`（只读预演）与 `POST /api/jd/purge`（真删）。
+
+    这里只钉**路由层**的契约（状态码 / 形状 / 参数名 / 指纹判门）；删除语义本身在
+    `tests/test_jddelete.py` 里逐条钉（含逐字节回滚）。
+    """
+
+    def _two_analyses(self):
+        self._analysis("a1", "简历甲", "", "a1.html", 66.0, "2026-10-01 09:00")
+        self._analysis("a2", "简历乙", "", "a2.html", 72.0, "2026-10-05 09:00")
+
+    def test_preview_returns_the_itemized_list_and_is_read_only(self):
+        self._two_analyses()
+        before = _disk_bytes(os.path.join(store.p_path("jobs.json")))
+        code, body = self._get("/api/jd/purge_preview?jd=" + quote(self.JD_ID))
+        self.assertEqual(code, 200, body)
+        self.assertTrue(body["ok"], body)
+        self.assertTrue(body["found"])
+        self.assertEqual(body["id"], self.JD_ID)
+        # 逐条：两条分析（id + 简历名 + 分数）
+        self.assertEqual([a["id"] for a in body["analyses"]], ["a1", "a2"])
+        self.assertEqual([a["resume"] for a in body["analyses"]], ["简历甲", "简历乙"])
+        self.assertEqual([a["score"] for a in body["analyses"]], [66.0, 72.0])
+        # 逐条：报告文件 + JD 原文（文件名逐个点名）
+        names = [f["name"] for f in body["files"]]
+        self.assertEqual(sorted(f["name"] for f in body["files"]
+                                if f["kind"] == "analysis_report"), ["a1.html", "a2.html"])
+        self.assertIn(self.JD_ID + ".txt", names)
+        # 指纹非空（执行侧要用它判"清单有没有变"）
+        self.assertTrue(body["fingerprint"])
+        # **严格只读**：读接口不能改一个字节
+        self.assertEqual(_disk_bytes(os.path.join(store.p_path("jobs.json"))), before)
+
+    def test_preview_accepts_the_documented_jd_parameter_and_the_id_alias(self):
+        self._two_analyses()
+        for qs in ("?jd=", "?id="):
+            with self.subTest(qs=qs):
+                code, body = self._get("/api/jd/purge_preview" + qs + quote(self.JD_ID))
+                self.assertEqual(code, 200, body)
+                self.assertEqual(body["id"], self.JD_ID)
+
+    def test_the_route_does_not_leak_internal_keys_to_the_frontend(self):
+        self._two_analyses()
+        code, body = self._get("/api/jd/purge_preview?jd=" + quote(self.JD_ID))
+        self.assertEqual(code, 200, body)
+        for k in ("_analyses", "_files", "_kb_cards", "_interviews"):
+            self.assertNotIn(k, body)
+
+    def test_a_missing_jd_is_404_with_a_sentence_not_a_crash(self):
+        code, body = self._get("/api/jd/purge_preview?jd=" + quote("根本没有_0001"))
+        self.assertEqual(code, 404, body)
+        self.assertFalse(body["ok"])
+        self.assertIn("没有", body["error"])
+
+    def test_a_missing_id_is_400(self):
+        code, body = self._get("/api/jd/purge_preview")
+        self.assertEqual(code, 400, body)
+        self.assertFalse(body["ok"])
+        self.assertIn("id", body["error"])
+
+    def test_purge_deletes_the_records_and_files_and_reports_the_backup_path(self):
+        self._two_analyses()
+        code, p = self._get("/api/jd/purge_preview?jd=" + quote(self.JD_ID))
+        self.assertEqual(code, 200, p)
+        code, body = self._post_json("/api/jd/purge",
+                                     {"id": self.JD_ID, "confirm_fingerprint": p["fingerprint"]})
+        self.assertEqual(code, 200, body)
+        self.assertTrue(body["ok"], body)
+        self.assertTrue(os.path.isdir(body["backup"]), body["backup"])
+        self.assertEqual(sorted(f["name"] for f in body["removed_files"]),
+                         ["a1.html", "a2.html", self.JD_ID + ".txt"])
+        self.assertIsNone(jdid.find_jd(self.JD_ID))
+        for name in ("a1.html", "a2.html", self.JD_ID + ".txt"):
+            self.assertFalse(os.path.exists(os.path.join(store.p_path("reports"), name)))
+        # 返回的台账里已经没有这一行了
+        self.assertEqual(body["jobs"], [])
+
+    def test_purge_without_a_fingerprint_still_works(self):
+        """老前端 / curl 不传指纹时照常执行（指纹是**额外**的一道闸门，不是必填）。"""
+        self._two_analyses()
+        code, body = self._post_json("/api/jd/purge", {"id": self.JD_ID})
+        self.assertEqual(code, 200, body)
+        self.assertIsNone(jdid.find_jd(self.JD_ID))
+
+    def test_a_stale_fingerprint_is_409_and_nothing_is_deleted(self):
+        self._two_analyses()
+        code, p = self._get("/api/jd/purge_preview?jd=" + quote(self.JD_ID))
+        self.assertEqual(code, 200, p)
+        self._analysis("a3", "简历丙", "", "a3.html", 90.0, "2026-10-09 09:00")
+        code, body = self._post_json("/api/jd/purge",
+                                     {"id": self.JD_ID, "confirm_fingerprint": p["fingerprint"]})
+        self.assertEqual(code, 409, body)
+        self.assertFalse(body["ok"])
+        self.assertIn("清单", body["error"])
+        self.assertIsNotNone(jdid.find_jd(self.JD_ID))
+        self.assertTrue(os.path.exists(os.path.join(store.p_path("reports"), "a1.html")))
+
+    def test_purging_a_missing_jd_is_404(self):
+        code, body = self._post_json("/api/jd/purge", {"id": "根本没有_0001"})
+        self.assertEqual(code, 404, body)
+        self.assertFalse(body["ok"])
+
+    def test_a_missing_id_on_purge_is_400(self):
+        code, body = self._post_json("/api/jd/purge", {})
+        self.assertEqual(code, 400, body)
+        self.assertFalse(body["ok"])
+
+
+_PURGE_PROBE_JS = """
+function attrOf(html, name){
+  const re = new RegExp(name + '="([^"]*)"');
+  const m = re.exec(String(html || ''));
+  return m ? m[1] : null;
+}
+function disabledOf(html, id){
+  const re = new RegExp('<button[^>]*id="' + id + '"[^>]*>');
+  const m = re.exec(String(html || ''));
+  return !!(m && /\\bdisabled\\b/.test(m[0]));
+}
+function captureToasts(){
+  __TOASTS = [];
+  toast = function(msg){ __TOASTS.push(String(msg)); };
+}
+/* 只留下**业务请求**：`logUI` 往 `/api/log` 发的是遥测，数进"发了几个请求"里会把断言
+   变成"日志发了几条"（顺序与条数都会被它搅乱）。 */
+function bizCalls(calls){
+  return calls.filter(function(c){ return String(c.url).indexOf('/api/log') < 0; });
+}
+"""
+
+
+class JdDeleteFrontendTest(LedgerWithReportsCase):
+    """前端入口（规格 §3）：按钮不再是禁用的占位；预演清单**逐条**渲染；两步确认；
+    删除后刷新台账；每个 fetch 有 catch；所有数据过 `esc()`。"""
+
+    def _row_fixture(self):
+        self._analysis("a1", "简历甲", "", "a1.html", 66.0, "2026-10-01 09:00")
+        self._analysis("a2", "简历乙", "", "a2.html", 72.0, "2026-10-05 09:00")
+        return self._row()
+
+    def _preview(self):
+        """**真后端**产出的那份预演（前端要用真清单渲染，不是手搓一个像的）。"""
+        self._row_fixture()
+        code, body = self._get("/api/jd/purge_preview?jd=" + quote(self.JD_ID))
+        self.assertEqual(code, 200, body)
+        return body
+
+    def test_the_card_carries_a_real_delete_button_not_a_disabled_placeholder(self):
+        _need_node()
+        row = self._row_fixture()
+        out = web_probe.run_index(
+            _PURGE_PROBE_JS +
+            "JOBS = [__fixture.row];\n"
+            "renderJobs();\n"
+            "var html = String(document.querySelector('#jobList').innerHTML);\n"
+            "out.btn = attrOf(html, 'data-jddel');\n"
+            "out.disabled = disabledOf(html, 'jddel-' + __fixture.row.id);\n"
+            "out.placeholder = html.indexOf('暂不可用') >= 0;\n",
+            {"row": row})
+        if not out.get("btn"):
+            raise AssertionError("卡片里没有删除按钮（渲染没发生 → 断言会变成恒真的假绿）：%r" % (out,))
+        self.assertEqual(out["btn"], self.JD_ID)
+        self.assertFalse(out["disabled"], "删除按钮还是禁用的占位：%r" % (out,))
+        self.assertFalse(out["placeholder"])
+        # 绑定的那一行也要在（写了 data-jddel 却不绑 = 死按钮）
+        self.assertIn("querySelectorAll('[data-jddel]')", _js_fn_body("renderJobs"))
+
+    def test_the_preview_list_is_rendered_item_by_item(self):
+        _need_node()
+        p = self._preview()
+        out = web_probe.run_index(
+            "out.lines = jdPurgeLines(__fixture.p);\n"
+            "out.text = out.lines.join('\\n');\n",
+            {"p": p})
+        lines = out["lines"]
+        self.assertTrue(lines, "清单渲染成了空的（断言会变成恒真的假绿）")
+        # 每一条分析、每一个报告文件、JD 原文、引用命中数**各自一行**
+        for a in p["analyses"]:
+            self.assertTrue(any(a["id"] in ln for ln in lines), "分析 %s 没被逐条列出" % a["id"])
+        for f in p["files"]:
+            self.assertTrue(any(f["name"] in ln for ln in lines),
+                            "文件 %s 没被逐条列出" % f["name"])
+        self.assertTrue(any(("知识库引用：" + str(p["refs"]["knowledge"]["hits"])) in ln
+                            for ln in lines), lines)
+        self.assertTrue(any(("面试记录：" + str(p["refs"]["interviews"]["hits"])) in ln
+                            for ln in lines), lines)
+
+    def test_the_second_confirmation_lists_every_report_file_of_the_real_preview(self):
+        _need_node()
+        p = self._preview()
+        out = web_probe.run_index(
+            # 第一句「是」→ 去预演；第二句「否」→ 打住（一个字节都不删）
+            "__fetchJson = __fixture.p;\n"
+            "__confirmQueue.push(true, false);\n"
+            "await jdDelete(__fixture.id);\n"
+            "out.confirms = __confirms.slice();\n",
+            {"id": self.JD_ID, "p": p})
+        msgs = out["confirms"]
+        self.assertEqual(len(msgs), 2, "没有走两步确认：%r" % (msgs,))
+        second = msgs[1]
+        # 第二次确认里**逐条**列出将被删除的每一个报告文件（一个都不许漏）
+        for f in p["files"]:
+            if f["kind"] == "analysis_report":
+                self.assertIn(f["name"], second, second)
+        self.assertIn(self.JD_ID + ".txt", second)          # JD 原文也点名
+        self.assertIn("不可恢复", second)
+        self.assertIn("备份", second)
+        # 每一条分析也逐条在清单里
+        for a in p["analyses"]:
+            self.assertIn(a["id"], second, second)
+
+    def test_delete_flow_uses_the_real_preview_and_refreshes_the_ledger(self):
+        _need_node()
+        p = self._preview()
+        out = web_probe.run_index(
+            _PURGE_PROBE_JS +
+            "captureToasts();\n"
+            "var calls = [];\n"
+            "fetch = function(url, opt){\n"
+            "  var u = String(url);\n"
+            "  if(u.indexOf('/api/jd/purge_preview') === 0){\n"
+            "    calls.push({url: u, method: String((opt && opt.method) || 'GET')});\n"
+            "    return Promise.resolve({ok:true, json:function(){ return Promise.resolve(__fixture.p); }});\n"
+            "  }\n"
+            "  if(u.indexOf('/api/jd/purge') === 0){\n"
+            "    calls.push({url: u, method: String((opt && opt.method) || 'GET'),\n"
+            "                body: String((opt && opt.body) || '')});\n"
+            "    return Promise.resolve({ok:true, json:function(){ return Promise.resolve(__fixture.res); }});\n"
+            "  }\n"
+            "  calls.push({url: u, method: String((opt && opt.method) || 'GET')});\n"
+            "  return Promise.resolve({ok:true, json:function(){ return Promise.resolve({ok:true, jds:[]}); }});\n"
+            "};\n"
+            "__confirmQueue.push(true, true);\n"
+            "await jdDelete(__fixture.id);\n"
+            "out.confirms = __confirms.slice();\n"
+            "out.alerts = __alerts.slice();\n"
+            "out.calls = bizCalls(calls);\n",
+            {"id": self.JD_ID, "p": p,
+             "res": {"ok": True, "id": self.JD_ID, "backup": "E:/x/data/profiles/删除备份_20261013_120000",
+                     "removed_files": [{"name": "a1.html"}, {"name": "a2.html"},
+                                       {"name": self.JD_ID + ".txt"}],
+                     "skipped_files": []}})
+        self.assertEqual(len(out["confirms"]), 2, "没有走两步确认：%r" % (out["confirms"],))
+        self.assertEqual(len(out["calls"]), 3, out["calls"])
+        # ① 先**只读**预演（参数名就是规格里的 `jd`）
+        self.assertIn("/api/jd/purge_preview?jd=", out["calls"][0]["url"])
+        self.assertEqual(out["calls"][0]["method"], "GET")
+        # ② 第二次确认的文案里**逐条**列出了将被删除的报告文件
+        second = out["confirms"][1]
+        for name in ("a1.html", "a2.html"):
+            self.assertIn(name, second, second)
+        self.assertIn(self.JD_ID + ".txt", second)
+        self.assertIn("不可恢复", second)
+        self.assertIn("备份", second)
+        # ③ 删除请求带着预演给的那份清单的指纹
+        self.assertEqual(out["calls"][1]["method"], "POST")
+        self.assertIn("/api/jd/purge", out["calls"][1]["url"])
+        self.assertEqual(json.loads(out["calls"][1]["body"]),
+                         {"id": self.JD_ID, "confirm_fingerprint": p["fingerprint"]})
+        # ④ 删完**如实说出备份路径**（不许让用户以为磁盘上真没了）
+        self.assertEqual(len(out["alerts"]), 1, out["alerts"])
+        self.assertIn("删除备份_20261013_120000", out["alerts"][0])
+        self.assertIn("不可恢复", out["alerts"][0])
+        # ⑤ 刷新台账（第三次请求就是它）
+        self.assertIn("/api/jds", out["calls"][2]["url"])
+
+    def test_a_failed_purge_is_reported_and_never_says_deleted(self):
+        _need_node()
+        p = self._preview()
+        out = web_probe.run_index(
+            _PURGE_PROBE_JS +
+            "captureToasts();\n"
+            "var calls = [];\n"
+            "fetch = function(url, opt){\n"
+            "  var u = String(url);\n"
+            "  calls.push(u);\n"
+            "  if(u.indexOf('/api/jd/purge_preview') === 0)\n"
+            "    return Promise.resolve({ok:true, json:function(){ return Promise.resolve(__fixture.p); }});\n"
+            "  if(u.indexOf('/api/jd/purge') === 0)\n"
+            "    return Promise.reject(new Error('连接被重置'));\n"
+            "  return Promise.resolve({ok:true, json:function(){ return Promise.resolve({ok:true, jds:[]}); }});\n"
+            "};\n"
+            "__confirmQueue.push(true, true);\n"
+            "await jdDelete(__fixture.id);\n"
+            "out.alerts = __alerts.slice();\n"
+            "out.toasts = __TOASTS.slice();\n"
+            "out.calls = bizCalls(calls.map(function(u){ return {url: u}; }));\n",
+            {"id": self.JD_ID, "p": p, "res": None})
+        self.assertEqual(out["unexpected"], [], "catch 没兜住：%r" % (out["unexpected"],))
+        self.assertEqual(out["alerts"], [], "失败了却弹了「已删除」的提示")
+        self.assertTrue(out["toasts"], "失败时一句提示都没有")
+        self.assertIn("删除失败", "\n".join(out["toasts"]))
+        self.assertNotIn("已真删除", "\n".join(out["toasts"]))
+        self.assertEqual(len(out["calls"]), 2, out["calls"])       # 预演 + 删除；**不刷新台账**
+
+    def test_a_failed_preview_says_so_and_sends_no_delete_request(self):
+        _need_node()
+        out = web_probe.run_index(
+            _PURGE_PROBE_JS +
+            "captureToasts();\n"
+            "var calls = [];\n"
+            "fetch = function(url, opt){\n"
+            "  calls.push(String(url));\n"
+            "  return Promise.reject(new Error('服务没在跑'));\n"
+            "};\n"
+            "__confirmQueue.push(true);\n"
+            "await jdDelete(__fixture.id);\n"
+            "out.alerts = __alerts.slice();\n"
+            "out.toasts = __TOASTS.slice();\n"
+            "out.calls = bizCalls(calls.map(function(u){ return {url: u}; }));\n",
+            {"id": self.JD_ID})
+        self.assertEqual(out["unexpected"], [], "catch 没兜住：%r" % (out["unexpected"],))
+        self.assertEqual(len(out["calls"]), 1, out["calls"])
+        self.assertEqual(out["alerts"], [])
+        self.assertIn("预演失败", "\n".join(out["toasts"]))
+
+    def test_the_two_confirmations_are_taken_before_any_delete_request(self):
+        _need_node()
+        p = self._preview()
+        out = web_probe.run_index(
+            _PURGE_PROBE_JS +
+            "captureToasts();\n"
+            "var calls = [];\n"
+            "fetch = function(url, opt){\n"
+            "  calls.push(String(url));\n"
+            "  return Promise.resolve({ok:true, json:function(){ return Promise.resolve(__fixture.p); }});\n"
+            "};\n"
+            "__confirmQueue.push(true, false);\n"   # 第二步点了「取消」
+            "await jdDelete(__fixture.id);\n"
+            "out.confirms = __confirms.slice();\n"
+            "out.calls = bizCalls(calls.map(function(u){ return {url: u}; }));\n"
+            "out.toasts = __TOASTS.slice();\n",
+            {"id": self.JD_ID, "p": p})
+        self.assertEqual(len(out["confirms"]), 2, out["confirms"])
+        self.assertEqual(len(out["calls"]), 1, out["calls"])          # 只预演，没发删除
+        self.assertIn("/api/jd/purge_preview", out["calls"][0]["url"])
+        self.assertIn("已取消", "\n".join(out["toasts"]))
+
+
 if __name__ == "__main__":
     unittest.main()

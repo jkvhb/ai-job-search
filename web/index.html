@@ -751,11 +751,12 @@ function renderJobs(){
     // 不整页重渲染 —— 重渲染会把用户正在输入的原因覆盖掉
     links.push('<button class="btn gray sm" data-oc="'+esc(id)+'">🏁 结果</button>');
     links.push('<button class="btn gray sm" data-edit="'+esc(id)+'">✏️ 编辑</button>');
-    // ⚠️ 本阶段**不提供删除入口**：`DELETE /api/jobs` 还是老语义（按**分析 id** 从 jobs.json 删），
-    // 而卡片上的 id 已经是 JD id —— 传过去只会 404（或者删错一条）。
-    // 真删除（不可恢复）是下一阶段 D 的事，所以这里只给一个禁用的占位按钮 + 说明。
-    links.push('<button class="btn gray sm" id="jddel-'+esc(id)+'" disabled'
-      + ' title="删岗位功能下一阶段做（真删除）：现在 DELETE /api/jobs 还是按分析 id 删 jobs.json 的记录，传 JD id 会 404">🗑 删除（暂不可用）</button>');
+    // 🗑 真删除（阶段 D）：**不可恢复**是它的语义（用户选的就是"连报告与 JD 原文一起真删"）。
+    // 入口本身只负责"先预演 → 列清单 → 两次确认"，真正的删除在 jdDelete() 里，
+    // 且后端会先备份到 `data/profiles/删除备份_<ts>/` 并把路径回给用户看。
+    // 按钮配色刻意偏"危险"（红字）：它与旁边的「✏️ 编辑」不是同一量级的动作。
+    links.push('<button class="btn danger sm" id="jddel-'+esc(id)+'" data-jddel="'+esc(id)
+      + '" title="真删除：连报告文件与 JD 原文一起删（不可恢复）。会先给你看一份逐条清单，两次确认后才动手">🗑 删除</button>');
 
     let h = '<div class="job jd" id="jd-'+esc(id)+'" data-jd="'+esc(id)+'">';
     h += '<div class="h">';
@@ -869,6 +870,7 @@ function renderJobs(){
   box.querySelectorAll('[data-idcancel]').forEach(b=>b.addEventListener('click',()=>jdIdToggle(b.dataset.idcancel, false)));
   box.querySelectorAll('[data-idsave]').forEach(b=>b.addEventListener('click',()=>saveJdId(b.dataset.idsave)));
   box.querySelectorAll('[data-another]').forEach(b=>b.addEventListener('click',()=>anotherResume(b.dataset.another)));
+  box.querySelectorAll('[data-jddel]').forEach(b=>b.addEventListener('click',()=>jdDelete(b.dataset.jddel)));
   ivPaintStats();       // 先用缓存里的面试统计把行内文字填上（没缓存就等 ivLoadStats 回来再填）
   ocPaintStats();       // 行内「已复盘」标记：数据就在台账行里，不需要额外请求
   ivLoadStats();        // 每个岗位问一次 /api/interview/list（没有「列出全部面试」的接口）
@@ -965,9 +967,111 @@ async function saveJob(id){
   }
   if(r && r.ok){ toast('已保存 ✓'); loadJobs(); } else { toast('保存失败：'+((r && r.error)||'服务无响应')); }
 }
-/* ⚠️ 这里**没有** delJob：本阶段刻意不提供「删岗位」入口。
-   岗位身份已经改成 JD id，而 `DELETE /api/jobs` 还是老语义（按**分析 id** 从 jobs.json 删一条），
-   拿 JD id 去调只会 404 —— 真删除（不可恢复）放下一阶段 D。卡片上只有一个禁用的占位按钮。 */
+/* ============ 阶段 D：真删除一个 JD（不可恢复）============
+   用户的决定原话是「连报告与 JD 原文一起真删」—— 所以这个入口**就是**不可恢复的。
+   工具能做的、也一定会做的三件事都摆在下面：
+     ① 先预演（`GET /api/jd/purge_preview`，**只读**）→ 把清单**逐条**念给用户；
+     ② **两次确认**（第二次把"将被删除的报告文件"逐条列出来）；
+     ③ 删除前先在磁盘上留一份带时间戳的安全备份，并把**备份路径**显示出来 ——
+        界面**如实说清**：功能语义是不可恢复，但盘上另有一份备份，路径是 X。
+        （绝不让用户以为"磁盘上真没了"，也绝不说"恢复很容易"。）
+   预演和执行之间数据变了（指纹对不上）→ 后端 409，前端如实转述，不假装成功。 */
+
+/* 预演清单 → 逐条文字。**每一条**报告文件、JD 原文、分析记录、引用命中都单独一行：
+   一次性把数组 join 进一句话，就没法一条一条念，也没法一条一条断言。 */
+function jdPurgeLines(p){
+  const L = [];
+  L.push('被删除的岗位记录：' + String(p.id || ''));
+  (p.analyses || []).forEach(function(a){
+    const sc = (a.score === null || a.score === undefined || a.score === '') ? '无分数' : (a.score + ' 分');
+    L.push('  · 分析记录：' + String(a.id || '') + '（简历：' + String(a.resume || '（未知简历）')
+      + '，' + sc + (a.merged ? '，已合并标记' : '') + '）');
+  });
+  (p.files || []).forEach(function(f){
+    const kind = f.kind === 'jd_text' ? 'JD 原文' : (f.kind === 'jd_image' ? '原截图' : '报告文件');
+    L.push('  · ' + kind + '：' + String(f.name || '')
+      + (f.exists ? '' : '（**不在盘上**）')
+      + (f.kept ? '（还有别的 JD 在用 → **保留不删**）' : ''));
+  });
+  const k = (p.refs && p.refs.knowledge) || {};
+  L.push('  · 知识库引用：' + String(k.hits || 0) + ' 条，分布在 '
+    + String((k.cards || []).length) + ' 张卡片上（卡片**保留**，只去掉指向它的来源）');
+  const iv = (p.refs && p.refs.interviews) || {};
+  L.push('  · 面试记录：' + String(iv.hits || 0) + ' 条（记录**保留**，只清空它的 job_id）');
+  const ad = p.advisories || [];
+  L.push('  · 算不出来的：' + (ad.length ? ad.map(function(x){ return String(x.message || ''); }).join('；')
+    : '无（清单里没有读不出的东西）'));
+  return L;
+}
+
+/* 二次确认的整段文案（**逐条**列出将被删除的文件；不在盘上的 / 要保留的照样点名）。 */
+function jdPurgeConfirmText(p, lines){
+  const reports = (p.files || []).filter(function(f){ return f.kind === 'analysis_report'; });
+  const kept = (p.files || []).filter(function(f){ return f.kept; });
+  return '再确认一次：真删除这个岗位「' + String(p.id || '') + '」\n\n'
+    + '① 即将删除（逐条）：\n' + lines.join('\n') + '\n\n'
+    + '② 将被删除的报告文件（逐条）：\n'
+    + (reports.length ? reports.map(function(f){ return '   - ' + String(f.name || ''); }).join('\n')
+                      : '   （没有报告文件）') + '\n\n'
+    + '③ 功能语义是**不可恢复**：台账记录、分析记录、报告文件与 JD 原文都会从工作目录里删掉。\n'
+    + '   工具会在删除前于磁盘上另留一份带时间戳的安全备份（路径会在删完后显示给你）——\n'
+    + '   那是可回滚的余地，**不代表"磁盘上还有原件"**。\n'
+    + (kept.length ? '④ 这几份还**留着**（还有别的岗位在用）：'
+        + kept.map(function(f){ return String(f.name || ''); }).join('、') + '\n' : '')
+    + '\n确定真删除？';
+}
+
+async function jdDelete(id){
+  if(!id) return;
+  if(!confirm('真删除岗位「' + id + '」？\n\n'
+      + '这一步会连【它的分析记录】【那些分析的报告文件】【这个 JD 的原文】一起删掉 ——\n'
+      + '**不可恢复**是它的语义。\n\n'
+      + '点「确定」后我会先**逐条列出**到底要删什么，你看过清单再决定（还有第二次确认）。')) return;
+  let p = null, err = '';
+  logUI('jd.purge_preview_ask', {jd: id});
+  try{
+    p = await fetch('/api/jd/purge_preview?jd=' + encodeURIComponent(id)).then(x=>x.json());
+  }catch(e){ err = (e && e.message) || '网络中断（服务没在跑？）'; }
+  if(err || !p || p.ok !== true || p.found !== true){
+    const why = err || (p && p.error) || '服务无响应';
+    toast('预演失败，什么都没删：' + why);
+    logUI('jd.purge_preview_failed', {jd: id, error: why}, 'error');
+    return;
+  }
+  const lines = jdPurgeLines(p);
+  if(!confirm(jdPurgeConfirmText(p, lines))){          // 第二次确认：清单**逐条**摆在眼前
+    logUI('jd.purge_cancelled', {jd: id});
+    return toast('已取消，什么都没删');
+  }
+  let r = null, err2 = '';
+  logUI('jd.purge', {jd: id, fingerprint: p.fingerprint, files: (p.files || []).length});
+  try{
+    r = await fetch('/api/jd/purge', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({id: id, confirm_fingerprint: p.fingerprint})}).then(x=>x.json());
+  }catch(e){ err2 = (e && e.message) || '网络中断（服务没在跑？）'; }
+  if(err2 || !r || r.ok !== true){
+    const why = err2 || (r && r.error) || '服务无响应';
+    // 失败时**绝不**说"已删除"：后端的失败路径已经逐字节回滚，这里如实转述它的话
+    toast('删除失败（已回滚）：' + why);
+    logUI('jd.purge_failed', {jd: id, error: why}, 'error');
+    return;
+  }
+  // 如实说清：功能语义不可恢复，但盘上另有一份安全备份，路径在这里。
+  // 用 alert 而不是 toast：路径要能被复制，且这句话必须被看见，不能 3 秒后自己消失。
+  const bk = String(r.backup || '');
+  alert('已真删除岗位「' + id + '」\n\n'
+    + '· 删除的文件：' + String((r.removed_files || []).length) + ' 个\n'
+    + ((r.skipped_files || []).length
+        ? '· 保留未删：' + (r.skipped_files || []).map(function(s){ return String(s.name || ''); }).join('、')
+          + '（还有别的岗位在用）\n' : '')
+    + '\n⚠️ 功能语义是**不可恢复**：台账记录、分析记录、报告文件与 JD 原文都已经从工作目录里删除。\n'
+    + '工具在磁盘上另留了一份安全备份（不是"原件还在"，只是可回滚的余地）：\n'
+    + bk + '\n\n'
+    + '确认无误后可以自行删除这个备份目录。');
+  logUI('jd.purged', {jd: id, backup: bk, files: (r.removed_files || []).length});
+  loadJobs();
+}
+
 async function showJdText(id){
   let r = null;
   try{
