@@ -3174,5 +3174,665 @@ class ResumeLoadShapeGuardTest(IsolatedCase):
         self.assertIn("简历列表渲染失败", out["list"], "渲染失败没有被转成结构化提示：%r" % (out,))
 
 
+# ---------------- 阶段 4C / Task 3b：6 维度并排表 + 409 出口 + 两处收尾 ----------------
+#
+# 这一段的断言原则（历次假绿的教训，逐条照做）：
+#   ① 表要**逐格**断言（尤其那个故意缺维的格子：必须空 + 标注，**不是 0**）；
+#   ② **绝不写"整页 HTML 里有没有某字符串"** —— 那句话可能就在源码里；
+#   ③ 409 的两面都要证明：换简历**不弹**（后端 200）、同一版**才弹**（后端 409）；
+#   ④ 前端拿到的响应体一律是**真后端产出的那一份**（口径一致：测试喂的形状生产真的到得了）。
+
+_DIM_PARSE_JS = r"""
+function attrOf(s, n){
+  var r = new RegExp('\\b' + n + '="([^"]*)"').exec(String(s));
+  return r ? r[1] : '';
+}
+function cellsOf(trHtml){
+  var cells = [], re = /<(td|th)\b([^>]*)>([\s\S]*?)<\/\1>/g, m;
+  while((m = re.exec(trHtml))){
+    var a = m[2];
+    cells.push({tag: m[1], dim: attrOf(a, 'data-dim'), score: attrOf(a, 'data-score'),
+                missing: attrOf(a, 'data-missing'), noscore: attrOf(a, 'data-noscore'),
+                noread: attrOf(a, 'data-noread'),
+                text: m[3].replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim()});
+  }
+  return cells;
+}
+function parseDimTable(html, jid){
+  var i = String(html).indexOf('data-dimtab="' + jid + '"');
+  if(i < 0) return null;
+  var s = String(html).lastIndexOf('<table', i), e = String(html).indexOf('</table>', i);
+  if(s < 0 || e < 0) return null;
+  var t = String(html).slice(s, e), rows = [], re = /<tr\b([^>]*)>([\s\S]*?)<\/tr>/g, m;
+  while((m = re.exec(t))){
+    rows.push({rid: attrOf(m[1], 'data-rid'), report: attrOf(m[1], 'data-report'),
+               versionUnknown: attrOf(m[1], 'data-version-unknown'),
+               scoresError: attrOf(m[1], 'data-scores-error'), cells: cellsOf(m[2])});
+  }
+  return rows;
+}
+function scoreLinesOf(html){
+  var out = [], re = /<div class="rsline" data-scoreline="1"([^>]*)>([\s\S]*?)<\/div>/g, m;
+  while((m = re.exec(String(html)))){
+    out.push({job: attrOf(m[1], 'data-job'), score: attrOf(m[1], 'data-score'),
+              at: attrOf(m[1], 'data-at'), report: attrOf(m[1], 'data-report'),
+              text: m[2].replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim()});
+  }
+  return out;
+}
+"""
+
+DIM_TEAM = "团队/供应商管理"
+DIM_QUALITY = "质量体系能力"
+DIM_ANNO = "标注生产经验"
+DIM_AI = "AI 认知"
+DIM_PROD = "产品/需求能力"
+DIM_IND = "行业经验"
+
+
+def _dim(dim, score, weight=10):
+    return {"dimension": dim, "weight": weight, "score": score}
+
+
+class LedgerWithReportsCase(_AnalyzeRouteCase):
+    """一个 JD 挂多份分析，每份带**真报告文件**（`REPORT_DATA.scores` 是真读出来的）。"""
+
+    JD_ID = "本科_字节_标注_文本_北京_6-8K_0001"
+    JD_TEXT = _AnalyzeRouteCase.LONG
+
+    def _report_file(self, name, scores, resume=""):
+        store.ensure_profile()
+        data = {"job_title": "语音文本评测", "score": 70, "resume": resume, "scores": scores}
+        store.write_text(os.path.join(store.p_path("reports"), name),
+                         "<html><body><script>\nconst REPORT_DATA = %s;\n</script></body></html>"
+                         % json.dumps(data, ensure_ascii=False))
+
+    def _analysis(self, rec_id, resume, resume_id, report, score, created_at, scores=None,
+                  write_report=True):
+        jdid.upsert_jd({"id": self.JD_ID, "job_title": "语音文本评测", "salary": "13-26K",
+                        "company": "示例公司", "location": "北京", "status": "未投递",
+                        "jd_text_file": self.JD_ID + ".txt"})
+        store.ensure_profile()
+        store.write_text(os.path.join(store.p_path("jd"), self.JD_ID + ".txt"), self.JD_TEXT)
+        if write_report:
+            self._report_file(report, scores if scores is not None else [])
+        rec = {"id": rec_id, "jd_id": self.JD_ID, "report": report, "created_at": created_at,
+               "score": score, "resume": resume}
+        if resume_id:
+            rec["resume_id"] = resume_id
+        app._save_analysis(rec)
+
+    def _row(self):
+        code, body = self._get("/api/jds")
+        self.assertEqual(code, 200, body)
+        rows = body["jds"]
+        self.assertEqual(len(rows), 1, "夹具不对：应当只有 1 个 JD，实际 %r" % (rows,))
+        return rows[0]
+
+
+class JdAnalysisScoresShapeTest(LedgerWithReportsCase):
+    """后端给前端的形状：`analyses[]` 必须带 `resume_id` 与**真从报告读出来**的 `scores`。
+
+    并排表与「取回历史版要看当时的分数」都吃这两项。**读不出就如实标 `scores_error`** ——
+    绝不返回 `[]` 冒充"这一版一个维度都没评"（那是两句不同的话）。
+    """
+
+    def test_readable_scores_come_from_the_report_and_carry_the_pinned_version(self):
+        va = self._version("简历A")
+        self._analysis("a1", "简历A", va["id"], "a1.html", 75.0, "2026-10-01 10:00",
+                       [_dim(DIM_TEAM, 5, 25), _dim(DIM_AI, 8, 15)])
+        row = self._row()
+        a = row["analyses"][0]
+        self.assertEqual(a["resume_id"], va["id"])                     # 钉住哪一版
+        self.assertEqual(a["scores"],
+                         [{"dimension": DIM_TEAM, "weight": 25, "score": 5},
+                          {"dimension": DIM_AI, "weight": 15, "score": 8}])
+        self.assertEqual(a["scores_error"], "")
+
+    def test_an_unreadable_report_says_so_instead_of_pretending_no_dimensions(self):
+        va = self._version("简历A")
+        self._analysis("a1", "简历A", va["id"], "a1.html", 75.0, "2026-10-01 10:00",
+                       write_report=False)                             # 报告文件根本不在
+        a = self._row()["analyses"][0]
+        self.assertIsNone(a["scores"], "读不出却回了一个列表：界面会把「读不到」说成「没评」")
+        self.assertIn("不在盘上", a["scores_error"])
+        self.assertIn("a1.html", a["scores_error"])
+
+    def test_an_old_analysis_without_a_resume_id_reports_an_empty_version(self):
+        self._analysis("a1", "旧简历", "", "a1.html", 66.0, "2026-08-01 09:00", [])
+        a = self._row()["analyses"][0]
+        self.assertEqual(a["resume_id"], "")          # 空串 = 版本未知，不是猜一个出来
+        self.assertEqual(a["scores"], [])
+
+
+class JdDimensionTableTest(LedgerWithReportsCase):
+    """用户决策 #3：展开 JD 卡片后的**6 维度并排表**（一行一份简历、一列一个维度）。
+
+    维度取法（**确定规则**）：该 JD 下所有分析的维度名**并集**，按**出现次数降序**排，
+    次数相同按首次出现顺序。某个分析缺某一维 → 那一格**留空 + 标注「该版未评这一维」**，
+    **绝不补 0**（0 分是"评了很差"，跟"没评"是两件事 —— 夹具里两种都有）。
+    """
+
+    # 三份简历的维度**故意各不相同**：
+    #   A 全评 6 维；B 少「标注生产经验」；C 少「行业经验」，且「产品/需求能力」是**真 0 分**
+    A = [_dim(DIM_TEAM, 5, 25), _dim(DIM_QUALITY, 8, 22), _dim(DIM_ANNO, 8, 20),
+         _dim(DIM_AI, 8, 15), _dim(DIM_PROD, 6, 10), _dim(DIM_IND, 6, 8)]
+    B = [_dim(DIM_AI, 9), _dim(DIM_QUALITY, 7), _dim(DIM_TEAM, 4), _dim(DIM_IND, 5), _dim(DIM_PROD, 3)]
+    C = [_dim(DIM_ANNO, 10), _dim(DIM_QUALITY, 9), _dim(DIM_TEAM, 3), _dim(DIM_AI, 2), _dim(DIM_PROD, 0)]
+
+    # 出现次数：团队 3 / 质量 3 / AI 3 / 产品 3 / 标注 2 / 行业 2
+    # → 次数降序 + 首次出现顺序（A 的顺序）：
+    EXPECT_DIMS = [DIM_TEAM, DIM_QUALITY, DIM_AI, DIM_PROD, DIM_ANNO, DIM_IND]
+
+    def _three(self):
+        va = self._version("简历A"); vb = self._version("简历B"); vc = self._version("简历C")
+        self._analysis("a1", "简历A", va["id"], "a1.html", 75.0, "2026-10-01 10:00", self.A)
+        self._analysis("a2", "简历B", vb["id"], "a2.html", 66.0, "2026-10-02 11:00", self.B)
+        self._analysis("a3", "简历C", vc["id"], "a3.html", 58.0, "2026-10-03 12:00", self.C)
+        return va, vb, vc
+
+    def _render(self, row, extra=""):
+        """真跑 `renderJobs()`（表就在大卡片里），再把**渲染出来的** `<table>` 逐格解析回来。"""
+        _need_node()
+        out = web_probe.run_index(
+            _DIM_PARSE_JS +
+            "JOBS = [__fixture.row];\n"
+            "renderJobs();\n"
+            "var html = String(document.querySelector('#jobList').innerHTML);\n"
+            "out.cardHasTable = html.indexOf('data-dimtab=') >= 0;\n"
+            "out.rows = parseDimTable(html, String(__fixture.row.id));\n"
+            "out.matrix = jdDimMatrix(__fixture.row);\n"
+            "out.dims = jdDimColumns(jdAnalyses(__fixture.row));\n"
+            + extra,
+            {"row": row})
+        if not out.get("rows"):
+            raise AssertionError("大卡片里没渲染出并排表（渲染没发生 → 断言会变成恒真的假绿）：%r" % (out,))
+        return out
+
+    def test_every_cell_is_asserted_one_by_one(self):
+        va, vb, vc = self._three()
+        out = self._render(self._row())
+        self.assertEqual(out["unexpected"], [], "渲染时抛了没人接的 promise")
+
+        # ① 列：并集 + 出现次数降序（标注生产经验在 A 里最先出现，但只有 2 份评了 → 排后面）
+        self.assertEqual(out["dims"], self.EXPECT_DIMS)
+        cells = out["rows"][0]["cells"]
+        self.assertEqual([c["text"] for c in cells], ["简历 \\ 维度"] + self.EXPECT_DIMS)
+
+        # ② 逐行：表头（简历名 / 版本号 / 分数）
+        body = out["rows"][1:]
+        self.assertEqual(len(body), 3, "表只渲染了 %d 份简历（应当 3 份）" % len(body))
+        self.assertEqual([r["rid"] for r in body], [va["id"], vb["id"], vc["id"]])
+        self.assertEqual([r["versionUnknown"] for r in body], ["", "", ""])
+        heads = [r["cells"][0]["text"] for r in body]
+        self.assertEqual(heads, ["简历A · 75 分 %s" % va["id"],
+                                 "简历B · 66 分 %s" % vb["id"],
+                                 "简历C · 58 分 %s" % vc["id"]])
+
+        # ③ 逐格：3 行 × 6 列，一个都不放过
+        want = [
+            # 团队5 质量8 AI8 产品6 标注8 行业6
+            [("score", "5"), ("score", "8"), ("score", "8"), ("score", "6"), ("score", "8"), ("score", "6")],
+            # 团队4 质量7 AI9 产品3 **标注缺** 行业5
+            [("score", "4"), ("score", "7"), ("score", "9"), ("score", "3"), ("missing", ""), ("score", "5")],
+            # 团队3 质量9 AI2 **产品真 0 分** 标注10 **行业缺**
+            [("score", "3"), ("score", "9"), ("score", "2"), ("score", "0"), ("score", "10"), ("missing", "")],
+        ]
+        for ri, row in enumerate(body):
+            got = []
+            for ci, cell in enumerate(row["cells"][1:]):
+                self.assertEqual(cell["dim"], self.EXPECT_DIMS[ci],
+                                 "第 %d 行第 %d 列不是这一维：%r" % (ri, ci, cell))
+                if cell["missing"] == "1":
+                    got.append(("missing", ""))
+                else:
+                    got.append(("score", cell["score"]))
+            self.assertEqual(got, want[ri], "第 %d 行逐格对不上" % ri)
+
+        # ④ 那个**故意缺维**的格子：空 + 标注，**不是 0**
+        miss_b = body[1]["cells"][5]
+        self.assertEqual(miss_b["missing"], "1")
+        self.assertEqual(miss_b["score"], "", "缺维那格带了分数：%r" % (miss_b,))
+        self.assertEqual(miss_b["text"], "该版未评这一维")
+        self.assertNotIn("0", miss_b["text"], "缺维被补成了 0：%r" % (miss_b,))
+        miss_c = body[2]["cells"][6]
+        self.assertEqual((miss_c["missing"], miss_c["score"], miss_c["text"]),
+                         ("1", "", "该版未评这一维"))
+        self.assertNotIn("0", miss_c["text"])
+
+        # ⑤ 反向：**真 0 分**必须照旧显示 0（不许被"缺维"那条路吞掉）
+        zero = body[2]["cells"][4]
+        self.assertEqual(zero["missing"], "")
+        self.assertEqual((zero["score"], zero["text"]), ("0", "0"))
+
+        # ⑥ 表结构：表头 7 格（1 个角 + 6 维），行数 == 分析数（渲染产物与数据两边同一口径）
+        self.assertEqual(len(out["rows"]), 4)                       # 1 表头 + 3 行
+        self.assertEqual(len(out["matrix"]["rows"]), len(body))
+
+    def test_the_column_rule_is_count_then_first_seen(self):
+        """维度取法**单独钉一遍**（顺序错了上面那条也会红，这条让"为什么是这个顺序"看得见）。"""
+        va, vb, vc = self._three()
+        row = self._row()
+        _need_node()
+        out = web_probe.run_index(
+            _DIM_PARSE_JS +
+            "out.dims = jdDimColumns(jdAnalyses(__fixture.row));\n"
+            "out.one = jdDimColumns([{scores: [{dimension: '只有这一维', score: 1}]}]);\n"
+            "out.none = jdDimColumns([{scores: []}, {scores: null}]);\n",
+            {"row": row})
+        self.assertEqual(out["dims"], self.EXPECT_DIMS)
+        self.assertEqual(out["one"], ["只有这一维"])
+        self.assertEqual(out["none"], [])
+
+    def test_a_report_that_cannot_be_read_is_not_reported_as_unrated(self):
+        """报告读不出 ≠ 这一版没评。**不许**把前者写成「该版未评这一维」。"""
+        va = self._version("简历A")
+        vb = self._version("简历B")
+        self._analysis("a1", "简历A", va["id"], "a1.html", 75.0, "2026-10-01 10:00", self.A)
+        self._analysis("a2", "简历B", vb["id"], "a2.html", 66.0, "2026-10-02 11:00", write_report=False)
+        out = self._render(self._row())
+        rows = out["rows"][1:]
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["scoresError"], "")
+        self.assertIn("报告文件不在盘上", rows[1]["scoresError"])
+        for cell in rows[1]["cells"][1:]:
+            self.assertEqual(cell["noread"], "1", "读不出被当成了「没评」：%r" % (cell,))
+            self.assertEqual(cell["missing"], "")
+            self.assertEqual(cell["text"], "报告读不出评分")
+
+    def test_the_table_is_wired_into_the_card_and_says_it_does_not_zero_fill(self):
+        """表格接进大卡片的那一行 + 「不补 0」这句要写在表里（逐行钉 `renderJobs` 的函数体）。"""
+        body = _js_fn_body("renderJobs")
+        self.assertIn("h +=   jdDimTable(j);", body,
+                      "并排表没有接进大卡片：表再对也不显示")
+        self.assertIn("不补 0", _js_fn_body("jdDimTable", "j"))
+        self.assertIn("该版未评这一维", _js_fn_body("jdDimTable", "j"))
+
+
+class DuplicateExitModalTest(LedgerWithReportsCase):
+    """409 出口的两面（规格 §6.2 / §5.3）。
+
+    前端拿到的响应体一律是**真后端**刚产出的那一份：先用探针跑 `analyzePayload()` 拿到
+    "浏览器真会发出去的那一份"，把那**逐字**提交给沙箱后端，再把响应喂回页面。这样
+    「前端发的形状」与「后端判的形状」不可能各说各话（有过"测试喂的形状生产到不了"的教训）。
+    """
+
+    def _payload(self, key, name):
+        """真跑页面：下拉里选中某一版 → 回传 `analyzePayload()`。"""
+        _need_node()
+        code, view = _resumes_view()
+        self.assertEqual(code, 200, view)
+        out = web_probe.run_index(
+            "renderResumePicker(__fixture.view);\n"
+            "$('#resumeSel').value = __fixture.key;\n"
+            "$('#jd').value = __fixture.jd;\n"
+            "$('#link').value = '';\n"
+            "out.payload = analyzePayload();\n"
+            "out.picked = String($('#resumeSel').value);\n",
+            {"view": view, "key": key, "jd": self.JD_TEXT})
+        self.assertEqual(out["picked"], key, "下拉没选中这一版（fixture 不对）")
+        self.assertEqual(out["payload"].get("resume_id"), key)
+        return out["payload"]
+
+    def _replay(self, payload, responses, extra=""):
+        """把**真响应**喂回页面，真跑 `analyzeSubmit()` / `dupResend()`，回传它发出的请求体。"""
+        _need_node()
+        out = web_probe.run_index(
+            _DIM_PARSE_JS +
+            "var sent = [];\n"
+            "var q = __fixture.resp.slice();\n"
+            "fetch = function(url, opt){\n"
+            "  var u = String(url);\n"
+            "  if(u.indexOf('/api/analyze') === 0){\n"
+            "    sent.push(JSON.parse(String(opt && opt.body)));\n"
+            "    var b = q.length ? q.shift() : {ok:false, error:'（探针：没有更多预设响应）'};\n"
+            "    return Promise.resolve({ok:true, json:function(){return Promise.resolve(b);}});\n"
+            "  }\n"
+            "  return Promise.resolve({ok:true, json:function(){return Promise.resolve("
+            "{ok:true, jds:[], categories:[], statuses:[]});}});\n"
+            "};\n"
+            "RESUME_PICKS = [{key: __fixture.payload.resume_id, name: __fixture.payload.resume_name,"
+            " version: __fixture.payload.resume_id}];\n"
+            "$('#resumeSel').value = String(__fixture.payload.resume_id || '');\n"
+            "$('#jd').value = String(__fixture.payload.jd_text || '');\n"
+            "$('#link').value = '';\n"
+            # 垫片不看 HTML 的 `hidden` 属性（元素恒为 false）→ 这里手工摆成页面真实的初始状态
+            "$('#dupModal').hidden = true;\n"
+            "out.modalBefore = $('#dupModal').hidden;\n"
+            "await analyzeSubmit();\n"
+            "out.modalAfterFirst = $('#dupModal').hidden;\n"
+            "out.dupBody = String($('#dupBody').innerHTML);\n"
+            "out.stAfterFirst = String($('#st').textContent);\n"
+            "out.attr = {};\n"
+            "['job','report','analysis','score','at','resume','resume-id'].forEach(function(k){\n"
+            "  out.attr[k] = attrOf(out.dupBody, 'data-dup-' + k);\n"
+            "});\n"
+            "out.hasOverwriteBtn = out.dupBody.indexOf('id=\"dupOverwrite\"') >= 0;\n"
+            "out.hasNewBtn = out.dupBody.indexOf('id=\"dupNew\"') >= 0;\n"
+            "out.sent = sent;\n"
+            + extra,
+            {"payload": payload, "resp": responses})
+        return out
+
+    def _first_body(self, out):
+        return out["sent"][0]
+
+    def test_a_different_resume_version_does_not_open_the_duplicate_modal(self):
+        """**用户的核心用法**：同一个岗位换第二份简历 → 后端 200 → 前端**不该**弹「重复」。
+
+        这里证明的是"前端只在响应体真带 `duplicate` 时才弹"：喂进去的是后端**真的**会
+        给的那一份（200 + report），所以弹窗必须保持关闭。
+        """
+        calls = self._patch_analyze_deps()
+        va = self._version("简历A")
+        self._analysis("a1", "简历A", va["id"], "a1.html", 75.0, "2026-10-01 10:00", [])
+        vb = self._version("简历B")
+        payload = self._payload(vb["id"], "简历B.md")
+        self.assertNotIn("overwrite", payload)
+        self.assertNotIn("allow_duplicate", payload)
+        code, body = self._post_json("/api/analyze", payload)
+        self.assertEqual(code, 200, body)                      # ← 换简历不是重复
+        self.assertNotIn("duplicate", body)
+
+        out = self._replay(payload, [body])
+        self.assertEqual(out["unexpected"], [])
+        self.assertTrue(out["modalBefore"])
+        self.assertTrue(out["modalAfterFirst"], "换一份简历也弹了「重复」弹窗：%r" % (out["dupBody"][:300],))
+        self.assertEqual(out["dupBody"], "")
+        self.assertIn("分析完成", out["stAfterFirst"])
+        sent = self._first_body(out)
+        self.assertEqual(sent, payload, "前端发出去的与刚才真提交的那一份不一致")
+        self.assertFalse(out["hasOverwriteBtn"] or out["hasNewBtn"])
+        self.assertEqual(calls["llm"], 1)
+
+    def test_the_same_resume_version_opens_the_modal_with_what_will_be_overwritten(self):
+        calls = self._patch_analyze_deps()
+        v = self._version("简历A")
+        self._analysis("a1", "简历A", v["id"], "a1.html", 75.0, "2026-10-01 10:00", [])
+        payload = self._payload(v["id"], "简历A.md")
+        code, body = self._post_json("/api/analyze", payload)
+        self.assertEqual(code, 409, body)                       # ← 同一版才是重复
+        self.assertEqual(calls["llm"], 0, "查重必须在花钱之前")
+
+        out = self._replay(payload, [body, {"ok": True, "report": "a1.html"}])
+        self.assertEqual(out["unexpected"], [])
+        self.assertFalse(out["modalAfterFirst"], "同一版没弹出口 → 用户卡死")
+        self.assertTrue(out["hasOverwriteBtn"], "弹窗里没有「覆盖」按钮：%r" % (out["dupBody"],))
+        self.assertTrue(out["hasNewBtn"], "弹窗里没有「仍然新建」按钮：%r" % (out["dupBody"],))
+        # 弹窗显示的必须是**要覆盖的那一条**的具体信息（逐项，不是"文案里有某个词"）
+        self.assertEqual(out["attr"]["job"], self.JD_ID)
+        self.assertEqual(out["attr"]["report"], "a1.html")
+        self.assertEqual(out["attr"]["analysis"], "a1")     # 「覆盖」要用的就是它（不是 JD id）
+        self.assertEqual(out["attr"]["score"], "75")
+        self.assertEqual(out["attr"]["at"], "2026-10-01 10:00")
+        self.assertEqual(out["attr"]["resume"], "简历A")
+        self.assertEqual(out["attr"]["resume-id"], v["id"])
+
+    def test_overwrite_resends_with_the_original_analysis_id_and_nothing_else(self):
+        self._patch_analyze_deps()
+        v = self._version("简历A")
+        self._analysis("a1", "简历A", v["id"], "a1.html", 75.0, "2026-10-01 10:00", [])
+        payload = self._payload(v["id"], "简历A.md")
+        code, dup_body = self._post_json("/api/analyze", payload)
+        self.assertEqual(code, 409, dup_body)
+
+        out = self._replay(payload, [dup_body, {"ok": True, "report": "a1.html"}],
+                           extra="await dupResend('overwrite');\n"
+                                 "out.sentAfter = sent.slice();\n"
+                                 "out.modalAfterOverwrite = $('#dupModal').hidden;\n"
+                                 "out.stAfter = String($('#st').textContent);\n")
+        self.assertEqual(out["unexpected"], [])
+        self.assertEqual(len(out["sentAfter"]), 2)          # 第一次 + 覆盖那一次
+        first, second = out["sentAfter"]
+        self.assertEqual(first, payload)
+        # 覆盖带的是**那条分析的 id**（不是 JD id —— 见下面那条 E2E 发现的真问题）
+        self.assertEqual(second["overwrite"], "a1")
+        self.assertNotIn("allow_duplicate", second, "覆盖时还带了 allow_duplicate：两条路串了")
+        self.assertEqual(second["resume_id"], v["id"])      # 还是这一版
+        self.assertEqual(second["resume_name"], "简历A.md")
+        self.assertEqual(second["jd_text"], payload["jd_text"])
+        self.assertTrue(out["modalAfterOverwrite"], "覆盖成功后弹窗没关")
+        self.assertIn("覆盖", out["stAfter"])
+
+    def test_the_overwrite_lands_on_the_duplicate_record_not_on_the_newest_one(self):
+        """**E2E 发现并修掉的真问题**：一个 JD 下有几份分析时，「覆盖」必须落到**要覆盖的那条**。
+
+        只带 JD id 时后端走 `_job_in_ledger(<JD id>)` → 取该 JD 下**最新**那条记录，于是
+        "覆盖 A 这份"会把 **B 那份**的记录改掉（连同它的 `resume_id`）——用户看到弹窗上写着
+        A 的报告名，盘上动的却是 B。所以 409 的 body 必须带命中那条分析的 `analysis_id`，
+        前端拿它当 `overwrite`。这条把**前端真的发出去的那一份**再交给真后端，端到端钉住。
+        """
+        self._patch_analyze_deps()
+        va = self._version("简历A")
+        vb = self._version("简历B")
+        self._analysis("a1", "简历A", va["id"], "a1.html", 75.0, "2026-10-01 10:00", [])
+        # 更新的那一条：`_job_in_ledger(<JD id>)` 会取它 —— 这正是坑
+        self._analysis("a2", "简历B", vb["id"], "a2.html", 66.0, "2026-10-02 11:00", [])
+        other_before = store.read_text(self._report("a2.html"))
+
+        payload = self._payload(va["id"], "简历A.md")
+        code, dup_body = self._post_json("/api/analyze", payload)
+        self.assertEqual(code, 409, dup_body)
+        self.assertEqual(dup_body["duplicate"]["analysis_id"], "a1")     # 命中的是这一条
+        self.assertEqual(dup_body["duplicate"]["report"], "a1.html")
+
+        out = self._replay(payload, [dup_body, {"ok": True, "report": "a1.html"}],
+                           extra="await dupResend('overwrite');\nout.sentAfter = sent.slice();\n")
+        resend = out["sentAfter"][1]
+        self.assertEqual(resend["overwrite"], "a1", "覆盖没有指向命中那条分析")
+
+        code2, body2 = self._post_json("/api/analyze", resend)           # ← 用前端真发的那一份
+        self.assertEqual(code2, 200, body2)
+        recs = {r["id"]: r for r in store.load_jobs()}
+        self.assertEqual(sorted(recs), ["a1", "a2"], "多建/少建了记录")
+        self.assertEqual(recs["a1"]["score"], 91.5, "要覆盖的那条没被改")
+        self.assertEqual(recs["a1"]["resume_id"], va["id"])
+        self.assertEqual(recs["a1"]["report"], "a1.html", "覆盖没有沿用原报告文件名")
+        self.assertEqual((recs["a2"]["score"], recs["a2"]["resume_id"], recs["a2"]["resume"]),
+                         (66.0, vb["id"], "简历B"), "另一份简历的记录被改掉了")
+        self.assertEqual(store.read_text(self._report("a2.html")), other_before,
+                         "另一份简历的报告文件被改写了")
+
+    def test_still_create_resends_with_allow_duplicate_and_nothing_else(self):
+        self._patch_analyze_deps()
+        v = self._version("简历A")
+        self._analysis("a1", "简历A", v["id"], "a1.html", 75.0, "2026-10-01 10:00", [])
+        payload = self._payload(v["id"], "简历A.md")
+        code, dup_body = self._post_json("/api/analyze", payload)
+        self.assertEqual(code, 409, dup_body)
+
+        out = self._replay(payload, [dup_body, {"ok": True, "report": "a1(2).html"}],
+                           extra="await dupResend('new');\n"
+                                 "out.sentAfter = sent.slice();\n"
+                                 "out.modalAfterNew = $('#dupModal').hidden;\n"
+                                 "out.stAfter = String($('#st').textContent);\n")
+        self.assertEqual(out["unexpected"], [])
+        second = out["sentAfter"][1]
+        self.assertIs(second["allow_duplicate"], True)
+        self.assertNotIn("overwrite", second, "「仍然新建」还带了 overwrite：那不是新建")
+        self.assertEqual(second["resume_id"], v["id"])
+        self.assertTrue(out["modalAfterNew"])
+        self.assertIn("另建", out["stAfter"])
+
+    def test_the_two_buttons_are_bound_to_the_two_resend_modes(self):
+        """探针的垫片里 `addEventListener` 是空实现 → 按钮到函数的**绑定**只能在源码那一行上钉。
+
+        真点击（无头 Chrome 里点这两个按钮）由 E2E 负责；这里只保证"点到的就是这两个模式"。
+        """
+        body = _js_fn_body("dupAsk", "payload, dup")
+        self.assertIn("$('#dupOverwrite').addEventListener('click', ()=>dupResend('overwrite'));", body)
+        self.assertIn("$('#dupNew').addEventListener('click', ()=>dupResend('new'));", body)
+        self.assertIn("$('#dupCancel').addEventListener('click', ()=>dupClose('cancel'));",
+                      _js_fn_body("rsInit"))
+        self.assertIn("$('#dupModal').hidden = false;", body)
+
+
+class ResumeMissingBranchScoreTest(LedgerWithReportsCase):
+    """规格 §4.5：历史版原文没保留时，除 `ai_diff` 外还要显示**这一版当时的分数**。
+
+    分数的唯一来源是台账（`analyses[]` 按 `resume_id` 精确匹配）。**找不到就如实说
+    「没有它的评分记录」**，绝不按显示名猜、绝不编一个数（规格 §8 的诚实边界）。
+    """
+
+    def _family(self):
+        v1 = resumelib.create_version("族谱", "第 1 版正文")
+        resumelib.choose(v1["id"])                                     # 母版
+        v2 = resumelib.create_version("族谱", "第 2 版正文", parent_id=v1["id"])
+        v3 = resumelib.create_version("族谱", "第 3 版正文", parent_id=v2["id"])
+        return v1, v2, v3
+
+    def _missing_response(self, vid):
+        """真接口拿到的 `missing` 那一份（空渲染/空响应一律报错，绝不当"成功"。）"""
+        code, body = self._get("/api/resumes/file?version=" + vid)
+        self.assertEqual(code, 200, body)
+        self.assertEqual(body.get("kind"), "missing", body)
+        self.assertEqual(body.get("version"), vid)
+        self.assertNotIn("text", body, "历史版返回了 text：那是在假装能取回原文")
+        self.assertIn("旧版原文未保留", body["error"])
+        return body
+
+    def _view(self, vid, response, rows, ledger_fails=False):
+        _need_node()
+        return web_probe.run_index(
+            _DIM_PARSE_JS +
+            "JOBS = __fixture.rows;\n"
+            "var q = [__fixture.resp];\n"
+            "fetch = function(url){\n"
+            "  if(String(url).indexOf('/api/jds') === 0){\n"
+            "    if(__fixture.ledgerFails) return Promise.reject(new Error('台账读不到'));\n"
+            "    return Promise.resolve({ok:true, json:function(){return Promise.resolve({jds:__fixture.rows});}});\n"
+            "  }\n"
+            "  return Promise.resolve({ok:true, json:function(){return Promise.resolve(q.shift() || {});}});\n"
+            "};\n"
+            "JOBS = __fixture.ledgerFails ? [] : __fixture.rows;\n"
+            "await openResumeText(__fixture.vid);\n"
+            "var body = String($('#rsViewBody').innerHTML);\n"
+            "out.body = body;\n"
+            "out.scoresKind = attrOf(body, 'data-scores');\n"
+            "out.scoresError = attrOf(body, 'data-scores-error');\n"
+            "out.lines = scoreLinesOf(body);\n"
+            "out.hasMissingNote = body.indexOf('旧版原文未保留') >= 0;\n"
+            "out.saysNoRecord = body.indexOf('没有它的评分记录') >= 0;\n",
+            {"vid": vid, "resp": response, "rows": rows, "ledgerFails": ledger_fails})
+
+    def test_the_score_of_that_version_is_shown_from_the_ledger(self):
+        v1, v2, v3 = self._family()
+        self._analysis("a1", "族谱", v2["id"], "a1.html", 71.5, "2026-10-05 12:00", [])
+        # 干扰项：**显示名一模一样**、但钉的是别的版本 / 没钉版本 → 绝不能被算进这一版
+        self._analysis("a2", "族谱", v3["id"], "a2.html", 90.0, "2026-10-06 12:00", [])
+        self._analysis("a3", "族谱", "", "a3.html", 55.0, "2026-10-07 12:00", [])
+        resp = self._missing_response(v2["id"])
+        out = self._view(v2["id"], resp, [self._row()])
+        self.assertEqual(out["unexpected"], [])
+        self.assertTrue(out["hasMissingNote"])
+        self.assertEqual(out["scoresKind"], "1")
+        self.assertFalse(out["saysNoRecord"])
+        self.assertEqual(out["lines"], [{"job": self.JD_ID, "score": "71.5",
+                                         "at": "2026-10-05 12:00", "report": "a1.html",
+                                         "text": "岗位「语音文本评测」 · 71.5 分 · 2026-10-05 12:00"}])
+        self.assertIn("71.5", out["body"])       # 变更说明那一段也在（这里只补分数这一项）
+
+    def test_a_version_without_any_analysis_says_there_is_no_score_record(self):
+        v1, v2, v3 = self._family()
+        self._analysis("a1", "族谱", v3["id"], "a1.html", 71.5, "2026-10-05 12:00", [])
+        resp = self._missing_response(v2["id"])
+        out = self._view(v2["id"], resp, [self._row()])
+        self.assertEqual(out["scoresKind"], "none")
+        self.assertEqual(out["lines"], [])
+        self.assertTrue(out["saysNoRecord"], "找不到评分记录时没有如实说：%r" % (out["body"],))
+
+    def test_a_ledger_read_failure_is_not_reported_as_no_record(self):
+        """"台账读不到"与"台账里没有它的评分记录"是两句不同的话 —— 不许混成一句。"""
+        v1, v2, v3 = self._family()
+        self._analysis("a1", "族谱", v2["id"], "a1.html", 71.5, "2026-10-05 12:00", [])
+        resp = self._missing_response(v2["id"])
+        out = self._view(v2["id"], resp, [self._row()], ledger_fails=True)
+        self.assertEqual(out["scoresKind"], "error")
+        self.assertEqual(out["scoresError"], "台账读不到")
+        self.assertFalse(out["saysNoRecord"], "把「没读到」说成了「没有记录」：%r" % (out["body"],))
+        self.assertEqual(out["lines"], [])
+
+    def test_the_lookup_is_by_resume_id_not_by_display_name(self):
+        """`rsScoresOfVersion` 单独钉一遍：同名不同版 / 无版本号都不算（这就是这次要修的坑）。"""
+        v1, v2, v3 = self._family()
+        self._analysis("a1", "族谱", v2["id"], "a1.html", 71.5, "2026-10-05 12:00", [])
+        self._analysis("a2", "族谱", v3["id"], "a2.html", 90.0, "2026-10-06 12:00", [])
+        self._analysis("a3", "族谱", "", "a3.html", 55.0, "2026-10-07 12:00", [])
+        row = self._row()
+        _need_node()
+        out = web_probe.run_index(
+            _DIM_PARSE_JS +
+            "out.same = rsScoresOfVersion([__fixture.row], __fixture.v2);\n"
+            "out.other = rsScoresOfVersion([__fixture.row], __fixture.v3);\n"
+            "out.unknown = rsScoresOfVersion([__fixture.row], '');\n",
+            {"row": row, "v2": v2["id"], "v3": v3["id"]})
+        self.assertEqual([x["score"] for x in out["same"]], [71.5])
+        self.assertEqual([x["score"] for x in out["other"]], [90.0])
+        self.assertEqual(out["unknown"], [])           # 没有版本 id 就不查（不猜）
+
+
+class ResumeFilePickRejectTest(IsolatedCase):
+    """收尾：**非文本文件要明确拒绝**（`.docx` 被当文本读进来 = 乱码存进简历库）。
+
+    `accept=".md,.txt"` 只是给文件对话框的**建议**，用户强选 `.docx` 照样能选进来 —— 所以
+    必须按扩展名显式判断：非 `.md` / `.txt` → 明确提示，**不读文件、不动编辑区**。
+    """
+
+    def _pick(self, files):
+        """真跑 `rsFileChosen()`（垫一个 FileReader，只在这里注入"读到的文本"）。"""
+        _need_node()
+        return web_probe.run_index(
+            _DIM_PARSE_JS +
+            "$('#resumeContent').value = '原有内容';\n"
+            "RS_EDIT = {name: '原有.md', version: '', content: '原有内容'};\n"
+            "FileReader = function(){\n"
+            "  var self = this;\n"
+            "  this.readAsText = function(f){ self.result = String(f.__text || '');"
+            " if(self.onload) self.onload(); };\n"
+            "};\n"
+            "out.results = __fixture.files.map(function(f){\n"
+            "  __alerts.length = 0;\n"
+            "  var ok = rsFileChosen(f);\n"
+            "  return {name: String(f.name), ok: ok, alerts: __alerts.slice(),\n"
+            "          content: String($('#resumeContent').value),\n"
+            "          picked: String($('#editingName').dataset.name || ''),\n"
+            "          rsEdit: String(RS_EDIT.name || '')};\n"
+            "});\n"
+            "out.isText = ['a.md', 'A.MD', 'b.txt', 'B.TXT', 'a.docx', 'a.pdf', 'md', 'a.md.exe']"
+            ".map(function(n){ return rsIsTextFile(n); });\n",
+            {"files": files})
+
+    def test_a_docx_is_rejected_out_loud_and_never_read(self):
+        out = self._pick([{"name": "我的简历.docx", "__text": "PK\x03\x04binary"}])
+        self.assertEqual(out["unexpected"], [])
+        got = out["results"][0]
+        self.assertFalse(got["ok"], "非文本文件被当成功处理了")
+        alerts = got["alerts"]
+        self.assertEqual(len(alerts), 1, "没有明确提示（或提示了不止一次）：%r" % (alerts,))
+        self.assertIn("只支持 .md / .txt", alerts[0])
+        self.assertIn("我的简历.docx", alerts[0])
+        self.assertEqual(got["content"], "原有内容", "被拒绝的文件仍然污染了编辑区（乱码）")
+        self.assertEqual(got["picked"], "", "被拒绝的文件仍然占住了「正在编辑」那一栏")
+        self.assertEqual(got["rsEdit"], "原有.md")
+
+    def test_md_and_txt_are_read_in_cluding_uppercase_names(self):
+        out = self._pick([{"name": "简历A.MD", "__text": "# 甲\n正文"},
+                          {"name": "简历B.txt", "__text": "乙正文"}])
+        md, txt = out["results"]
+        self.assertTrue(md["ok"])
+        self.assertEqual((md["content"], md["picked"], md["rsEdit"]), ("# 甲\n正文", "简历A.MD", "简历A.MD"))
+        self.assertEqual(md["alerts"], [])
+        self.assertEqual((txt["content"], txt["picked"]), ("乙正文", "简历B.txt"))
+
+    def test_the_extension_rule_itself(self):
+        out = self._pick([])
+        self.assertEqual(out["isText"],
+                         [True, True, True, True, False, False, False, False],
+                         "扩展名判断不对（大小写要认、`md` 这种没扩展名的与 `a.md.exe` 都不收）")
+        body = _js_fn_body("rsFileChosen", "f")
+        self.assertIn("rsIsTextFile(f.name)", body,
+                      "读文件之前没有按扩展名显式判断")
+
+
 if __name__ == "__main__":
     unittest.main()

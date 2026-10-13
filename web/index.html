@@ -195,6 +195,17 @@
   .rsmeta{font-size:12.5px;color:var(--sub);margin-bottom:6px;word-break:break-all}
   .rsline{font-size:13px;margin:4px 0;word-break:break-word}
   .rstext{white-space:pre-wrap;word-break:break-word;max-height:340px;overflow:auto;background:#fcfdff;border:1px solid var(--line);border-radius:9px;padding:12px;font-size:12.5px;line-height:1.55;font-family:inherit;margin-top:8px}
+  /* 📊 6 维度并排表（阶段 4C / 用户决策 #3）：一行一份简历、一列一个维度。
+     缺维的格子**留空 + 写明「该版未评这一维」**，绝不补 0（0 分与没评是两件事）。 */
+  .dimwrap{margin:12px 0 4px;padding-top:9px;border-top:1px dashed var(--line)}
+  .dimcap{font-size:12.5px;color:var(--muted);margin-bottom:6px}
+  table.dimtab{border-collapse:collapse;width:100%;font-size:12.5px}
+  table.dimtab th,table.dimtab td{border:1px solid var(--line);padding:5px 8px;text-align:center;white-space:nowrap}
+  table.dimtab thead th{background:#f6f8fc;color:var(--sub);font-weight:600}
+  table.dimtab th.dimrow{text-align:left;background:#fcfdff;white-space:normal;min-width:150px}
+  table.dimtab td.dimnum{font-weight:700}
+  table.dimtab td.dimmiss{color:var(--muted);font-size:11.8px}
+  table.dimtab td.dimnoread{color:var(--amber);font-size:11.8px;font-weight:600}
 </style>
 </head>
 <body>
@@ -417,6 +428,20 @@
   </div>
 </div>
 
+<!-- ⚠️ 409 出口（阶段 4C / 规格 §6.2）：同 JD + **同一版**简历才走到这里。
+     两条出路都带对了字段才叫"有出口"：覆盖 = `overwrite=<duplicate.analysis_id>`（那条分析的
+     id，沿用它的报告名）；仍然新建 = `allow_duplicate=true`。换一份简历**不会** 409 → 不出现。 -->
+<div class="ivmodal" id="dupModal" hidden>
+  <div class="ivbox">
+    <div class="ivhd">
+      <div class="t" id="dupTitle">同一个岗位 + 同一版简历已经分析过</div>
+      <button class="btn gray sm" id="dupCancel">✕ 取消（先不分析）</button>
+    </div>
+    <div id="dupBody"></div>
+    <div class="idmsg err" id="dupErr" hidden></div>
+  </div>
+</div>
+
 <script>
 const $ = s => document.querySelector(s);
 const $$ = s => document.querySelectorAll(s);
@@ -537,6 +562,113 @@ function stCls(s){
   if(s==='已拒'||s==='放弃') return 'st dead';
   return 'st';
 }
+
+/* ---------------- 6 维度并排表（阶段 4C / 用户决策 #3） ----------------
+   用户的原话用法：A/B/C 三份简历都拿去分析**同一个岗位** → 要"一眼看出谁在哪一维强"。
+   所以展开 JD 卡片后给一张「一行一份简历、一列一个维度」的表。
+
+   维度取法**必须有确定规则**（不同报告可能维度名/顺序都不一样）：
+   取该 JD 下**所有分析的维度名并集**，按**出现次数降序**排；次数相同按**首次出现顺序**
+   （两个键都定死，重渲染不会换列序）。某个分析缺某一维 → 那一格**留空 + 标注
+   「该版未评这一维」**，**绝不补 0**（0 分 = 评了但很差，跟"没评"是两件事）。
+
+   数据来源：`/api/jds` 的 `analyses[]`。每条分析带：
+   `scores`（`[{dimension,weight,score}]`，从它自己的报告 REPORT_DATA 读出来）与
+   `scores_error`（读不出时的原因）。`scores` **不是数组** = 这份报告根本读不出评分 →
+   那一行说「报告读不出评分」，**不冒充**「没评」。
+*/
+function jdDimColumns(ans){
+  const order = [], count = {};
+  (ans || []).forEach(a=>{
+    const here = {};
+    const sc = (a && Array.isArray(a.scores)) ? a.scores : [];
+    sc.forEach(s=>{
+      const d = String((s && s.dimension) || '').trim();
+      if(!d || here[d]) return;                    // 同一份分析里重复出现只算一次
+      here[d] = 1;
+      if(!Object.prototype.hasOwnProperty.call(count, d)){ count[d] = 0; order.push(d); }
+      count[d] += 1;
+    });
+  });
+  return order.slice().sort((x,y)=> (count[y]-count[x]) || (order.indexOf(x)-order.indexOf(y)));
+}
+function jdDimScoreOf(a, dim){
+  const sc = (a && Array.isArray(a.scores)) ? a.scores : [];
+  for(let i=0;i<sc.length;i++){
+    const s = sc[i];
+    if(String((s && s.dimension) || '').trim() === dim) return (s && s.score);
+  }
+  return null;
+}
+function jdDimHasDim(a, dim){
+  const sc = (a && Array.isArray(a.scores)) ? a.scores : [];
+  return sc.some(s=>String((s && s.dimension) || '').trim() === dim);
+}
+/* 逐格数据（探针断言的对象就是它 —— 不是"整页里有没有某个字符串"）：
+   `cell.kind` 四选一：`score`（评了）/ `noscore`（评了但没数字）/ `missing`（没评这一维）/
+   `noread`（这一版的报告读不出评分）。后两种**都没有分数**，绝不补 0。 */
+function jdDimMatrix(j){
+  const ans = jdAnalyses(j);
+  const dims = jdDimColumns(ans);
+  const rows = ans.map(a=>{
+    const readable = Array.isArray(a.scores);
+    const rid = String(a.resume_id || '');
+    return {
+      resume_id: rid,
+      version_unknown: !rid,
+      resume: String(a.resume || ''),
+      score: (a.score === null || a.score === undefined || a.score === '') ? null : a.score,
+      report: String(a.report || ''),
+      scores_error: String(a.scores_error || ''),
+      readable: readable,
+      cells: dims.map(dim=>{
+        if(!readable) return {dim: dim, kind: 'noread', score: null};
+        if(!jdDimHasDim(a, dim)) return {dim: dim, kind: 'missing', score: null};
+        const v = jdDimScoreOf(a, dim);
+        const usable = !(v === null || v === undefined || v === '');
+        return {dim: dim, kind: usable ? 'score' : 'noscore', score: usable ? v : null};
+      }),
+    };
+  });
+  return {dims: dims, rows: rows};
+}
+function jdDimCellHtml(cell){
+  if(cell.kind === 'score') return '<td class="dimnum" data-dim="' + esc(cell.dim) + '" data-score="' + esc(cell.score) + '">' + esc(cell.score) + '</td>';
+  if(cell.kind === 'noscore') return '<td class="dimmiss" data-dim="' + esc(cell.dim) + '" data-noscore="1" data-score="">这一维没有分数</td>';
+  if(cell.kind === 'noread') return '<td class="dimnoread" data-dim="' + esc(cell.dim) + '" data-noread="1" data-score="">报告读不出评分</td>';
+  return '<td class="dimmiss" data-dim="' + esc(cell.dim) + '" data-missing="1" data-score="">该版未评这一维</td>';
+}
+function jdDimTable(j){
+  const m = jdDimMatrix(j);
+  if(!m.rows.length) return '';
+  const id = String((j && j.id) || '');
+  let h = '<div class="dimwrap" id="dim-' + esc(id) + '">';
+  h += '<div class="dimcap">📊 逐维对比（一行一份简历，一列一个维度；维度取这些分析的并集，按出现次数降序）。' +
+       '缺的格子写「该版未评这一维」，<b>不补 0</b> —— 0 分是"评了很差"，跟"没评"是两件事。</div>';
+  if(!m.dims.length){
+    // 所有分析都读不出评分 → 连列都建不起来。**如实说**，不摆一张空表糊弄。
+    h += '<div class="rsbad">这些分析的报告都读不出逐维评分 —— 无法并排对比（不是"都没评"）。</div>';
+  } else {
+    h += '<table class="dimtab" data-dimtab="' + esc(id) + '"><thead><tr><th class="dimrow">简历 \\ 维度</th>';
+    h += m.dims.map(d=>'<th data-dim="' + esc(d) + '">' + esc(d) + '</th>').join('');
+    h += '</tr></thead><tbody>';
+    m.rows.forEach(r=>{
+      const sc = (r.score === null) ? '无分数' : (esc(r.score) + ' 分');
+      const ver = r.version_unknown ? '版本未知（早于版本库）' : r.resume_id;
+      h += '<tr data-rid="' + esc(r.resume_id) + '" data-report="' + esc(r.report) + '"' +
+           (r.version_unknown ? ' data-version-unknown="1"' : '') +
+           (r.scores_error ? ' data-scores-error="' + esc(r.scores_error) + '"' : '') + '>';
+      h += '<th class="dimrow" data-rowhead="1">' + esc(r.resume || '(未知简历)') + ' · ' + sc +
+           '<br><span class="mt">' + esc(ver) + '</span></th>';
+      h += r.cells.map(jdDimCellHtml).join('');
+      h += '</tr>';
+    });
+    h += '</tbody></table>';
+  }
+  h += '</div>';
+  return h;
+}
+
 function renderJobs(){
   const q = $('#q').value.trim().toLowerCase();
   const fc = $('#fCat').value, fs = $('#fStatus').value, sort = $('#fSort').value;
@@ -631,6 +763,8 @@ function renderJobs(){
         h += '</div>';
       });
     }
+    // 并排表就在子报告下面：展开 JD 卡片后"一眼看出谁在哪一维强"（用户决策 #3）。
+    h +=   jdDimTable(j);
     h +=   '<div class="subacts">';
     h +=     '<button class="btn ghost sm" data-another="'+esc(id)+'">＋ 用另一份简历分析</button>';
     h +=     '<span class="hintline" style="margin:0">本阶段仍是完整分析（B 段才会只重跑简历那一段）</span>';
@@ -1712,6 +1846,60 @@ function rsCurrentOf(stem){
   return cur;
 }
 
+/* ---- 这一版**当时**拿到的分数（规格 §4.5：「展示 `ai_diff` 与当时的分数」） ----
+   历史版原文没保留时，能拿出来的就是：AI 写的变更说明 + **那一版当时的分数**。
+   分数只在台账里：`/api/jds` 的每一行挂着自己的 `analyses[]`，每条分析带 `resume_id`
+   （= 那次用的是哪一版）。**按 `resume_id` 精确匹配** —— 绝不按简历显示名猜
+   （同名不同版正是这次要修的东西），也绝不编一个分数出来。
+
+   返回 [{job_id, job_title, score, at, report}]；没有就是空数组。`score` 可能是 null
+   （那次分析确实没落分数）—— 那与"台账里根本没有它的评分记录"是两件事，分别如实说。 */
+function rsScoresOfVersion(rows, versionId){
+  const want = String(versionId == null ? '' : versionId);
+  const out = [];
+  if(!want || !Array.isArray(rows)) return out;
+  rows.forEach(j=>{
+    jdAnalyses(j).forEach(a=>{
+      if(String(a.resume_id || '') !== want) return;
+      const sc = (a.score === null || a.score === undefined || a.score === '') ? null : a.score;
+      out.push({job_id: String((j && j.id) || ''), job_title: String((j && j.job_title) || ''),
+                score: sc, at: String(a.created_at || ''), report: String(a.report || '')});
+    });
+  });
+  return out;
+}
+/* 台账行从哪里来：页面内存里的 `JOBS` 优先（启动就 loadJobs 了），为空时才现拉一次
+   —— 用户直接进「简历管理」时内存里可能还没有。读不到就**说读不到**，
+   绝不把"没读到"说成"没有它的评分记录"（那是两句不同的话）。 */
+async function rsLedgerRows(){
+  if(Array.isArray(JOBS) && JOBS.length) return {rows: JOBS, error: ''};
+  let r;
+  try{
+    r = await fetch('/api/jds').then(x=>x.json());
+  }catch(e){
+    return {rows: null, error: e.message};
+  }
+  if(!r || !Array.isArray(r.jds)) return {rows: null, error: (r && r.error) || '台账返回里没有 jds 列表'};
+  return {rows: r.jds, error: ''};
+}
+function rsScoresHtml(lines, error){
+  if(error) return '<div class="rsscores" data-scores="error" data-scores-error="' + esc(error) + '">' +
+    '<div class="rsbad">这一版当时的分数没能读到：台账读取失败（' + esc(error) + '）</div>' +
+    '<div class="hintline">这不是「没有评分记录」—— 只是这次没读到台账。刷新页面再试。</div></div>';
+  const list = Array.isArray(lines) ? lines : [];
+  if(!list.length) return '<div class="rsscores" data-scores="none">' +
+    '<div class="hintline">台账里<b>没有它的评分记录</b>：这一版还没有在任何岗位上被分析过（或那次分析早于版本库、没有钉版本号）。</div></div>';
+  let h = '<div class="rsscores" data-scores="1"><div class="hintline">这一版当时拿到的分数（按 <code>resume_id</code> 从台账里找出来的）：</div>';
+  list.forEach(x=>{
+    const has = !(x.score === null || x.score === undefined || x.score === '');
+    h += '<div class="rsline" data-scoreline="1" data-job="' + esc(x.job_id) + '" data-score="' +
+         esc(has ? x.score : '') + '" data-at="' + esc(x.at) + '" data-report="' + esc(x.report) + '">岗位「' +
+         esc(x.job_title || x.job_id || '(未知岗位)') + '」 · <b>' + (has ? esc(x.score) + ' 分' : '（这次分析没有分数）') +
+         '</b> · ' + esc(x.at || '时间未知') + '</div>';
+  });
+  return h + '</div>';
+}
+
 /* 变更说明的展示口径（规格 §8.3/§8.4）：有就说"AI 写的、可能漏、以原文为准"；
    失败就明说"这次没能生成变更说明"；第一版没有可比对的母版 —— 三种都不是错误。 */
 function rsDiffText(v){
@@ -1866,10 +2054,15 @@ function rsInit(){
   $('#rsPickModal').addEventListener('click', e=>{ if(e.target === $('#rsPickModal')) rsClosePick('backdrop'); });
   $('#rsViewClose').addEventListener('click', rsCloseView);
   $('#rsViewModal').addEventListener('click', e=>{ if(e.target === $('#rsViewModal')) rsCloseView(); });
+  // 409 出口（分析页）的取消 / 遮罩 / Esc：只绑一次，与上面两个弹层同一套写法。
+  // `dupClose` 是在下面的分析段里声明的函数（函数声明提升）—— 这里只是注册，不立刻调用。
+  $('#dupCancel').addEventListener('click', ()=>dupClose('cancel'));
+  $('#dupModal').addEventListener('click', e=>{ if(e.target === $('#dupModal')) dupClose('backdrop'); });
   document.addEventListener('keydown', e=>{
     if(e.key !== 'Escape') return;
     if(!$('#rsViewModal').hidden) rsCloseView();
     else if(!$('#rsPickModal').hidden) rsClosePick('esc');
+    else if($('#dupModal') && !$('#dupModal').hidden) dupClose('esc');
   });
 }
 function rsOpenView(title, html){
@@ -1909,11 +2102,15 @@ async function openResumeText(id){
                ' 次修改 · ' + esc(String(d.at || '时间未知')) + '</div>';
   if(d.kind === 'missing'){
     // ⚠️ **不是错误**、也**不是空文件**：这一版原文按设计没保留。只有变更说明与当时的分数。
+    // 分数现从台账里按 `resume_id` 找（规格 §4.5：取回历史版要"展示 ai_diff 与当时的分数"）；
+    // 找不到就如实说"没有它的评分记录"，**绝不编一个分数**（那正是 §8 的诚实边界）。
+    const led = await rsLedgerRows();
     rsOpenView('这一版原文未保留', meta +
       '<div class="rsbad" data-kind="missing">旧版原文未保留</div>' +
       '<div class="hintline">每个族谱只保留【母版】与【最新版】两份原文 —— 这一版取不回原文（本项目绝不假装能取回）。下面是这一版留下的全部信息：</div>' +
+      rsScoresHtml(rsScoresOfVersion(led.rows, d.version || id), led.error) +
       rsDiffText(d));
-    logUI('resume.view_missing', {id: id});
+    logUI('resume.view_missing', {id: id, scores: rsScoresOfVersion(led.rows, d.version || id).length});
     return;
   }
   if(d.kind === 'mismatch'){
@@ -2167,10 +2364,27 @@ $('#clearResumeBtn').addEventListener('click', ()=>{
   rsHint('');
 });
 
-/* 「选择文件」：.md / .txt 由 FileReader 读成文本，再按**原 JSON 提交**（不引第三方依赖、不做 multipart） */
-$('#resumeFile').addEventListener('change', e=>{
-  const f = e.target.files && e.target.files[0];
-  if(!f) return;
+/* 「选择文件」：.md / .txt 由 FileReader 读成文本，再按**原 JSON 提交**（不引第三方依赖、不做 multipart）。
+
+   ⚠️ `accept=".md,.txt"` 只是给文件对话框的**建议** —— 用户强选 `.docx` 照样能选进来。
+   不判扩展名就会把二进制按文本读进来（乱码）再以 `.md` 存下，用户在报告里拿到一堆问号。
+   所以这里**按扩展名显式判断**：只收 `.md` / `.txt`（大小写不敏感），其它**明确拒绝**并说清
+   该怎么办（另存为 .md/.txt）——本工具不做 .docx/.pdf/.doc 转换，也绝不静默存乱码。 */
+const RS_TEXT_EXT = ['.md', '.txt'];
+function rsIsTextFile(fileName){
+  const n = String(fileName == null ? '' : fileName).trim().toLowerCase();
+  return RS_TEXT_EXT.some(x=>n.length > x.length && n.slice(-x.length) === x);
+}
+function rsFileChosen(f){
+  if(!f) return false;
+  if(!rsIsTextFile(f.name)){
+    // 明确拒绝：**不读**这个文件、**不动**编辑区里已有的内容（免得把用户正在写的东西冲掉）
+    const msg = '只支持 .md / .txt 文本文件：「' + String(f.name || '') +
+      '」不是文本文件（本工具不转换 .docx/.doc/.pdf）—— 请先另存为 .md 或 .txt 再上传。';
+    alert(msg);
+    logUI('resume.file_rejected', {name: String(f.name || ''), reason: '非 .md/.txt 文本文件'}, 'warn');
+    return false;
+  }
   const reader = new FileReader();
   reader.onload = ()=>{
     const text = String(reader.result == null ? '' : reader.result);
@@ -2190,6 +2404,12 @@ $('#resumeFile').addEventListener('change', e=>{
     logUI('resume.file_read_failed', {name: f.name}, 'error');
   };
   reader.readAsText(f);
+  return true;
+}
+$('#resumeFile').addEventListener('change', e=>{
+  const f = e.target.files && e.target.files[0];
+  if(!f) return;
+  rsFileChosen(f);
   e.target.value = '';                                  // 允许重复选同一个文件
 });
 
@@ -2566,26 +2786,129 @@ function showResult(report){
 }
 function clearResult(){ $('#result').className = 'result'; $('#result').innerHTML = ''; }
 
-$('#goBtn').addEventListener('click', async ()=>{
-  const jd = $('#jd').value.trim();
-  const link = $('#link').value.trim();
-  // 简历下拉的 value 是**版本 id**（盘上有文件但没登记版本时退成 `file:<文件名>`）：
-  // 分析请求必须把版本 id 一起发出去 —— 它是"这次用的是哪一版"的唯一凭据，
-  // 同时是新查重粒度 (JD × 简历版本) 的另一半（不带它 = 生产里等同"永不查重"）。
+/* 这次提交要发的那一份（探针直接调它 → 断言"浏览器真会发出去的是什么"）。
+
+   简历下拉的 value 是**版本 id**（盘上有文件但没登记版本时退成 `file:<文件名>`）：
+   分析请求必须把版本 id 一起发出去 —— 它是"这次用的是哪一版"的唯一凭据，
+   同时是查重粒度 (JD × 简历版本) 的另一半（不带它 = 生产里等同"永不查重"）。 */
+function analyzePayload(){
   const pick = RESUME_PICKS.filter(p=>p.key === $('#resumeSel').value)[0] || null;
-  const resume = pick ? pick.name : '';
+  const payload = {jd_text: $('#jd').value.trim(), image: imageB64,
+                   resume_name: pick ? pick.name : '', link: $('#link').value.trim()};
+  if(pick && pick.version) payload.resume_id = pick.version;
+  return payload;
+}
+
+/* ---- 409 出口（规格 §6.2 / §5.3）：查重粒度是 (JD × **简历版本**) ----
+   同 JD + **同一版**简历已经分析过 → 后端 409，body 里带 `duplicate`。用户必须有一条出路，
+   否则就是"卡死"：今天的前端全仓没有 overwrite / allow_duplicate 入口。
+
+   ⚠️ 同 JD + **换一份**简历**不会** 409（后端 `_duplicate_of_resume` 按 `resume_id` 判，
+   不同版本直接放行）→ 这个弹窗只在响应体**真带** `duplicate` 时才开。判据就是那个字段本身，
+   不是"有没有失败"—— 否则换简历被别的错误带进来也会弹一个莫名其妙的「重复」。
+
+   两条出路各自只带自己那个字段：
+   * 「覆盖」= `overwrite=<duplicate.analysis_id>` —— **是那条分析的 id，不是 JD id**。
+     一个 JD 下挂着好几份分析（用户就是一个岗位对三份简历），后端 `_job_in_ledger(<JD id>)`
+     只能取"最新那条" → 拿 JD id 覆盖会把**另一份简历**的记录改掉（E2E 实测：B 那份的版本号
+     与报告被改写成 A 的，而弹窗上写的却是 A 的报告名）。老后端没有 `analysis_id` 时退回
+     JD id（照旧能走通，只是那份歧义还在）。
+   * 「仍然新建」= `allow_duplicate=true`（另建一条，报告名带 (2)）。 */
+let DUP_PENDING = null;                      // {payload, dup}
+function dupErr(msg){ const el = $('#dupErr'); if(!el) return; el.textContent = msg; el.hidden = false; }
+function dupClose(reason){
+  DUP_PENDING = null;
+  const m = $('#dupModal'); if(m) m.hidden = true;
+  const b = $('#dupBody'); if(b) b.innerHTML = '';
+  const e = $('#dupErr'); if(e){ e.textContent = ''; e.hidden = true; }
+  logUI('analyze.dup_choice', {reason: reason || 'cancel'});
+}
+function dupAsk(payload, dup){
+  const d = dup || {};
+  DUP_PENDING = {payload: payload, dup: d};
+  const hasScore = !(d.score === null || d.score === undefined || d.score === '');
+  const at = String(d.created_at || '');
+  $('#dupTitle').textContent = '同一个岗位 + 同一版简历已经分析过';
+  $('#dupBody').innerHTML =
+    '<div class="hintline">查重的粒度是「<b>同一个 JD</b> × <b>同一版简历</b>」。' +
+      '换一份简历分析同一个岗位<b>不算重复</b>（那正是你比三份简历的用法）—— 这次是同一版，才走到这里。</div>' +
+    '<div class="rsmeta" data-dup-job="' + esc(d.job_id || '') + '">岗位：<b>' + esc(d.job_title || d.job_id || '') +
+      '</b>（<code>' + esc(d.job_id || '') + '</code>）</div>' +
+    '<div class="rsline" data-dup-report="' + esc(d.report || '') + '" data-dup-analysis="' +
+      esc(d.analysis_id || '') + '">已经有一份报告：<code>' +
+      esc(d.report || '（没有报告文件名）') + '</code></div>' +
+    '<div class="rsline" data-dup-score="' + esc(hasScore ? d.score : '') + '">当时拿到的分数：<b>' +
+      (hasScore ? esc(d.score) + ' 分' : '（那一次分析没有分数）') + '</b></div>' +
+    '<div class="rsline" data-dup-at="' + esc(at) + '" data-dup-resume="' + esc(d.resume || '') +
+      '" data-dup-resume-id="' + esc(d.resume_id || '') + '">那一次分析：' + esc(at || '时间未知') +
+      '　用的简历：' + esc(d.resume || '（未记录）') + '</div>' +
+    '<div class="row" style="margin-top:14px">' +
+      '<button class="btn" id="dupOverwrite">覆盖（沿用原报告文件名）</button>' +
+      '<span class="hintline" style="margin:0">这次的结果写回<b>那一条</b>分析记录与那份报告' +
+        '（<code>' + esc(d.report || '原报告') + '</code>，旧内容被覆盖）</span>' +
+    '</div>' +
+    '<div class="row" style="margin-top:12px">' +
+      '<button class="btn gray" id="dupNew">仍然新建</button>' +
+      '<span class="hintline" style="margin:0">保留上面那份，另建一条新分析（报告名会带 (2)，两份都在）</span>' +
+    '</div>';
+  $('#dupModal').hidden = false;
+  logUI('analyze.dup_asked', {job: d.job_id || '', resume_id: d.resume_id || '', score: hasScore ? d.score : ''});
+  $('#dupOverwrite').addEventListener('click', ()=>dupResend('overwrite'));
+  $('#dupNew').addEventListener('click', ()=>dupResend('new'));
+}
+/* 重发一次分析：`mode='overwrite'` → 带 `overwrite`；`mode='new'` → 带 `allow_duplicate`。
+   两个字段**互斥**：覆盖时还带 `allow_duplicate` 就等于"既不覆盖又跳过查重"，两条路都错。
+   `overwrite` 用**那条分析的 id**（`analysis_id`）：一个 JD 下好几份分析时，只有它能让后端
+   落到"用户要覆盖的这一条"上（用 JD id 会取最新那条 = 可能是另一份简历）。 */
+async function dupResend(mode){
+  const P = DUP_PENDING;
+  if(!P) return false;
+  const body = Object.assign({}, P.payload);
+  if(mode === 'overwrite') body.overwrite = String(P.dup.analysis_id || P.dup.job_id || '');
+  else body.allow_duplicate = true;
+  $('#goBtn').disabled = true;
+  show($('#st'),'info', mode === 'overwrite' ? '正在覆盖那一条分析……' : '正在另建一条新分析……');
+  let r = null;
+  try{
+    r = await fetch('/api/analyze', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(body)}).then(x=>x.json());
+  }catch(e){
+    dupErr('请求出错：' + e.message);
+    logUI('analyze.dup_resend_exception', {mode: mode, error: e.message}, 'error');
+    $('#goBtn').disabled = false;
+    return false;
+  }
+  $('#goBtn').disabled = false;
+  if(r && r.ok){
+    dupClose(mode);
+    show($('#st'),'ok', mode === 'overwrite' ? '已覆盖那一条分析（沿用原报告文件名）✓' : '已另建一条新分析 ✓');
+    showResult(r.report);
+    loadJobs();
+    logUI('analyze.dup_resolved', {mode: mode, report: r.report});
+    return true;
+  }
+  dupErr('失败：' + ((r && r.error) || '未知错误'));
+  logUI('analyze.dup_resend_failed', {mode: mode, error: (r && r.error) || ''}, 'error');
+  return false;
+}
+
+async function analyzeSubmit(){
+  const payload = analyzePayload();
+  const jd = payload.jd_text, link = payload.link, resume = payload.resume_name;
   if(!jd && !imageB64 && !link){ logUI('analyze.blocked', {reason:'no_jd'}, 'warn'); return show($('#st'),'err','请粘贴 JD 文字、上传截图，或填分享链接'); }
   if(!resume){ logUI('analyze.blocked', {reason:'no_resume'}, 'warn'); return show($('#st'),'err','请先选择一份简历'); }
   clearResult();
-  logUI('analyze.click', {resume: resume, resume_id: (pick && pick.version) || '', has_text: !!jd, has_image: !!imageB64, has_link: !!link});
+  logUI('analyze.click', {resume: resume, resume_id: payload.resume_id || '', has_text: !!jd, has_image: !!imageB64, has_link: !!link});
   $('#goBtn').disabled = true;
   show($('#st'),'info','正在分析……（识图 + 跑 SOP + 生成报告，约需 20–60 秒，请勿关闭本页）');
   try{
-    const payload = {jd_text: jd, image: imageB64, resume_name: resume, link: link};
-    if(pick && pick.version) payload.resume_id = pick.version;
     const r = await fetch('/api/analyze', {method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify(payload)}).then(x=>x.json());
-    if(r.ok){
+    if(r && r.duplicate){
+      // 只有后端**真**给了 duplicate 才弹（换简历那条路后端 200，走不到这里）
+      dupAsk(payload, r.duplicate);
+      show($('#st'),'warn','这一版在这个岗位上已经分析过 —— 选「覆盖」或「仍然新建」');
+    } else if(r.ok){
       show($('#st'),'ok','分析完成 ✓');
       showResult(r.report);
       loadJobs();
@@ -2599,7 +2922,8 @@ $('#goBtn').addEventListener('click', async ()=>{
     logUI('analyze.exception', {error: e.message}, 'error');
   }
   $('#goBtn').disabled = false;
-});
+}
+$('#goBtn').addEventListener('click', analyzeSubmit);
 $('#demoBtn').addEventListener('click', async ()=>{
   clearResult();
   logUI('demo.click');

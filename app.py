@@ -409,22 +409,65 @@ def _jd_id_of_row(rec):
     return str(rec.get("jd_id") or rec.get("id") or "")
 
 
+def _analysis_scores(rec):
+    """一条分析**当时**的逐维分数（从它自己的报告 `REPORT_DATA` 里读）。
+
+    返回 `(scores, error)`：
+
+    - `scores` = `[{"dimension","weight","score"}, …]`（**只留真有维度名的**）；`error` = ""
+    - 读不出（没有报告名 / 文件不在盘上 / 报告坏）→ `(None, 原因)`，`error` 非空
+
+    ⚠️ **读不出就是读不出**：绝不编一份分数、也绝不拿 `[]` 冒充"这一版一个维度都没评"
+    （前者是假话，后者会让界面把"读不到"说成"没评"）。前端据 `scores`/`scores_error`
+    决定那一格是「该版未评这一维」还是「报告读不出评分」。
+    """
+    name = store.safe_name(str((rec or {}).get("report") or ""))
+    if not name:
+        return None, "这条分析没有报告文件名"
+    path = os.path.join(store.p_path("reports"), name)
+    if not os.path.isfile(path):
+        return None, "报告文件不在盘上：%s" % name
+    data = kb.read_report_data(path)
+    if not isinstance(data, dict):
+        return None, "报告里读不出 REPORT_DATA：%s" % name
+    out = []
+    for s in (data.get("scores") or []):
+        if not isinstance(s, dict):
+            continue
+        dim = str(s.get("dimension") or "").strip()
+        if not dim:
+            continue
+        out.append({"dimension": dim, "weight": s.get("weight"), "score": s.get("score")})
+    return out, ""
+
+
 def _jd_row(jd_id, records):
     """一行 = 一个 JD：JD 记录全字段 + 分析聚合（份数 / 最高分 / 每份分析）。
 
     ⚠️ `id` = **JD id**（不是分析 id）：前端拿它去 `/api/jd_text`、`/api/job/outcome`、
     `/api/job/result`、`X-Job-Id`，这些现在都以 JD 为身份。分析级字段（`report`/`resume`/
     `score`/`jd_text_file`）逐份挂在 `analyses` 里，**不**冒充 JD 字段。
+
+    `analyses[]` 另外带两样**前端要用的真相**（阶段 4C 的并排表与取回分支）：
+    `resume_id`（这次用的是**哪一版** —— 缺它就只能显示「版本未知」）与
+    `scores`/`scores_error`（那一版当时的逐维分数，源报告见 `_analysis_scores`）。
     """
     jd = jdid.find_jd(jd_id) or {}
     rows = sorted(records, key=lambda r: (str(r.get("created_at") or ""), str(r.get("id") or "")))
-    analyses = [{
-        "id": str(r.get("id") or ""),
-        "resume": str(r.get("resume") or ""),
-        "score": r.get("score"),
-        "report": str(r.get("report") or ""),
-        "created_at": str(r.get("created_at") or ""),
-    } for r in rows]
+    analyses = []
+    for r in rows:
+        scores, scores_error = _analysis_scores(r)
+        analyses.append({
+            "id": str(r.get("id") or ""),
+            "resume": str(r.get("resume") or ""),
+            # 老分析**没有**这个键（不是空串）→ 前端显示「版本未知（早于版本库）」，不猜
+            "resume_id": str(r.get("resume_id") or ""),
+            "score": r.get("score"),
+            "report": str(r.get("report") or ""),
+            "created_at": str(r.get("created_at") or ""),
+            "scores": scores,
+            "scores_error": scores_error,
+        })
     scores = []
     for r in rows:
         try:
@@ -783,6 +826,10 @@ def find_analyze_duplicate(jd_text, overwrite_id="", resume_id=""):
     那一支，不会再算成一个新岗位；`report` / `score` / `resume_id` 是**命中的那条分析**的，
     给前端的 409 弹窗显示"你要覆盖的是哪一份"。
 
+    ⚠️ `analysis_id` 是**命中那条分析**的 id，前端「覆盖」必须拿它当 `overwrite`（原因见返回值
+    那一段的注释）：一个 JD 下可以挂多份分析（几份简历），只给 JD id 的话后端只能取"最新那条"，
+    覆盖就会写到**另一份简历**的记录上。
+
     为什么粒度必须带简历（用户今天被它卡死）：他 C 阶段的核心用法是「同一个岗位拿三份简历
     分别分析」，而旧实现只看 JD 文本 → 第二份简历被判重复 → **409**，前端又没有出口。
     """
@@ -816,10 +863,16 @@ def find_analyze_duplicate(jd_text, overwrite_id="", resume_id=""):
         "job_title": str(jd.get("job_title") or ""),
         "created_at": str(dup.get("created_at") or jd.get("created_at") or ""),
         "score": dup.get("score"),
-        # 前端弹窗（阶段 4C 的 409 出口）要显示"覆盖的是哪一份分析"，这两项此前没有
+        # 前端弹窗（阶段 4C 的 409 出口）要显示"覆盖的是哪一份分析"，这几项此前没有
         "report": str(dup.get("report") or ""),
         "resume": str(dup.get("resume") or ""),
         "resume_id": str(dup.get("resume_id") or ""),
+        # ⚠️ 「覆盖」必须用**这个**（不是 JD id）：一个 JD 下可以挂多份分析 —— 用户的用法就是
+        # 一个岗位对三份简历。`_job_in_ledger(<JD id>)` 只能取该 JD 下**最新**那条记录，于是
+        # 「覆盖」会写到**另一份简历**的记录上（实测：把 B 那份分析的版本号与报告一起改写成 A 的
+        # —— 用户看到的是"覆盖了这一份、动的是那一份"，而且报告文件名与弹窗上说的不一致）。
+        # 用命中那条分析的 id，`fixed_id` 才真的等于它的报告名 → 「沿用原报告文件名」才是真话。
+        "analysis_id": str(dup.get("id") or ""),
         "similarity": score,
         "suggestions": list(ANALYZE_DUP_SUGGESTIONS),
     }
