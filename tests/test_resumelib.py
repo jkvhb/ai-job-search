@@ -337,6 +337,9 @@ class MismatchTest(IsolatedCase):
         ④ 另开同名新简历（乙）→ **覆盖**那个孤儿文件；
         ⑤ 读 a2 —— a2 在甲族谱里 rev 最高，``_owner_in`` 认定"``<名字>.md`` 里是它"，于是旧代码
            把**乙的全新简历**当成 a2 的原文、以 ``kind="latest"`` 静默返回。
+
+        ⚠️ 修 3 之后这一步走**快照**（a2 自己是母版、快照一直在）：拿回的是 a2 的原文，
+        ``kind="mother"``。要钉住的不变量没变 —— **绝不把乙的内容当成 a2 的原文**。
         """
         a1 = resumelib.create_version("同名", "甲的第一版")
         resumelib.choose(a1["id"])
@@ -350,18 +353,20 @@ class MismatchTest(IsolatedCase):
         stranger = resumelib.create_version("同名", "乙的全新简历")   # 覆盖孤儿文件
         self.assertEqual(stranger["root_id"], stranger["id"])
         text, path, kind = resumelib.read_version(a2["id"])
-        self.assertEqual(kind, "mismatch")                       # ← 旧代码这里是 "latest"（静默给别人的内容）
-        self.assertEqual(text, "乙的全新简历")                    # 内容照常给，便于对账
-        self.assertEqual(path, store.p_path("resumes", "同名.md"))
-        self.assertEqual(resumelib.sha256_of(text), stranger["sha256"])        # 逐字就是乙那一份
-        self.assertNotEqual(resumelib.sha256_of(text), a2["sha256"])           # 与 a2 记录不符（证据）
+        self.assertEqual(kind, "mother")                         # ← 旧代码这里是 "latest"（静默给别人的内容）
+        self.assertEqual(text, "甲的第二版")                      # ← **是 a2 自己的原文**，不是乙的
+        self.assertEqual(path, self._snap_path(a2["id"]))         # 从快照取（不可变的那份）
+        self.assertNotEqual(text, "乙的全新简历")
+        self.assertEqual(resumelib.sha256_of(text), a2["sha256"])              # 逐字就是 a2 那一份
+        self.assertNotEqual(resumelib.sha256_of(text), stranger["sha256"])     # 与乙的记录不符（证据）
 
-    def test_a_live_version_whose_file_was_orphaned_by_purge_is_mismatch(self):
+    def test_a_live_version_whose_file_was_orphaned_by_purge_reads_its_mother_snapshot(self):
         """**全是未移出记录**的孤儿路径（界面真会读到的那种）：
 
         purge 掉最新版 a3 后，``<名字>.md`` 里留下的是 a3 的内容；此时 a2 既是母版又是
         "文件主人"，旧代码会以 ``kind="latest"`` 把 **a3 的内容**当成 a2 的原文返回 ——
-        记录里的 sha 明明对不上。修好后必须报 ``mismatch``（a2 真正的原文仍在它的快照里）。
+        记录里的 sha 明明对不上。修 3 之后**先看快照**：a2 的原文完好地在它自己的快照里，
+        于是如实回 ``mother`` + a2 的原文（而不是拿被彻底删掉的那一版来冒充）。
         """
         a1 = resumelib.create_version("同名", "甲的第一版")
         resumelib.choose(a1["id"])
@@ -370,12 +375,14 @@ class MismatchTest(IsolatedCase):
         a3 = resumelib.create_version("同名", "甲的第三版", parent_id=a2["id"])
         resumelib.purge(a3["id"])
         self.assertEqual([r["id"] for r in resumelib.list_versions()], [a1["id"], a2["id"]])   # 全是活的
+        # 事实：`<名字>.md` 里确实还是 a3 的内容（孤儿文件）
+        self.assertEqual(store.read_text(store.p_path("resumes", "同名.md")), "甲的第三版")
         text, path, kind = resumelib.read_version(a2["id"])
-        self.assertEqual(kind, "mismatch")                       # ← 旧代码这里是 "latest"
-        self.assertEqual(text, "甲的第三版")                      # 拿到的是已被彻底删除的 a3 的内容
-        self.assertEqual(path, store.p_path("resumes", "同名.md"))
-        self.assertNotEqual(resumelib.sha256_of(text), resumelib.by_id(a2["id"])["sha256"])
-        # a2 真正的原文没丢：还在它自己的快照里（记录也如实写了 mother_file）
+        self.assertEqual(kind, "mother")                          # ← 旧代码这里是 "latest"
+        self.assertEqual(text, "甲的第二版")                       # ← 逐字是 a2 的原文，不是 a3 的
+        self.assertEqual(path, self._snap_path(a2["id"]))
+        self.assertEqual(resumelib.sha256_of(text), resumelib.by_id(a2["id"])["sha256"])   # 对得上
+        # a2 的原文没丢：就在它自己的快照里（记录也如实写了 mother_file）
         self.assertEqual(store.read_text(self._snap_path(a2["id"])), "甲的第二版")
         self.assertEqual(resumelib.by_id(a2["id"])["mother_file"],
                          "resumes/%s/%s.md" % (resumelib.SNAPSHOT_DIR, a2["id"]))
@@ -431,6 +438,47 @@ class SnapshotCertaintyAfterCleanupTest(IsolatedCase):
         self.assertFalse(os.path.exists(self._snap_path(v2["id"])),
                          "给「原文没保留」的母版写了一个空快照（假装留了档）")
         self.assertIsNone(resumelib.by_id(v2["id"])["mother_file"])
+
+
+class MotherSnapshotPrecedenceTest(IsolatedCase):
+    """修 3：**有母版快照时优先从快照取**（快照不可变，正是为"最新版被彻底删掉"留的）。
+
+    探针（修之前）：``v1(chosen) + v2 → purge(v2) → read_version(v1)`` 回 ``mismatch``、
+    ``text`` 是 **v2 的内容**，而 v1 的原文一直躺在 ``resumes/快照/rv_0001.md`` 里、一个字节
+    都没动 —— 界面据此对用户说「可能被程序外修改过」，是**假话**。根因是判定顺序：先认
+    「文件主人」（purge 后退到 v1）→ 内容与记录 sha 不符 → mismatch，**根本没看快照**。
+    """
+
+    def _snap_path(self, version_id):
+        return store.p_path("resumes", resumelib.SNAPSHOT_DIR, version_id + ".md")
+
+    def test_after_purging_the_newer_version_the_mother_comes_back_from_its_snapshot(self):
+        v1 = resumelib.create_version("母版", "v1 的原文\n第二行")
+        resumelib.choose(v1["id"])
+        v2 = resumelib.create_version("母版", "v2 的内容", parent_id=v1["id"])
+        resumelib.purge(v2["id"])
+        # 前提（两个"事实"都摆出来）：最新版容器里是 v2 的内容，快照里是 v1 的原文
+        self.assertEqual(store.read_text(store.p_path("resumes", "母版.md")), "v2 的内容")
+        self.assertEqual(store.read_text(self._snap_path(v1["id"])), "v1 的原文\n第二行")
+
+        text, path, kind = resumelib.read_version(v1["id"])
+        self.assertEqual(kind, "mother")                        # ← 修之前是 "mismatch"
+        self.assertEqual(text, "v1 的原文\n第二行")              # ← 逐字；修之前是 v2 的内容
+        self.assertEqual(path, self._snap_path(v1["id"]))
+        self.assertNotEqual(text, "v2 的内容")
+
+    def test_a_tampered_snapshot_is_still_reported_as_mismatch(self):
+        """快照也不可用时（被程序外改过）仍必须如实 ``mismatch``：改了顺序，sha 核对一步没少。"""
+        v1 = resumelib.create_version("母版", "v1 的原文")
+        resumelib.choose(v1["id"])
+        v2 = resumelib.create_version("母版", "v2 的内容", parent_id=v1["id"])
+        resumelib.purge(v2["id"])
+        with open(self._snap_path(v1["id"]), "w", encoding="utf-8", newline="") as f:
+            f.write("别人手改的快照")
+        text, path, kind = resumelib.read_version(v1["id"])
+        self.assertEqual(kind, "mismatch")
+        self.assertEqual(text, "别人手改的快照")
+        self.assertEqual(path, self._snap_path(v1["id"]))
 
 
 if __name__ == "__main__":

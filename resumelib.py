@@ -19,9 +19,14 @@
    就不是母亲那一份，条件永远不成立 → 这里直接报错（见 ``create_version``）。
 
 2. ``read_version`` 的四种 ``kind``：``latest``（读 ``<名字>.md``）／
-   ``mother``（读快照；**母版同时是最新版时也读最新版文件**）／
+   ``mother``（读快照）／
    ``mismatch``（读到内容了，但**内容与记录里的 ``sha256`` 不符**）／
    ``missing``（既不最新也不是母版的历史版 → 原文没保留）。
+   **判定顺序（修 3）**：**先看快照，再看"文件主人"**。快照不可变、正是为
+   "``<名字>.md`` 已经不是这一版了"留的；先认主人就会在 ``purge`` 掉最新版之后，
+   拿文件里残留的**别人/别版的内容**回报这一版（``mismatch``），而它的原文其实完好地
+   躺在快照里。只有**没有快照**时才走"文件主人 + sha 核对"那条路（母版同时是最新版、
+   且从未延续过 → 没有快照 → 读最新版文件，仍报 ``latest``）。
    ``missing`` 时 ``text`` 是空串是**事实**，但调用方**必须靠 ``kind`` 分辨**，
    **绝不把空串当成功**（界面据此显示"旧版原文未保留"）。
    ``mismatch`` 与 ``missing`` 是**两回事**：一个"从来没存过"，一个"存过、但磁盘上的
@@ -225,11 +230,23 @@ def _mother_in(recs, root_id):
 
 
 def _read_in(recs, version_id):
-    """``read_version`` 的本体（复用已加载的 doc，供锁内调用）。"""
+    """``read_version`` 的本体（复用已加载的 doc，供锁内调用）。
+
+    **顺序是判定的一部分**（修 3）：**先看母版快照，再看"文件主人"**。
+    快照是不可变的、且正是为"``<名字>.md`` 已经不是这一版了"留的；先认主人的话，
+    ``purge`` 掉最新版之后（文件里留着那一版的内容、主人退到它身上）就会把**别人的内容**
+    当成这一版、并以 ``mismatch`` 回报 —— 而这一版的原文其实完好地躺在快照里。
+    """
     rec = _find(recs, version_id)
     if rec is None:
         raise ValueError("找不到版本：%s" % (version_id,))
     vid = _clean_id(rec.get("id"))
+    # ① 有快照 → 从快照取（快照同样是磁盘文件：它不可变，sha 对不上说明出事了 → 照样 mismatch）
+    snap = _snapshot_path(vid)
+    if os.path.exists(snap):
+        text = store.read_text(snap, "")
+        return text, snap, _kind_on_disk(text, rec, "mother")
+    # ② 没有快照才认"文件主人"（``<名字>.md`` 里装的是它）
     owner = _owner_in(recs, _root_of(rec))
     if owner is not None and _clean_id(owner.get("id")) == vid:
         path = _resume_path(_name_of(rec))
@@ -237,12 +254,7 @@ def _read_in(recs, version_id):
         # 读到了也要**核指纹**：`<名字>.md` 是共享容器，磁盘上的东西可能已经不是这一版了
         # （程序外改过 / purge 留的孤儿被别人覆盖）。不符 → mismatch，绝不谎报 latest。
         return text, path, _kind_on_disk(text, rec, "latest")
-    snap = _snapshot_path(vid)
-    if os.path.exists(snap):
-        text = store.read_text(snap, "")
-        # 快照同样是磁盘上的文件：它不可变，sha 对不上同样说明出事了 → 一样要核。
-        return text, snap, _kind_on_disk(text, rec, "mother")
-    # 原文确实没保留：text 为空是**事实**，path 也**故意**给空串——
+    # ③ 原文确实没保留：text 为空是**事实**，path 也**故意**给空串——
     # 免得调用方拿着一个"名义路径"去读，把最新版当成这一版发出去。
     return "", "", "missing"
 
@@ -397,8 +409,10 @@ def read_version(version_id):
     """取某一版原文 → ``(text, path, kind)``，``kind ∈ {latest, mother, mismatch, missing}``。
 
     - ``latest``：这一版就是 ``<名字>.md`` 里那一份（**且内容与记录 sha 一致**）→ 读该文件
-    - ``mother``：这一版是母版且留有快照（**且快照内容与记录 sha 一致**）→ 读快照
-      （母版同时是最新版时走 ``latest``，避免"一件事两处存"）
+      （只在**没有快照**时才会走到这一步）
+    - ``mother``：这一版留有快照（**且快照内容与记录 sha 一致**）→ 读快照。
+      **快照优先于"文件主人"**（修 3）：``purge`` 掉更新的版本之后，``<名字>.md`` 里留着的
+      是那一版的内容，而这一版的原文仍完好地在快照里 —— 先认主人就会拿别人的内容回报它。
     - ``mismatch``：**读到内容了，但它不是这一版** —— ``sha256_of(text) != record["sha256"]``。
       ``text`` / ``path`` **照常返回**（调用方要能把内容亮出来对账），只有 ``kind`` 如实变红。
     - ``missing``：原文没保留 → ``text == ""`` 且 ``path == ""``；
@@ -456,6 +470,35 @@ def remove(version_id):
         rec[REMOVED] = True
         save_resumes(doc)
         return dict(rec)
+
+
+def remove_current_of(name):
+    """按简历**名字**移出它**当前**那一版（解析与移出在**同一个临界区**里，修 7）。
+
+    语义与"先 ``current_of`` 再 ``remove``"完全一样，但**两步不许分开**：分开时中间插进一次
+    并发保存，移出的就是**过时的那一版**（用户看到消失的是另一版）。数据不见得丢，但"移出的是
+    哪一版"成了错的 —— 这种事在界面上根本看不出来，所以必须由库自己在锁内一次做完。
+
+    名字口径与 ``create_version`` 记录里的 ``name`` 一致（**不含扩展名**：``母版.md`` → ``母版``），
+    与"老前端按文件名删"那条路对得上。这个名字没有任何**未移出**的版本 → ``ValueError``。
+    """
+    with _LOCK:
+        doc = load_resumes()
+        recs = doc["resumes"]
+        want = os.path.splitext(store.safe_name(name))[0]
+        target = None
+        if want:
+            for r in recs:
+                if _is_removed(r) or _name_of(r) != want:
+                    continue
+                # 同一族谱里取 rev 最大的**未移出**版本（= 这个名字当前对应的那一版）
+                target = _current_in(recs, _root_of(r)) or r
+                break
+        if target is None:
+            raise ValueError("找不到该简历：%s" % (name,))
+        target[REMOVED] = True
+        save_resumes(doc)
+        return dict(target)
 
 
 def restore(version_id):

@@ -283,6 +283,17 @@ class BadOverwrite(RuntimeError):
     """
 
 
+class BadResumeVersion(RuntimeError):
+    """`resume_id` 指向一个**不存在**的版本 → 路由回 400（修 4）。
+
+    为什么必须复核而不是直通：`resume_id` 是「这次用的是**哪一版**」的唯一凭据 —— 它会写进
+    `jobs.json` 与报告数据（报告里那句"用的是哪一版"就成了假话），同时又是查重的另一半粒度
+    （两个不同文件共用一个 id → **误 409**，而前端那时没有出口）。与 `overwrite` 同一套纪律：
+    给了一个 id，就必须**真的**能在 `resumelib` 里找到它；找不到就明确报错，绝不静默接受。
+    空串是**另一回事**（老前端 / 老数据不传版本号）→ 照常放行，记录里不写这个键。
+    """
+
+
 def _job_merged_into(job):
     """记录上的 `merged_into`（只认非空字符串；手改出的 5 / [] / "" 一律当没合并）。"""
     v = job.get("merged_into") if isinstance(job, dict) else None
@@ -860,22 +871,6 @@ def _resume_files():
     return sorted(f for f in os.listdir(d) if f.lower().endswith(_RESUME_EXTS))
 
 
-def _version_of_name(name):
-    """按简历**名字**找它当前的版本记录（`name` 不含扩展名）；找不到回 `None`。
-
-    一个名字在**未移出**的版本里是唯一的（`resumelib.create_version` 校验），所以这里最多
-    命中一个族谱；同一族谱里取 rev 最大的那一版（`current_of`）。
-    """
-    want = os.path.splitext(store.safe_name(name))[0]
-    if not want:
-        return None
-    for rec in resumelib.list_versions():
-        if str(rec.get("name") or "") == want:
-            cur = resumelib.current_of(rec.get("root_id"))
-            return cur if cur is not None else rec
-    return None
-
-
 def save_resume_version(name, content, parent_id="", lineage=""):
     """保存一份简历并登记版本（**唯一**的写简历路径，规格 §4.1/4.2）。
 
@@ -1006,6 +1001,7 @@ def do_analyze(jd_text, image_data_url, resume_name, link="", overwrite_id="", a
 
     `resume_id`（阶段 4C）= 这次用的是**哪一版**简历（`resumelib` 的版本 id）。它是查重的
     另一半粒度（同 JD + 同版本才判重复），并落进分析记录 —— 报告因此能追溯到"用的哪一版"。
+    **非空时必须真的存在于 `resumelib`**，否则抛 `BadResumeVersion`（路由回 400，修 4）；
     **老调用方不传**（空串）→ 记录里**不写**这个键 = "版本未知（早于版本库）"，界面据此显示，
     **绝不猜**一个填上去。
 
@@ -1026,6 +1022,13 @@ def do_analyze(jd_text, image_data_url, resume_name, link="", overwrite_id="", a
     resume_id = str(resume_id or "").strip()
     allow_duplicate = _as_bool(allow_duplicate)
     refresh_jd_facts = _as_bool(refresh_jd_facts)
+
+    # `resume_id` 非空 = 调用方**声称**"这次用的是这一版"→ 必须真的存在（修 4）。
+    # 位置在**所有花钱的事之前**（OCR / 抓链接 / 查重 / 模型）：id 错了当场抛 BadResumeVersion
+    # → 路由回 400，一个额度都不花。空串是老前端/老数据那条路（记录里不写这个键），放行。
+    if resume_id and resumelib.by_id(resume_id) is None:
+        raise BadResumeVersion("找不到这一版简历（resume_id=%s）："
+                               "拒绝把这次分析记到一个不存在的版本上" % resume_id)
 
     source_bits = []
     if jd_text:
@@ -1505,13 +1508,19 @@ class Handler(BaseHTTPRequestHandler):
             # 就是用户全部的简历，界面必须看得见，绝不能因为"没有版本记录"就当成不存在。
             include_removed = _as_bool(q.get("include_removed", ["0"])[0])
             try:
-                versions = resumelib.list_versions(include_removed=include_removed)
+                # 版本名集合一律取**全量（含已移出）**：`unregistered` 说的是"盘上这个文件
+                # **有没有版本记录**"，而"移出列表"只是不再显示/不能继续用 —— 记录还在。
+                # 拿过滤后的集合算，会把刚移出的简历报成"没有版本记录"（T3a 据此给"登记"
+                # 入口就是错的：用户以为自己的版本记录丢了）。列表本身仍按 include_removed 过滤。
+                all_versions = resumelib.list_versions(include_removed=True)
             except Exception as e:
                 # do_GET 没有外层 try（见 /api/knowledge 的注释）：不兜底就是连接裸断
                 log.log_exc("resume.list_error", e)
                 return self._send(500, {"ok": False, "error": "简历版本库读取失败：%s" % e})
+            versions = all_versions if include_removed else [r for r in all_versions
+                                                            if not r.get(resumelib.REMOVED)]
             files = _resume_files()
-            registered = {str(r.get("name") or "") for r in versions}
+            registered = {str(r.get("name") or "") for r in all_versions}
             return self._send(200, {
                 "ok": True,
                 "resumes": versions,
@@ -2198,6 +2207,11 @@ class Handler(BaseHTTPRequestHandler):
                 # 前端传错 id：结果**没有**被写进任何一条记录，必须说清（不能只回一句「重复」）
                 log.log_event("analyze.bad_overwrite", level="warn", error=str(e))
                 return self._send(400, {"ok": False, "error": str(e)})
+            except BadResumeVersion as e:
+                # 传错的版本 id：同上 —— 「哪一版」这句话绝不能靠猜（修 4）
+                log.log_event("analyze.bad_resume_version", level="warn", error=str(e),
+                              resume_id=str(body.get("resume_id") or ""))
+                return self._send(400, {"ok": False, "error": str(e)})
             except Exception as e:
                 return self._send(200, {"ok": False, "error": str(e)})
 
@@ -2215,6 +2229,16 @@ class Handler(BaseHTTPRequestHandler):
     # ---- DELETE
     def do_DELETE(self):
         self._t0 = time.time()
+        try:
+            return self._handle_delete()
+        except Exception as e:
+            # 兜底与 `do_POST` 同一写法：没有它，一次写盘失败（`resumelib.remove` →
+            # `store.write_json` 会抛）就是**连接裸断** —— 前端只看到网络错误，
+            # 既不知道"移出"成没成，也拿不到一句人能看懂的话（修 6）。
+            log.log_exc("http.delete_unhandled_error", e, path=urlparse(self.path).path)
+            return self._send(500, {"ok": False, "error": "服务器内部错误：%s" % e})
+
+    def _handle_delete(self):
         u = urlparse(self.path)
         q = parse_qs(u.query)
         if u.path == "/api/resumes":
@@ -2224,16 +2248,18 @@ class Handler(BaseHTTPRequestHandler):
             # （`POST /api/resumes/purge` + 前端二次确认）。
             vid = str(q.get("version", [""])[0]).strip()
             if not vid:
-                # 老前端按**文件名**删：解析成那份简历当前的版本 —— 语义仍然是"移出列表"，
-                # 绝不 `os.remove`（哪怕调用方是旧代码）。
-                rec = _version_of_name(q.get("name", [""])[0])
-                if rec is None:
-                    return self._send(404, {"ok": False, "error": "找不到该简历"})
+                # 老前端按**文件名**删：解析 + 移出**在同一临界区**里完成（`resumelib` 内持锁，
+                # 修 7）—— 两步之间插进一次并发保存，就会移出**错的那一版**。
+                try:
+                    rec = resumelib.remove_current_of(q.get("name", [""])[0])
+                except ValueError as e:
+                    return self._send(404, {"ok": False, "error": str(e)})
                 vid = str(rec.get("id") or "")
-            try:
-                rec = resumelib.remove(vid)
-            except ValueError as e:
-                return self._send(404, {"ok": False, "error": str(e)})
+            else:
+                try:
+                    rec = resumelib.remove(vid)
+                except ValueError as e:
+                    return self._send(404, {"ok": False, "error": str(e)})
             log.log_event("resume.remove", version=vid, name=rec.get("name"))
             return self._send(200, {"ok": True, "removed": rec, "name": rec.get("name"),
                                     "note": "已移出列表；简历文件与母版快照仍留在盘上"})

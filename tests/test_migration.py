@@ -546,5 +546,38 @@ class MergedRecordTest(IsolatedCase):
         self.assertIn("保留原样", text)
 
 
+class ResumeIdSurvivesMigrationTest(MigrationTestBase):
+    """修 2：`_build_jobs` 的**硬编码白名单**会把 `resume_id` 静默丢掉。
+
+    分析记录里「这次用的是**哪一版**简历」（`resume_id`，阶段 4C）是 `ANALYSIS_FIELDS` 的一员：
+    迁移把 JD 级字段搬去 `jds.json` 时**必须逐字留下它** —— 它既是"报告用的是哪一版"的凭据，
+    又是查重的另一半粒度。硬编码白名单漏一个键 = **静默丢用户数据**（`--执行` 至今没在真实
+    数据上跑过，所以它是"待触发"的）。
+    """
+
+    def setUp(self):
+        MigrationTestBase.setUp(self)
+        jobs = store.load_jobs()                       # 给 A / B 两条分析钉上版本号（真实形状）
+        for j in jobs:
+            if j["id"] in ("分析A", "分析B"):
+                j["resume_id"] = "rv_00%02d" % (1 if j["id"] == "分析A" else 2)
+        store.save_jobs(jobs)
+
+    def test_the_resume_id_survives_the_migration_verbatim(self):
+        code, _text = self.run_cli(["--执行"])
+        self.assertEqual(code, 0)
+        jobs = self.jobs_by_id()
+        self.assertEqual(jobs["分析A"]["resume_id"], "rv_0001")      # ← 逐字，不是"还在"就行
+        self.assertEqual(jobs["分析B"]["resume_id"], "rv_0002")
+        self.assertNotIn("resume_id", jobs["分析D"])                  # 没有的不许凭空补
+        for jd in jdid.load_jds()["jds"]:
+            self.assertNotIn("resume_id", jd, "分析级字段漏进 jds.json 了")
+
+    def test_the_script_field_list_matches_the_app_one(self):
+        """`ANALYSIS_FIELDS` 两处各列一份是既有事实，但**必须逐字一致**（同一口径）。"""
+        import app
+        self.assertEqual(CLI.ANALYSIS_FIELDS, app.ANALYSIS_FIELDS)
+
+
 if __name__ == "__main__":
     unittest.main()

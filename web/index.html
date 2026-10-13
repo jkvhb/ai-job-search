@@ -1578,9 +1578,9 @@ async function ocAttribute(){
 async function loadResumes(){
   const r = await fetch('/api/resumes').then(x=>x.json());
   const sel = $('#resumeSel');
-  sel.innerHTML = r.resumes.map(n=>'<option>'+esc(n)+'</option>').join('') || '<option value="">（无简历，请先新建）</option>';
+  sel.innerHTML = r.files.map(n=>'<option>'+esc(n)+'</option>').join('') || '<option value="">（无简历，请先新建）</option>';
   const list = $('#resumeList');
-  list.innerHTML = r.resumes.length ? r.resumes.map(n=>
+  list.innerHTML = r.files.length ? r.files.map(n=>
     '<div class="item"><span class="nm">📄 '+esc(n)+'</span>'+
     '<button class="btn gray sm" data-edit="'+esc(n)+'">编辑</button>'+
     '<button class="btn danger sm" data-del="'+esc(n)+'">删除</button></div>'

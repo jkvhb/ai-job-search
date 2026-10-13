@@ -69,8 +69,8 @@ import store   # noqa: E402
 JD_FIELDS = ("job_title", "job_category", "location", "salary", "company", "hr_name", "phone",
              "address", "status", "verdict", "notes", "jd_text_file", "jd_image", "source_type",
              "source_link", "outcome_at", "outcome_reason", "outcome_ai")
-# 分析级字段（只存 `jobs.json`）——与 `app.ANALYSIS_FIELDS` 同一口径
-ANALYSIS_FIELDS = ("id", "jd_id", "resume", "score", "report", "created_at", "merged_into")
+# 分析级字段（只存 `jobs.json`）——与 `app.ANALYSIS_FIELDS` **逐字**一致（同一口径）
+ANALYSIS_FIELDS = ("id", "jd_id", "resume", "resume_id", "score", "report", "created_at", "merged_into")
 
 # 报告 → JD 级字段的取值顺序（报告的数据类型比台账记录更全，先取报告的值）
 _REPORT_FIRST = ("job_title", "company", "hr_name", "phone", "address", "job_category",
@@ -504,7 +504,9 @@ def _build_jobs(raw_jobs, new_ids):
         jid = str(rec.get("id") or "")
         ordered = {"id": jid,
                    "jd_id": new_ids.get(jid) or str(rec.get("jd_id") or jid)}
-        for key in ("resume", "score", "report", "created_at"):
+        # 白名单必须与 `ANALYSIS_FIELDS` 对齐：漏一个键（`resume_id` 曾经就这样丢了）就是
+        # **静默丢用户数据** —— 迁移后没人再知道那份报告用的是哪一版简历。
+        for key in ("resume", "resume_id", "score", "report", "created_at"):
             if key in rec:
                 ordered[key] = rec[key]
         out.append(ordered)
