@@ -18,19 +18,32 @@
    另外，延续**必须沿用族谱的名字**：换了名字，"即将被覆盖的 ``<名字>.md``"
    就不是母亲那一份，条件永远不成立 → 这里直接报错（见 ``create_version``）。
 
-2. ``read_version`` 的三种 ``kind``：``latest``（读 ``<名字>.md``）／
+2. ``read_version`` 的四种 ``kind``：``latest``（读 ``<名字>.md``）／
    ``mother``（读快照；**母版同时是最新版时也读最新版文件**）／
+   ``mismatch``（读到内容了，但**内容与记录里的 ``sha256`` 不符**）／
    ``missing``（既不最新也不是母版的历史版 → 原文没保留）。
    ``missing`` 时 ``text`` 是空串是**事实**，但调用方**必须靠 ``kind`` 分辨**，
    **绝不把空串当成功**（界面据此显示"旧版原文未保留"）。
+   ``mismatch`` 与 ``missing`` 是**两回事**：一个"从来没存过"，一个"存过、但磁盘上的
+   东西不再是它了"。``mismatch`` 时 ``text`` **照常返回**（让调用方能显示出来对账），
+   但 ``kind`` 必须如实说是 ``mismatch``，**不许**谎报 ``latest`` / ``mother``。
 
 诚实边界（规格 §8）：
 
 - **旧版原文不保留**（用户已定的取舍：每个族谱只留母版 + 最新版）→ 历史版只有
   ``kind="missing"``。``ai_diff`` 也只是 AI 写的（Task 4），可能漏，以原文为准。
-- ``sha256`` 是**内容指纹**。``read_version`` 只回答"这一版原文该从哪个文件读"，
-  **不**回答"文件有没有被程序外改过"；调用方要把记录里的 ``sha256`` 与
-  ``sha256_of(text)`` 比一比，才能如实提示"该文件被程序外修改过"（规格 §8.2）。
+- ``sha256`` 是**内容指纹**（文本口径，与 ``sha256_of`` / ``_write_content`` 一致）。
+  ``read_version`` **自己**用它核对磁盘（快照路径也核 —— 快照不可变，对不上同样是出事了），
+  不一致就报 ``mismatch``。**不指望每个调用方都记得比 sha**：一处忘了，就会**静默把别人的
+  简历内容当成这一版**返回 —— 这违反"失败绝不静默变成成功"。会不一致的三条真实路径：
+  ① 文件被**程序外**改过（手工编辑 / 外部工具 / 别的程序写同名文件）；
+  ② ``purge`` 彻底删掉某族谱的最新版后 ``resumes/<名字>.md`` 成**孤儿**，随后
+  **另开同名简历**覆盖了它 → 该族谱里仍有记录、仍被 ``_owner_in`` 认作"文件主人"的版本
+  会读到**别人的内容**（``kind`` 曾是 ``latest``，sha 却对不上）；
+  ③ 手工编辑 ``resumes.json``（记录的 ``sha256`` 与磁盘文件对不上：记录被改了，或文件没跟着改）。
+- **调用方约定**：见到 ``mismatch`` 必须显示
+  「内容与记录不符（可能被程序外修改过）」，并**把内容与 sha 都亮出来**，
+  **绝不静默当正常版本用**（规格 §8.2）。
 - 内容文件按 ``newline=""`` 写：磁盘字节 == 内容的 UTF-8 字节（不做 ``\\r\\n`` 转换），
   所以 ``size`` 与 ``sha256`` 严格对应同一份内容，且与仓库里已有的 LF 简历文件一致。
 """
@@ -111,6 +124,27 @@ def sha256_of(text):
     """内容的 sha256（小写十六进制）。指纹口径 = 文本的 UTF-8 编码（与 ``_write_content`` 一致）。"""
     t = text if isinstance(text, str) else str(text or "")
     return hashlib.sha256(t.encode("utf-8")).hexdigest()
+
+
+def _kind_on_disk(text, rec, ok_kind):
+    """内容与记录指纹**一致** → 维持 ``ok_kind``（``latest`` / ``mother``）；不一致 → ``mismatch``。
+
+    为什么要在这里核、而不是留给调用方：``sha256`` 只有一个用途 —— 回答"磁盘上这份东西
+    还是不是这一版"。把它留给每个调用方各自去比，一处忘了就会**静默把别人的简历内容当成
+    这一版**返回（见 ``purge`` 的孤儿文件路径）。所以核对收进库里，``kind`` 如实说话。
+
+    口径与边界：
+    - 只比 ``text`` 的 sha（``sha256_of`` 口径 = 文本的 UTF-8 字节）。换行转换不参与判断：
+      程序外用 CRLF 重写、而按文本读回来一致的文件**不会**被判 mismatch（``size`` 才会变）。
+    - 记录里没有 ``sha256``（人工改坏 / 老记录）→ 没有可比对的依据，只能维持 ``ok_kind``；
+      这里的"不知道"绝不冒充"核对通过"，但也绝不凭空喊 mismatch。
+    - 文件被删 / 读不出来时 ``store.read_text`` 给空串 → 与记录不符 → ``mismatch``：
+      "磁盘上的东西不是它了"包括"东西都没了"，这比谎报 ``latest``（text 为空）诚实。
+    """
+    expected = _text(rec.get("sha256"))
+    if expected and sha256_of(text) != expected:
+        return "mismatch"
+    return ok_kind
 
 
 # ---------- 记录字段的容错读取（不在读/写侧"净化"，否则坏形状会被悄悄修好） ----------
@@ -199,10 +233,15 @@ def _read_in(recs, version_id):
     owner = _owner_in(recs, _root_of(rec))
     if owner is not None and _clean_id(owner.get("id")) == vid:
         path = _resume_path(_name_of(rec))
-        return store.read_text(path, ""), path, "latest"
+        text = store.read_text(path, "")
+        # 读到了也要**核指纹**：`<名字>.md` 是共享容器，磁盘上的东西可能已经不是这一版了
+        # （程序外改过 / purge 留的孤儿被别人覆盖）。不符 → mismatch，绝不谎报 latest。
+        return text, path, _kind_on_disk(text, rec, "latest")
     snap = _snapshot_path(vid)
     if os.path.exists(snap):
-        return store.read_text(snap, ""), snap, "mother"
+        text = store.read_text(snap, "")
+        # 快照同样是磁盘上的文件：它不可变，sha 对不上同样说明出事了 → 一样要核。
+        return text, snap, _kind_on_disk(text, rec, "mother")
     # 原文确实没保留：text 为空是**事实**，path 也**故意**给空串——
     # 免得调用方拿着一个"名义路径"去读，把最新版当成这一版发出去。
     return "", "", "missing"
@@ -321,7 +360,9 @@ def create_version(name, content, parent_id=None, note=""):
             if not os.path.exists(snap_path) and os.path.exists(file_path):
                 m_text, _m_path, m_kind = _read_in(recs, mid)
                 # 必须**确定**母版原文才敢写快照：m_kind=="missing" 时读出来是空串，
-                # 拿它当快照就是"假装留了档"。已在盘上的快照一律不重写（不可变）。
+                # 拿它当快照就是"假装留了档"；m_kind=="mismatch" 时磁盘上的东西已经不是母版
+                # 那一版了（程序外改过），照写就是把被改过的内容冒充成"母版原文"存进不可变快照。
+                # 已在盘上的快照一律不重写（不可变）。
                 if m_kind in ("latest", "mother") and m_text == store.read_text(file_path, ""):
                     _write_content(snap_path, m_text)
                     mother["mother_file"] = _snapshot_rel(mid)
@@ -349,13 +390,33 @@ def create_version(name, content, parent_id=None, note=""):
 
 
 def read_version(version_id):
-    """取某一版原文 → ``(text, path, kind)``，``kind ∈ {latest, mother, missing}``。
+    """取某一版原文 → ``(text, path, kind)``，``kind ∈ {latest, mother, mismatch, missing}``。
 
-    - ``latest``：这一版就是 ``<名字>.md`` 里那一份 → 读该文件
-    - ``mother``：这一版是母版且留有快照 → 读快照
+    - ``latest``：这一版就是 ``<名字>.md`` 里那一份（**且内容与记录 sha 一致**）→ 读该文件
+    - ``mother``：这一版是母版且留有快照（**且快照内容与记录 sha 一致**）→ 读快照
       （母版同时是最新版时走 ``latest``，避免"一件事两处存"）
+    - ``mismatch``：**读到内容了，但它不是这一版** —— ``sha256_of(text) != record["sha256"]``。
+      ``text`` / ``path`` **照常返回**（调用方要能把内容亮出来对账），只有 ``kind`` 如实变红。
     - ``missing``：原文没保留 → ``text == ""`` 且 ``path == ""``；
       **调用方必须靠 kind 分辨**，绝不把空串当成功
+
+    为什么 ``mismatch`` 必须独立于 ``missing``：``missing`` 是"**从来没存过**"（历史版按设计
+    不留原文），``mismatch`` 是"**存过，但磁盘上的东西不再是它了**"。把后者混进前者，用户会
+    以为"这版当初就没留档"；混进 ``latest`` / ``mother``，用户会**拿着别人的简历内容当自己
+    这一版**用 —— 静默的错比响的错危险得多。
+
+    会走到 ``mismatch`` 的三条真实路径：
+    ① 文件被**程序外**改过（手工编辑、外部工具、别的程序写同名文件）；
+    ② ``purge`` 彻底删掉某族谱的最新版后 ``resumes/<名字>.md`` 成**孤儿**，随后**另开同名
+       简历**覆盖了它 —— 该族谱里仍有记录、仍被认作"文件主人"的版本就会读到**别人的内容**；
+    ③ 手工编辑 ``resumes.json``（记录的 ``sha256`` 与磁盘文件对不上：记录被改了，或文件没跟着改）。
+
+    一个说不清的边界（如实写在 ``_kind_on_disk`` 里）：记录**没有** ``sha256`` 字段时没有可
+    比对的依据，只能维持 ``latest`` / ``mother`` —— "不知道"不冒充"核对通过"。
+
+    **调用方约定（T2/T3 照此做）**：见到 ``mismatch`` 必须显示
+    「内容与记录不符（可能被程序外修改过）」，并**把内容与 sha 都亮出来**（记录的 vs 实测的），
+    **绝不静默当正常版本用**。
 
     未知 id → ``ValueError``。
     """

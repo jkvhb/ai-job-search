@@ -271,6 +271,116 @@ class ConcurrencyTest(IsolatedCase):
         self.assertEqual(len({r["id"] for r in recs}), 8)
 
 
+class MismatchTest(IsolatedCase):
+    """内容与记录不符必须如实报 ``mismatch``：绝不把"磁盘上的东西不是这一版"说成 latest/mother。
+
+    这些用例覆盖三条实际会发生的路径：
+    ① 文件被**程序外**改过；② ``purge`` 留下孤儿文件后被同名简历覆盖；③ 快照被改。
+    """
+
+    def _snap_path(self, version_id):
+        return store.p_path("resumes", resumelib.SNAPSHOT_DIR, version_id + ".md")
+
+    def _write_outside_resumelib(self, rel_path, text):
+        """模拟"程序外"改文件：绕开 resumelib，只用裸 open（字节与内容严格一致）。"""
+        with open(store.p_path(rel_path), "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+
+    def test_a_tampered_live_file_is_reported_as_mismatch_not_latest(self):
+        v1 = resumelib.create_version("母版", "原始内容")
+        # 程序外改文件（绕开 resumelib）
+        self._write_outside_resumelib("resumes/母版.md", "别人手改的内容")
+        text, path, kind = resumelib.read_version(v1["id"])
+        self.assertEqual(kind, "mismatch")                      # 不许谎报 latest
+        self.assertEqual(text, "别人手改的内容")                 # 内容照常给，便于对账
+        self.assertEqual(path, store.p_path("resumes", "母版.md"))
+        self.assertNotEqual(resumelib.sha256_of(text), v1["sha256"])   # 证据
+
+    def test_a_tampered_mother_snapshot_is_also_mismatch(self):
+        v1 = resumelib.create_version("母版", "第一版内容")
+        resumelib.choose(v1["id"])
+        v2 = resumelib.create_version("母版", "第二版内容", parent_id=v1["id"])
+        self.assertEqual(v2["rev"], 2)
+        snap = resumelib.by_id(v1["id"])["mother_file"]
+        self.assertEqual(snap, "resumes/%s/%s.md" % (resumelib.SNAPSHOT_DIR, v1["id"]))
+        self._write_outside_resumelib(snap, "快照被改了")
+        text, path, kind = resumelib.read_version(v1["id"])
+        self.assertEqual(kind, "mismatch")                      # 快照不可变 → 对不上就是出事了
+        self.assertEqual(text, "快照被改了")
+        self.assertEqual(path, self._snap_path(v1["id"]))
+        self.assertNotEqual(resumelib.sha256_of(text), v1["sha256"])
+
+    def test_an_untampered_snapshot_still_reports_mother(self):
+        """反例对照：没被动过就必须还是 mother（别把 mismatch 撒得到处都是）。"""
+        v1 = resumelib.create_version("母版", "第一版内容")
+        resumelib.choose(v1["id"])
+        resumelib.create_version("母版", "第二版内容", parent_id=v1["id"])
+        text, _path, kind = resumelib.read_version(v1["id"])
+        self.assertEqual((text, kind), ("第一版内容", "mother"))
+
+    def test_a_record_without_a_sha256_field_is_not_falsely_flagged_as_mismatch(self):
+        """人工把 resumes.json 里的 ``sha256`` 删掉 → 没有比对依据，不许凭空喊 mismatch。"""
+        v1 = resumelib.create_version("母版", "原始内容")
+        doc = resumelib.load_resumes()
+        doc["resumes"][0].pop("sha256")
+        resumelib.save_resumes(doc)
+        self.assertIsNone(resumelib.by_id(v1["id"]).get("sha256"))
+        text, _path, kind = resumelib.read_version(v1["id"])
+        self.assertEqual((text, kind), ("原始内容", "latest"))     # 读得到、也说得清"没法核"
+
+    def test_the_purge_orphan_scenario_no_longer_silently_returns_a_stranger(self):
+        """**真实可达**的"别人的简历"路径（用公开接口走通，不靠手工改盘）：
+
+        ① 甲族谱 a1(母) → a2(母) → a3(最新，其内容成了 ``<名字>.md`` 里的孤儿)；
+        ② ``purge(a3)``：记录没了，孤儿文件留着；
+        ③ ``remove(a2)``/``remove(a1)``：名字空出来（``read_version`` 仍可寻址它们）；
+        ④ 另开同名新简历（乙）→ **覆盖**那个孤儿文件；
+        ⑤ 读 a2 —— a2 在甲族谱里 rev 最高，``_owner_in`` 认定"``<名字>.md`` 里是它"，于是旧代码
+           把**乙的全新简历**当成 a2 的原文、以 ``kind="latest"`` 静默返回。
+        """
+        a1 = resumelib.create_version("同名", "甲的第一版")
+        resumelib.choose(a1["id"])
+        a2 = resumelib.create_version("同名", "甲的第二版", parent_id=a1["id"])
+        resumelib.choose(a2["id"])
+        a3 = resumelib.create_version("同名", "甲的第三版", parent_id=a2["id"])
+        resumelib.purge(a3["id"])                                # 最新版记录没了 → 孤儿文件 = "甲的第三版"
+        self.assertEqual(store.read_text(store.p_path("resumes", "同名.md")), "甲的第三版")
+        resumelib.remove(a2["id"])                               # 甲族谱里 rev 最高的残留版本
+        resumelib.remove(a1["id"])                               # 名字空出来（哪怕母版还留着一份快照）
+        stranger = resumelib.create_version("同名", "乙的全新简历")   # 覆盖孤儿文件
+        self.assertEqual(stranger["root_id"], stranger["id"])
+        text, path, kind = resumelib.read_version(a2["id"])
+        self.assertEqual(kind, "mismatch")                       # ← 旧代码这里是 "latest"（静默给别人的内容）
+        self.assertEqual(text, "乙的全新简历")                    # 内容照常给，便于对账
+        self.assertEqual(path, store.p_path("resumes", "同名.md"))
+        self.assertEqual(resumelib.sha256_of(text), stranger["sha256"])        # 逐字就是乙那一份
+        self.assertNotEqual(resumelib.sha256_of(text), a2["sha256"])           # 与 a2 记录不符（证据）
+
+    def test_a_live_version_whose_file_was_orphaned_by_purge_is_mismatch(self):
+        """**全是未移出记录**的孤儿路径（界面真会读到的那种）：
+
+        purge 掉最新版 a3 后，``<名字>.md`` 里留下的是 a3 的内容；此时 a2 既是母版又是
+        "文件主人"，旧代码会以 ``kind="latest"`` 把 **a3 的内容**当成 a2 的原文返回 ——
+        记录里的 sha 明明对不上。修好后必须报 ``mismatch``（a2 真正的原文仍在它的快照里）。
+        """
+        a1 = resumelib.create_version("同名", "甲的第一版")
+        resumelib.choose(a1["id"])
+        a2 = resumelib.create_version("同名", "甲的第二版", parent_id=a1["id"])
+        resumelib.choose(a2["id"])
+        a3 = resumelib.create_version("同名", "甲的第三版", parent_id=a2["id"])
+        resumelib.purge(a3["id"])
+        self.assertEqual([r["id"] for r in resumelib.list_versions()], [a1["id"], a2["id"]])   # 全是活的
+        text, path, kind = resumelib.read_version(a2["id"])
+        self.assertEqual(kind, "mismatch")                       # ← 旧代码这里是 "latest"
+        self.assertEqual(text, "甲的第三版")                      # 拿到的是已被彻底删除的 a3 的内容
+        self.assertEqual(path, store.p_path("resumes", "同名.md"))
+        self.assertNotEqual(resumelib.sha256_of(text), resumelib.by_id(a2["id"])["sha256"])
+        # a2 真正的原文没丢：还在它自己的快照里（记录也如实写了 mother_file）
+        self.assertEqual(store.read_text(self._snap_path(a2["id"])), "甲的第二版")
+        self.assertEqual(resumelib.by_id(a2["id"])["mother_file"],
+                         "resumes/%s/%s.md" % (resumelib.SNAPSHOT_DIR, a2["id"]))
+
+
 if __name__ == "__main__":
     import unittest
     unittest.main()
