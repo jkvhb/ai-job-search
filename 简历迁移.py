@@ -1,0 +1,553 @@
+# -*- coding: utf-8 -*-
+"""简历迁移（维护脚本）：把**盘上已有的简历文件**登记成版本库（`resumes.json`）的第一版，
+并把老分析指向它。
+
+为什么需要它：阶段 4C 之前，简历只有"一个会被截断覆盖的文件"，没有任何版本记录
+（`resumes.json` 不存在），于是报告里"这份分析用的是哪一版简历"无从查起。
+这份脚本把**已经存在的那份简历**补登成 `rv_0001`，并给已经跑完的分析补上 `resume_id`。
+**文件一个都不动**（不移动、不改名、不删除）。
+
+用法：
+  python 简历迁移.py --试跑     # **严格只读**：打印对照表，一个字节都不写
+  python 简历迁移.py --执行     # 先整目录备份，再迁移（失败 → 从备份恢复）
+
+----------------------------------------------------------------- 推定依据（规格 §7）
+**有证据，不是猜**。用户真实数据的实测形状：
+
+    简历文件 resumes/周汉钦-母版.md  2455 字节  改于 2026-09-18 23:06:24
+    6 次分析的创建时间：2026-09-19 14:29 / 14:50 / 15:06 / 21:18 / 2026-10-03 00:30 / 2026-10-08 16:40
+    （`jobs.json` 6 条记录，其中 1 条 `merged_into` 死记录；`resumes.json` 当时不存在）
+
+**文件改于所有分析之前**，而"保存简历会更新文件时间" → 这 6 次分析读到的就是当前这份内容。
+所以：登记为 `rv_0001`（`at` 取**文件 mtime**、`chosen=true`、`rev=1`、`root_id`=自己），
+并给这 6 条补 `resume_id`。
+
+注意：**这是"推定"，不是记录里写着的**（旧分析本来就没有 `resume_id` 这个字段）：
+脚本把它印在对照表里、写进日志，界面也要照规格 §8.5 标出来。**绝不假装是当时的记录。**
+（也正因为是推定：一旦盘上那份文件的内容与已有版本记录**对不上**（程序外改过），
+"这几次分析用的是当前这份内容"这条依据就跟着失效 → 本脚本**什么都不写**，如实报告。）
+
+安全保证：
+  - `--试跑` 严格只读：不写库、不建 `resumes.json`、不记日志、不取备份、不动简历文件
+  - `--执行` **第一步**就是 `data/profiles/<key>/` 的整目录备份（带时间戳，**保留不删**；
+    拷备份时跳过旧备份目录，备份里不再套备份）；
+    任一步失败 → 用备份恢复整目录，并把迁移新建的文件删掉（备份里没有的东西一律不留下）
+  - **简历文件不移动、不改名、不删除**；报告 / `jd/` 原文 / `knowledge.json` / 面试记录**都不碰**
+  - 幂等：已有版本记录按 `name`（文件名去扩展名）认领，**不重复建、不撞号**；
+    已经有 `resume_id` 的分析**绝不覆盖**；第二次执行三个文件字节级不变
+
+只 import 本任务用到的模块（`resumelib` / `store` / `log`），**绝不 import `app.py`**
+（那是服务，脚本不能拖起 Web 依赖）。
+"""
+import hashlib
+import json
+import os
+import shutil
+import sys
+from datetime import datetime
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import log        # noqa: E402
+import resumelib  # noqa: E402
+import store      # noqa: E402
+
+# 备份目录名前缀（`data/profiles/简历迁移备份_<时间戳>/`）。**唯一一份定义**：
+# 备份命名与「拷备份时跳过旧备份」两处都用它（与 `身份迁移.py` 的 BACKUP_PREFIX 同一做法，
+# 但**不能共用**：那次备份的是 JD 身份，这次备份的是简历版本，用户要能分开看）。
+BACKUP_PREFIX = "简历迁移备份"
+
+# 简历文件的扩展名（与 `app._RESUME_EXTS` 同一口径：只收文本）。
+RESUME_EXTS = (".md", ".txt")
+
+USAGE = """用法：
+  python 简历迁移.py --试跑     # 只打印对照表（严格只读，一个字节都不写）
+  python 简历迁移.py --执行     # 先整目录备份，再迁移（失败 → 从备份恢复）
+"""
+
+# 测试注入点（生产恒为空）：`--执行` 每写一个文件后把它的相对名 append 进来；
+# 测试往里面放一个「打开即抛错」的对象，就能在**事务中途**制造写盘失败，
+# 从而验证「失败 → 从备份恢复」。生产路径永远不 append，等于零开销。
+_FAIL_AFTER_WRITE = []
+
+# 版本记录的键序（与 `resumelib.create_version` 落盘的形状**逐字**一致：
+# 同一个文件被两条代码路径写下不同的键序，人打开看会觉得"是不是被人改过"）。
+_VERSION_KEYS = ("id", "name", "root_id", "parent_id", "rev", "at", "size", "sha256", "file",
+                 "mother_file", "chosen", "ai_diff", "ai_diff_error", "note", resumelib.REMOVED)
+
+
+def _as_int(value, default=0):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _name_of_file(filename):
+    """文件名去扩展名（与 `resumelib` 记录里的 `name`、`app` 的 `unregistered` 同一口径）"""
+    return os.path.splitext(store.safe_name(filename))[0]
+
+
+def _resume_key(value):
+    """分析记录里的 `resume` 值 → 与 `name` 可比的口径（多写了个 `.md` 也认）"""
+    return os.path.splitext(store.safe_name(value))[0]
+
+
+def _resume_files():
+    """盘上真实的简历文件 `[(文件名, 绝对路径)]`。
+
+    **不含** `resumes/快照/` 下的母版快照（那是版本库自己的东西，不是"用户的一份简历"），
+    也不递归：`resumes/` 这一层的文件就是简历（旧约定，打包分享等照旧）。
+    """
+    d = store.p_path("resumes")
+    if not os.path.isdir(d):
+        return []
+    out = []
+    for fn in sorted(os.listdir(d)):
+        p = os.path.join(d, fn)
+        if os.path.isfile(p) and fn.lower().endswith(RESUME_EXTS):
+            out.append((fn, p))
+    return out
+
+
+def _mtime_text(path):
+    """文件 mtime 的**秒级**原文（对照表里给人看的证据）"""
+    return datetime.fromtimestamp(os.path.getmtime(path)).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _at_of(path):
+    """版本记录的 `at`：**取文件 mtime**（与 `resumelib._AT_FMT` 同一格式）"""
+    return datetime.fromtimestamp(os.path.getmtime(path)).strftime("%Y-%m-%d %H:%M")
+
+
+def _sha_file(path):
+    """磁盘**字节**的 sha256（只用于对照：与文本口径不一致时如实提示，不当指纹存库）"""
+    with open(path, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
+
+
+def _doc_state():
+    """读 `resumes.json` 的**原始**形状：`(version, 记录列表, 文件是否存在)`。
+
+    为什么不走 `resumelib.load_resumes()`：那个会把「没有 id / 名字」的记录**过滤掉**，
+    我们照它写回去就等于**静默删掉**用户手改坏的那几条。这里原样取、原样写回。
+
+    「**有内容但解析失败**」→ 直接中止（同 `身份迁移._build_knowledge` 那条铁律）：
+    拿一份空库顶掉用户手改坏的文件，就是**静默丢数据** —— 那是本脚本最不该做的事。
+    """
+    path = store.p_path(resumelib.RESUMES_FILE)
+    raw = store.read_json(path, None)
+    if raw is None and store.read_text(path, "").strip():
+        raise RuntimeError("resumes.json 有内容但解析失败：已放弃本次迁移，"
+                           "绝不把它写成空库（先修好或移开这个文件再跑）")
+    if not isinstance(raw, dict):
+        return 1, [], os.path.exists(path)
+    items = raw.get("resumes")
+    return (_as_int(raw.get("version"), 1) or 1,
+            list(items) if isinstance(items, list) else [], True)
+
+
+# ---------------------------------------------------------------- 迁移计划（只读）
+def plan_migration():
+    """算出整轮迁移的全部内容，**一个字节都不落盘**（`--试跑` 与 `--执行` 共用）。"""
+    version, raw_items, had_doc = _doc_state()
+    known_names = {}                                # name → 已有记录（含已移出、含坏形状）
+    for rec in raw_items:
+        if not isinstance(rec, dict):
+            continue
+        name = store.safe_name(rec.get("name"))
+        if name and name not in known_names:
+            known_names[name] = rec
+
+    items = []
+    for fn, path in _resume_files():
+        name = _name_of_file(fn)
+        text = store.read_text(path, "")
+        item = {
+            "file_name": fn,
+            "rel": "resumes/%s" % fn,
+            "name": name,
+            "path": path,
+            "size": os.path.getsize(path),
+            "mtime": _mtime_text(path),
+            "at": _at_of(path),
+            "sha256": resumelib.sha256_of(text),          # 文本口径：与 read_version 核对的一致
+            "file_sha256": _sha_file(path),
+            "kind": "new",
+            "version": None,
+            "conflict": None,
+        }
+        old = known_names.get(name)
+        if old is None:
+            items.append(item)
+            continue
+        expected = str(old.get("sha256") or "")
+        if expected and expected != item["sha256"]:
+            # 内容与记录不符（程序外改过，规格 §8.2）→ **不新建、不改动**，
+            # 并且"这几次分析用的是当前这份内容"这条推定同时失效 → 那几条分析也不补
+            item["kind"] = "conflict"
+            item["conflict"] = {"expected": expected, "actual": item["sha256"]}
+        else:
+            item["kind"] = "existing"
+            item["version"] = old
+        items.append(item)
+
+    doc = {"version": version, "resumes": list(raw_items)}
+    new_versions = []
+    used = list(raw_items)
+    for item in items:
+        if item["kind"] != "new":
+            continue
+        # 版本 id 的格式只有 `resumelib` 一份定义（顺延现有最大号，绝不撞号）
+        vid = resumelib._next_id(used)              # noqa: SLF001
+        rec = {"id": vid, "name": item["name"], "root_id": vid, "parent_id": None, "rev": 1,
+               "at": item["at"], "size": item["size"], "sha256": item["sha256"],
+               "file": item["rel"], "mother_file": None,
+               # 单版本族谱里，它自己就是这一族的母简历（"选定继续优化"的目标）
+               "chosen": True,
+               "ai_diff": {}, "ai_diff_error": "", "note": "", resumelib.REMOVED: False}
+        rec = {k: rec[k] for k in _VERSION_KEYS}
+        used.append(rec)
+        item["version"] = rec
+        new_versions.append(rec)
+        doc["resumes"].append(rec)
+
+    id_by_name = {item["name"]: resumelib._clean_id((item["version"] or {}).get("id"))
+                  for item in items if item["kind"] in ("new", "existing")}
+    # 已有记录里的 id 可能是手改坏的（`""` / 带路径分隔符）→ **绝不把它当成版本号写进 jobs.json**
+    # （那既是一句假话，又会让下一次分析因为"版本不存在"被 400 挡掉）
+    id_by_name = {name: vid for name, vid in id_by_name.items() if vid}
+    conflict_names = {item["name"] for item in items if item["kind"] == "conflict"}
+
+    jobs = store.load_jobs()
+    point, already, skipped = [], [], []
+    for rec in jobs:
+        if not isinstance(rec, dict):
+            continue
+        row = {"id": str(rec.get("id") or ""), "resume": rec.get("resume"),
+               "resume_id": str(rec.get("resume_id") or ""),
+               "created_at": str(rec.get("created_at") or ""),
+               "merged_into": str(rec.get("merged_into") or "")}
+        if row["resume_id"]:
+            # 已经有版本号（新写的分析 / 别的迁移）→ **绝不覆盖**（幂等的前提）
+            already.append(row)
+            continue
+        key = _resume_key(row["resume"])
+        if key and key in conflict_names:
+            row["why"] = "该简历内容与版本库记录不符（程序外改过）→ 不硬塞"
+            skipped.append(row)
+        elif key and key in id_by_name:
+            row["resume_id"] = id_by_name[key]
+            point.append(row)
+        else:
+            row["why"] = ("resume 为空" if not key
+                          else "resume 值与简历文件名对不上（resumes/ 里没有这份文件）")
+            skipped.append(row)
+
+    # 引用完整性：`jobs.json` 里新补的 `resume_id` 必须指向**真的写下去**的那条版本记录
+    new_id_by_row = {row["id"]: row["resume_id"] for row in point}
+    jobs_doc = [(_with_resume_id(rec, new_id_by_row[str(rec.get("id") or "")])
+                 if isinstance(rec, dict) and str(rec.get("id") or "") in new_id_by_row else rec)
+                for rec in jobs]
+
+    return {
+        "profile": store.current_profile(),
+        "dir": store.profile_dir(),
+        "had_doc": had_doc,
+        "version": version,
+        "before_records": len([r for r in raw_items if isinstance(r, dict)]),
+        "new_versions": new_versions,
+        "items": items,
+        "jobs_total": len([r for r in jobs if isinstance(r, dict)]),
+        "jobs_merged": len([r for r in jobs if isinstance(r, dict)
+                            and str(r.get("merged_into") or "").strip()]),
+        "point": point,
+        "already": already,
+        "skipped": skipped,
+        "conflicts": [item for item in items if item["kind"] == "conflict"],
+        "resumes_doc": doc,
+        "jobs_doc": jobs_doc,
+        "changed_resumes": bool(new_versions),
+        "changed_jobs": bool(point),
+    }
+
+
+def _with_resume_id(rec, version_id):
+    """给一条分析补 `resume_id`，**其余键与顺序一字不动**（插在 `resume` 后面）。
+
+    为什么插在 `resume` 后面：`app.ANALYSIS_FIELDS` 里两者就是挨着的，人打开 `jobs.json`
+    一眼能对上"这一版用的是哪一份简历"；改键序也会让"其余字段一字未动"的对照变得难做。
+    """
+    out = {}
+    for key, value in rec.items():
+        out[key] = value
+        if key == "resume" and "resume_id" not in rec:
+            out["resume_id"] = version_id
+    if "resume_id" not in out:
+        out["resume_id"] = version_id
+    return out
+
+
+# ---------------------------------------------------------------- 对照表
+def _evidence_rows(plan, item):
+    """会被指向这一版的分析（含"早就有版本号、号就是这一版"的那些）—— 用来印推定依据。"""
+    name = item["name"]
+    vid = (item["version"] or {}).get("id")
+    rows = [r for r in plan["point"] if _resume_key(r["resume"]) == name]
+    rows += [r for r in plan["already"]
+             if _resume_key(r["resume"]) == name and r["resume_id"] == vid]
+    return sorted(rows, key=lambda r: (r["created_at"], r["id"]))
+
+
+def render_table(plan):
+    """「迁移前 → 迁移后」对照表（给人逐行看的）。返回整段文本。"""
+    lines = []
+    lines.append("简历迁移 · 试跑（严格只读，一个字节都不写）")
+    lines.append("profile: %s" % plan["profile"])
+    lines.append("目录: %s" % plan["dir"])
+    if plan["had_doc"]:
+        lines.append("版本库 resumes.json: 已有 %d 条记录" % plan["before_records"])
+    else:
+        lines.append("版本库 resumes.json: 不存在（将新建）")
+    lines.append("简历文件 %d 份 | 分析记录 %d 条（其中已合并 merged_into %d 条）"
+                 % (len(plan["items"]), plan["jobs_total"], plan["jobs_merged"]))
+    lines.append("")
+    lines.append("推定依据（规格 §7 —— 有证据，不是猜）：")
+    for item in plan["items"]:
+        rows = _evidence_rows(plan, item)
+        times = " / ".join(r["created_at"] for r in rows) or "（无）"
+        lines.append("  %s 改于 %s" % (item["rel"], item["mtime"]))
+        lines.append("  %d 条分析全在文件时间之后（%s）" % (len(rows), times))
+    lines.append("  保存简历会更新文件时间 → 文件既然早于所有分析，这几次分析用的就是当前这份内容")
+    lines.append("  注意：所以 resume_id 是**推定**：旧分析本来就没有这个字段"
+                 "（规格 §8.5，界面要把「推定」标出来）")
+    lines.append("")
+    lines.append("文件 → 版本（**不移动、不改名、不删除**任何简历文件）")
+    for item in plan["items"]:
+        if item["kind"] == "new":
+            rec = item["version"]
+            lines.append("  %s  →  %s" % (item["rel"], rec["id"]))
+            lines.append("    name=%s | rev=%d | root_id=%s（自己） | chosen=true | file=%s"
+                         % (rec["name"], rec["rev"], rec["root_id"], rec["file"]))
+            lines.append("    at=%s（取文件 mtime %s） | size=%d 字节 | sha256=%s"
+                         % (rec["at"], item["mtime"], rec["size"], item["sha256"]))
+        elif item["kind"] == "existing":
+            rec = item["version"]
+            lines.append("  %s  →  %s（已登记，沿用）" % (item["rel"], rec.get("id")))
+            lines.append("    记录里的 sha256 与磁盘一致（%s）；size=%d 字节"
+                         % (item["sha256"], item["size"]))
+        else:
+            lines.append("  %s  →  **不登记**（注意：内容与记录不符，程序外改过）" % item["rel"])
+            lines.append("    记录里的 sha256=%s" % item["conflict"]["expected"])
+            lines.append("    磁盘上实测     sha256=%s" % item["conflict"]["actual"])
+            lines.append("    → 不新建版本、也不给分析补 resume_id（规格 §8.2：如实提示，不假装一致）")
+        if item["file_sha256"] != item["sha256"]:
+            lines.append("    注意：该文件的磁盘字节与文本口径不一致（CRLF/编码转换？）："
+                         "文件 %s / 文本 %s" % (item["file_sha256"], item["sha256"]))
+    lines.append("")
+    lines.append("会被指向 rv_0001 的分析（逐条）" if len(plan["items"]) == 1
+                 else "会被指向各自版本的分析（逐条）")
+    if not plan["point"]:
+        lines.append("  （无）匹配的分析都已经有 resume_id")
+    for row in plan["point"]:
+        lines.append("  %s | resume=%s | created_at=%s" % (row["id"], row["resume"] or "（空）",
+                                                          row["created_at"] or "无日期"))
+    if plan["point"]:
+        lines.append("  —— 共 %d 条（含已合并 merged_into 的死记录 %d 条：它同样是那几次分析"
+                     "用的那一版，照样补；台账本就不显示它们）"
+                     % (len(plan["point"]), len([r for r in plan["point"] if r["merged_into"]])))
+    lines.append("")
+    lines.append("不会被处理的分析（不硬塞 resume_id）")
+    if not plan["skipped"]:
+        lines.append("  （无）")
+    for row in plan["skipped"]:
+        lines.append("  %s | resume=%s | created_at=%s | 理由: %s"
+                     % (row["id"], row["resume"] or "（空）", row["created_at"] or "无日期",
+                        row["why"]))
+    lines.append("")
+    lines.append("已有 resume_id 的分析（保持原样）")
+    if not plan["already"]:
+        lines.append("  （无）")
+    for row in plan["already"]:
+        lines.append("  %s | resume=%s | resume_id=%s | created_at=%s"
+                     % (row["id"], row["resume"] or "（空）", row["resume_id"],
+                        row["created_at"] or "无日期"))
+    lines.append("")
+    lines.append("本次 --执行 将改动：resumes.json %s | jobs.json %s"
+                 % ("是（新增 %d 条版本记录 %s）"
+                    % (len(plan["new_versions"]),
+                       "、".join(r["id"] for r in plan["new_versions"]))
+                    if plan["changed_resumes"] else "否（已登记，不新建）",
+                    "是（%d 条分析补 resume_id）" % len(plan["point"])
+                    if plan["changed_jobs"] else "否（匹配的分析都已有 resume_id）"))
+    lines.append("本脚本只写 resumes.json 与 jobs.json 的 resume_id 这一处字段；"
+                 "不碰 knowledge.json / jds.json / 报告 / jd/ / 面试记录。")
+    lines.append("简历文件：不移动、不改名、不删除（%d 份 .md/.txt 就地保留）。"
+                 % len(plan["items"]))
+    lines.append("")
+    lines.append("以上只是试跑，**未改动任何文件**（加 --执行 才迁移，先整目录备份）。")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------- 备份 / 恢复
+def _profile_files(root):
+    """目录下所有文件的相对路径（含子目录）"""
+    out = set()
+    for dirpath, _dirnames, filenames in os.walk(root):
+        for fn in filenames:
+            out.add(os.path.relpath(os.path.join(dirpath, fn), root))
+    return out
+
+
+def _ignore_previous_backups(_dirpath, names):
+    """`shutil.copytree` 的 ignore：**备份里绝不套备份**（拷一次就多 MB 级、再跑就滚雪球）。
+
+    备份落在 `data/profiles/简历迁移备份_<ts>/`，是 profile 目录的**兄弟**，真布局下本来就
+    拷不进去；这道闸门钉的是**不变量**：备份根将来挪进 profile（或用户手工搬进来）也不会滚雪球。
+    """
+    return [n for n in names if n.startswith(BACKUP_PREFIX)]
+
+
+def _backup_profile():
+    """把 `data/profiles/<key>/` **整目录拷贝**到 `data/profiles/简历迁移备份_<时间戳>/`。
+
+    **拷贝而不是移动**：整目录移动会让 `profile_dir()` 在迁移过程中不存在（`store` 的任何读
+    路径都会当场坏掉），而且"备份"本来就该是"原地不动的那一份"。备份**保留不删**。
+    """
+    src = os.path.abspath(store.profile_dir())
+    if not os.path.isdir(src):
+        raise RuntimeError("profile 目录不存在：%s" % src)
+    root = store.profiles_root()
+    os.makedirs(root, exist_ok=True)
+    dest = os.path.join(root, BACKUP_PREFIX + "_" + datetime.now().strftime("%Y%m%d_%H%M%S"))
+    if os.path.exists(dest):
+        dest = os.path.join(root, BACKUP_PREFIX + "_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f"))
+    shutil.copytree(src, dest, ignore=_ignore_previous_backups)
+    return dest
+
+
+def _restore_profile(backup, had_files):
+    """从备份恢复：把备份里的文件写回，并**删掉迁移新建的东西**（备份里没有的一律不留下）。
+
+    `had_files` 是迁移前该目录的全部文件（相对路径）。恢复后凡是不在 `had_files` 里的文件
+    都被删掉 —— 这正是「失败 → 从备份恢复」的严格含义（不留半改的、不留新造的）。
+
+    **空目录也要还原**：`os.walk` 会把空目录也走一遍，所以上面那圈会把 `logs/` 这种
+    `copytree` 拷过来、却一个文件都没有的目录重建出来；收尾那圈只删**备份里没有**的空目录
+    （"备份里有的空目录"是用户原来的形状，普通文件复制表达不出来，只能这样补）。
+    """
+    root = os.path.abspath(store.profile_dir())
+    backup_dirs = set()
+    for dirpath, _dirnames, filenames in os.walk(backup):
+        rel = os.path.relpath(dirpath, backup)
+        rel = "" if rel == "." else rel
+        backup_dirs.add(rel)
+        dest_dir = root if not rel else os.path.join(root, rel)
+        if not os.path.isdir(dest_dir):
+            os.makedirs(dest_dir, exist_ok=True)
+        for fn in filenames:
+            shutil.copy2(os.path.join(dirpath, fn), os.path.join(dest_dir, fn))
+    for rel in sorted(_profile_files(root) - set(had_files), reverse=True):
+        try:
+            os.remove(os.path.join(root, rel))
+        except OSError:
+            pass
+    for dirpath, dirnames, filenames in os.walk(root, topdown=False):
+        if dirpath == root:
+            continue
+        rel = os.path.relpath(dirpath, root)
+        if rel not in backup_dirs and not dirnames and not filenames:
+            try:
+                os.rmdir(dirpath)
+            except OSError:
+                pass
+
+
+def _write_json(path, obj):
+    """原子写一个 JSON，并触发 `_FAIL_AFTER_WRITE` 注入点（生产恒为空）。"""
+    store.write_json(path, obj)
+    if _FAIL_AFTER_WRITE:
+        probe = _FAIL_AFTER_WRITE[0]
+        if probe is not None:
+            raise getattr(probe, "boom", OSError("注入的写盘失败"))
+
+
+# ---------------------------------------------------------------- 执行
+def execute_migration():
+    """备份 → 迁移 → 落盘；失败从备份恢复。返回进程退出码。"""
+    plan = plan_migration()
+    print(render_table(plan))
+    print("")
+    root = store.profile_dir()
+    had_files = _profile_files(root)
+    try:
+        backup = _backup_profile()
+    except BaseException as e:
+        sys.stderr.write("错误：备份失败，**没有改动任何文件**：%s\n" % e)
+        return 1
+    print("已备份整目录：%s（保留不删）" % backup)
+    log.LOG_FILE = os.path.join(store.profile_dir(), "logs", "events.jsonl")
+    try:
+        # 顺序是契约：**先写版本库、再写引用它的 jobs.json**。
+        # 中间崩了最坏只留一条没人引用的版本记录（用户删掉即可）；
+        # 反过来先写 jobs.json 就会留下"指向一个不存在的版本"的假话。
+        if plan["changed_resumes"]:
+            with resumelib._LOCK:                  # noqa: SLF001 —— 与 resumelib 的读写持同一把锁
+                _write_json(store.p_path(resumelib.RESUMES_FILE), plan["resumes_doc"])
+        if plan["changed_jobs"]:
+            _write_json(store.jobs_path(), plan["jobs_doc"])
+    except BaseException as e:
+        import traceback
+        restored = False
+        try:
+            _restore_profile(backup, had_files)
+            restored = True
+        except BaseException as e2:                # 回滚本身不能再把原始异常吞掉
+            sys.stderr.write("错误：恢复也失败了：%s\n" % e2)
+        sys.stderr.write("错误：迁移失败：%s\n%s\n" % (e, traceback.format_exc()))
+        print("错误：迁移失败：%s（%s）"
+              % (e, "已用备份恢复 " + backup if restored else "恢复失败，请手工从 %s 恢复" % backup))
+        return 1
+    changed = plan["changed_resumes"] or plan["changed_jobs"]
+    if changed:
+        # 无事发生就不写审计行：这样"再跑一次"连 events.jsonl 都一个字节不变（真幂等）。
+        try:
+            log.log_event("resume.migration_done", profile=plan["profile"],
+                          versions=len(plan["new_versions"]), analyses=len(plan["point"]),
+                          skipped=len(plan["skipped"]), conflicts=len(plan["conflicts"]),
+                          backup=os.path.basename(backup))
+        except Exception:
+            pass                                   # 日志写不进去不该让一次成功的迁移算失败
+    print("")
+    if changed:
+        print("迁移完成：新增 %d 条版本记录（%s）| %d 条分析补上 resume_id | 跳过 %d 条 | 冲突 %d 条"
+              % (len(plan["new_versions"]),
+                 "、".join(r["id"] for r in plan["new_versions"]) or "无",
+                 len(plan["point"]), len(plan["skipped"]), len(plan["conflicts"])))
+    else:
+        print("无需改动：版本库与分析都已经登记过（本次只做了一份备份）。")
+    print("简历文件没移动、没改名、没删除；备份保留在 %s（确认无误后可自行删除）" % backup)
+    print("注意：老分析的 resume_id 是**推定**（依据：简历文件 mtime 早于这几次分析），"
+          "不是当时的记录。")
+    return 0
+
+
+# ---------------------------------------------------------------- CLI
+def main():
+    args = [a for a in sys.argv[1:] if a.strip()]
+    if args not in (["--试跑"], ["--执行"]):
+        sys.stderr.write(USAGE)
+        return 2
+    try:
+        if args == ["--试跑"]:
+            print(render_table(plan_migration()))
+            return 0
+        return execute_migration()
+    except RuntimeError as e:
+        # 「库读不出来」这类**前置**失败：计划阶段就中止了，一个字节都没写（绝不半改）
+        sys.stderr.write("错误：%s\n" % e)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

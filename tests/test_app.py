@@ -22,6 +22,7 @@ import app
 import interview
 import jdid
 import kb
+import llm
 import outcome
 import resumelib
 import store
@@ -2683,6 +2684,35 @@ class ResumeVersionRouteTest(IsolatedCase):
         self.assertEqual(body["sha256"], v1["sha256"])     # 记录里的
         self.assertEqual(body["actual_sha256"], resumelib.sha256_of("别人手改的内容"))
         self.assertNotEqual(body["actual_sha256"], body["sha256"])
+
+    def test_a_new_root_never_calls_ai_diff_of_at_all(self):
+        """新开（`mode != "continue"`）时 `resumelib.ai_diff_of` **根本没被调用**。
+
+        为什么必须 spy **那个函数**、而不是只数模型调用：`resumelib.ai_diff_of` 自己还有一道闸
+        （这一版没有母版 → 直接返回、一次都不调模型），所以只断言"模型没被调"时，把 `app.py`
+        那道 `if mode == "continue":` 拿掉，用例**照样绿** —— 两道闸任一在就都不调模型，
+        这条断言是唯一能钉住 app 侧那道闸的东西。
+        """
+        calls = []
+        real = resumelib.ai_diff_of
+
+        def spy(version_id, *args, **kwargs):
+            calls.append(version_id)
+            return real(version_id, *args, **kwargs)
+
+        fake_model = mock.Mock(return_value='{"summary": "补了 ASR 评测经历", '
+                                            '"changes": [{"where": "技能", "what": "加了 ASR"}]}')
+        with mock.patch.object(resumelib, "ai_diff_of", side_effect=spy), \
+                mock.patch.object(llm, "call_openai_compatible", fake_model):
+            v1 = self._new("母版.md", "第一版内容")
+            self.assertEqual(calls, [], "「新开一份独立的」不该调 ai_diff_of：%s" % calls)
+            self.assertEqual(fake_model.call_count, 0)
+            # 对照：**同一个 spy** 在"延续"时必须被调用一次 —— 证明 spy 真装上了、
+            # 上面那条不是"patch 没生效"造成的假绿。
+            self._post("/api/resumes/choose", {"version": v1["id"]})
+            v2 = self._new("母版.md", "第二版内容", lineage="延续")
+        self.assertEqual(calls, [v2["id"]])
+        self.assertEqual(fake_model.call_count, 1)
 
     def test_saving_goes_through_create_version_so_a_record_always_appears(self):
         """§4.1 保存必须走 `resumelib.create_version`（留快照、记 sha/时间/rev）。"""
