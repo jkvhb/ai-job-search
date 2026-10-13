@@ -1619,7 +1619,9 @@ class AnalyzeFlagTruthinessTest(_AnalyzeRouteCase):
         """`"allow_duplicate": "false"` 曾经 = **真** → 悄悄跳过查重（该 409 的没 409）。"""
         # 阶段 4C：判重复还要看简历版本 —— 这条用例喂的是**同一版**（同一个真版本 id），
         # 所以"该 409 的"仍然是 409，测的还是 `allow_duplicate` 的真值口径。
-        v = self._version("旧简历")
+        # 版本名与下面提交的 `resume_name` 必须**同一份**（修 8 起 resume_id 要属于被分析的那份
+        # 简历，否则 400）：这里用的是 `self._resume()` 默认的「我的简历.md」。
+        v = self._version("我的简历")
         self._old_job(resume_id=v["id"])
         calls = self._deps()
         for value in self.FALSY:
@@ -2295,6 +2297,47 @@ class ResumeIdValidationTest(_AnalyzeRouteCase):
             self.assertNotIn("resume_id", rec)                # 不猜、也不写一个空串
 
 
+class ResumeVersionOwnershipTest(_AnalyzeRouteCase):
+    """修 8：`resume_id` **存在**还不够 —— 它必须**属于被分析的那份简历**。
+
+    只校验"存在"时的代价：拿 A 的版本号 + B 的文件名提交也能过 → 报告数据与 `jobs.json`
+    都把"这次用的是哪一版"记成**假话**（B 的内容 + A 的版本号）；而版本号又是查重的另一半粒度
+    → 同一份 B 用 A 的版本号提交还会**误 409**（正是本阶段要根除的那条死路）。
+    名字口径与 `create_version` 存的一致：文件名**去扩展名**（`我的简历.md` ↔ 版本 `我的简历`）。
+    """
+
+    def test_a_version_of_another_resume_is_400_and_spends_nothing(self):
+        calls = self._patch_analyze_deps()
+        va = self._version("我的简历", "我的简历正文")
+        other = self._resume("别人的简历.md")
+        code, body = self._post_json("/api/analyze",
+                                     {"jd_text": self.LONG, "resume_name": other,
+                                      "source_type": "粘贴文本", "resume_id": va["id"]})
+        self.assertEqual(code, 400, body)                    # ← 修之前是 200 + ok:true
+        self.assertFalse(body.get("ok"))
+        err = str(body.get("error"))
+        self.assertIn(va["id"], err)                         # 说清是哪个版本号
+        self.assertIn("我的简历", err)                        # 说清这一版属于谁
+        self.assertIn("别人的简历", err)                      # 说清要分析的是谁
+        # 一个额度都没花：校验在**所有花钱的事之前**（与"版本不存在"那条同一位置）
+        self.assertEqual((calls["llm"], calls["search"], calls["knowledge"]), (0, 0, 0))
+        self.assertEqual(store.load_jobs(), [])               # 台账一个字都没写
+        self.assertEqual(jdid.load_jds()["jds"], [])
+
+    def test_the_matching_version_passes_the_same_gate(self):
+        """反向：**同名**那一版照常通过 —— 否则上面那条就成了「恒真的拦截」。
+
+        `我的简历.md` ↔ 版本 `我的简历`（去扩展名同一口径）；落盘的 `resume_id` 逐字正确。
+        """
+        v = self._version("我的简历")
+        self._patch_analyze_deps()
+        code, body = self._post_json("/api/analyze",
+                                     {"jd_text": self.LONG, "resume_name": self._resume("我的简历.md"),
+                                      "source_type": "粘贴文本", "resume_id": v["id"]})
+        self.assertEqual((code, body.get("ok")), (200, True), body)
+        self.assertEqual(store.load_jobs()[0]["resume_id"], v["id"])
+
+
 class ResumeVersionRouteTest(IsolatedCase):
     """§6.1 简历版本路由：族谱元数据 / 取回（四种 kind）/ 选定 / 移出 / 彻底删。"""
 
@@ -2659,7 +2702,7 @@ class ResumeVersionRouteTest(IsolatedCase):
         self.assertTrue(resumelib.by_id(v1["id"])["removed"])        # 还在移出状态
 
 
-# ---------------- 前端接线（修 1）：简历下拉到底读哪个字段 ----------------
+# ---------------- 前端接线（修 1 / 阶段 4C）：简历下拉到底读哪个字段 ----------------
 WEB_INDEX = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                          "web", "index.html")
 
@@ -2677,24 +2720,23 @@ def _js_string(v):
     return str(v)
 
 
-def _esc_html(v):
-    """前端 `esc()`（web/index.html:378）的同一口径：String(v) 后转义这 5 个字符。"""
-    return (_js_string(v).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-            .replace('"', "&quot;").replace("'", "&#39;"))
-
-
 class ResumeSelectWiringTest(IsolatedCase):
     """简历下拉的数据来源必须与 `/api/resumes` 的**真实形状**对齐。
 
     用户真实数据的形状（Task 5 迁移之前）：`resumes/` 里有文件、`resumes.json` **不存在**
-    → 接口回 `{"resumes": [], "files": ["周汉钦-母版.md"], ...}`。`resumes` 是**版本记录
-    对象数组**（`app.py` 的 `versions`），`files` 才是**文件名数组**。下拉若读 `resumes`：
-    盘上明明有简历，用户却一份都看不见（随后被「请先选择一份简历」拦下，**无法分析任何 JD**）；
-    一旦登记过版本，`esc(对象)` 又会变成 `"[object Object]"` 并被当成 `resume_name` 发出去
-    → 「找不到简历」。
+    → 接口回 `{"resumes": [], "files": ["周汉钦-母版.md"], "unregistered": ["周汉钦-母版.md"], …}`。
+    `resumes` 是**版本记录对象数组**（`app.py` 的 `versions`），`files` 是**文件名数组**，
+    `unregistered` 才是"盘上有文件但**还没有**版本记录"那一份（用户现在的全部简历）。
 
-    这里**不重抄**一遍前端逻辑：字段名直接从 `web/index.html` 的 `loadResumes()` 源码里读出来。
-    读错字段 → 下拉里就没有那份文件 → 红（这就是修 1 的变异取证点）。
+    阶段 4C 起下拉是「**版本 id 当 value**（分析请求据此带上 `resume_id` —— 新查重粒度
+    (JD × 简历版本) 的另一半，漏了它生产里就等于"永不查重"）+ **文件名当 option 文本**
+    （浏览器把它当 `resume_name` 发出去）」。所以两条来源缺一不可：
+    只读 `resumes` → 盘上那份没登记版本的简历看不见；只读 `files` → 没有版本 id。
+
+    这里**不重抄**一遍前端逻辑：字段名直接从 `web/index.html` 的 `renderResumePicker()`
+    源码里正则读出来（`r.X.map(`）。读错字段 / 删掉那两行 → 下面立刻红。
+    更细的渲染断言（真的 `<option value="rv_…">`、族谱缩进层级、★ 只出现在母版行、
+    「延续/新开」发出的 body）在 Node 探针里**真跑这段 JS** 验证；本用例只钉数据来源与语义。
     """
 
     def _handler(self, method, path):
@@ -2704,34 +2746,51 @@ class ResumeSelectWiringTest(IsolatedCase):
     def _get(self, path):
         return self._handler("GET", path)
 
-    def _select_field(self):
-        """`loadResumes()` 里构 `<option>` 用的字段名（读不到就立刻失败，别静默跳过）。"""
+    def _picker_source(self):
+        """`renderResumePicker()` 的函数体（切不到就立刻失败，别静默空跑）。"""
         with open(WEB_INDEX, "r", encoding="utf-8") as f:
             js = f.read()
-        start = js.index("async function loadResumes()")
-        body = js[start:js.index("\n}", start)]
-        hits = re.findall(r"r\.([A-Za-z_$][\w$]*)\s*\.\s*map\s*\(", body)
-        self.assertTrue(hits, "loadResumes() 里没有从任何字段构下拉：前端接线被改坏了")
-        return hits[0]
+        # 按锚点切函数体：函数体以「行首的 }」收尾（内层箭头函数都缩进，不会切错）
+        start = js.index("function renderResumePicker(r)")
+        end = js.index("\n}", start)
+        return js[start:end]
 
-    def _submitted_names(self, response):
-        """按前端那一行真的跑一遍：`'<option>'+esc(n)+'</option>'`。
+    def _picker_fields(self):
+        """构下拉时从响应里读的**字段名**（读不到就立刻失败，别静默跳过）。"""
+        hits = re.findall(r"r\.([A-Za-z_$][\w$]*)\s*\.\s*map\s*\(", self._picker_source())
+        self.assertTrue(hits, "renderResumePicker() 里没有从任何字段构下拉：前端接线被改坏了")
+        return hits
 
-        这些 `<option>` **没有 value 属性**，所以浏览器提交的 `$('#resumeSel').value`
-        就是 option 的文本（= 这里的返回值）。
+    def _submitted(self, response):
+        """按源码那几个字段的语义摊成「浏览器会发出去的东西」：文本 → `resume_name`、value → `resume_id`。
+
+        版本行（`r.resumes` 的元素是**对象**）：文本 = 文件名、value = **版本 id**；
+        未登记文件行（`r.unregistered` 的元素是**字符串**）：文本 = value = 文件名（没有版本 id）。
         """
-        html = "".join("<option>%s</option>" % _esc_html(n)
-                       for n in response.get(self._select_field()) or [])
-        return re.findall(r"<option[^>]*>(.*?)</option>", html, re.S)
+        out = []
+        for field in self._picker_fields():
+            for item in response.get(field) or []:
+                if isinstance(item, dict):
+                    out.append({"resume_name": _js_string(item.get("name")) + ".md",
+                                "resume_id": _js_string(item.get("id"))})
+                else:
+                    out.append({"resume_name": _js_string(item), "resume_id": ""})
+        return out
 
-    def _assert_dropdown_works(self, body):
-        names = self._submitted_names(body)
-        self.assertEqual(names, ["周汉钦-母版.md"],           # ← 下拉里**确实出现**那份文件
-                         "简历下拉里没有盘上那份简历：字段读错了（body=%r）" % (body,))
-        sent = names[0]                                       # 浏览器会把它当 resume_name 发出去
-        self.assertNotEqual(sent, "[object Object]")          # ← 修 1 之前的实测症状
-        self.assertTrue(os.path.exists(os.path.join(store.p_path("resumes"), sent)),
-                        "发出去的 resume_name 在盘上找不到 → do_analyze 会回「找不到简历」")
+    def test_the_option_template_carries_the_version_id_as_value(self):
+        """丢掉 `<option value=…>` 时浏览器提交的只有 option 文本 → 分析请求里再不会有
+        `resume_id` = **静默失效**（不报错，只是查重粒度没了）。这条只钉源码形状；
+        真渲染（`option.value` 实际是什么）由 Node 探针断言。
+
+        ⚠️ 断言必须**精确到那一行**：`'<option value="'` 这个前缀在占位选项
+        （`'<option value="">（无简历，请先新建）</option>'`）里也有 —— 只判前缀会**假绿**
+        （已用变异 `optval` 实测：把条目那一行的 value 删掉，宽松断言照样通过）。
+        所以这里连上 `esc(p.key)`：value 必须真的来自**这一条**（版本 id）。
+        """
+        body = self._picker_source()
+        self.assertIn("""'<option value="'+esc(p.key)+'">'+esc(p.name)+'</option>'""", body,
+                      "下拉条目那一行的 <option> 丢了 value（或 value 不再来自版本 id）：resume_id 发不出去")
+        self.assertIn("resumePickOf(", body, "下拉条目不再经过 resumePickOf()：value/文本的来源没了保证")
 
     def test_disk_only_shape_shows_the_file_and_submits_the_file_name(self):
         store.ensure_profile()
@@ -2741,17 +2800,27 @@ class ResumeSelectWiringTest(IsolatedCase):
         self.assertEqual(code, 200)
         self.assertEqual(body["resumes"], [])                             # 版本库还是空的
         self.assertEqual(body["files"], ["周汉钦-母版.md"])                # 盘上的真话在这儿
-        self._assert_dropdown_works(body)
+        self.assertEqual(body["unregistered"], ["周汉钦-母版.md"])          # 还没登记版本的就是它
+        sent = self._submitted(body)
+        self.assertEqual(sent, [{"resume_name": "周汉钦-母版.md", "resume_id": ""}],
+                         "盘上那份简历没有出现在下拉里：字段读错了（body=%r）" % (body,))
+        self.assertNotEqual(sent[0]["resume_name"], "[object Object]")     # ← 修 1 之前的实测症状
+        self.assertTrue(os.path.exists(os.path.join(store.p_path("resumes"), sent[0]["resume_name"])),
+                        "发出去的 resume_name 在盘上找不到 → do_analyze 会回「找不到简历」")
+        self.assertEqual(sent[0]["resume_id"], "")                         # 没有版本可钉 → 如实不传
 
-    def test_a_registered_version_still_fills_the_dropdown(self):
+    def test_a_registered_version_is_picked_by_version_id(self):
         v1 = resumelib.create_version("周汉钦-母版", "登记过的正文")
         code, body = self._get("/api/resumes")
         self.assertEqual(code, 200)
         self.assertEqual([r["id"] for r in body["resumes"]], [v1["id"]])   # 记录是**对象**数组
         self.assertEqual(body["files"], ["周汉钦-母版.md"])
-        # 反证：真去读对象数组，前端拿到的就是 "[object Object]"（下拉与 resume_name 一起坏掉）
+        self.assertEqual(body["unregistered"], [])                         # 有版本记录 → 不重复出现
+        # 反证：真把版本记录当文件名用，发出去的就是 "[object Object]"
         self.assertEqual(_js_string(body["resumes"][0]), "[object Object]")
-        self._assert_dropdown_works(body)
+        sent = self._submitted(body)
+        self.assertEqual(sent, [{"resume_name": "周汉钦-母版.md", "resume_id": v1["id"]}],
+                         "下拉没有把**版本 id** 当 value → 分析请求不会带 resume_id")
 
 
 if __name__ == "__main__":

@@ -185,6 +185,16 @@
   .ocbox{border:1px solid var(--line);border-radius:10px;padding:12px 14px;margin-top:14px;background:#fcfdff}
   .ochint{font-size:12.3px;color:var(--muted)}
   .ocwhy{font-size:12.3px;color:var(--red);line-height:1.5}
+  /* 📚 简历族谱（阶段 4C）：母版 → 子版缩进；诚实边界（未保留/不符）要显眼但不吓人 */
+  .rrow{flex-wrap:wrap}
+  .rrow .nm{white-space:normal}
+  .rrow.removed{opacity:.62}
+  .rsfam{font-size:12.5px;color:var(--sub);font-weight:600;margin:12px 0 6px}
+  .rssect{margin:16px 0 6px;padding-top:10px;border-top:1px dashed var(--line);font-size:12.5px;color:var(--muted)}
+  .rsbad{background:var(--amber-soft);color:var(--amber);border-radius:8px;padding:8px 11px;font-size:13px;font-weight:600;margin:8px 0}
+  .rsmeta{font-size:12.5px;color:var(--sub);margin-bottom:6px;word-break:break-all}
+  .rsline{font-size:13px;margin:4px 0;word-break:break-word}
+  .rstext{white-space:pre-wrap;word-break:break-word;max-height:340px;overflow:auto;background:#fcfdff;border:1px solid var(--line);border-radius:9px;padding:12px;font-size:12.5px;line-height:1.55;font-family:inherit;margin-top:8px}
 </style>
 </head>
 <body>
@@ -249,18 +259,31 @@
     </div>
   </section>
 
-  <!-- 简历管理 -->
+  <!-- 简历管理（阶段 4C：族谱 / 延续 / 取回） -->
   <section class="panel" id="p-resumes">
     <div class="card">
-      <h2>简历列表</h2>
+      <h2>简历列表 <span class="hint" style="font-weight:400;color:var(--sub);font-size:13px">按族谱分组：母版 → 子版（缩进）</span></h2>
       <div class="list" id="resumeList"></div>
       <div class="row" style="margin-top:12px">
         <input type="text" id="newResumeName" class="grow" placeholder="新简历文件名，如：AI产品经理方向.md">
         <button class="btn ghost" id="newResumeBtn">＋ 新建</button>
       </div>
+      <div class="hintline">
+        <b>取不回旧版原文</b>（这是这个项目的取舍）：每个族谱只保留「母版」与「最新版」两份原文，
+        中间版本只留 AI 写的变更说明与当时的分数 —— 界面绝不假装能取回。
+      </div>
+      <div class="hintline">
+        「移出列表」不是删文件：版本记录移出列表，<b>简历文件、母版快照与变更说明都留在盘上</b>，可恢复。
+        「彻底删除」是另一个入口（二次确认），并且<b>这一版已经在历史分析里用过的事实不可撤销</b>。
+      </div>
     </div>
     <div class="card">
       <h2>编辑简历 <span class="pill" id="editingName">未选择</span></h2>
+      <div class="row">
+        <input type="file" id="resumeFile" accept=".md,.txt">
+        <span class="hintline" style="margin:0">「选择文件」只读 .md / .txt 文本（前端 FileReader，不引第三方依赖）；读进来后点「保存」才登记版本。</span>
+      </div>
+      <div class="hintline" id="editingHint"></div>
       <textarea id="resumeContent" style="min-height:340px" placeholder="先在上方点「编辑」，或新建一份……"></textarea>
       <div class="row" style="margin-top:12px">
         <button class="btn" id="saveResumeBtn">💾 保存</button>
@@ -369,6 +392,28 @@
       <button class="btn gray sm" id="ocClose">✕ 关闭</button>
     </div>
     <div id="ocBody"></div>
+  </div>
+</div>
+
+<!-- 📚 简历版本：保存时的「延续 / 新开一份独立的」选择（**默认什么都不选**，绝不自动延续） -->
+<div class="ivmodal" id="rsPickModal" hidden>
+  <div class="ivbox">
+    <div class="ivhd">
+      <div class="t" id="rsPickTitle">这一版怎么存？</div>
+      <button class="btn gray sm" id="rsPickCancel">✕ 取消（先不存）</button>
+    </div>
+    <div id="rsPickBody"></div>
+  </div>
+</div>
+
+<!-- 📚 简历版本：取回原文 / 变更说明（按后端返回的 `kind` 分支说话） -->
+<div class="ivmodal" id="rsViewModal" hidden>
+  <div class="ivbox">
+    <div class="ivhd">
+      <div class="t" id="rsViewTitle">这一版</div>
+      <button class="btn gray sm" id="rsViewClose">✕ 关闭</button>
+    </div>
+    <div id="rsViewBody"></div>
   </div>
 </div>
 
@@ -1573,44 +1618,530 @@ async function ocAttribute(){
   }
 }
 
-/* ---------------- 简历 ---------------- */
+/* ---------------- 简历（阶段 4C：族谱 / 延续 / 取回） ----------------
+   用户要的形态：A/B/C 三份都拿去分析同一个岗位 → 从中挑一份（比如 A）「★ 选定继续优化」
+   → A 就是**母简历**；把 A 改完再上传 → 那份成为 A 的**子简历**。全程可选，绝不强制。
+
+   三条硬依赖（接口层面，漏了不会报错，只会让功能静默失效）：
+   ① 分析请求必须带 `resume_id`（下拉的 value 用**版本 id**）—— 不带就等于新查重粒度"永不查重"；
+   ② 取回原文**按 `kind` 分支**：missing = 旧版原文未保留（**不是错误**、也不是空文件），
+      mismatch = 内容与记录不符（可能被程序外修改过）→ 把内容亮出来对账；
+   ③ `DELETE` = **移出列表**（文件与快照都保留），「彻底删除」是另一个入口 + 二次确认。
+
+   诚实边界（规格 §8）：旧版原文不保留；sha 对不上如实说；ai_diff 是模型写的、以原文为准；
+   AI 比对失败就明说"没生成变更说明"；彻底删撤销不了"它曾被某次分析用过"这个事实。
+*/
+let RESUME_PICKS = [];     // 下拉条目：{key, name, version}
+let RESUME_VIEW = null;    // 最近一次 /api/resumes 的响应（族谱视图用）
+let RS_EDIT = {name:'', version:'', content:''};   // 编辑区当前对应哪一份（保存时判"内容有变化"）
+
+function rsVersions(){ return (RESUME_VIEW && Array.isArray(RESUME_VIEW.resumes)) ? RESUME_VIEW.resumes : []; }
+function rsStem(fileName){ return String(fileName == null ? '' : fileName).replace(/\.[^./\\]+$/, ''); }
+function rsHint(text){ const el = $('#editingHint'); if(el) el.textContent = text; }
+
+/* 下拉/可选项的一条：`version` = 版本 id（分析请求据此带上 resume_id）。
+   盘上有文件但还没登记版本时没有版本可钉 → version 为空，分析请求如实不传。 */
+function resumePickOf(version, name){
+  const v = String(version == null ? '' : version).trim();
+  const n = String(name == null ? '' : name);
+  return {key: v || ('file:' + n), name: n, version: v};
+}
+
+/* 简历下拉。字段名就在下面两行（`ResumeSelectWiringTest` 从**这段真源码**里正则读它：
+   读错字段 → 下拉里就没有那份简历 → 用户一份都选不了）。
+   ⚠️ 分析请求必须带上版本 id：`r.resumes` 那一行的 value 就是 `v.id`。 */
+function renderResumePicker(r){
+  const versionRows = r.resumes.map(v=>v.removed ? null : resumePickOf(v.id, String(v.name || '') + '.md')).filter(Boolean);
+  const unregRows = r.unregistered.map(n=>resumePickOf('', n));
+  RESUME_PICKS = versionRows.concat(unregRows);
+  const sel = $('#resumeSel');
+  if(!sel) return;
+  sel.innerHTML = RESUME_PICKS.length
+    ? RESUME_PICKS.map(p=>'<option value="'+esc(p.key)+'">'+esc(p.name)+'</option>').join('')
+    : '<option value="">（无简历，请先新建）</option>';
+}
+
+/* 按族谱（root_id）分组，族谱内按 rev 升序 → 母版 → 子版 → 孙版。 */
+function resumeLineages(versions){
+  const roots = [], byRoot = {};
+  (versions || []).forEach(v=>{
+    const root = String(v.root_id || v.id || '');
+    if(!byRoot[root]){ byRoot[root] = []; roots.push(byRoot[root]); }
+    byRoot[root].push(v);
+  });
+  roots.forEach(rows=>rows.sort((a,b)=>(Number(a.rev) || 1) - (Number(b.rev) || 1)));
+  return roots;
+}
+
+function rsLiveFamily(stem){
+  const rows = rsVersions().filter(v=>!v.removed && String(v.name || '') === stem);
+  if(!rows.length) return [];
+  const root = String(rows[0].root_id || rows[0].id || '');
+  return rsVersions().filter(v=>String(v.root_id || v.id || '') === root);
+}
+function rsMotherOf(stem){
+  const fam = rsLiveFamily(stem).filter(v=>!v.removed && v.chosen);
+  return fam.length ? fam[0] : null;
+}
+function rsCurrentOf(stem){
+  const fam = rsLiveFamily(stem).filter(v=>!v.removed);
+  let cur = null;
+  fam.forEach(v=>{ if(!cur || (Number(v.rev) || 1) > (Number(cur.rev) || 1)) cur = v; });
+  return cur;
+}
+
+/* 变更说明的展示口径（规格 §8.3/§8.4）：有就说"AI 写的、可能漏、以原文为准"；
+   失败就明说"这次没能生成变更说明"；第一版没有可比对的母版 —— 三种都不是错误。 */
+function rsDiffText(v){
+  const rec = v || {};
+  const d = (rec.ai_diff && typeof rec.ai_diff === 'object') ? rec.ai_diff : {};
+  const changes = Array.isArray(d.changes) ? d.changes : [];
+  if(d.summary || changes.length){
+    let h = '<div class="hintline">下面是 <b>AI 写的</b>变更说明，可能漏 —— 以原文为准。</div>';
+    if(d.summary) h += '<div class="rsline">' + esc(d.summary) + '</div>';
+    changes.forEach(c=>{
+      const where = c && c.where, what = c && c.what;
+      h += '<div class="rsline"><b>' + esc(where || '') + '</b>　' + esc(what || '') + '</div>';
+    });
+    return h;
+  }
+  if(rec.ai_diff_error) return '<div class="rsbad">这次没能生成变更说明</div>' +
+    '<div class="hintline">原因：' + esc(rec.ai_diff_error) + '（版本照样保存了）。</div>';
+  if((Number(rec.rev) || 1) <= 1) return '<div class="hintline">这一版是这个族谱的第一版，没有可比对的母版 → 没有变更说明。</div>';
+  return '<div class="hintline">这一版没有留下变更说明（旧版原文按设计不保留，只有当时的分数）。</div>';
+}
+
+/* 一行 = 一个版本：上传时间 / 第几次修改 / ★母简历 / 变更说明入口 / 取回原文。
+   缩进（data-depth + margin-left）就是"母版 → 子版"的层级本身。 */
+function rsRowHtml(v, depth){
+  const id = String(v.id || ''), name = String(v.name || '');
+  const rev = Number(v.rev) || 1, at = String(v.at || '时间未知');
+  const mother = !!v.chosen;
+  const label = name + '.md 第 ' + rev + ' 次修改';
+  let h = '<div class="item rrow" data-rid="' + esc(id) + '" data-depth="' + depth + '" data-rev="' + rev + '"' +
+          ' style="margin-left:' + (depth * 22) + 'px">' +
+    '<span class="nm" data-name="' + esc(name) + '">' + esc(name) + '.md</span>' +
+    '<span class="mt" data-revlabel>第 ' + rev + ' 次修改</span>' +
+    '<span class="mt" data-at="' + esc(at) + '">' + esc(at) + '</span>';
+  if(mother) h += '<span class="pill" data-mother="' + esc(id) + '">★ 母简历</span>';
+  if(!mother) h += '<button class="btn ghost sm" data-choose="' + esc(id) + '" data-label="' + esc(label) + '">★ 选定继续优化</button>';
+  h += '<button class="btn gray sm" data-diff="' + esc(id) + '">变更说明</button>' +
+       '<button class="btn gray sm" data-get="' + esc(id) + '">取回原文</button>' +
+       '<button class="btn gray sm" data-edit="' + esc(name) + '.md">编辑</button>' +
+       '<button class="btn danger sm" data-remove="' + esc(id) + '" data-label="' + esc(label) + '">移出列表</button>' +
+       '<button class="btn danger sm" data-purge="' + esc(id) + '" data-label="' + esc(label) + '">彻底删除</button>' +
+    '</div>';
+  return h;
+}
+
+function rsRemovedRowHtml(v){
+  const id = String(v.id || ''), name = String(v.name || '');
+  const rev = Number(v.rev) || 1;
+  const label = name + '.md 第 ' + rev + ' 次修改';
+  return '<div class="item rrow removed" data-rid="' + esc(id) + '" data-removed="1" style="margin-left:0">' +
+    '<span class="nm">' + esc(name) + '.md</span>' +
+    '<span class="mt">第 ' + rev + ' 次修改</span>' +
+    '<span class="mt">' + esc(String(v.at || '时间未知')) + '</span>' +
+    '<span class="mt">已移出（文件与快照仍在盘上）</span>' +
+    '<button class="btn gray sm" data-diff="' + esc(id) + '">变更说明</button>' +
+    '<button class="btn gray sm" data-restore="' + esc(id) + '">恢复</button>' +
+    '<button class="btn danger sm" data-purge="' + esc(id) + '" data-label="' + esc(label) + '">彻底删除</button>' +
+  '</div>';
+}
+
+function rsUnregRowHtml(n){
+  const name = String(n || '');
+  return '<div class="item rrow" data-unreg="' + esc(name) + '" style="margin-left:0">' +
+    '<span class="nm">' + esc(name) + '</span>' +
+    '<span class="mt">盘上有文件 · 还没登记版本</span>' +
+    '<span class="mt">保存后成为「第 1 次修改」</span>' +
+    '<button class="btn gray sm" data-edit="' + esc(name) + '">编辑</button>' +
+  '</div>';
+}
+
+function renderResumeTree(r){
+  const list = $('#resumeList');
+  if(!list) return;
+  const versions = Array.isArray(r.resumes) ? r.resumes : [];
+  const live = versions.filter(v=>!v.removed);
+  const gone = versions.filter(v=>v.removed);
+  const unreg = Array.isArray(r.unregistered) ? r.unregistered : [];
+  let h = '';
+  resumeLineages(live).forEach(rows=>{
+    let mother = null;
+    rows.forEach(v=>{ if(v.chosen) mother = v; });
+    const root = String((rows[0] && (rows[0].root_id || rows[0].id)) || '');
+    h += '<div class="rsfam" data-root="' + esc(root) + '">📚 ' + esc(String((rows[0] && rows[0].name) || '')) + '.md 族谱（' +
+         rows.length + ' 版' + (mother ? '，母版 = 第 ' + (Number(mother.rev) || 1) + ' 次修改' : '，还没「选定继续优化」') + '）</div>';
+    rows.forEach((v, i)=>{ h += rsRowHtml(v, i); });
+  });
+  if(unreg.length){
+    h += '<div class="rssect">盘上有文件但还没登记版本（' + unreg.length + '）—— 点「编辑」再「保存」就登记为第 1 次修改</div>';
+    unreg.forEach(n=>{ h += rsUnregRowHtml(n); });
+  }
+  if(gone.length){
+    h += '<div class="rssect">已移出列表（' + gone.length + '）—— 文件、母版快照与变更说明都还在盘上，可以恢复</div>';
+    gone.forEach(v=>{ h += rsRemovedRowHtml(v); });
+  }
+  if(!h) h = '<div class="empty">还没有简历 —— 点下面「＋ 新建」，或用「选择文件」把 .md/.txt 读进来再保存。</div>';
+  list.innerHTML = h;
+  list.querySelectorAll('[data-choose]').forEach(b=>b.addEventListener('click', ()=>chooseResumeVersion(b.dataset.choose)));
+  list.querySelectorAll('[data-get]').forEach(b=>b.addEventListener('click', ()=>openResumeText(b.dataset.get)));
+  list.querySelectorAll('[data-diff]').forEach(b=>b.addEventListener('click', ()=>openResumeDiff(b.dataset.diff)));
+  list.querySelectorAll('[data-edit]').forEach(b=>b.addEventListener('click', ()=>editResumeFile(b.dataset.edit)));
+  list.querySelectorAll('[data-remove]').forEach(b=>b.addEventListener('click', ()=>removeResumeVersion(b.dataset.remove, b.dataset.label)));
+  list.querySelectorAll('[data-purge]').forEach(b=>b.addEventListener('click', ()=>purgeResumeVersion(b.dataset.purge, b.dataset.label)));
+  list.querySelectorAll('[data-restore]').forEach(b=>b.addEventListener('click', ()=>restoreResumeVersion(b.dataset.restore)));
+}
 
 async function loadResumes(){
-  const r = await fetch('/api/resumes').then(x=>x.json());
-  const sel = $('#resumeSel');
-  sel.innerHTML = r.files.map(n=>'<option>'+esc(n)+'</option>').join('') || '<option value="">（无简历，请先新建）</option>';
-  const list = $('#resumeList');
-  list.innerHTML = r.files.length ? r.files.map(n=>
-    '<div class="item"><span class="nm">📄 '+esc(n)+'</span>'+
-    '<button class="btn gray sm" data-edit="'+esc(n)+'">编辑</button>'+
-    '<button class="btn danger sm" data-del="'+esc(n)+'">删除</button></div>'
-  ).join('') : '<div class="empty">还没有简历，新建一份，或把 <code>资产库/母版简历.md</code> 的内容粘进来</div>';
-
-  list.querySelectorAll('[data-edit]').forEach(b=>b.addEventListener('click', async ()=>{
-    const name = b.dataset.edit;
-    const d = await fetch('/api/resumes?name='+encodeURIComponent(name)).then(x=>x.json());
-    $('#resumeContent').value = d.content; $('#editingName').textContent = name; $('#editingName').dataset.name = name;
-    window.scrollTo({top:document.body.scrollHeight,behavior:'smooth'});
-  }));
-  list.querySelectorAll('[data-del]').forEach(b=>b.addEventListener('click', async ()=>{
-    if(!confirm('确定删除「'+b.dataset.del+'」？')) return;
-    await fetch('/api/resumes?name='+encodeURIComponent(b.dataset.del), {method:'DELETE'});
-    loadResumes();
-  }));
+  let r;
+  try{
+    // `include_removed=1`：已移出的族谱要能看见（否则「移出」是死路：没有恢复入口）
+    r = await fetch('/api/resumes?include_removed=1').then(x=>x.json());
+  }catch(e){
+    $('#resumeList').innerHTML = '<div class="empty">简历列表读取失败：' + esc(e.message) + '</div>';
+    $('#resumeSel').innerHTML = '<option value="">（简历读取失败）</option>';
+    logUI('resume.load_failed', {error: e.message}, 'error');
+    return;
+  }
+  if(!r || r.ok === false){
+    const err = (r && r.error) || '服务没有返回简历列表';
+    $('#resumeList').innerHTML = '<div class="empty">简历列表读取失败：' + esc(err) + '</div>';
+    $('#resumeSel').innerHTML = '<option value="">（简历读取失败）</option>';
+    logUI('resume.load_failed', {error: err}, 'error');
+    return;
+  }
+  RESUME_VIEW = r;
+  renderResumePicker(r);
+  renderResumeTree(r);
 }
+
+/* ---- 弹层（只绑一次：同 `ivInit` 的守卫写法） ---- */
+function rsInit(){
+  if(rsInit.done) return;
+  rsInit.done = true;
+  $('#rsPickCancel').addEventListener('click', ()=>rsClosePick('cancel'));
+  $('#rsPickModal').addEventListener('click', e=>{ if(e.target === $('#rsPickModal')) rsClosePick('backdrop'); });
+  $('#rsViewClose').addEventListener('click', rsCloseView);
+  $('#rsViewModal').addEventListener('click', e=>{ if(e.target === $('#rsViewModal')) rsCloseView(); });
+  document.addEventListener('keydown', e=>{
+    if(e.key !== 'Escape') return;
+    if(!$('#rsViewModal').hidden) rsCloseView();
+    else if(!$('#rsPickModal').hidden) rsClosePick('esc');
+  });
+}
+function rsOpenView(title, html){
+  $('#rsViewTitle').textContent = title;
+  $('#rsViewBody').innerHTML = html;
+  $('#rsViewModal').hidden = false;
+}
+function rsCloseView(){
+  const m = $('#rsViewModal'); if(m) m.hidden = true;
+  const b = $('#rsViewBody'); if(b) b.innerHTML = '';
+}
+function rsPickError(msg){
+  const el = $('#rsPickErr'); if(!el) return;
+  el.textContent = msg; el.hidden = false;
+}
+function rsClosePick(reason){
+  const m = $('#rsPickModal'); if(m) m.hidden = true;
+  const b = $('#rsPickBody'); if(b) b.innerHTML = '';
+  logUI('resume.continue_choice', {reason: reason || 'cancel'});
+}
+
+/* ---- 取回原文：**按 `kind` 分支**（规格 §4.5 / §8.1 / §8.2） ---- */
+async function openResumeText(id){
+  let d;
+  try{
+    d = await fetch('/api/resumes/file?version=' + encodeURIComponent(id)).then(x=>x.json());
+  }catch(e){
+    rsOpenView('取回原文失败', '<div class="rsbad">读取失败：' + esc(e.message) + '</div>');
+    logUI('resume.read_version_failed', {id: id, error: e.message}, 'error');
+    return;
+  }
+  if(!d || d.ok === false && !d.kind){
+    rsOpenView('取回原文失败', '<div class="rsbad">' + esc((d && d.error) || '服务没有返回这一版') + '</div>');
+    return;
+  }
+  const meta = '<div class="rsmeta">' + esc(String(d.name || '') + '.md') + ' · 第 ' + esc(d.rev == null ? '?' : d.rev) +
+               ' 次修改 · ' + esc(String(d.at || '时间未知')) + '</div>';
+  if(d.kind === 'missing'){
+    // ⚠️ **不是错误**、也**不是空文件**：这一版原文按设计没保留。只有变更说明与当时的分数。
+    rsOpenView('这一版原文未保留', meta +
+      '<div class="rsbad" data-kind="missing">旧版原文未保留</div>' +
+      '<div class="hintline">每个族谱只保留【母版】与【最新版】两份原文 —— 这一版取不回原文（本项目绝不假装能取回）。下面是这一版留下的全部信息：</div>' +
+      rsDiffText(d));
+    logUI('resume.view_missing', {id: id});
+    return;
+  }
+  if(d.kind === 'mismatch'){
+    // ⚠️ 内容**照常亮出来对账**，但绝不当它是这一版的原文（规格 §8.2）
+    rsOpenView('内容与记录不符', meta +
+      '<div class="rsbad" data-kind="mismatch">内容与记录不符（可能被程序外修改过）</div>' +
+      '<div class="hintline">记录的 sha256：<code>' + esc(String(d.sha256 || '')) + '</code><br>' +
+      '实测的 sha256：<code>' + esc(String(d.actual_sha256 || '')) + '</code><br>' +
+      '下面是磁盘上真实读到的那份内容 —— 拿它对账，别当作这一版原文用。</div>' +
+      '<pre class="rstext" data-kind="mismatch">' + esc(String(d.text == null ? '' : d.text)) + '</pre>');
+    logUI('resume.view_mismatch', {id: id});
+    return;
+  }
+  rsOpenView(d.kind === 'mother' ? '母版原文' : '最新版原文', meta +
+    '<div class="hintline">' + (d.kind === 'mother'
+      ? '从<b>母版快照</b>读回（快照一经生成不可变，是这一族谱的参照原点）。'
+      : '这是这一族谱的<b>最新版原文</b>（<code>' + esc(String(d.path || '')) + '</code>）。') + '</div>' +
+    '<pre class="rstext" data-kind="' + esc(String(d.kind || '')) + '">' + esc(String(d.text == null ? '' : d.text)) + '</pre>');
+  logUI('resume.view_text', {id: id, kind: d.kind || ''});
+}
+
+function openResumeDiff(id){
+  const v = rsVersions().filter(x=>String(x.id || '') === String(id))[0];
+  if(!v){ toast('找不到这一版'); return; }
+  const rev = Number(v.rev) || 1;
+  rsOpenView('变更说明（第 ' + rev + ' 次修改）',
+    '<div class="rsmeta">' + esc(String(v.name || '') + '.md') + ' · ' + esc(String(v.at || '时间未知')) + '</div>' + rsDiffText(v));
+}
+
+/* ---- 选定母简历 / 移出 / 彻底删 / 恢复 ---- */
+async function chooseResumeVersion(id){
+  if(!id) return;
+  let r;
+  try{
+    r = await fetch('/api/resumes/choose', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({version: id})}).then(x=>x.json());
+  }catch(e){
+    toast('选定失败：' + e.message);
+    logUI('resume.choose_failed', {id: id, error: e.message}, 'error');
+    return;
+  }
+  if(!r || !r.ok){ toast('选定失败：' + ((r && r.error) || '')); logUI('resume.choose_rejected', {id: id, error: (r && r.error) || ''}, 'warn'); return; }
+  toast('已选定「' + String(r.name || '') + '」这一版继续优化（同族谱只有它一颗 ★）');
+  logUI('resume.chosen', {id: id, name: r.name || ''});
+  loadResumes();
+}
+
+async function removeResumeVersion(id, label){
+  if(!id) return;
+  if(!confirm('把「' + label + '」移出列表？\n\n' +
+      '这只是移出列表：简历文件、母版快照与变更说明**都保留在盘上**，随时可以「恢复」。\n' +
+      '（要真正删掉记录与它自己的快照，用「彻底删除」。）')) return;
+  let r;
+  try{
+    r = await fetch('/api/resumes?version=' + encodeURIComponent(id), {method:'DELETE'}).then(x=>x.json());
+  }catch(e){
+    toast('移出失败：' + e.message);
+    logUI('resume.remove_failed', {id: id, error: e.message}, 'error');
+    return;
+  }
+  if(!r || !r.ok){ toast('移出失败：' + ((r && r.error) || '')); return; }
+  toast('已移出列表（文件与快照仍保留）');
+  logUI('resume.removed', {id: id, name: r.name || ''});
+  loadResumes();
+}
+
+async function purgeResumeVersion(id, label){
+  if(!id) return;
+  if(!confirm('彻底删除「' + label + '」？\n\n会删掉这条版本记录与**它自己的**母版快照 —— 这一步不可恢复。')) return;
+  if(!confirm('再确认一次：彻底删除「' + label + '」。\n\n' +
+      '① 不可恢复（记录与快照都删掉）；\n' +
+      '② 「这一版已经在某次分析里用过」这个**事实不可撤销** —— 那些历史报告里仍然留着它的版本号与显示名；\n' +
+      '③ 别的版本 / 别的简历的文件一律不动。\n\n确定彻底删除？')) return;
+  let r;
+  try{
+    r = await fetch('/api/resumes/purge', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({version: id})}).then(x=>x.json());
+  }catch(e){
+    toast('彻底删除失败：' + e.message);
+    logUI('resume.purge_failed', {id: id, error: e.message}, 'error');
+    return;
+  }
+  if(!r || !r.ok){ toast('彻底删除失败：' + ((r && r.error) || '')); return; }
+  toast('已彻底删除（历史分析里用过它的事实仍在）');
+  logUI('resume.purged', {id: id});
+  loadResumes();
+}
+
+async function restoreResumeVersion(id){
+  if(!id) return;
+  let r;
+  try{
+    r = await fetch('/api/resumes/restore', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({version: id})}).then(x=>x.json());
+  }catch(e){
+    toast('恢复失败：' + e.message);
+    logUI('resume.restore_failed', {id: id, error: e.message}, 'error');
+    return;
+  }
+  if(!r || !r.ok){ toast('恢复失败：' + ((r && r.error) || '')); return; }
+  toast('已恢复到列表');
+  logUI('resume.restored', {id: id, name: r.name || ''});
+  loadResumes();
+}
+
+/* ---- 编辑区 ---- */
+async function editResumeFile(fileName){
+  let d;
+  try{
+    d = await fetch('/api/resumes?name=' + encodeURIComponent(fileName)).then(x=>x.json());
+  }catch(e){
+    alert('读取简历失败：' + e.message);
+    logUI('resume.read_failed', {name: fileName, error: e.message}, 'error');
+    return;
+  }
+  if(!d || d.error){ alert('读取简历失败：' + ((d && d.error) || '服务没有返回内容')); return; }
+  const stem = rsStem(fileName);
+  const cur = rsCurrentOf(stem), mother = rsMotherOf(stem);
+  const text = String(d.content == null ? '' : d.content);
+  $('#resumeContent').value = text;
+  const pill = $('#editingName');
+  pill.textContent = fileName;
+  pill.dataset.name = fileName;
+  if(cur) pill.dataset.version = String(cur.id); else delete pill.dataset.version;
+  RS_EDIT = {name: fileName, version: cur ? String(cur.id) : '', content: text};
+  rsHint('编辑的是这个族谱的最新版原文 ' + fileName + '。' + (mother
+    ? '已选定母版「第 ' + (Number(mother.rev) || 1) + ' 次修改」→ 保存且内容有变化时会让你选「延续 / 新开一份独立的」。'
+    : '这个族谱还没「选定继续优化」→ 保存直接续一版（点某行的「★ 选定继续优化」就会进入延续选择）。'));
+  window.scrollTo({top:document.body.scrollHeight, behavior:'smooth'});
+}
+
+/* ---- 保存：延续 / 新开（**默认不选，绝不自动延续**） ---- */
+function rsSuggestName(stem){
+  const taken = {};
+  rsVersions().forEach(v=>{ if(!v.removed) taken[String(v.name || '')] = 1; });
+  ((RESUME_VIEW && RESUME_VIEW.unregistered) || []).forEach(n=>{ taken[rsStem(n)] = 1; });
+  let i = 2;
+  while(taken[stem + '-' + i] && i < 999) i++;
+  return stem + '-' + i + '.md';
+}
+
+async function rsSubmitSave(fileName, content, parentId, opts){
+  const body = {name: fileName, content: content};
+  if(parentId) body.parent_id = parentId;            // 「延续」= 显式带母版 id
+  let r;
+  try{
+    r = await fetch('/api/resumes', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(body)}).then(x=>x.json());
+  }catch(e){
+    const msg = '保存失败：' + e.message;
+    if(opts && opts.onError) opts.onError(msg); else alert(msg);
+    logUI('resume.save_failed', {name: fileName, parent: parentId || '', error: e.message}, 'error');
+    return false;
+  }
+  if(!r || !r.ok){
+    const msg = (r && r.error) || '未知错误';
+    if(opts && opts.onError) opts.onError(msg); else alert('保存失败：' + msg);
+    logUI('resume.save_rejected', {name: fileName, parent: parentId || '', error: msg}, 'warn');
+    return false;
+  }
+  const rec = r.resume || {};
+  const pill = $('#editingName');
+  if(pill){ pill.dataset.name = fileName; pill.dataset.version = String(rec.id || ''); }
+  RS_EDIT = {name: fileName, version: String(rec.id || ''), content: content};
+  rsHint((parentId ? '已保存在同一族谱（延续）：' : '已保存（新开一份独立的 / 首次登记）：') +
+    '「' + String(rec.name || '') + '」第 ' + (Number(rec.rev) || 1) + ' 次修改。取回原文与变更说明在列表里。');
+  toast('已保存 ✓ 第 ' + (Number(rec.rev) || 1) + ' 次修改');
+  logUI('resume.saved', {name: rec.name || '', id: rec.id || '', rev: Number(rec.rev) || 1, parent: parentId || ''});
+  loadResumes();
+  return true;
+}
+
+function rsAskContinue(fileName, content, mother){
+  const stem = rsStem(fileName);
+  const fam = rsLiveFamily(stem).filter(v=>!v.removed);
+  let top = 0;
+  fam.forEach(v=>{ top = Math.max(top, Number(v.rev) || 1); });
+  const suggested = rsSuggestName(stem);
+  $('#rsPickTitle').textContent = '「' + stem + '」已选定母简历（第 ' + (Number(mother.rev) || 1) + ' 次修改）—— 这一版怎么存？';
+  $('#rsPickBody').innerHTML =
+    '<div class="hintline">内容有变化。这里<b>默认什么都不选</b>：不点下面两个按钮就不保存，也<b>绝不自动延续</b>。</div>' +
+    '<div class="row" style="margin-top:14px">' +
+      '<button class="btn" id="rsPickContinue">延续（成为子简历）</button>' +
+      '<span class="hintline" style="margin:0">同一族谱里续一版 → <b>第 ' + (top + 1) + ' 次修改</b>，覆盖前先把母版原文留成快照</span>' +
+    '</div>' +
+    '<div class="row" style="margin-top:18px">' +
+      '<input type="text" id="rsPickName" class="grow" value="' + esc(suggested) + '">' +
+      '<button class="btn gray" id="rsPickFork">新开一份独立的</button>' +
+    '</div>' +
+    '<div class="hintline">新开 = 独立族谱（第 1 次修改）。同名新开会被重名校验挡下，所以这里预填了一个没被占用的名字。</div>' +
+    '<div class="idmsg err" id="rsPickErr" hidden></div>';
+  $('#rsPickModal').hidden = false;
+  logUI('resume.continue_asked', {name: stem, mother: mother.id, next_rev: top + 1});
+  $('#rsPickContinue').addEventListener('click', async ()=>{
+    rsClosePick('continue');
+    await rsSubmitSave(fileName, content, mother.id);
+  });
+  $('#rsPickFork').addEventListener('click', async ()=>{
+    const forkName = String($('#rsPickName').value || '').trim();
+    if(!forkName){ rsPickError('新开一份独立的：请先填一个文件名'); return; }
+    const ok = await rsSubmitSave(forkName, content, '', {onError: rsPickError});
+    if(ok) rsClosePick('fork');
+  });
+}
+
+async function saveResumeFlow(){
+  const pill = $('#editingName');
+  const fileName = String(pill.dataset.name || '').trim();
+  if(!fileName){ alert('请先选择或新建一份简历'); return; }
+  const stem = rsStem(fileName);
+  const content = $('#resumeContent').value;
+  const mother = rsMotherOf(stem);
+  const registered = !!RS_EDIT.version || !!rsCurrentOf(stem);
+  const changed = content !== String(RS_EDIT.content == null ? '' : RS_EDIT.content);
+  if(!changed && registered){ toast('内容没有变化 —— 没有新建版本'); return; }
+  if(mother && changed){ rsAskContinue(fileName, content, mother); return; }
+  // 没有母版 → **不弹选择**。有族谱就续一版，没族谱就开一份新的。
+  // 为什么"有族谱就续"：同名新开会被 `create_version` 的重名校验挡下
+  //（「已有一份未移出的简历叫 X，不能覆盖它」）→ 用户改完自己那份**根本存不进去**。
+  const cur = rsCurrentOf(stem);
+  await rsSubmitSave(fileName, content, cur ? String(cur.id) : '');
+}
+
 $('#newResumeBtn').addEventListener('click', ()=>{
   const n = $('#newResumeName').value.trim(); if(!n) return alert('请填文件名');
-  $('#resumeContent').value = '# ' + n.replace(/\.md$/,'') + '\n\n## 基本信息\n- 姓名：\n- 学历：\n\n## 工作经历\n';
-  $('#editingName').textContent = n; $('#editingName').dataset.name = n;
+  const file = /\.[A-Za-z0-9]+$/.test(n) ? n : (n + '.md');
+  $('#resumeContent').value = '# ' + rsStem(file) + '\n\n## 基本信息\n- 姓名：\n- 学历：\n\n## 工作经历\n';
+  const pill = $('#editingName');
+  pill.textContent = file; pill.dataset.name = file; delete pill.dataset.version;
+  RS_EDIT = {name: file, version: '', content: ''};
+  rsHint('新简历（还没登记版本）：点「保存」后成为第 1 次修改。');
   $('#resumeContent').focus();
 });
-$('#saveResumeBtn').addEventListener('click', async ()=>{
-  const name = $('#editingName').dataset.name; if(!name) return alert('请先选择或新建一份简历');
-  const r = await fetch('/api/resumes', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({name, content: $('#resumeContent').value})}).then(x=>x.json());
-  alert(r.ok ? '已保存 ✓' : ('保存失败：'+(r.error||'')));
-  loadResumes();
+$('#saveResumeBtn').addEventListener('click', ()=>{ saveResumeFlow(); });
+$('#clearResumeBtn').addEventListener('click', ()=>{
+  $('#resumeContent').value = '';
+  $('#editingName').textContent = '未选择';
+  delete $('#editingName').dataset.name; delete $('#editingName').dataset.version;
+  RS_EDIT = {name: '', version: '', content: ''};
+  rsHint('');
 });
-$('#clearResumeBtn').addEventListener('click', ()=>{ $('#resumeContent').value=''; $('#editingName').textContent='未选择'; delete $('#editingName').dataset.name; });
+
+/* 「选择文件」：.md / .txt 由 FileReader 读成文本，再按**原 JSON 提交**（不引第三方依赖、不做 multipart） */
+$('#resumeFile').addEventListener('change', e=>{
+  const f = e.target.files && e.target.files[0];
+  if(!f) return;
+  const reader = new FileReader();
+  reader.onload = ()=>{
+    const text = String(reader.result == null ? '' : reader.result);
+    $('#resumeContent').value = text;
+    const pill = $('#editingName');
+    pill.textContent = f.name; pill.dataset.name = f.name; delete pill.dataset.version;
+    // 刚读进来的文本**还没登记过**（内容一律视为"有变化"）→ 保存时该问就问。
+    RS_EDIT = {name: f.name, version: '', content: ''};
+    const mother = rsMotherOf(rsStem(f.name));
+    rsHint('已读入 ' + f.name + '（' + text.length + ' 字符）。点「保存」登记为版本' + (mother
+      ? '：这一族谱已选定母版 → 保存时会让你选「延续 / 新开一份独立的」。'
+      : '（第 1 次修改）。'));
+    logUI('resume.file_loaded', {name: f.name, chars: text.length});
+  };
+  reader.onerror = ()=>{
+    toast('文件读取失败：' + f.name);
+    logUI('resume.file_read_failed', {name: f.name}, 'error');
+  };
+  reader.readAsText(f);
+  e.target.value = '';                                  // 允许重复选同一个文件
+});
+
+rsInit();
 
 /* ---------------- 搜索源 ---------------- */
 let SP = [];
@@ -1986,16 +2517,22 @@ function clearResult(){ $('#result').className = 'result'; $('#result').innerHTM
 $('#goBtn').addEventListener('click', async ()=>{
   const jd = $('#jd').value.trim();
   const link = $('#link').value.trim();
-  const resume = $('#resumeSel').value;
+  // 简历下拉的 value 是**版本 id**（盘上有文件但没登记版本时退成 `file:<文件名>`）：
+  // 分析请求必须把版本 id 一起发出去 —— 它是"这次用的是哪一版"的唯一凭据，
+  // 同时是新查重粒度 (JD × 简历版本) 的另一半（不带它 = 生产里等同"永不查重"）。
+  const pick = RESUME_PICKS.filter(p=>p.key === $('#resumeSel').value)[0] || null;
+  const resume = pick ? pick.name : '';
   if(!jd && !imageB64 && !link){ logUI('analyze.blocked', {reason:'no_jd'}, 'warn'); return show($('#st'),'err','请粘贴 JD 文字、上传截图，或填分享链接'); }
   if(!resume){ logUI('analyze.blocked', {reason:'no_resume'}, 'warn'); return show($('#st'),'err','请先选择一份简历'); }
   clearResult();
-  logUI('analyze.click', {resume: resume, has_text: !!jd, has_image: !!imageB64, has_link: !!link});
+  logUI('analyze.click', {resume: resume, resume_id: (pick && pick.version) || '', has_text: !!jd, has_image: !!imageB64, has_link: !!link});
   $('#goBtn').disabled = true;
   show($('#st'),'info','正在分析……（识图 + 跑 SOP + 生成报告，约需 20–60 秒，请勿关闭本页）');
   try{
+    const payload = {jd_text: jd, image: imageB64, resume_name: resume, link: link};
+    if(pick && pick.version) payload.resume_id = pick.version;
     const r = await fetch('/api/analyze', {method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({jd_text: jd, image: imageB64, resume_name: resume, link: link})}).then(x=>x.json());
+      body: JSON.stringify(payload)}).then(x=>x.json());
     if(r.ok){
       show($('#st'),'ok','分析完成 ✓');
       showResult(r.report);

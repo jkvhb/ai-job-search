@@ -1026,9 +1026,23 @@ def do_analyze(jd_text, image_data_url, resume_name, link="", overwrite_id="", a
     # `resume_id` 非空 = 调用方**声称**"这次用的是这一版"→ 必须真的存在（修 4）。
     # 位置在**所有花钱的事之前**（OCR / 抓链接 / 查重 / 模型）：id 错了当场抛 BadResumeVersion
     # → 路由回 400，一个额度都不花。空串是老前端/老数据那条路（记录里不写这个键），放行。
-    if resume_id and resumelib.by_id(resume_id) is None:
-        raise BadResumeVersion("找不到这一版简历（resume_id=%s）："
-                               "拒绝把这次分析记到一个不存在的版本上" % resume_id)
+    if resume_id:
+        _version = resumelib.by_id(resume_id)
+        if _version is None:
+            raise BadResumeVersion("找不到这一版简历（resume_id=%s）："
+                                   "拒绝把这次分析记到一个不存在的版本上" % resume_id)
+        # 存在还不够：这一版必须**属于被分析的这份简历**（阶段 4C 修 8）。
+        # 光看"存在"时，从 A 的版本号 + B 的文件名提交也能过 —— 报告数据与 `jobs.json` 都会把
+        # "这次用的是哪一版"记成**假话**（B 的内容 + A 的版本号），而版本号又是查重的另一半粒度
+        # → 同一份 B 用 A 的版本号提交还会**误 409**。名字口径与 `create_version` 存的一致
+        # （文件名去扩展名），与下面 `resume_display` 同一口径。
+        _want = os.path.splitext(store.safe_name(resume_name))[0]
+        _got = str(_version.get("name") or "")
+        if _want and _got != _want:
+            raise BadResumeVersion(
+                "resume_id=%s 是「%s」的版本，不是要分析的简历「%s」："
+                "拒绝把这次分析记到别人那一版上（报告里那句「用的是哪一版」会变成假话）"
+                % (resume_id, _got, _want))
 
     source_bits = []
     if jd_text:
