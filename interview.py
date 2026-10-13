@@ -106,6 +106,26 @@ def _set_status(interview_id, state, error=None, **extra):
     return st
 
 
+def _publish_terminal(interview_id, state, error=None, **extra):
+    """发布**终态**（done / error）：写 status.json 与摘除线程登记，**同一次临界区里做完**。
+
+    为什么必须原子：`status()` 读 status.json、`is_running()` 看登记表，是两个数据源。
+      * 先写终态、之后才摘登记 → 中间那道缝里 `is_running()` 会对着「状态已经 done」的记录
+        返回 True（前端显示「已完成却还在跑」；测试里就是那条 1/5 偶发红灯）。
+        持着 `_THREADS_LOCK` 一次做完两件事之后，读者调用 `is_running()` 会被挡到摘除之后才
+        返回 —— 于是**落盘状态是终态 ⟹ is_running() 必为 False** 成为能成立的不变式。
+      * 反过来先摘登记、后写终态更糟：那道缝里 `status()` 会把还在跑的记录报成 interrupted，
+        用户一点「重试」就是两条流水线同时烧机器。
+
+    只有当前线程真的登记在这条记录上时才摘（同步调用 run_pipeline 时表里本来就没有它；
+    也绝不误摘「后一轮」线程的登记）。
+    """
+    with _THREADS_LOCK:
+        _set_status(interview_id, state, error=error, **extra)
+        if _INTERVIEW_THREADS.get(interview_id) is threading.current_thread():
+            del _INTERVIEW_THREADS[interview_id]
+
+
 def _elapsed_since(started_at):
     try:
         return max(0.0, round(time.time() - datetime.strptime(str(started_at), "%Y-%m-%d %H:%M:%S").timestamp(), 1))
@@ -704,7 +724,13 @@ def render_report(out, jd_id, interview_id):
 
 
 def run_pipeline(jd_id, interview_id, cfg, kind="audio", deps=None):
-    """【同步】跑完 转写 → 分析 → 反哺 → 渲染。测试直接调它，不必轮询线程。"""
+    """【同步】跑完 转写 → 分析 → 反哺 → 渲染。测试直接调它，不必轮询线程。
+
+    两条**顺序铁律**（都被真实事故证明过）：
+      * 终态发布 `_publish_terminal` 必须是**最后一步**（它一摘登记，隔离守卫就看不见这个线程了）；
+      * 所有写盘/写日志（含 `interview.pipeline_done`）都在**它之前**做完 —— 否则线程就能在
+        测试还原出真实路径之后再去写日志（真事故：真实 events.jsonl 被追了一行 pipeline_done）。
+    """
     deps = deps or {}
     t0 = time.time()
     log.log_event("interview.pipeline_start", interview=interview_id, job=jd_id, kind=kind)
@@ -727,13 +753,13 @@ def run_pipeline(jd_id, interview_id, cfg, kind="audio", deps=None):
         _apply_feedback(_jd_identity_of(jd_id), tr, ana, interview_id)
         out = dict(ana, kind="interview", meta=_meta_of(interview_id, tr))
         (deps.get("render") or render_report)(out, jd_id, interview_id)
-        _set_status(interview_id, "done")
         log.log_event("interview.pipeline_done", interview=interview_id, job=jd_id,
                       chars=out["meta"]["chars"], ms=int((time.time() - t0) * 1000))
+        _publish_terminal(interview_id, "done")
     except Exception as e:
-        _set_status(interview_id, "error", error=str(e))   # 失败保留音频，绝不删录音
         log.log_event("interview.pipeline_error", level="error", interview=interview_id,
                       job=jd_id, error=str(e))
+        _publish_terminal(interview_id, "error", error=str(e))   # 失败保留音频，绝不删录音
         raise
 
 
@@ -744,9 +770,9 @@ def start(jd_id, interview_id, cfg, kind="audio", deps=None):
     又点「重试」，会并发跑两次 27 分钟的转写 —— 既白烧机器，两份流水线还会互相覆盖
     transcript.json / analysis.json（谁后写谁赢），反哺知识库也会被计两次。
 
-    判据用 `t.is_alive()` 而不是「字典里有没有这个键」：跑完的线程会留在字典里，
-    只看有没有键的话，一条已经 done 的记录会永远起不了新一轮（而 status() 也会把
-    它误判成在跑）。
+    判据用 `t.is_alive()` 而不是「字典里有没有这个键」：正常跑完的登记由 `_publish_terminal`
+    摘掉，但被替换掉的 run_pipeline（测试里会 patch）或异常路径可能把**已死线程**留在表里 ——
+    只看有没有键的话，一条已经 done 的记录会永远起不了新一轮（而 status() 也会把它误判成在跑）。
 
     注册线程**在 t.start() 之前**：反过来的话，短音频可能在赋值之前就跑完了，
     而那个赋值会把一个**已死线程**放进表里 —— 之后 status() 一直判它「没在跑」，

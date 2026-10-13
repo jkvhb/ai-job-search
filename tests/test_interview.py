@@ -7,6 +7,8 @@
 import io
 import json
 import os
+import queue
+import threading
 import time
 import unittest
 
@@ -427,13 +429,93 @@ class PipelineTest(IsolatedCase):
         store.save_stream("iv1", "audio.wav", io.BytesIO(b"x" * 100), max_bytes=10_000)
         t = interview.start("j1", "iv1", {}, deps=self._deps())
         self.assertTrue(t.daemon)                       # 主程序退出不该被转写线程拖住
-        deadline = time.time() + 10
-        while time.time() < deadline:
-            if interview.status("iv1").get("state") in ("done", "error"):
-                break
-            time.sleep(0.05)
+        # 确定性等它真的结束（join，不是 sleep 轮询赌它跑完 —— 那正是这条用例曾经 1/5 偶发红的原因：
+        # 状态先写成 done、线程登记还没摘，中间那道缝里 is_running 仍是 True）
+        t.join(10)
+        self.assertFalse(t.is_alive(), "流水线线程 10 秒内没跑完")
         self.assertEqual(interview.status("iv1")["state"], "done")
         self.assertFalse(interview.is_running("iv1"))
+
+    def test_terminal_state_is_published_atomically_with_thread_deregistration(self):
+        """不变式：**所有写盘/写日志都在线程登记期内**，而**终态发布必须是最后一步**。
+
+        这是「先写 done、后摘登记」那条竞态的根因用例。用固定 sleep / 反复轮询去测只能是碰运气
+        （偶发复现不了、修好了也证明不了），所以这里用检查点把线程**钉在关键位置上**，
+        两个方向各钉一次（按它们真实发生的顺序，不假设谁先谁后）：
+
+          A. 「终态发布之前的最后一步」（终态写盘之前的最后一次日志）：
+             落盘状态必须**还不是**终态，且 is_running() 是 True。
+             反过来就是那条偶发红：前端/测试看到「已完成却还在跑」。
+          B. 「终态已写盘、登记尚未摘除」：`_THREADS_LOCK` 必须被线程握着 ——
+             只有两者在同一次临界区里做完，读者才不可能在中间钻进来。
+
+        另外钉住**顺序**（`seen == [before_publish, terminal_written]`）：终态发布必须是线程的
+        最后一步 —— 摘登记之后线程若还能写日志，隔离守卫（tests/base.py）就看不见它了，
+        它就能在真实路径被还原之后写进用户文件（那是已经发生过的真事故）。
+        """
+        store.save_stream("iv1", "audio.wav", io.BytesIO(b"x" * 100), max_bytes=10_000)
+        checkpoints = queue.Queue()        # 线程把 (检查点名, 放行闸) 放进来
+        seen = []
+        real_event, real_save = log.log_event, store.save_interview_json
+
+        def checkpoint(kind):
+            """把自己钉在这个位置上，等测试放行（Event，不是 sleep）。"""
+            rel = threading.Event()
+            checkpoints.put((kind, rel))
+            rel.wait(5)
+
+        def hooked_log_event(event, *a, **kw):
+            if event == "interview.pipeline_done":
+                checkpoint("before_publish")
+            return real_event(event, *a, **kw)
+
+        def hooked_save(interview_id, filename, obj, **kw):
+            out = real_save(interview_id, filename, obj, **kw)
+            if filename == "status.json" and isinstance(obj, dict) and obj.get("state") == "done":
+                checkpoint("terminal_written")
+            return out
+
+        log.log_event = hooked_log_event
+        self.addCleanup(setattr, log, "log_event", real_event)
+        store.save_interview_json = hooked_save
+        self.addCleanup(setattr, store, "save_interview_json", real_save)
+
+        t = interview.start("j1", "iv1", {}, deps=self._deps())
+        try:
+            while len(seen) < 2:
+                try:
+                    kind, rel = checkpoints.get(timeout=5)
+                except queue.Empty:
+                    self.fail("流水线没走到第 %d 个关键点（已到：%s）" % (len(seen) + 1, seen))
+                seen.append(kind)
+                try:
+                    if kind == "before_publish":
+                        # A：终态还没发布 —— 落盘状态绝不能是终态，线程也还在跑
+                        self.assertEqual(store.load_interview_json("iv1", "status.json")["state"], "analyzing")
+                        self.assertNotIn(interview.status("iv1")["state"], ("done", "error"))
+                        self.assertTrue(interview.is_running("iv1"))
+                    else:
+                        # B：终态已落盘但登记没摘 —— 必须在同一次临界区里
+                        self.assertEqual(store.load_interview_json("iv1", "status.json")["state"], "done")
+                        held = interview._THREADS_LOCK.acquire(blocking=False)
+                        if held:
+                            interview._THREADS_LOCK.release()
+                        self.assertFalse(held, "终态写盘时没持 _THREADS_LOCK：状态与线程登记不是原子发布")
+                finally:
+                    rel.set()
+        finally:
+            while True:                     # 失败退出时也别把线程挂在闸门上
+                try:
+                    _, rel = checkpoints.get_nowait()
+                except queue.Empty:
+                    break
+                rel.set()
+            t.join(10)
+        self.assertEqual(seen, ["before_publish", "terminal_written"])   # 顺序：终态发布是最后一步
+        # 不变式的终局：终态 + 不在跑
+        self.assertFalse(t.is_alive())
+        self.assertFalse(interview.is_running("iv1"))
+        self.assertEqual(interview.status("iv1")["state"], "done")
 
     def test_stale_running_state_is_reported_as_interrupted(self):
         store.save_interview_json("iv1", "status.json",
