@@ -579,5 +579,153 @@ class ResumeIdSurvivesMigrationTest(MigrationTestBase):
         self.assertEqual(CLI.ANALYSIS_FIELDS, app.ANALYSIS_FIELDS)
 
 
+def _gbk_unsafe(value):
+    """字符串里**编码不进 GBK（cp936）**的字符 → ``["U+26A0", …]``；都安全 → ``[]``。
+
+    为什么要这一道：Windows 控制台默认 cp936，`print`/`sys.stderr.write` 一个非 GBK 字符
+    就是 `UnicodeEncodeError` —— 而那两处恰好都在**失败路径**上（备份失败 / 迁移失败），
+    用户看到的会是"迁移脚本自己崩了"，真正的失败原因反而被吃掉。这类崩溃以前真发生过。
+    """
+    bad = []
+    for ch in value:
+        try:
+            ch.encode("gbk")
+        except UnicodeEncodeError:
+            bad.append("U+%04X" % ord(ch))
+    return bad
+
+
+def _walk_strings(value, path="<module>"):
+    """递归遍历（含容器），产出 ``[(path, str), …]``：字符串常量 + 调用时会 `%` 进去的格式串。
+
+    只走**顶层模块成员**的容器（测试自己塞进去的字符串不算本文档的常量）。
+    """
+    if isinstance(value, str):
+        yield path, value
+    elif isinstance(value, dict):
+        for k, v in value.items():
+            yield from _walk_strings(k, "%s{%r}" % (path, k))
+            yield from _walk_strings(v, "%s{%r}" % (path, k))
+    elif isinstance(value, (list, tuple, set)):
+        for i, v in enumerate(value):
+            yield from _walk_strings(v, "%s[%d]" % (path, i))
+
+
+def _walk_code_strings(code, path="<module>"):
+    """**全部**字符串常量：按树遍历 `code.co_consts`，**函数体内的字面量也在内**。
+
+    为什么必须走 code object 而不是 `dir(CLI)`：`sys.stderr.write("…")` 里那个字面量是
+    **函数局部的**常量，`dir(模块)` 根本看不见它 —— 只扫模块属性的话，往失败路径里加回一个
+    `✗` 照样能过（第一版就是这么漏的，变异取证时抓到了）。这里连嵌套 code 一起走。
+    """
+    yield path, code.co_name
+    for const in code.co_consts:
+        if isinstance(const, str):
+            yield "%s/%s" % (path, code.co_name), const
+        elif hasattr(const, "co_consts"):          # 嵌套的函数 / 推导式
+            yield from _walk_code_strings(const, "%s/%s" % (path, code.co_name))
+        elif isinstance(const, (tuple, frozenset)):
+            for item in const:
+                if isinstance(item, str):
+                    yield "%s/%s" % (path, code.co_name), item
+
+
+class GbkSafetyTest(MigrationTestBase):
+    """`身份迁移.py` 必须在 cp936 控制台上**说得出话**（非 GBK 字符会 `UnicodeEncodeError`）。
+
+    上一轮同类修复在 `简历迁移.py`（那里的 `⚠`/`✗` 被换掉）；本文件当时还留着 ——
+    而它的非 GBK 字符全在**失败路径**上，正常跑永远碰不到，只有真出事时才崩成
+    "脚本自己报错"，把真正的原因盖掉。所以这里钉两层：
+    ① 源码与全部字符串常量 GBK 可编码（结构性地保证不再有人加回来）；
+    ② 把两条真的失败路径走一遍，断言它不是 `UnicodeEncodeError`。
+    """
+
+    SOURCE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                          "身份迁移.py")
+
+    def test_source_file_is_gbk_encodable(self):
+        with io.open(self.SOURCE, encoding="utf-8") as f:
+            src = f.read()
+        self.assertEqual(_gbk_unsafe(src), [],
+                         "源码里有非 GBK 字符（cp936 控制台上 print 出去就是 UnicodeEncodeError）")
+        src.encode("gbk")                      # 逐字节过一遍真实的编码器，不看上面的结论
+
+    def test_every_string_constant_is_gbk_encodable(self):
+        """**全部**字符串常量（含函数体内的字面量 + `%` 进格式串的那两句）。"""
+        unsafe = {}
+        seen = 0
+        # ① 按 code object 走：函数体内的 `"✗ …"` 也在内（`dir(模块)` 看不见它们）
+        with io.open(self.SOURCE, encoding="utf-8") as f:
+            tree = compile(f.read(), self.SOURCE, "exec")
+        for path, text in _walk_code_strings(tree):
+            seen += 1
+            bad = _gbk_unsafe(text)
+            if bad:
+                unsafe["%s = %r" % (path, text)] = bad
+        self.assertGreater(seen, 100, "一个常量都没扫到 = 扫描本身坏了（假绿）")
+        # ② 模块属性里的容器（USAGE 等）再走一遍：两条路互为兜底
+        for name in dir(CLI):
+            if name.startswith("__"):
+                continue
+            value = getattr(CLI, name)
+            if callable(value):
+                continue
+            for path, text in _walk_strings(value, name):
+                bad = _gbk_unsafe(text)
+                if bad:
+                    unsafe["%s = %r" % (path, text)] = bad
+        self.assertEqual(unsafe, {}, "这些字符串常量 GBK 编不出来：%s" % unsafe)
+
+    def test_the_constant_scan_actually_sees_function_local_strings(self):
+        """反假绿：扫描必须真的能看见**函数体内**的字符串（否则它只是个摆设）。
+
+        `sys.stderr.write("✗ …")` 那种字面量是函数局部常量；扫不到就没资格当证据。
+        """
+        with io.open(self.SOURCE, encoding="utf-8") as f:
+            tree = compile(f.read(), self.SOURCE, "exec")
+        found = [t for _p, t in _walk_code_strings(tree) if "备份失败" in t]
+        self.assertEqual(len(found), 1, "函数体内的字面量扫不到（扫描口径错了）：%r" % found)
+        self.assertIn("错误：", found[0])
+
+    def _run_execute(self):
+        """跑一次 `--执行`（argv 必须带模式，否则 main 只回用法码 2 什么都不做）。"""
+        with mock.patch.object(sys, "argv", ["身份迁移.py", "--执行"]):
+            return CLI.main()
+
+    def test_failure_paths_speak_gbk_not_unicode_error(self):
+        """走两条真的失败路径：备份失败 + 事务中途写盘失败（报错文案必须 GBK 安全）。"""
+        boom = OSError("disk full (注入)")
+        real = store.write_json
+        calls = {"n": 0}
+
+        def flaky(path, obj):
+            calls["n"] += 1
+            if calls["n"] == 2:                # jds.json 已落盘、jobs.json 炸 → 走恢复+报错那一支
+                raise boom
+            return real(path, obj)
+
+        with mock.patch.object(store, "write_json", side_effect=flaky), \
+                contextlib.redirect_stdout(io.StringIO()) as out, \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            code = self._run_execute()
+        self.assertEqual(code, 1)
+        self.assertEqual(calls["n"], 2, "注入没落在「事务中途」上（第二次写盘）")
+        for name, text in (("stdout", out.getvalue()), ("stderr", err.getvalue())):
+            bad = _gbk_unsafe(text)
+            self.assertEqual(bad, [], "%s 里有非 GBK 字符 %s：%r" % (name, bad, text[:200]))
+            text.encode("gbk")                 # 真的过一遍编码器（cp936 控制台就是这一步会炸）
+        self.assertIn("迁移失败", out.getvalue() + err.getvalue())
+
+        # 备份失败那一支（同样是 sys.stderr.write）：文案也必须 GBK 安全
+        with mock.patch.object(CLI, "_backup_profile", side_effect=OSError("no space (注入)")), \
+                contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()) as err2:
+            code2 = self._run_execute()
+        self.assertEqual(code2, 1)
+        self.assertEqual(_gbk_unsafe(err2.getvalue()), [], repr(err2.getvalue()))
+        err2.getvalue().encode("gbk")
+        self.assertIn("备份失败", err2.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

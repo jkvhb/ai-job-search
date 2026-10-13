@@ -440,7 +440,7 @@ def _merge_jd_record(record):
     existing = record["existing"]
     created = (str(existing.get("created_at") or "").strip() if isinstance(existing, dict) else "")
     created = created or str(canonical.get("created_at") or "").strip() or _now()
-    # ⚠ 这里**绝不**把 `record["fields"]`（ID 的归一化六段）写进 JD 级字段：
+    # 注意：这里**绝不**把 `record["fields"]`（ID 的归一化六段）写进 JD 级字段：
     #   `company` / `salary` 等 JD 级字段要的是**原始表述**（`6-8K（一金7k+）` / 公司全名），
     #   归一化值是**身份**（ID）才用的。把两者混在一起会让用户看到被截短的薪资与公司名
     #   —— 那正是规格 §3「ID 六段取归一化值、JD 级字段取原始值」这条要守住的分界。
@@ -678,7 +678,7 @@ def render_table(plan):
                         len(record["reports"]), record["seq"],
                         " | 这个 JD 已存在（沿用原 id/原编号）" if record["existing"] is not None else ""))
         if not record["report"]:
-            lines.append("  ⚠ 这一组的报告都读不出 REPORT_DATA → ID 六段从台账记录派生（如实降级，不猜）")
+            lines.append("  注意：这一组的报告都读不出 REPORT_DATA → ID 六段从台账记录派生（如实降级，不猜）")
         lines.append("")
     if skipped["no_text"]:
         lines.append("缺 JD 原文（无法比对 → 各自自成 1 个 JD，不猜）：")
@@ -708,7 +708,7 @@ def render_table(plan):
                      "不另建 JD、不加 jd_id），只把指向它们的引用改指对应 JD。"
                      % len(plan["merged"]))
     if plan["kb_unreadable"]:
-        lines.append("⚠ 有 %d 处知识库引用读不出报告、**没敢改**（保持原样，绝不指丢）：%s"
+        lines.append("注意：有 %d 处知识库引用读不出报告、**没敢改**（保持原样，绝不指丢）：%s"
                      % (len(plan["kb_unreadable"]), "、".join(plan["kb_unreadable"][:5])))
     lines.append("")
     lines.append("以上只是试跑，**未改动任何文件**（加 --执行 才迁移，先整目录备份）。")
@@ -732,7 +732,7 @@ def _profile_files(root):
 def _ignore_previous_backups(_dirpath, names):
     """`shutil.copytree` 的 ignore：**备份里绝不套备份**。
 
-    ⚠ 实测澄清（别照抄上一版的猜测）：备份落在 `data/profiles/迁移备份_<ts>/`，
+    注意 实测澄清（别照抄上一版的猜测）：备份落在 `data/profiles/迁移备份_<ts>/`，
     它是 `data/profiles/<key>/` 的**兄弟目录**，所以真布局下**根本拷不进去**嵌套
     （已用隔离副本实测：新备份顶层没有 `迁移备份_*`）。这道闸门钉的是**不变量**：
     只要备份根将来挪进 profile 目录（或用户手工把旧备份搬进来），也不会滚雪球。
@@ -811,7 +811,7 @@ def execute_migration():
     try:
         backup = _backup_profile()
     except BaseException as e:
-        sys.stderr.write("✗ 备份失败，**没有改动任何文件**：%s\n" % e)
+        sys.stderr.write("错误：备份失败，**没有改动任何文件**：%s\n" % e)
         return 1
     print("已备份整目录：%s（保留不删）" % backup)
     log.LOG_FILE = os.path.join(store.profile_dir(), "logs", "events.jsonl")
@@ -831,9 +831,9 @@ def execute_migration():
             _restore_profile(backup, had_files)
             restored = True
         except BaseException as e2:            # 回滚本身不能再把原始异常吞掉
-            sys.stderr.write("✗ 恢复也失败了：%s\n" % e2)
-        sys.stderr.write("✗ 迁移失败：%s\n%s\n" % (e, traceback.format_exc()))
-        print("✗ 迁移失败：%s（%s）"
+            sys.stderr.write("错误：恢复也失败了：%s\n" % e2)
+        sys.stderr.write("错误：迁移失败：%s\n%s\n" % (e, traceback.format_exc()))
+        print("错误：迁移失败：%s（%s）"
               % (e, "已用备份恢复 " + backup if restored else "恢复失败，请手工从 %s 恢复" % backup))
         return 1
     try:
