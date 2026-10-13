@@ -36,7 +36,7 @@
 诚实边界（规格 §8）：
 
 - **旧版原文不保留**（用户已定的取舍：每个族谱只留母版 + 最新版）→ 历史版只有
-  ``kind="missing"``。``ai_diff`` 也只是 AI 写的（Task 4），可能漏，以原文为准。
+  ``kind="missing"``。``ai_diff`` 也只是 AI 写的（见下），可能漏，以原文为准。
 - ``sha256`` 是**内容指纹**（文本口径，与 ``sha256_of`` / ``_write_content`` 一致）。
   ``read_version`` **自己**用它核对磁盘（快照路径也核 —— 快照不可变，对不上同样是出事了），
   不一致就报 ``mismatch``。**不指望每个调用方都记得比 sha**：一处忘了，就会**静默把别人的
@@ -51,6 +51,15 @@
   **绝不静默当正常版本用**（规格 §8.2）。
 - 内容文件按 ``newline=""`` 写：磁盘字节 == 内容的 UTF-8 字节（不做 ``\\r\\n`` 转换），
   所以 ``size`` 与 ``sha256`` 严格对应同一份内容，且与仓库里已有的 LF 简历文件一致。
+
+AI 变更比对（规格 §4.4，见 ``ai_diff_of``）：
+
+- **只在"延续"时触发**：``ai_diff_of(新版本id)`` 由**调用方**在"这次是延续"时调用；
+  "新开一份独立的"**没有可比对的对象** → 一个 chat 都不调（``create_version`` 自己绝不调模型）。
+- 输入 = **母版内容** + **子版内容**（都从 ``resumes.json`` 指到的文件读）。
+- **失败不是致命**：网络 / 额度 / 坏 JSON → 版本**照样保存**，``ai_diff_error`` 记原因，
+  ``ai_diff`` **保持空对象** —— **绝不写一个空的假 ``ai_diff``**（规格 §8.4）。
+  界面据此显示"这次没能生成变更说明"。
 """
 import hashlib
 import os
@@ -58,6 +67,7 @@ import re
 import threading
 from datetime import datetime
 
+import llm
 import store
 
 RESUMES_FILE = "resumes.json"
@@ -395,7 +405,10 @@ def create_version(name, content, parent_id=None, note=""):
             "file": _resume_rel(clean),
             "mother_file": None,
             "chosen": False,
-            "ai_diff": {},                 # Task 4 填：{summary, changes:[{where, what}]}
+            # 变更说明（Task 4）：这里**只留空壳**，绝不在这里调模型 ——
+            # "新开一份独立的"没有可比对的对象，一次 chat 都不该调（规格 §4.4）。
+            # 延续时由调用方另调 `ai_diff_of(新版本id)` 填。失败时 `ai_diff_error` 非空、`ai_diff` 留空对象。
+            "ai_diff": {},                 # {summary, changes:[{where, what}]}
             "ai_diff_error": "",
             "note": note if isinstance(note, str) else str(note or ""),
             REMOVED: False,
@@ -440,6 +453,172 @@ def read_version(version_id):
     """
     with _LOCK:
         return _read_in(load_resumes()["resumes"], version_id)
+
+
+# ---------- AI 变更比对（规格 §4.4 / Task 4） ----------
+#
+# 触发条件只有一条：**这次保存是"延续"**（有母版可参照）。"新开一份独立的"没有可比对的对象
+# → 一个 chat 都不调（那条路由根本不调 `ai_diff_of`，本模块里也没有别的地方碰模型）。
+#
+# 调用约定与 `interview.analyze` / `outcome.attribute` **完全一致**：`chat(prompt, cfg)` 两参；
+# 默认实现走 `llm.call_openai_compatible`（模块属性在**调用时**现取，不是 import 时绑定 ——
+# 所以测试 patch `llm.call_openai_compatible` 就能挡住整条路，绝不会真发网络请求）。
+_AI_DIFF_PROMPT = """你在对比一份简历的**两个版本**，写出"新版到底改了哪些地方"。
+
+要求（这几条是硬要求）：
+1. **只写确实改了的地方**；没有把握的**宁可不写**，绝不为了凑数编一条。
+2. 没改的部分**不要提**。
+3. 每条要能对上原文里的具体位置（比如 项目经历 / 技能 / 教育经历 / 自我评价 / 基本信息）。
+4. **只输出一个 JSON 对象**，不要解释、不要 markdown 代码块，格式：
+{"summary": "一句话总述这次改了什么", "changes": [{"where": "改在哪一节", "what": "改了什么"}]}
+5. 如果两版**没有任何实质差别**：summary 写"没有实质变化"，changes 给空数组。
+
+【旧版（母版）内容】
+%(mother)s
+
+【新版（这次上传的）内容】
+%(child)s
+"""
+
+
+def _clean_diff(value):
+    """把模型返回的东西收成 ``{summary, changes}``；**收不出任何内容就返回 None**。
+
+    为什么不"缺字段补空默认值"：``ai_diff`` 只有在**真的写出了东西**时才该非空 ——
+    空壳 ``{"summary": "", "changes": []}`` 与"没生成"在界面上长得一样，却会骗过
+    "有 ai_diff 就是成功"的判断（规格 §8.4：绝不写假的 ``ai_diff``）。
+    """
+    if not isinstance(value, dict):
+        return None
+    summary = value.get("summary")
+    summary = summary.strip() if isinstance(summary, str) else ""
+    raw = value.get("changes")
+    raw = raw if isinstance(raw, list) else []
+    changes = []
+    for c in raw:
+        if not isinstance(c, dict):
+            continue
+        where = c.get("where")
+        what = c.get("what")
+        where = where.strip() if isinstance(where, str) else ""
+        what = what.strip() if isinstance(what, str) else ("" if what is None else str(what).strip())
+        if not (where and what):
+            continue
+        changes.append({"where": where, "what": what})
+    if not summary and not changes:
+        return None
+    return {"summary": summary, "changes": changes}
+
+
+def normalize_ai_diff(value):
+    """对外口径：永远是 ``{summary, changes}``（给界面/测试一个稳定的形状）。"""
+    return _clean_diff(value) or {"summary": "", "changes": []}
+
+
+def _diff_of(reply):
+    """解析模型回复：dict 直接用（已经是对象），字符串走 ``llm.parse_json_reply``。"""
+    if isinstance(reply, dict):
+        return _clean_diff(reply)
+    return _clean_diff(llm.parse_json_reply(reply))
+
+
+def _call_text_model(prompt, cfg, chat=None):
+    """文本模型调用的**唯一**出口（调用约定与 `interview._call_model` 逐字一致）。
+
+    ``chat`` 的注入约定是 **`chat(prompt, cfg)` 两参**（与 `interview.analyze` /
+    `outcome.attribute` 一致）；默认实现走 `llm.call_openai_compatible`。
+    模型细节（base_url / key / model / temperature）只在这里收口 ——
+    **绝不把网络细节漏进"变更比对"的业务逻辑里**，也**绝不自己拼 HTTP**。
+
+    `llm.call_openai_compatible` 是**模块属性、调用时现取**（不是 import 时绑定）：
+    测试 patch 它一次就能挡住整条路（`resumelib` 不持有它的旧引用）。
+    """
+    if chat is not None:
+        return chat(prompt, cfg)
+    cfg = cfg if isinstance(cfg, dict) else (store.load_config() or {})
+    tm = (cfg.get("text_model") or {}) if isinstance(cfg, dict) else {}
+    return llm.call_openai_compatible(tm.get("base_url") or "", tm.get("api_key") or "",
+                                      tm.get("model") or "",
+                                      [{"role": "user", "content": prompt}],
+                                      json_mode=True, temperature=tm.get("temperature"))
+
+
+def _save_diff(version_id, diff=None, error=""):
+    """把比对结果（或失败原因）写进那条记录并返回它。**失败时只写 ``ai_diff_error``**。
+
+    只在锁里读改写这一条：`ai_diff` 与 `ai_diff_error` 是**互为反证**的两个字段，
+    分开两次写会留下"两个都空"的中间态（界面据此会显示"没留下变更说明"，那不是真的）。
+    """
+    with _LOCK:
+        doc = load_resumes()
+        rec = _find(doc["resumes"], version_id)
+        if rec is None:
+            raise ValueError("找不到版本：%s" % (version_id,))
+        if diff is not None:
+            rec["ai_diff"] = diff
+            rec["ai_diff_error"] = ""
+        else:
+            rec["ai_diff_error"] = error
+        save_resumes(doc)
+        return dict(rec)
+
+
+def ai_diff_of(version_id, chat=None, cfg=None):
+    """这一版相比**母版**改了哪些地方（AI 写）。**只在"延续"时由调用方调用**。
+
+    输入是**母版内容**与**子版内容**（都从 ``resumes.json`` 指到的文件读，见 ``read_version``）。
+    比成功 → 写进 ``ai_diff``；比失败（没母版 / 网络 / 额度 / 坏 JSON）→ 写 ``ai_diff_error``，
+    ``ai_diff`` **保持空对象**，**版本照样在**。返回那条记录（调用方据此看 ``ai_diff``）。
+
+    失败时**抛异常只有两种情况**：版本 id 不存在（``ValueError``，编程错误）。
+    其余一律记进 ``ai_diff_error`` 返回 —— 用户在界面上要看到"这次没能生成变更说明 + 原因"，
+    而不是一个连版本都没有了的 500（规格 §8.4）。
+
+    ⚠️ **"没有母版"不等于"比对失败"**（§4.4：没有可比对的对象 → 一次都不调）：
+    新开的独立简历（``parent_id`` 为空 / 母版记录已不在）时**直接返回、不写任何字段**，
+    **绝不**写成 ``ai_diff_error``（那会让界面把"本来就没有可比的东西"说成一次失败）。
+    **"只在延续时调模型"这道闸就在下面这行**：调用方（`app.py`）只对延续调本函数，
+    本函数自己再挡一次"没有母版"——两道闸都在，任一道被绕开都跑不出比对。
+
+    ``chat`` 注入约定与 ``interview.analyze`` 一致：``chat(prompt, cfg)`` 两参。
+    """
+    with _LOCK:
+        recs = load_resumes()["resumes"]
+        rec = _find(recs, version_id)
+        if rec is None:
+            raise ValueError("找不到版本：%s" % (version_id,))
+        pid = _clean_id(rec.get("parent_id"))
+        mother = _find(recs, pid) if pid else None
+        if mother is None:
+            # 没有母版＝这次不是"延续"（新开的独立简历）→ **没有可比对的对象，一次都不调**。
+            # 也绝不写成错误：那不是失败，是"本来就没有可比的东西"。
+            return dict(rec)
+        m_text, _m_path, m_kind = _read_in(recs, pid)
+        c_text, _c_path, c_kind = _read_in(recs, _clean_id(rec.get("id")))
+
+    if m_kind not in ("latest", "mother"):
+        # 母版原文没保留（或与记录不符）→ 拿不出"母版内容"。**如实报错**，
+        # 绝不拿空串/别人的内容去让模型瞎猜一遍（那会写出一份看起来像真的变更说明）。
+        reason = ("拿不到母版原文（%s）：旧版原文未保留，或内容与记录不符，"
+                  "无法比对这次改了什么" % (m_kind,))
+        return _save_diff(version_id, error=reason)
+    if c_kind not in ("latest", "mother"):
+        reason = "拿不到这一版的原文（%s）：内容与记录不符，无法比对" % (c_kind,)
+        return _save_diff(version_id, error=reason)
+    if not c_text:
+        reason = "这一次的内容是空文件，没有可比的正文"
+        return _save_diff(version_id, error=reason)
+
+    prompt = _AI_DIFF_PROMPT % {"mother": m_text, "child": c_text}
+    try:
+        reply = _call_text_model(prompt, cfg, chat)
+        diff = _diff_of(reply)
+        if diff is None:
+            raise RuntimeError("模型没有写出任何改动的条目（summary 与 changes 都空）")
+    except Exception as e:
+        # 坏 JSON **不重试**：版本已经保存了，比对失败不是致命（规格 §4.4）。原因要留给用户看。
+        return _save_diff(version_id, error=("变更比对失败：%s" % e)[:600])
+    return _save_diff(version_id, diff=diff)
 
 
 def choose(version_id):

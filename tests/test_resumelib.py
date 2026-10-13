@@ -4,10 +4,13 @@
 继承 IsolatedCase：store.DATA_ROOT 与 log.LOG_FILE 同时被重定向到临时目录，
 绝不在真实 data/ 上跑。
 """
+import json
 import os
 import threading
 from datetime import datetime
+from unittest import mock
 
+import llm
 import resumelib
 import store
 
@@ -479,6 +482,178 @@ class MotherSnapshotPrecedenceTest(IsolatedCase):
         self.assertEqual(kind, "mismatch")
         self.assertEqual(text, "别人手改的快照")
         self.assertEqual(path, self._snap_path(v1["id"]))
+
+
+PART_NAME = "周汉钦-A"
+MOTHER_TEXT = ("候选人简历正文（母版）\n"
+               "项目经历：语音质检平台\n"
+               "技能：Python / 数据标注")
+CHILD_TEXT = ("候选人简历正文（母版）\n"
+              "项目经历：语音质检平台；新增语音Agent项目\n"
+              "技能：Python / 数据标注")
+
+
+class AiDiffTest(IsolatedCase):
+    """Task 4 / 规格 §4.4：AI 变更比对**只在延续时触发**，且走 `llm.chat(prompt, cfg)` 两参约定。
+
+    注入点与 `interview.analyze` / `outcome.attribute` 完全相同：替身**实现** `llm.call_openai_compatible`
+    （模块属性在调用时现取，不是 import 时绑定）—— 所以这里 patch 一次就够，
+    **绝不真调模型**、也不需要给 `resumelib` 开一条只在测试里存在的参数。
+    """
+
+    def _fake_chat(self, reply):
+        prompts = []
+
+        def fake(base_url, api_key, model, messages, json_mode=False, **kw):
+            prompts.append(messages[0]["content"])
+            return reply
+
+        self._patch(llm, "call_openai_compatible", fake)
+        return prompts
+
+    def _patch(self, obj, name, value):
+        p = mock.patch.object(obj, name, value)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _lineage(self):
+        v1 = resumelib.create_version(PART_NAME, MOTHER_TEXT)
+        resumelib.choose(v1["id"])
+        return v1
+
+    def test_a_continuation_calls_the_model_once_with_both_versions_verbatim(self):
+        v1 = self._lineage()
+        prompts = self._fake_chat(json.dumps({
+            "summary": "把语音Agent项目补进了项目经历",
+            "changes": [{"where": "项目经历", "what": "新增语音Agent项目"},
+                        {"where": "自我评价", "what": "强调数据标注经验"}]},
+            ensure_ascii=False))
+        v2 = resumelib.create_version(PART_NAME, CHILD_TEXT, parent_id=v1["id"])
+        resumelib.ai_diff_of(v2["id"])
+
+        self.assertEqual(len(prompts), 1, "延续应当**恰好**调用一次模型：%r" % (prompts,))
+        prompt = prompts[0]
+        # 逐字断言"输入确实是母版内容 + 子版内容"（两段内容都出现在同一条提示词里）
+        self.assertIn(MOTHER_TEXT, prompt, "提示词里没有母版内容")
+        self.assertIn(CHILD_TEXT, prompt, "提示词里没有子版内容")
+        self.assertLess(prompt.index(MOTHER_TEXT), prompt.index(CHILD_TEXT),
+                        "母版与子版的先后顺序反了（模型会读反「这一版改了什么」）")
+
+        rec = resumelib.by_id(v2["id"])
+        self.assertEqual(rec["ai_diff_error"], "")
+        self.assertEqual(rec["ai_diff"], {
+            "summary": "把语音Agent项目补进了项目经历",
+            "changes": [{"where": "项目经历", "what": "新增语音Agent项目"},
+                        {"where": "自我评价", "what": "强调数据标注经验"}]})
+        # 永久可查：重新读库仍是这一份（不是只活在内存里）
+        self.assertEqual(resumelib.by_id(v2["id"])["ai_diff"]["summary"],
+                         "把语音Agent项目补进了项目经历")
+
+    def test_a_crashing_model_still_saves_the_version_and_never_writes_an_empty_fake_diff(self):
+        v1 = self._lineage()
+        prompts = self._fake_chat(None)
+
+        def boom(base_url, api_key, model, messages, json_mode=False, **kw):
+            prompts.append(messages[0]["content"])
+            raise RuntimeError("模型接口返回 429：余额不足（注入）")
+
+        self._patch(llm, "call_openai_compatible", boom)
+        v2 = resumelib.create_version(PART_NAME, CHILD_TEXT, parent_id=v1["id"])
+        rec = resumelib.ai_diff_of(v2["id"])
+
+        # ① 版本照样在（比对失败不是致命：规格 §8.4）
+        self.assertEqual(resumelib.read_version(v2["id"])[0], CHILD_TEXT)
+        self.assertIn(v2["id"], [r["id"] for r in resumelib.list_versions()])
+        # ② 原因非空、且说得出是什么错
+        self.assertIn("429", rec["ai_diff_error"])
+        # ③ **绝不写一个空的假 ai_diff**：空对象/空壳都算"假装成功"
+        self.assertEqual(resumelib.by_id(v2["id"])["ai_diff"], {},
+                         "比对失败却写了一个空的假 ai_diff")
+        self.assertEqual(store.read_json(store.p_path("resumes.json"))["resumes"][-1]["ai_diff"], {})
+
+    def test_a_broken_json_reply_is_not_retried_and_not_faked(self):
+        v1 = self._lineage()
+        prompts = self._fake_chat("这不是 JSON，模型随口说的话")
+        v2 = resumelib.create_version(PART_NAME, CHILD_TEXT, parent_id=v1["id"])
+        rec = resumelib.ai_diff_of(v2["id"])
+
+        self.assertEqual(len(prompts), 1, "坏 JSON **不重试**（版本已保存，比对失败不是致命）")
+        self.assertEqual(resumelib.read_version(v2["id"])[0], CHILD_TEXT)   # 版本仍在
+        self.assertIn("JSON", rec["ai_diff_error"])
+        self.assertEqual(resumelib.by_id(v2["id"])["ai_diff"], {})
+
+    def test_a_new_independent_resume_never_calls_the_model(self):
+        prompts = self._fake_chat('{"summary":"不该被调用","changes":[]}')
+        resumelib.create_version(PART_NAME, MOTHER_TEXT)          # 新开一份独立的
+        self.assertEqual(prompts, [], "新开一份独立的**没有可比对的对象**，一次 chat 都不该调")
+        # 记录里也不该有假的变更说明
+        rec = resumelib.list_versions()[0]
+        self.assertEqual((rec["ai_diff"], rec["ai_diff_error"]), ({}, ""))
+
+    def test_a_mother_whose_text_was_not_kept_is_an_honest_error_not_an_empty_call(self):
+        """母版原文没保留 → **明确报错**（不发两条内容去让模型瞎猜），也不写假 ai_diff。"""
+        v1 = resumelib.create_version(PART_NAME, MOTHER_TEXT)
+        v2 = resumelib.create_version(PART_NAME, CHILD_TEXT, parent_id=v1["id"])
+        resumelib.create_version(PART_NAME, "第三版内容", parent_id=v2["id"])
+        resumelib.choose(v2["id"])                                 # 母版 = v2（历史版，原文没保留）
+        prompts = self._fake_chat('{"summary":"瞎写","changes":[]}')
+        v4 = resumelib.create_version(PART_NAME, "第四版内容", parent_id=v1["id"])
+        rec = resumelib.ai_diff_of(v4["id"])
+
+        self.assertEqual(prompts, [], "母版原文都没有，却还是调了模型（只能靠猜）")
+        self.assertIn("旧版原文未保留", rec["ai_diff_error"])
+        self.assertEqual(resumelib.by_id(v4["id"])["ai_diff"], {})
+
+    def test_the_model_reply_is_cleaned_field_by_field(self):
+        """模型返回的形状不保证：空的 since（where）丢掉、非字符串压成字符串、缺的补空。"""
+        clean = resumelib.normalize_ai_diff({
+            "summary": "  加了两个项目  ",
+            "changes": [{"where": " 项目经历 ", "what": " 新增语音Agent "},
+                        {"where": "", "what": "没说是哪儿改的"},     # 缺 where → 不算一条
+                        {"what": "只有 where 的空字符串"},
+                        "根本不是对象",
+                        {"where": "技能", "what": 123}],
+        })
+        self.assertEqual(clean["summary"], "加了两个项目")
+        self.assertEqual(clean["changes"], [{"where": "项目经历", "what": "新增语音Agent"},
+                                            {"where": "技能", "what": "123"}])
+        self.assertEqual(resumelib.normalize_ai_diff({"changes": "不是数组"}),
+                         {"summary": "", "changes": []})
+
+    def test_a_reply_that_is_already_a_dict_is_used_as_is(self):
+        v1 = self._lineage()
+
+        def fake(base_url, api_key, model, messages, json_mode=False, **kw):
+            return {"summary": "直接给了对象", "changes": [{"where": "教育经历", "what": "补了学校"}]}
+
+        self._patch(llm, "call_openai_compatible", fake)
+        v2 = resumelib.create_version(PART_NAME, CHILD_TEXT, parent_id=v1["id"])
+        resumelib.ai_diff_of(v2["id"])
+        self.assertEqual(resumelib.by_id(v2["id"])["ai_diff"],
+                         {"summary": "直接给了对象",
+                          "changes": [{"where": "教育经历", "what": "补了学校"}]})
+
+    def test_an_injected_two_argument_chat_is_used_as_is(self):
+        """注入约定就是 **`chat(prompt, cfg)` 两参**（与 interview.analyze / outcome.attribute 一致）。
+
+        这条用**两参可调用对象**走一遍：既钉住"能注入"，也钉住"提示词里同时有母版与子版"。
+        """
+        v1 = self._lineage()
+        seen = []
+
+        def chat(prompt, cfg):
+            seen.append(prompt)
+            return '{"summary":"补了项目","changes":[{"where":"项目经历","what":"新增语音Agent项目"}]}'
+
+        v2 = resumelib.create_version(PART_NAME, CHILD_TEXT, parent_id=v1["id"])
+        resumelib.ai_diff_of(v2["id"], chat=chat, cfg={"text_model": {"model": "假模型"}})
+
+        self.assertEqual(len(seen), 1)
+        self.assertIn(MOTHER_TEXT, seen[0])
+        self.assertIn(CHILD_TEXT, seen[0])
+        self.assertEqual(resumelib.by_id(v2["id"])["ai_diff"],
+                         {"summary": "补了项目",
+                          "changes": [{"where": "项目经历", "what": "新增语音Agent项目"}]})
 
 
 if __name__ == "__main__":

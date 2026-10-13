@@ -936,6 +936,9 @@ def save_resume_version(name, content, parent_id="", lineage=""):
 
     会抛 `ValueError`（路由翻成 400）：名字为空 / 重名（未移出的）/ 父版本不存在 /
     父版本已移出 / 延续时改了名字 / 要延续却没有选定的母版。
+
+    **延续**时多走一步：`resumelib.ai_diff_of`（AI 写"改了哪些地方"，规格 §4.4）。
+    它失败**不影响保存**（版本已落盘，原因进 `ai_diff_error`）；"新开一份独立的"**一次模型都不调**。
     """
     clean = os.path.splitext(store.safe_name(name))[0].strip()
     if not clean:
@@ -953,6 +956,16 @@ def save_resume_version(name, content, parent_id="", lineage=""):
     rec = resumelib.create_version(clean, content, parent_id=pid or None)
     log.log_event("resume.save", name=rec.get("name"), id=rec.get("id"), rev=rec.get("rev"),
                   parent_id=rec.get("parent_id"), mode=mode, chars=len(content or ""))
+    if mode == "continue":
+        # 规格 §4.4：AI 变更比对**只在延续时触发**（"新开一份独立的"没有可比对的对象 → 一次都不调）。
+        # 版本在上面已经落盘；比对失败**不是致命**（`ai_diff_of` 会把原因记进 `ai_diff_error`）。
+        # 绝不在这里自己拼 prompt / 发请求：一切都在 `resumelib.ai_diff_of` 里（含注入点）。
+        rec = resumelib.ai_diff_of(rec.get("id"))
+        diff = rec.get("ai_diff") or {}
+        log.log_event("resume.ai_diff", name=rec.get("name"), id=rec.get("id"),
+                      ok=bool(diff.get("summary") or (diff.get("changes") or [])),
+                      changes=len(diff.get("changes") or []),
+                      error=str(rec.get("ai_diff_error") or "")[:300])
     return rec
 
 

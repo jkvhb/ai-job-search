@@ -576,15 +576,25 @@ function stCls(s){
    `scores`（`[{dimension,weight,score}]`，从它自己的报告 REPORT_DATA 读出来）与
    `scores_error`（读不出时的原因）。`scores` **不是数组** = 这份报告根本读不出评分 →
    那一行说「报告读不出评分」，**不冒充**「没评」。
+
+   维度名归一（审查发现的**真问题**）：真实报告里同时存在 `AI认知` 与 `AI 认知`（差一个空格）。
+   按字面"并集"它们会成**两列**、两只各填一只 → 看起来"全都没评"。裁定（与知识库卡片 id 的
+   `normalize_id` 同一条原则）：**比较维度名时先 NFKC 归一 + 去掉所有空白**；**显示时用出现
+   次数最多的那个原始写法**（同次数按首次出现顺序）。所以那些函数吃的 `dim` 参数一律是
+   `jdDimKey()` 归一后的键，`cell.label` 才是给用户看的原始写法。
 */
+function jdDimKey(dim){
+  try { return String(dim == null ? '' : dim).normalize('NFKC').trim().replace(/\s+/g, ''); }
+  catch(e){ return String(dim == null ? '' : dim).trim().replace(/\s+/g, ''); }   // 老引擎没有 NFKC 也不崩
+}
 function jdDimColumns(ans){
   const order = [], count = {};
   (ans || []).forEach(a=>{
     const here = {};
     const sc = (a && Array.isArray(a.scores)) ? a.scores : [];
     sc.forEach(s=>{
-      const d = String((s && s.dimension) || '').trim();
-      if(!d || here[d]) return;                    // 同一份分析里重复出现只算一次
+      const d = jdDimKey((s && s.dimension) || '');
+      if(!d || here[d]) return;                    // 同一份分析里重复出现只算一次（含写法不同的同一维）
       here[d] = 1;
       if(!Object.prototype.hasOwnProperty.call(count, d)){ count[d] = 0; order.push(d); }
       count[d] += 1;
@@ -592,24 +602,44 @@ function jdDimColumns(ans){
   });
   return order.slice().sort((x,y)=> (count[y]-count[x]) || (order.indexOf(x)-order.indexOf(y)));
 }
+/* 显示用哪一种原始写法：**出现次数最多的**；同次数按首次出现顺序（= 就是 `order` 里的顺序）。
+   计数只按"哪一种写法"累加，与 `count`（按归一键、一份分析算一次）是两个不同的口径 ——
+   这里要的正是"用户实际写成哪一种样子"的那个频次。 */
+function jdDimLabelOf(ans, dim){
+  const want = jdDimKey(dim), tally = new Map();
+  (ans || []).forEach(a=>{
+    const sc = (a && Array.isArray(a.scores)) ? a.scores : [];
+    sc.forEach(s=>{
+      const raw = String((s && s.dimension) || '').trim();
+      if(!raw || jdDimKey(raw) !== want) return;
+      tally.set(raw, (tally.get(raw) || 0) + 1);
+    });
+  });
+  let best = '', bestCount = -1;
+  tally.forEach((n, raw)=>{ if(n > bestCount){ best = raw; bestCount = n; } });   // Map 保插入序 → 同次数取首次
+  return best;                                     // 一个写法都对不上 → 空串（调用方回退到键本身）
+}
 function jdDimScoreOf(a, dim){
   const sc = (a && Array.isArray(a.scores)) ? a.scores : [];
   for(let i=0;i<sc.length;i++){
     const s = sc[i];
-    if(String((s && s.dimension) || '').trim() === dim) return (s && s.score);
+    if(jdDimKey(s && s.dimension) === dim) return (s && s.score);
   }
   return null;
 }
 function jdDimHasDim(a, dim){
   const sc = (a && Array.isArray(a.scores)) ? a.scores : [];
-  return sc.some(s=>String((s && s.dimension) || '').trim() === dim);
+  return sc.some(s=>jdDimKey(s && s.dimension) === dim);
 }
 /* 逐格数据（探针断言的对象就是它 —— 不是"整页里有没有某个字符串"）：
    `cell.kind` 四选一：`score`（评了）/ `noscore`（评了但没数字）/ `missing`（没评这一维）/
-   `noread`（这一版的报告读不出评分）。后两种**都没有分数**，绝不补 0。 */
+   `noread`（这一版的报告读不出评分）。后两种**都没有分数**，绝不补 0。
+   `cell.dim` 是归一后的键（别处按 dim 找格子用的就是它）；`cell.label` 是**原始写法**（给人看）。 */
 function jdDimMatrix(j){
   const ans = jdAnalyses(j);
   const dims = jdDimColumns(ans);
+  const labels = {};
+  dims.forEach(d=>{ labels[d] = jdDimLabelOf(ans, d); });
   const rows = ans.map(a=>{
     const readable = Array.isArray(a.scores);
     const rid = String(a.resume_id || '');
@@ -622,21 +652,35 @@ function jdDimMatrix(j){
       scores_error: String(a.scores_error || ''),
       readable: readable,
       cells: dims.map(dim=>{
-        if(!readable) return {dim: dim, kind: 'noread', score: null};
-        if(!jdDimHasDim(a, dim)) return {dim: dim, kind: 'missing', score: null};
+        const label = labels[dim];
+        if(!readable) return {dim: dim, label: label, kind: 'noread', score: null};
+        if(!jdDimHasDim(a, dim)) return {dim: dim, label: label, kind: 'missing', score: null};
         const v = jdDimScoreOf(a, dim);
         const usable = !(v === null || v === undefined || v === '');
-        return {dim: dim, kind: usable ? 'score' : 'noscore', score: usable ? v : null};
+        return {dim: dim, label: label, kind: usable ? 'score' : 'noscore', score: usable ? v : null};
       }),
     };
   });
-  return {dims: dims, rows: rows};
+  return {dims: dims, labels: labels, rows: rows};
 }
 function jdDimCellHtml(cell){
-  if(cell.kind === 'score') return '<td class="dimnum" data-dim="' + esc(cell.dim) + '" data-score="' + esc(cell.score) + '">' + esc(cell.score) + '</td>';
-  if(cell.kind === 'noscore') return '<td class="dimmiss" data-dim="' + esc(cell.dim) + '" data-noscore="1" data-score="">这一维没有分数</td>';
-  if(cell.kind === 'noread') return '<td class="dimnoread" data-dim="' + esc(cell.dim) + '" data-noread="1" data-score="">报告读不出评分</td>';
-  return '<td class="dimmiss" data-dim="' + esc(cell.dim) + '" data-missing="1" data-score="">该版未评这一维</td>';
+  const lb = ' data-dimlabel="' + esc(cell.label || cell.dim) + '"';
+  if(cell.kind === 'score') return '<td class="dimnum" data-dim="' + esc(cell.dim) + '"' + lb + ' data-score="' + esc(cell.score) + '">' + esc(cell.score) + '</td>';
+  if(cell.kind === 'noscore') return '<td class="dimmiss" data-dim="' + esc(cell.dim) + '"' + lb + ' data-noscore="1" data-score="">这一维没有分数</td>';
+  if(cell.kind === 'noread') return '<td class="dimnoread" data-dim="' + esc(cell.dim) + '"' + lb + ' data-noread="1" data-score="">报告读不出评分</td>';
+  return '<td class="dimmiss" data-dim="' + esc(cell.dim) + '"' + lb + ' data-missing="1" data-score="">该版未评这一维</td>';
+}
+/* 表头 7 格：1 个角 + 每个维度一格。列键（`data-dim`）是**归一后**的键，显示（`data-dimlabel`）
+   是**原始写法**里出现次数最多的那一种 —— 两者都要写出来，否则别处按 dim 找格子/按显示文案对账
+   只能靠"整页里有没有那个词"（那种断言是假绿的重灾区）。 */
+function jdDimHeadHtml(m){
+  function th(dim, label, cls, text){
+    return '<th' + (cls ? ' class="' + cls + '"' : '') + ' data-dim="' + esc(dim) + '"' +
+           ' data-dimlabel="' + esc(label || dim) + '">' + esc(text) + '</th>';
+  }
+  let h = th('', '', 'dimrow', '简历 \\ 维度');
+  h += m.dims.map(d=>th(d, m.labels[d], '', m.labels[d] || d)).join('');
+  return h;
 }
 function jdDimTable(j){
   const m = jdDimMatrix(j);
@@ -649,8 +693,8 @@ function jdDimTable(j){
     // 所有分析都读不出评分 → 连列都建不起来。**如实说**，不摆一张空表糊弄。
     h += '<div class="rsbad">这些分析的报告都读不出逐维评分 —— 无法并排对比（不是"都没评"）。</div>';
   } else {
-    h += '<table class="dimtab" data-dimtab="' + esc(id) + '"><thead><tr><th class="dimrow">简历 \\ 维度</th>';
-    h += m.dims.map(d=>'<th data-dim="' + esc(d) + '">' + esc(d) + '</th>').join('');
+    h += '<table class="dimtab" data-dimtab="' + esc(id) + '"><thead><tr>';
+    h += jdDimHeadHtml(m);
     h += '</tr></thead><tbody>';
     m.rows.forEach(r=>{
       const sc = (r.score === null) ? '无分数' : (esc(r.score) + ' 分');

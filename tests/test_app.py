@@ -3191,7 +3191,8 @@ function cellsOf(trHtml){
   var cells = [], re = /<(td|th)\b([^>]*)>([\s\S]*?)<\/\1>/g, m;
   while((m = re.exec(trHtml))){
     var a = m[2];
-    cells.push({tag: m[1], dim: attrOf(a, 'data-dim'), score: attrOf(a, 'data-score'),
+    cells.push({tag: m[1], dim: attrOf(a, 'data-dim'), label: attrOf(a, 'data-dimlabel'),
+                score: attrOf(a, 'data-score'),
                 missing: attrOf(a, 'data-missing'), noscore: attrOf(a, 'data-noscore'),
                 noread: attrOf(a, 'data-noread'),
                 text: m[3].replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim()});
@@ -3305,7 +3306,28 @@ class JdAnalysisScoresShapeTest(LedgerWithReportsCase):
         self.assertEqual(a["scores"], [])
 
 
-class JdDimensionTableTest(LedgerWithReportsCase):
+class _DimTableCase(LedgerWithReportsCase):
+    """并排表两条用例共用：真跑 `renderJobs()`，再把**渲染出来的** `<table>` 逐格解析回来。"""
+
+    def _render(self, row, extra=""):
+        _need_node()
+        out = web_probe.run_index(
+            _DIM_PARSE_JS +
+            "JOBS = [__fixture.row];\n"
+            "renderJobs();\n"
+            "var html = String(document.querySelector('#jobList').innerHTML);\n"
+            "out.cardHasTable = html.indexOf('data-dimtab=') >= 0;\n"
+            "out.rows = parseDimTable(html, String(__fixture.row.id));\n"
+            "out.matrix = jdDimMatrix(__fixture.row);\n"
+            "out.dims = jdDimColumns(jdAnalyses(__fixture.row));\n"
+            + extra,
+            {"row": row})
+        if not out.get("rows"):
+            raise AssertionError("大卡片里没渲染出并排表（渲染没发生 → 断言会变成恒真的假绿）：%r" % (out,))
+        return out
+
+
+class JdDimensionTableTest(_DimTableCase):
     """用户决策 #3：展开 JD 卡片后的**6 维度并排表**（一行一份简历、一列一个维度）。
 
     维度取法（**确定规则**）：该 JD 下所有分析的维度名**并集**，按**出现次数降序**排，
@@ -3323,6 +3345,9 @@ class JdDimensionTableTest(LedgerWithReportsCase):
     # 出现次数：团队 3 / 质量 3 / AI 3 / 产品 3 / 标注 2 / 行业 2
     # → 次数降序 + 首次出现顺序（A 的顺序）：
     EXPECT_DIMS = [DIM_TEAM, DIM_QUALITY, DIM_AI, DIM_PROD, DIM_ANNO, DIM_IND]
+    # 列键是**归一后**的（`jdDimKey`：NFKC + 去空白），所以 DIM_AI 的列键没有那个空格；
+    # 显示用的原始写法另算（这里每维只有一种写法，两者只差 AI 这个空格）。
+    EXPECT_KEYS = [DIM_TEAM, DIM_QUALITY, "AI认知", DIM_PROD, DIM_ANNO, DIM_IND]
 
     def _three(self):
         va = self._version("简历A"); vb = self._version("简历B"); vc = self._version("简历C")
@@ -3331,33 +3356,18 @@ class JdDimensionTableTest(LedgerWithReportsCase):
         self._analysis("a3", "简历C", vc["id"], "a3.html", 58.0, "2026-10-03 12:00", self.C)
         return va, vb, vc
 
-    def _render(self, row, extra=""):
-        """真跑 `renderJobs()`（表就在大卡片里），再把**渲染出来的** `<table>` 逐格解析回来。"""
-        _need_node()
-        out = web_probe.run_index(
-            _DIM_PARSE_JS +
-            "JOBS = [__fixture.row];\n"
-            "renderJobs();\n"
-            "var html = String(document.querySelector('#jobList').innerHTML);\n"
-            "out.cardHasTable = html.indexOf('data-dimtab=') >= 0;\n"
-            "out.rows = parseDimTable(html, String(__fixture.row.id));\n"
-            "out.matrix = jdDimMatrix(__fixture.row);\n"
-            "out.dims = jdDimColumns(jdAnalyses(__fixture.row));\n"
-            + extra,
-            {"row": row})
-        if not out.get("rows"):
-            raise AssertionError("大卡片里没渲染出并排表（渲染没发生 → 断言会变成恒真的假绿）：%r" % (out,))
-        return out
-
     def test_every_cell_is_asserted_one_by_one(self):
         va, vb, vc = self._three()
         out = self._render(self._row())
         self.assertEqual(out["unexpected"], [], "渲染时抛了没人接的 promise")
 
         # ① 列：并集 + 出现次数降序（标注生产经验在 A 里最先出现，但只有 2 份评了 → 排后面）
-        self.assertEqual(out["dims"], self.EXPECT_DIMS)
+        self.assertEqual(out["dims"], self.EXPECT_KEYS)
         cells = out["rows"][0]["cells"]
         self.assertEqual([c["text"] for c in cells], ["简历 \\ 维度"] + self.EXPECT_DIMS)
+        # 角格不是维度 → 它的 dim / label 都是空串（表头每一格的显示文案见上面那条 text 断言）
+        self.assertEqual([c["label"] for c in cells], [""] + self.EXPECT_DIMS)
+        self.assertEqual([c["dim"] for c in cells], [""] + self.EXPECT_KEYS)
 
         # ② 逐行：表头（简历名 / 版本号 / 分数）
         body = out["rows"][1:]
@@ -3381,8 +3391,11 @@ class JdDimensionTableTest(LedgerWithReportsCase):
         for ri, row in enumerate(body):
             got = []
             for ci, cell in enumerate(row["cells"][1:]):
-                self.assertEqual(cell["dim"], self.EXPECT_DIMS[ci],
-                                 "第 %d 行第 %d 列不是这一维：%r" % (ri, ci, cell))
+                self.assertEqual(cell["dim"], self.EXPECT_KEYS[ci],
+                                 "第 %d 行第 %d 列的列键不是这一维：%r" % (ri, ci, cell))
+                # 经过归一之后，那一格显示的**原始写法**必须仍是这一维（不许把中文替掉/换了）
+                self.assertEqual(cell["label"], self.EXPECT_DIMS[ci],
+                                 "第 %d 行第 %d 列显示的原始写法不对：%r" % (ri, ci, cell))
                 if cell["missing"] == "1":
                     got.append(("missing", ""))
                 else:
@@ -3420,7 +3433,7 @@ class JdDimensionTableTest(LedgerWithReportsCase):
             "out.one = jdDimColumns([{scores: [{dimension: '只有这一维', score: 1}]}]);\n"
             "out.none = jdDimColumns([{scores: []}, {scores: null}]);\n",
             {"row": row})
-        self.assertEqual(out["dims"], self.EXPECT_DIMS)
+        self.assertEqual(out["dims"], self.EXPECT_KEYS)
         self.assertEqual(out["one"], ["只有这一维"])
         self.assertEqual(out["none"], [])
 
@@ -3447,6 +3460,295 @@ class JdDimensionTableTest(LedgerWithReportsCase):
                       "并排表没有接进大卡片：表再对也不显示")
         self.assertIn("不补 0", _js_fn_body("jdDimTable", "j"))
         self.assertIn("该版未评这一维", _js_fn_body("jdDimTable", "j"))
+
+
+class JdDimensionNameFilterTest(_DimTableCase):
+    """维度名归一（上一轮审查的**真问题**）：真实报告里同时存在 `AI认知` 与 `AI 认知`（差一个空格）。
+
+    按规格字面"维度名并集"它们是**两列**，两只各填一只 → 用户看到的是"全都没评"。
+    裁定（与知识库卡片 id 的 `normalize_id` 同一条原则）：比较维度名时先做 **NFKC 归一 + 去掉
+    所有空白**；显示时用**出现次数最多的那个原始写法**（同次数按首次出现顺序）。
+
+    这里两份分析**故意**一份写 `AI认知`、一份写 `AI 认知`（带空格的是多数写法）。
+    """
+
+    # ⚠️ **不要**在这个类里用模块级的 `DIM_AI`：父类 `JdDimensionTableTest` 里那个类属性
+    # 恰好叫 `DIM_AI`（= "AI认知"，无空格），会把模块常量遮住 —— 上一位实现者就是这样
+    # 让 `assertEqual(..., DIM_AI)` 变成"拿无空格去比有空格"（真红却看着像文案不对）。
+    DIM_AI_NOSPACE = "AI认知"
+    DIM_AI_SPACED = "AI 认知"
+    A = [_dim(DIM_AI_NOSPACE, 8)]
+    B = [_dim(DIM_AI_SPACED, 9)]
+
+    def test_one_space_variant_is_not_a_second_column_and_both_cells_are_filled(self):
+        va = self._version("简历A")
+        vb = self._version("简历B")
+        # ⚠️ 局部变量**不能**叫 A / B：那会遮住类属性 `self.A` / `self.B`（夹具就喂成了两份无空格写法，
+        # 「带空格是多数写法」那个前提静默失效 —— 这条用例第一版就踩了这个坑）。
+        self._analysis("a1", "简历A", va["id"], "a1.html", 75.0, "2026-10-01 10:00", self.A)
+        self._analysis("a2", "简历B", vb["id"], "a2.html", 66.0, "2026-10-02 11:00", self.B)
+
+        out = self._render(self._row())
+
+        self.assertEqual(out["unexpected"], [], "渲染时抛了没人接的 promise")
+        # ① 只有一列（← 变异「维度不归一」会让这里变成两列）；列键是归一的
+        self.assertEqual(out["dims"], ["AI认知"], "带空格/不带空格被当成了两维：%r" % (out["dims"],))
+        cells = out["rows"][0]["cells"]
+        # ② 表头显示**出现次数最多的那种写法**：这次两种写法各出现 1 次（平局）→ 按首次出现顺序，
+        #    也就是"先被写出来的那一种"。平局是**真会发生的**（这里就是），所以不能写死某一种。
+        first_seen = self.A[0]["dimension"]
+        self.assertEqual([c["label"] for c in cells], ["", first_seen])
+        self.assertEqual([c["dim"] for c in cells], ["", self.DIM_AI_NOSPACE])
+        self.assertEqual(cells[1]["text"], first_seen)
+
+        body = out["rows"][1:]
+        self.assertEqual(len(body), 2)
+        # ③ 两格**都填上了**（而不是"全都没评"）
+        self.assertEqual([r["cells"][1]["text"] for r in body], ["8", "9"])
+        self.assertEqual([r["cells"][1]["missing"] for r in body], ["", ""],
+                         "归一之后仍有一格被当成「该版未评这一维」：%r" % ([r["cells"][1] for r in body],))
+        # ④ 格子里的 `data-dim` 也必须是归一后的那个键（否则前端别处按 dim 找会又找不着）
+        self.assertEqual([r["cells"][1]["dim"] for r in body],
+                         [self.DIM_AI_NOSPACE, self.DIM_AI_NOSPACE])
+
+    def test_the_zero_score_of_a_normalized_dimension_is_still_not_swallowed(self):
+        """归一不许把**真 0 分**吞成"没评"（两份都是 0 分，两格都得是 0）。"""
+        va = self._version("简历A")
+        vb = self._version("简历B")
+        self._analysis("a1", "简历A", va["id"], "a1.html", 75.0, "2026-10-01 10:00",
+                       [_dim(self.DIM_AI_NOSPACE, 0)])
+        self._analysis("a2", "简历B", vb["id"], "a2.html", 66.0, "2026-10-02 11:00",
+                       [_dim(self.DIM_AI_SPACED, 0)])
+        out = self._render(self._row())
+        body = out["rows"][1:]
+        self.assertEqual([r["cells"][1]["missing"] for r in body], ["", ""])
+        self.assertEqual([(r["cells"][1]["text"], r["cells"][1]["score"]) for r in body],
+                         [("0", "0"), ("0", "0")])
+
+    def test_a_more_common_spelling_wins_over_first_seen(self):
+        """反向钉住"次数优先"：两份分析都写**带空格**那种 → 表头就是带空格那种（不是"一律用第一次那个"）。
+
+        顺带钉住一条老边界：**同一份分析里**写了两种写法时只算一维（那一份不会既填 8 又填 9 地重复）。
+        """
+        va = self._version("简历A")
+        vb = self._version("简历B")
+        self._analysis("a1", "简历A", va["id"], "a1.html", 75.0, "2026-10-01 10:00",
+                       [_dim(self.DIM_AI_SPACED, 8)])
+        self._analysis("a2", "简历B", vb["id"], "a2.html", 66.0, "2026-10-02 11:00",
+                       [_dim(self.DIM_AI_SPACED, 9), _dim(self.DIM_AI_NOSPACE, 3)])
+        out = self._render(self._row())
+        self.assertEqual(out["dims"], [self.DIM_AI_NOSPACE], "两份分析各写一种写法 → 应当只有一列")
+        self.assertEqual([c["label"] for c in out["rows"][0]["cells"]], ["", self.DIM_AI_SPACED])
+        # 同一份里两种写法只算一格：B 那一格是它先写的那种的值（8/9 不是各占一格）
+        self.assertEqual(len(out["rows"][1]["cells"]), 2)
+        self.assertEqual([r["cells"][1]["text"] for r in out["rows"][1:]], ["8", "9"])
+
+    def test_a_dimension_that_only_one_resume_wrote_is_still_empty_in_the_other_row(self):
+        """反向：归一**不许**把真的缺维也填上去（否则上面"都填上了"就成了恒真）。"""
+        va = self._version("简历A")
+        vb = self._version("简历B")
+        self._analysis("a1", "简历A", va["id"], "a1.html", 75.0, "2026-10-01 10:00",
+                       [_dim(self.DIM_AI_NOSPACE, 8), _dim(DIM_QUALITY, 7)])
+        self._analysis("a2", "简历B", vb["id"], "a2.html", 66.0, "2026-10-02 11:00",
+                       [_dim(self.DIM_AI_SPACED, 9)])
+        out = self._render(self._row())
+        body = out["rows"][1:]
+        # 质量体系能力：A 评了、B **没评** → A 那格 7 分，B 那格是 missing（不是 0、不是空白得分）
+        self.assertEqual(body[0]["cells"][2]["text"], "7")
+        self.assertEqual(body[1]["cells"][2]["missing"], "1")
+        self.assertEqual(body[1]["cells"][2]["text"], "该版未评这一维")
+        self.assertEqual(body[1]["cells"][2]["score"], "")
+
+    def test_nfkc_folding_also_catches_a_full_width_variant(self):
+        """NFKC 也认：全角 `ＡＩ认知` 与 `AI认知` 是同一维（只去空白挡不住这一种）。"""
+        va = self._version("简历A")
+        vb = self._version("简历B")
+        self._analysis("a1", "简历A", va["id"], "a1.html", 75.0, "2026-10-01 10:00",
+                       [_dim("ＡＩ认知", 4)])
+        self._analysis("a2", "简历B", vb["id"], "a2.html", 66.0, "2026-10-02 11:00",
+                       [_dim(self.DIM_AI_NOSPACE, 6)])
+        out = self._render(self._row())
+        self.assertEqual(len(out["dims"]), 1, "全角/半角被当成了两维：%r" % (out["dims"],))
+        body = out["rows"][1:]
+        self.assertEqual([r["cells"][1]["text"] for r in body], ["4", "6"])
+
+
+# 变更说明的三种情形（规格 §8.3/§8.4）：后端**真数据**喂进 `rsDiffText` 的**渲染结果**。
+# 断言逐条到"个体"：摘要那一行、每一条 where/what、失败那一句+原因、第一版那一句。
+_DIFF_CASE_JS = r"""
+function stripTags(s){ return String(s).replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim(); }
+out.diff = rsDiffText(__fixture.diff);
+out.fail = rsDiffText(__fixture.fail);
+out.first = rsDiffText(__fixture.first);
+out.empty = rsDiffText(__fixture.empty);
+out.diffText = stripTags(out.diff);
+out.failText = stripTags(out.fail);
+out.firstText = stripTags(out.first);
+out.emptyText = stripTags(out.empty);
+"""
+
+
+class ResumeAiDiffRouteTest(ResumeVersionRouteTest):
+    """Task 4 的接线面（规格 §4.4）：`POST /api/resumes` 在**延续**时调一次模型写变更说明。
+
+    注入约定与 `interview.analyze` / `outcome.attribute` 一致：替身**实现**
+    `llm.call_openai_compatible`（`resumelib` 调用时现取，不是 import 时绑定）——
+    **绝不真调模型**，计数由替身自己做。
+    """
+
+    MOTHER = "候选人简历正文\n项目经历：语音质检平台\n技能：Python"
+    CHILD = "候选人简历正文\n项目经历：语音质检平台；新增语音Agent项目\n技能：Python"
+
+    def _patch(self, obj, name, value):
+        p = mock.patch.object(obj, name, value)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _fake_chat(self, reply):
+        calls = []
+
+        def fake(base_url, api_key, model, messages, json_mode=False, **kw):
+            calls.append(messages[0]["content"])
+            if isinstance(reply, Exception):
+                raise reply
+            return reply
+
+        self._patch(app.llm, "call_openai_compatible", fake)
+        return calls
+
+    def test_continuing_calls_the_model_once_with_the_mother_and_both_versions_verbatim(self):
+        calls = self._fake_chat(json.dumps(
+            {"summary": "补了语音Agent项目",
+             "changes": [{"where": "项目经历", "what": "新增语音Agent项目"}]},
+            ensure_ascii=False))
+        v1 = self._new("母版.md", self.MOTHER)
+        self._post("/api/resumes/choose", {"version": v1["id"]})
+        v2 = self._new("母版.md", self.CHILD, parent_id=v1["id"])
+
+        self.assertEqual(len(calls), 1, "延续应当**恰好**调一次模型：%r" % (calls,))
+        self.assertIn(self.MOTHER, calls[0], "提示词里没有母版内容（逐字）")
+        self.assertIn(self.CHILD, calls[0], "提示词里没有子版内容（逐字）")
+        self.assertEqual(v2["ai_diff"], {"summary": "补了语音Agent项目",
+                                         "changes": [{"where": "项目经历",
+                                                      "what": "新增语音Agent项目"}]})
+        self.assertEqual(v2["ai_diff_error"], "")
+        # 落盘了才算数（不是只活在响应里）
+        self.assertEqual(resumelib.by_id(v2["id"])["ai_diff"], v2["ai_diff"])
+        # 母版快照照旧留下（比对不改变"只留母版 + 最新"这条取舍）
+        self.assertTrue(resumelib.by_id(v1["id"])["mother_file"])
+
+    def test_a_failing_model_still_saves_the_version_with_an_honest_error(self):
+        self._fake_chat(RuntimeError("模型接口返回 429：余额不足（注入）"))
+        v1 = self._new("母版.md", self.MOTHER)
+        self._post("/api/resumes/choose", {"version": v1["id"]})
+        code, body = self._save("母版.md", self.CHILD, parent_id=v1["id"])
+
+        self.assertEqual(code, 200, body)                       # 比对失败**不是**致命的
+        rec = body["resume"]
+        self.assertEqual(store.read_text(self._snap_path("resumes/母版.md")), self.CHILD)
+        self.assertIn("429", rec["ai_diff_error"])
+        self.assertEqual(rec["ai_diff"], {})                    # ← 绝不写一个空的假 ai_diff
+        self.assertEqual(resumelib.by_id(rec["id"])["ai_diff"], {})
+
+    def test_a_broken_json_reply_is_not_retried_and_never_fakes_a_diff(self):
+        calls = self._fake_chat("这根本不是 JSON")
+        v1 = self._new("母版.md", self.MOTHER)
+        self._post("/api/resumes/choose", {"version": v1["id"]})
+        code, body = self._save("母版.md", self.CHILD, parent_id=v1["id"])
+
+        self.assertEqual(code, 200, body)
+        self.assertEqual(len(calls), 1, "坏 JSON **不重试**")
+        self.assertIn("JSON", body["resume"]["ai_diff_error"])
+        self.assertEqual(body["resume"]["ai_diff"], {})
+        self.assertEqual(store.read_text(self._snap_path("resumes/母版.md")), self.CHILD)
+
+    def test_a_new_independent_resume_never_calls_the_model(self):
+        calls = self._fake_chat('{"summary":"不该被调用","changes":[]}')
+        v1 = self._new("母版.md", self.MOTHER)                  # 新开一份独立的
+        self.assertEqual(calls, [], "新开一份独立的没有可比对的对象：一次 chat 都不该调")
+        self.assertEqual((v1["ai_diff"], v1["ai_diff_error"]), ({}, ""))
+        # 「要延续却没有选定母版」= 400，**也不许**为了"试一试"先调一次模型
+        code, body = self._save("母版.md", self.CHILD, lineage="延续")
+        self.assertEqual(code, 400, body)
+        self.assertEqual(calls, [])
+
+    def test_the_lineage_continue_word_also_triggers_exactly_one_comparison(self):
+        """前端选「延续」时可能只发 `lineage`（母版由"已选定"解析）—— 那条路同样只调一次。"""
+        calls = self._fake_chat(json.dumps({"summary": "改了技能", "changes": []}, ensure_ascii=False))
+        v1 = self._new("母版.md", self.MOTHER)
+        self._post("/api/resumes/choose", {"version": v1["id"]})
+        rec = self._new("母版.md", self.CHILD, lineage="延续")
+        self.assertEqual(len(calls), 1)
+        self.assertIn(self.MOTHER, calls[0])
+        self.assertEqual(rec["parent_id"], v1["id"])
+        self.assertEqual(rec["ai_diff"]["summary"], "改了技能")
+
+
+class ResumeChangeSummaryRenderTest(IsolatedCase):
+    """简历 tab 的「变更说明」入口要显示**三种情形**，数据来自后端 `resumes.json` 的真实记录。
+
+    Task 4 只负责"后端把真数据接上"：这一页的渲染 T3a 已经写好了，所以这里钉的是
+    「后端产出的三个形状 → 渲染出的三句话」对得上（含 §8.3 的"AI 生成，可能漏"）。
+    """
+
+    def _render(self, fixture):
+        _need_node()
+        out = web_probe.run_index(_DIFF_CASE_JS, fixture)
+        self.assertEqual(out["unexpected"], [], "渲染时抛了没人接的 promise")
+        for k in ("diff", "fail", "first", "empty"):
+            self.assertTrue(out.get(k), "`rsDiffText` 对 %s 什么都没渲染（探针空跑 = 假绿）" % k)
+        return out
+
+    def test_a_generated_summary_renders_every_change_verbatim(self):
+        out = self._render({
+            "diff": {"rev": 2, "ai_diff": {"summary": "补充了语音Agent项目",
+                                           "changes": [{"where": "项目经历", "what": "新增语音Agent项目"},
+                                                       {"where": "技能", "what": "补了向量检索"}]},
+                     "ai_diff_error": ""},
+            "fail": {"rev": 2, "ai_diff": {}, "ai_diff_error": ""},
+            "first": {"rev": 1, "ai_diff": {}, "ai_diff_error": ""},
+            "empty": {"rev": 2, "ai_diff": {}, "ai_diff_error": ""},
+        })
+        self.assertIn("AI 写的", out["diffText"])              # §8.3：标注是模型写的
+        self.assertIn("以原文为准", out["diffText"])
+        self.assertIn("补充了语音Agent项目", out["diffText"])   # summary 逐字
+        for where, what in (("项目经历", "新增语音Agent项目"), ("技能", "补了向量检索")):
+            self.assertIn(where, out["diffText"], "少渲染了一条变更的 where：%r" % (out["diffText"],))
+            self.assertIn(what, out["diffText"], "少渲染了一条变更的 what：%r" % (out["diffText"],))
+        self.assertNotIn("没能生成变更说明", out["diffText"])
+
+    def test_a_failed_comparison_says_so_with_the_reason_and_the_version_still_saved(self):
+        out = self._render({
+            "diff": {"rev": 2, "ai_diff": {"summary": "s", "changes": []}, "ai_diff_error": ""},
+            "fail": {"rev": 2, "ai_diff": {}, "ai_diff_error": "模型接口返回 429：余额不足"},
+            "first": {"rev": 1, "ai_diff": {}, "ai_diff_error": ""},
+            "empty": {"rev": 2, "ai_diff": {}, "ai_diff_error": ""},
+        })
+        self.assertIn("这次没能生成变更说明", out["failText"])
+        self.assertIn("模型接口返回 429：余额不足", out["failText"])   # 原因逐字，不许吞掉
+        self.assertIn("版本照样保存了", out["failText"])              # §8.4
+
+    def test_the_first_version_says_there_is_no_mother_to_compare_with(self):
+        out = self._render({
+            "diff": {"rev": 2, "ai_diff": {"summary": "s", "changes": []}, "ai_diff_error": ""},
+            "fail": {"rev": 2, "ai_diff": {}, "ai_diff_error": "x"},
+            "first": {"rev": 1, "ai_diff": {}, "ai_diff_error": ""},
+            "empty": {"rev": 2, "ai_diff": {}, "ai_diff_error": ""},
+        })
+        self.assertIn("第一版", out["firstText"])
+        self.assertIn("没有可比对的母版", out["firstText"])
+
+    def test_a_child_with_neither_diff_nor_error_does_not_pretend_a_summary_exists(self):
+        """反假绿：没变更说明也没原因时，**不许**编一句"AI 写了变更说明"。"""
+        out = self._render({
+            "diff": {"rev": 2, "ai_diff": {"summary": "s", "changes": []}, "ai_diff_error": ""},
+            "fail": {"rev": 2, "ai_diff": {}, "ai_diff_error": "x"},
+            "first": {"rev": 1, "ai_diff": {}, "ai_diff_error": ""},
+            "empty": {"rev": 2, "ai_diff": {}, "ai_diff_error": ""},
+        })
+        self.assertIn("没有留下变更说明", out["emptyText"])
+        self.assertNotIn("AI 写的", out["emptyText"])
+        self.assertNotIn("补充", out["emptyText"])
 
 
 class DuplicateExitModalTest(LedgerWithReportsCase):
