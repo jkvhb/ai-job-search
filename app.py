@@ -1002,6 +1002,9 @@ def do_analyze(jd_text, image_data_url, resume_name, link="", overwrite_id="", a
     `resume_id`（阶段 4C）= 这次用的是**哪一版**简历（`resumelib` 的版本 id）。它是查重的
     另一半粒度（同 JD + 同版本才判重复），并落进分析记录 —— 报告因此能追溯到"用的哪一版"。
     **非空时必须真的存在于 `resumelib`**，否则抛 `BadResumeVersion`（路由回 400，修 4）；
+    而且它必须是**它所属族谱的当前版**（`resumelib.current_of()`，阶段 4C 修 1）—— 因为本函数
+    读的永远是 `resumes/<名字>.md` 那个文件（= 该族谱最新版正文），钉一个历史版上去，
+    记录里那句「用的是哪一版」就是**假话**。
     **老调用方不传**（空串）→ 记录里**不写**这个键 = "版本未知（早于版本库）"，界面据此显示，
     **绝不猜**一个填上去。
 
@@ -1043,6 +1046,23 @@ def do_analyze(jd_text, image_data_url, resume_name, link="", overwrite_id="", a
                 "resume_id=%s 是「%s」的版本，不是要分析的简历「%s」："
                 "拒绝把这次分析记到别人那一版上（报告里那句「用的是哪一版」会变成假话）"
                 % (resume_id, _got, _want))
+        # 存在 + 属于这份简历还不够：**必须还是这一族谱的当前版**（阶段 4C 修 1）。
+        # 理由（这一条正是"会写假数据"的地方）：`do_analyze` 读的**永远是** `resumes/<名字>.md`
+        # 那个文件 = 该族谱的**最新版正文**（见下面 `rp` / `store.read_text(rp)` 那几行），
+        # 而 `resume_id` 是要落进报告数据与 `jobs.json` 的「这次用了哪一版」。钉一个**历史版**
+        # 上去，那句话当场就是**假话**（记录说 rv_0001、模型读的是 rv_0003 的正文）；
+        # 而 `resume_id` 又是查重的另一半粒度（`_duplicate_of_resume`）→ 同一个 JD 用同一族谱的
+        # 第二版再分析会**误 409**，前端目前**没有 409 出口**（Task 3b 才有）→ 用户卡死。
+        # "当前版"的口径只有一处：`resumelib.current_of()`（族谱内 rev 最大的**未移出**版本）——
+        # 前端下拉给的就是它（一份简历一个选项），两边必须是同一个答案。
+        _root = str(_version.get("root_id") or _version.get("id") or "")
+        _cur = resumelib.current_of(_root)
+        if _cur is None or str(_cur.get("id") or "") != resume_id:
+            raise BadResumeVersion(
+                "resume_id=%s 不是「%s」这一族谱的当前版（当前版是 %s）："
+                "分析读的是当前版文件（resumes/%s.md），钉到历史版/已移出的版本会让记录里"
+                "「这次用的是哪一版」变成假话 —— 拒绝"
+                % (resume_id, _got, str((_cur or {}).get("id") or "（没有可用版本）"), _got))
 
     source_bits = []
     if jd_text:

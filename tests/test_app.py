@@ -13,7 +13,6 @@ REPORT_DATA 快照」动态重渲染（模板改进立刻作用到老报告）�
 import io
 import json
 import os
-import re
 import threading
 import unittest
 from unittest import mock
@@ -27,6 +26,7 @@ import outcome
 import resumelib
 import store
 
+from tests import web_probe
 from tests.base import IsolatedCase
 
 
@@ -1320,13 +1320,14 @@ class _AnalyzeRouteCase(IsolatedCase):
         store.write_text(os.path.join(store.p_path("resumes"), name), "候选人简历正文")
         return name
 
-    def _version(self, name="我的简历", content="候选人简历正文"):
+    def _version(self, name="我的简历", content="候选人简历正文", **kw):
         """登记一份**真实**的简历版本，返回它的记录（`resume_id` 从修 4 起会被校验）。
 
         内容与 `_resume()` 写的逐字相同：版本记录的 sha 与盘上的文件保持一致。
+        `parent_id` 走 `**kw`：族谱（母版 → 子版 → 孙版）那几条用例要真的续版。
         """
         store.ensure_profile()
-        return resumelib.create_version(name, content)
+        return resumelib.create_version(name, content, **kw)
 
     def _patch_analyze_deps(self):
         """把**真正花钱的三个入口**换成计数替身（先读 do_analyze 看清它调谁）：
@@ -2338,6 +2339,66 @@ class ResumeVersionOwnershipTest(_AnalyzeRouteCase):
         self.assertEqual(store.load_jobs()[0]["resume_id"], v["id"])
 
 
+class ResumeVersionMustBeCurrentTest(_AnalyzeRouteCase):
+    """修 1（后端）：`resume_id` 必须指向**它所属族谱的当前版**（不是"存在 + 名字对得上"就算）。
+
+    为什么"存在 + 名字对得上"还不够：`do_analyze` 读的一律是 `resumes/<名字>.md` 那个文件
+    = 该族谱的**最新版正文**（`app.py:1097-1104`）。把**历史版**的 id 钉上去，报告数据
+    （`d["resume_id"]`）与 `jobs.json` 里那句「这次用的是哪一版」就是**假话**
+    （记录说 rv_0001、模型读的却是 rv_0003 的正文）。而 `resume_id` 又是查重的另一半粒度
+    （`app.py:748-770`）→ 同一个 JD 用同一族谱的第二版再分析会**误 409**，前端又没有 409 出口
+    （Task 3b 的事）→ 用户卡死。所以这里与「版本不存在」「版本是别人的」同一位置、同一口径拦截。
+
+    "当前版"的口径**只有一处**：`resumelib.current_of()`（族谱内 rev 最大的**未移出**版本）——
+    前端下拉给的那个 value 就是它，两边必须是同一个答案。
+    """
+
+    def _three(self, name="我的简历"):
+        """一个真族谱：v1 → v2 → v3（都是同一个 root，名字不改）。"""
+        v1 = self._version(name, "第 1 版正文")
+        v2 = self._version(name, "第 2 版正文", parent_id=v1["id"])
+        v3 = self._version(name, "第 3 版正文", parent_id=v2["id"])
+        return v1, v2, v3
+
+    def _analyze_with(self, version_id, name="我的简历"):
+        return self._post_json("/api/analyze",
+                               {"jd_text": self.LONG, "resume_name": name + ".md",
+                                "source_type": "粘贴文本", "resume_id": version_id})
+
+    def test_a_historical_version_is_400_and_spends_nothing(self):
+        v1, v2, v3 = self._three()
+        calls = self._patch_analyze_deps()
+        code, body = self._analyze_with(v1["id"])
+        self.assertEqual(code, 400, body)                    # ← 修之前是 200 + ok:true
+        self.assertFalse(body.get("ok"))
+        err = str(body.get("error"))
+        self.assertIn(v1["id"], err)                         # 说清是哪个版本号
+        self.assertIn(v3["id"], err)                         # 说清当前版是哪一个
+        # 一个额度都没花：校验在**所有花钱的事之前**
+        self.assertEqual((calls["llm"], calls["search"], calls["knowledge"]), (0, 0, 0))
+        self.assertEqual(store.load_jobs(), [])              # 台账一个字都没写
+        self.assertEqual(jdid.load_jds()["jds"], [])
+
+    def test_a_removed_version_is_not_the_current_one(self):
+        """已移出的版本同样不是当前版（移出 = 不能继续用）—— 不能因为"记录还在"就放行。"""
+        v1, v2, v3 = self._three()
+        resumelib.remove(v2["id"])
+        calls = self._patch_analyze_deps()
+        code, body = self._analyze_with(v2["id"])
+        self.assertEqual(code, 400, body)
+        self.assertIn(v2["id"], str(body.get("error")))
+        self.assertEqual((calls["llm"], calls["search"], calls["knowledge"]), (0, 0, 0))
+        self.assertEqual(store.load_jobs(), [])
+
+    def test_the_current_version_still_passes_the_same_gate(self):
+        """反向：**当前版**照常通过 —— 否则上面两条就成了「恒真的拦截」。"""
+        v1, v2, v3 = self._three()
+        self._patch_analyze_deps()
+        code, body = self._analyze_with(v3["id"])
+        self.assertEqual((code, body.get("ok")), (200, True), body)
+        self.assertEqual(store.load_jobs()[0]["resume_id"], v3["id"])   # ← 真正落盘的那一行
+
+
 class ResumeVersionRouteTest(IsolatedCase):
     """§6.1 简历版本路由：族谱元数据 / 取回（四种 kind）/ 选定 / 移出 / 彻底删。"""
 
@@ -2702,22 +2763,88 @@ class ResumeVersionRouteTest(IsolatedCase):
         self.assertTrue(resumelib.by_id(v1["id"])["removed"])        # 还在移出状态
 
 
-# ---------------- 前端接线（修 1 / 阶段 4C）：简历下拉到底读哪个字段 ----------------
+# ---------------- 前端接线（修 1 / 修 2 / 修 3 / 修 4 / 修 5 / 修 6）+ 阶段 4C：简历下拉 ----------------
+#
+# 为什么这里的断言要**真跑页面的 JS**（`tests/web_probe.py`）：源码字符串断言太容易假绿 ——
+# `'<option value="'` 在**占位选项**（`'<option value="">（无简历，请先新建）'`）里也出现，
+# 把真选项的 value 删掉照样能通过（上一位实现者实测到过这条假绿）。所以凡是要断言"渲染出来
+# 长什么样"的，一律把真函数丢进 Node 里跑，再逐个断言**那一个元素 / 那一个值**。
 WEB_INDEX = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                          "web", "index.html")
 
 
-def _js_string(v):
-    """JS `String(v)` 的最小口径（只为让 `esc(对象)` 那个失败模式在测试里看得见）。"""
-    if v is None:
-        return ""
-    if isinstance(v, dict):
-        return "[object Object]"          # JS: String({}) / String(记录对象)
-    if isinstance(v, list):
-        return ",".join(_js_string(x) for x in v)
-    if isinstance(v, bool):
-        return "true" if v else "false"
-    return str(v)
+def _js_value(v):
+    """JS 值字面量（走 JSON：中文 / 引号 / 反斜杠都不用手工转义）。"""
+    return json.dumps(v, ensure_ascii=False)
+
+
+def _js_fn_body(name, arg=""):
+    """某个顶层函数的函数体（切不到就**立刻失败** —— 静默空跑出来的绿是假绿）。"""
+    with open(WEB_INDEX, "r", encoding="utf-8") as f:
+        js = f.read()
+    head = "function %s(%s)" % (name, arg)
+    start = js.index(head)
+    return js[start:js.index("\n}", start)]
+
+
+def _need_node():
+    if web_probe.NODE is None:
+        raise unittest.SkipTest("本机没有 Node，跳过「真跑页面 JS」的渲染探针")
+
+
+def _resumes_view(include_removed=True):
+    """`/api/resumes` 的真实响应（用户看到的就是这份数据：`resumes` / `files` / `unregistered`）。"""
+    path = "/api/resumes?include_removed=1" if include_removed else "/api/resumes"
+    h = _sandbox_handler("GET", path, b"", {})
+    return h._status, h._body
+
+
+def _picker_probe(view):
+    """**真跑** `renderResumePicker()`，回下拉里的每一个 option + 浏览器会提交的那一份。
+
+    提交那一份照 `#goBtn` 的**真实逻辑**（`web/index.html:2523-2533`）：按 `sel.value` 在
+    `RESUME_PICKS` 里取一条 → `pick.name` 当 `resume_name`、`pick.version` 当 `resume_id`。
+    不在 Python 里重抄一遍前端（旧写法按字段名摊平，在"一个族谱一项"之后已经不成立了）。
+
+    空结果 = 渲染根本没发生 → 直接报错（否则断言会变成恒真的假绿）。
+    """
+    _need_node()
+    out = web_probe.run_index(
+        "renderResumePicker(__fixture);\n"
+        "var sel = document.querySelector('#resumeSel');\n"
+        "var pick = RESUME_PICKS.filter(function(p){ return p.key === String(sel.value); })[0] || null;\n"
+        "out.options = __opts(sel);\n"
+        "out.selected = String(sel.value);\n"
+        "out.sent = {resume_name: pick ? pick.name : '', resume_id: (pick && pick.version) || ''};\n",
+        view)
+    if not out.get("options"):
+        raise AssertionError("下拉一个选项都没有（渲染没有发生）—— 断言会变成恒真的假绿：%r" % (out,))
+    return out
+
+
+def _continue_modal(view, stem, content="改过的正文"):
+    """**真跑** `rsAskContinue()`（续版弹窗），回它渲染出来的东西。
+
+    空弹窗直接报错：不然「文案里没有某句话」这类断言会**恒真**（空字符串里什么都没有）。
+    """
+    _need_node()
+    out = web_probe.run_index(
+        "RESUME_VIEW = __fixture;\n"
+        "var m = null;\n"
+        "__fixture.resumes.forEach(function(v){\n"
+        "  if(!v.removed && v.chosen && v.name === " + _js_value(stem) + ") m = v;\n"
+        "});\n"
+        "out.mother = m ? m.id : null;\n"
+        "rsAskContinue(" + _js_value(stem + ".md") + ", " + _js_value(content) + ", m);\n"
+        "out.body = String(document.querySelector('#rsPickBody').innerHTML);\n"
+        "out.title = String(document.querySelector('#rsPickTitle').textContent);\n"
+        "out.suggested = String(rsSuggestName(" + _js_value(stem) + "));\n",
+        view)
+    if not out.get("mother"):
+        raise AssertionError("探针没在 fixture 里找到母版（用例的前提不对）：%r" % (out,))
+    if not out.get("body"):
+        raise AssertionError("续版弹窗什么都没渲染（页面为空）：%r" % (out,))
+    return out
 
 
 class ResumeSelectWiringTest(IsolatedCase):
@@ -2728,15 +2855,16 @@ class ResumeSelectWiringTest(IsolatedCase):
     `resumes` 是**版本记录对象数组**（`app.py` 的 `versions`），`files` 是**文件名数组**，
     `unregistered` 才是"盘上有文件但**还没有**版本记录"那一份（用户现在的全部简历）。
 
-    阶段 4C 起下拉是「**版本 id 当 value**（分析请求据此带上 `resume_id` —— 新查重粒度
-    (JD × 简历版本) 的另一半，漏了它生产里就等于"永不查重"）+ **文件名当 option 文本**
-    （浏览器把它当 `resume_name` 发出去）」。所以两条来源缺一不可：
-    只读 `resumes` → 盘上那份没登记版本的简历看不见；只读 `files` → 没有版本 id。
+    阶段 4C / 修 1 起下拉是「**当前版 id 当 items 的 version**（分析请求据此带上 `resume_id` ——
+    新查重粒度 (JD × 简历版本) 的另一半，漏了它生产里就等于"永不查重"）+ **文件名当 `name`**
+    （`#goBtn` 把它当 `resume_name` 发出去）」。两条来源缺一不可：只读 `resumes` → 盘上那份没
+    登记版本的简历看不见；只读 `files` → 没有版本 id。
 
-    这里**不重抄**一遍前端逻辑：字段名直接从 `web/index.html` 的 `renderResumePicker()`
-    源码里正则读出来（`r.X.map(`）。读错字段 / 删掉那两行 → 下面立刻红。
-    更细的渲染断言（真的 `<option value="rv_…">`、族谱缩进层级、★ 只出现在母版行、
-    「延续/新开」发出的 body）在 Node 探针里**真跑这段 JS** 验证；本用例只钉数据来源与语义。
+    **怎么"读"前端**：真跑 `renderResumePicker()`（`_picker_probe`），再照 `#goBtn` 的逻辑取
+    出它会提交的那一份。这样字段名读错 / 那条 `<option>` 丢了 value 都会立刻红 —— 比在 Python
+    里按字段名摊平（旧写法）可靠：后者既不覆盖"一个族谱一项"的新语义，也看不见真实渲染。
+    源码形状那一条（`<option value="'+esc(p.key)+'">`）另外由
+    `test_the_option_template_carries_the_version_id_as_value` 钉住，且**精确到那一行**。
     """
 
     def _handler(self, method, path):
@@ -2746,48 +2874,21 @@ class ResumeSelectWiringTest(IsolatedCase):
     def _get(self, path):
         return self._handler("GET", path)
 
-    def _picker_source(self):
-        """`renderResumePicker()` 的函数体（切不到就立刻失败，别静默空跑）。"""
-        with open(WEB_INDEX, "r", encoding="utf-8") as f:
-            js = f.read()
-        # 按锚点切函数体：函数体以「行首的 }」收尾（内层箭头函数都缩进，不会切错）
-        start = js.index("function renderResumePicker(r)")
-        end = js.index("\n}", start)
-        return js[start:end]
-
-    def _picker_fields(self):
-        """构下拉时从响应里读的**字段名**（读不到就立刻失败，别静默跳过）。"""
-        hits = re.findall(r"r\.([A-Za-z_$][\w$]*)\s*\.\s*map\s*\(", self._picker_source())
-        self.assertTrue(hits, "renderResumePicker() 里没有从任何字段构下拉：前端接线被改坏了")
-        return hits
-
-    def _submitted(self, response):
-        """按源码那几个字段的语义摊成「浏览器会发出去的东西」：文本 → `resume_name`、value → `resume_id`。
-
-        版本行（`r.resumes` 的元素是**对象**）：文本 = 文件名、value = **版本 id**；
-        未登记文件行（`r.unregistered` 的元素是**字符串**）：文本 = value = 文件名（没有版本 id）。
-        """
-        out = []
-        for field in self._picker_fields():
-            for item in response.get(field) or []:
-                if isinstance(item, dict):
-                    out.append({"resume_name": _js_string(item.get("name")) + ".md",
-                                "resume_id": _js_string(item.get("id"))})
-                else:
-                    out.append({"resume_name": _js_string(item), "resume_id": ""})
-        return out
+    def _sent(self, response):
+        """浏览器**真的会发出去**的那一份（真跑页面的 JS，见 `_picker_probe`）。"""
+        return _picker_probe(response)["sent"]
 
     def test_the_option_template_carries_the_version_id_as_value(self):
         """丢掉 `<option value=…>` 时浏览器提交的只有 option 文本 → 分析请求里再不会有
         `resume_id` = **静默失效**（不报错，只是查重粒度没了）。这条只钉源码形状；
-        真渲染（`option.value` 实际是什么）由 Node 探针断言。
+        真渲染（`option.value` 实际是什么）由 `_picker_probe` 断言。
 
         ⚠️ 断言必须**精确到那一行**：`'<option value="'` 这个前缀在占位选项
         （`'<option value="">（无简历，请先新建）</option>'`）里也有 —— 只判前缀会**假绿**
         （已用变异 `optval` 实测：把条目那一行的 value 删掉，宽松断言照样通过）。
-        所以这里连上 `esc(p.key)`：value 必须真的来自**这一条**（版本 id）。
+        所以这里连上 `esc(p.key)`：value 必须真的来自**这一条**。
         """
-        body = self._picker_source()
+        body = _js_fn_body("renderResumePicker", "r")
         self.assertIn("""'<option value="'+esc(p.key)+'">'+esc(p.name)+'</option>'""", body,
                       "下拉条目那一行的 <option> 丢了 value（或 value 不再来自版本 id）：resume_id 发不出去")
         self.assertIn("resumePickOf(", body, "下拉条目不再经过 resumePickOf()：value/文本的来源没了保证")
@@ -2801,13 +2902,13 @@ class ResumeSelectWiringTest(IsolatedCase):
         self.assertEqual(body["resumes"], [])                             # 版本库还是空的
         self.assertEqual(body["files"], ["周汉钦-母版.md"])                # 盘上的真话在这儿
         self.assertEqual(body["unregistered"], ["周汉钦-母版.md"])          # 还没登记版本的就是它
-        sent = self._submitted(body)
-        self.assertEqual(sent, [{"resume_name": "周汉钦-母版.md", "resume_id": ""}],
+        sent = self._sent(body)
+        self.assertEqual(sent, {"resume_name": "周汉钦-母版.md", "resume_id": ""},
                          "盘上那份简历没有出现在下拉里：字段读错了（body=%r）" % (body,))
-        self.assertNotEqual(sent[0]["resume_name"], "[object Object]")     # ← 修 1 之前的实测症状
-        self.assertTrue(os.path.exists(os.path.join(store.p_path("resumes"), sent[0]["resume_name"])),
+        self.assertNotEqual(sent["resume_name"], "[object Object]")        # ← 修 1 之前的实测症状
+        self.assertTrue(os.path.exists(os.path.join(store.p_path("resumes"), sent["resume_name"])),
                         "发出去的 resume_name 在盘上找不到 → do_analyze 会回「找不到简历」")
-        self.assertEqual(sent[0]["resume_id"], "")                         # 没有版本可钉 → 如实不传
+        self.assertEqual(sent["resume_id"], "")                            # 没有版本可钉 → 如实不传
 
     def test_a_registered_version_is_picked_by_version_id(self):
         v1 = resumelib.create_version("周汉钦-母版", "登记过的正文")
@@ -2816,11 +2917,261 @@ class ResumeSelectWiringTest(IsolatedCase):
         self.assertEqual([r["id"] for r in body["resumes"]], [v1["id"]])   # 记录是**对象**数组
         self.assertEqual(body["files"], ["周汉钦-母版.md"])
         self.assertEqual(body["unregistered"], [])                         # 有版本记录 → 不重复出现
-        # 反证：真把版本记录当文件名用，发出去的就是 "[object Object]"
-        self.assertEqual(_js_string(body["resumes"][0]), "[object Object]")
-        sent = self._submitted(body)
-        self.assertEqual(sent, [{"resume_name": "周汉钦-母版.md", "resume_id": v1["id"]}],
+        sent = self._sent(body)
+        self.assertEqual(sent, {"resume_name": "周汉钦-母版.md", "resume_id": v1["id"]},
                          "下拉没有把**版本 id** 当 value → 分析请求不会带 resume_id")
+
+
+class ResumePickerOneOptionPerLineageTest(IsolatedCase):
+    """修 1（前端）：**一份简历（一个族谱）只给一个选项**，且它指向该族谱的**当前版**。
+
+    为什么不能每版一个选项：`do_analyze` **永远读 `resumes/<名字>.md`**（= 该族谱的最新版正文），
+    而 `resume_id` 是要写进报告与 `jobs.json` 的「这次用了哪一版」。3 版族谱在旧实现下会渲染出
+    三行同名选项（value = rv_0001 / rv_0002 / rv_0003），用户（或默认选中的第一项 = 最老那一版）
+    于是拿到「记录说用了 rv_0001、模型读的是 rv_0003 正文」的**假话**；`resume_id` 又是查重的
+    另一半粒度 → 同 JD 同族谱**误 409**，而前端没有 409 出口 → 死路。
+
+    已移出的族谱**一个选项都不给**（移出 = 不能继续用）；`unregistered`（盘上有文件、还没登记
+    版本）那条路保持不变：value 退成 `file:<文件名>`，分析请求如实**不带** `resume_id`。
+    """
+
+    def test_three_versions_give_exactly_one_option_holding_the_current_id(self):
+        v1 = resumelib.create_version("周汉钦-母版", "第 1 版正文")
+        v2 = resumelib.create_version("周汉钦-母版", "第 2 版正文", parent_id=v1["id"])
+        v3 = resumelib.create_version("周汉钦-母版", "第 3 版正文", parent_id=v2["id"])
+        code, view = _resumes_view()
+        self.assertEqual(code, 200, view)
+        opts = _picker_probe(view)["options"]
+        mine = [o for o in opts if o["text"] == "周汉钦-母版.md"]
+        self.assertEqual(len(mine), 1, "同一族谱给了不止一个选项：%r" % (opts,))
+        self.assertEqual(mine[0]["value"], v3["id"])            # ← 逐字等于当前版 id
+        values = [o["value"] for o in opts]
+        for historical in (v1["id"], v2["id"]):
+            self.assertNotIn(historical, values,
+                             "历史版 %s 还能被选中 → 记录里那句「用了哪一版」会是假话" % historical)
+
+    def test_the_current_version_is_what_the_same_lineage_reports_as_current(self):
+        """两边**同一个口径**：下拉给的那条 == `resumelib.current_of(root)`。"""
+        v1 = resumelib.create_version("周汉钦-母版", "第 1 版正文")
+        v2 = resumelib.create_version("周汉钦-母版", "第 2 版正文", parent_id=v1["id"])
+        code, view = _resumes_view()
+        self.assertEqual(code, 200, view)
+        picked = _picker_probe(view)["selected"]
+        self.assertEqual(picked, resumelib.current_of(v2["root_id"])["id"])
+
+    def test_a_removed_lineage_gets_no_option_at_all(self):
+        va = resumelib.create_version("甲", "甲正文")
+        vb = resumelib.create_version("乙", "乙正文")
+        resumelib.remove(va["id"])
+        code, view = _resumes_view()
+        self.assertEqual(code, 200, view)
+        self.assertEqual(view["unregistered"], [], "移出的名字不该同时出现在「还没登记版本」里")
+        opts = _picker_probe(view)["options"]
+        self.assertEqual([o["text"] for o in opts], ["乙.md"], "已移出的族谱还在下拉里：%r" % (opts,))
+        self.assertEqual([o["value"] for o in opts], [vb["id"]])
+
+    def test_the_unregistered_path_still_gives_exactly_one_option_without_a_version(self):
+        store.ensure_profile()
+        store.write_text(os.path.join(store.p_path("resumes"), "盘上简历.md"), "正文")
+        code, view = _resumes_view()
+        self.assertEqual(code, 200, view)
+        probe = _picker_probe(view)
+        self.assertEqual(probe["options"], [{"value": "file:盘上简历.md", "text": "盘上简历.md"}])
+        self.assertEqual(probe["sent"], {"resume_name": "盘上简历.md", "resume_id": ""})
+
+
+class ResumePickerKeepsTheSelectionTest(IsolatedCase):
+    """修 2：重渲染**不许**清掉用户已选的简历。
+
+    `loadResumes()` 每次都重写 `sel.innerHTML`，浏览器于是把 select 打回**第一项**（= 最早那一版）。
+    本次新增了 5 个触发点（★ 选定 / 移出 / 彻底删 / 恢复 / 保存），于是"去简历 tab 点一下 ★ 或
+    保存一下"之后，回分析页看到的下拉已经**静默换成另一项** —— 用户可能分析**错的简历/版本**。
+    要求：原值还在新列表里就保留；**原值没了**才回落到第一项（不能卡在一个不存在的值上）。
+    """
+
+    def _two(self):
+        va = resumelib.create_version("甲", "甲正文")
+        vb = resumelib.create_version("乙", "乙正文")
+        code, view = _resumes_view()
+        self.assertEqual(code, 200, view)
+        return va, vb, view
+
+    def test_the_second_option_survives_a_rerender(self):
+        va, vb, view = self._two()
+        _need_node()
+        out = web_probe.run_index(
+            "renderResumePicker(__fixture);\n"
+            "var sel = document.querySelector('#resumeSel');\n"
+            "var before = __opts(sel);\n"
+            "out.before = before;\n"
+            "sel.value = before[1].value;\n"                       # 用户选了第 2 项
+            "out.picked = String(sel.value);\n"
+            "renderResumePicker(__fixture);\n"                     # 任意一个触发点重渲染
+            "out.after = String(sel.value);\n"
+            "out.afterOptions = __opts(sel);\n",
+            view)
+        before = out["before"]
+        self.assertEqual(len(before), 2, "fixture 不对：应有 2 个选项，实际 %r" % (before,))
+        self.assertEqual(before[1]["value"], vb["id"])              # 第 2 项 = 乙
+        self.assertEqual(out["picked"], vb["id"], "前置条件：真的选中了第 2 项")
+        self.assertEqual(out["after"], vb["id"], "重渲染把用户已选的简历清掉了")
+        self.assertNotEqual(out["after"], before[0]["value"], "重渲染后跳回了第一项")
+        self.assertEqual([o["value"] for o in out["afterOptions"]], [va["id"], vb["id"]])
+
+    def test_a_vanished_selection_falls_back_to_the_first_option(self):
+        """原值**不在**新列表里（那一族谱被移出）→ 如实回落到第一项，不保留一个已不存在的值。"""
+        va, vb, view = self._two()
+        _need_node()
+        out = web_probe.run_index(
+            "renderResumePicker(__fixture);\n"
+            "var sel = document.querySelector('#resumeSel');\n"
+            "sel.value = __opts(sel)[1].value;\n"
+            "out.picked = String(sel.value);\n"
+            "__fixture = {ok: true, resumes: __fixture.resumes.filter(function(v){\n"
+            "  return String(v.name) !== " + _js_value("乙") + ";\n"
+            "}), unregistered: []};\n"
+            "renderResumePicker(__fixture);\n"
+            "out.after = String(sel.value);\n"
+            "out.afterOptions = __opts(sel);\n",
+            view)
+        self.assertEqual(out["picked"], vb["id"])
+        self.assertEqual([o["value"] for o in out["afterOptions"]], [va["id"]])
+        self.assertEqual(out["after"], va["id"], "选中的那一项没了却还留着旧值（下拉会提交空简历）")
+
+
+class ResumeContinueModalTest(IsolatedCase):
+    """续版弹窗（修 3 / 修 5 / 修 6②）：不承诺做不到的事；预览的次数与真正落盘**同一口径**。"""
+
+    def _family(self):
+        """真族谱 v1 → v2 → v3，母版选定 v2。"""
+        v1 = resumelib.create_version("族谱", "第 1 版正文")
+        v2 = resumelib.create_version("族谱", "第 2 版正文", parent_id=v1["id"])
+        v3 = resumelib.create_version("族谱", "第 3 版正文", parent_id=v2["id"])
+        resumelib.choose(v2["id"])
+        return v1, v2, v3
+
+    def test_the_snapshot_promise_is_conditional(self):
+        """修 3：母版原文为 `missing` / `mismatch` 时 `create_version` **故意不写快照**
+        （`resumelib.py:369-384`）→「覆盖前先把母版原文留成快照」这句话并不总成立。"""
+        self._family()
+        code, view = _resumes_view()
+        self.assertEqual(code, 200, view)
+        body = _continue_modal(view, "族谱")["body"]
+        self.assertNotIn("覆盖前先把母版原文留成快照", body,
+                         "弹窗又在无条件承诺留快照（母版原文不可用时并不写快照）")
+        self.assertIn("母版原文可用", body, "没有说清「什么时候才留快照」")
+        self.assertIn("不写快照", body, "没有说清原文不可用时会怎样（只留变更说明）")
+
+    def test_the_preview_revision_matches_what_is_really_written(self):
+        """修 5：预览与 `create_version` **同一口径（含已移出）**。
+
+        造一个「最高的那一版**已移出**」的族谱：旧口径（只看未移出）预览「第 3 次修改」，
+        而 `create_version` 用**含已移出**的最大 rev 真的写出「第 4 次修改」——预览比落盘小。
+        """
+        v1, v2, v3 = self._family()
+        resumelib.remove(v3["id"])                              # 最高的那一版已移出
+        code, view = _resumes_view()
+        self.assertEqual(code, 200, view)
+        body = _continue_modal(view, "族谱")["body"]
+        real = resumelib.create_version("族谱", "第 4 版正文", parent_id=v2["id"])
+        self.assertEqual(real["rev"], 4, "落盘口径变了，这条用例的前提要重看：%r" % (real,))
+        self.assertIn("<b>第 %d 次修改</b>" % real["rev"], body,
+                      "预览的次数与真正落盘的不一致（预览 %r，实际第 %d 次）"
+                      % (body, real["rev"]))
+
+    def test_the_suggested_name_uses_the_first_free_suffix(self):
+        """修 6②：建议名从**第一个空闲后缀**起（空闲的 `-1` 也要用，不能从 `-2` 起跳过它）。"""
+        resumelib.create_version("甲", "甲正文")
+        resumelib.create_version("乙-1", "乙正文")
+        store.ensure_profile()
+        store.write_text(os.path.join(store.p_path("resumes"), "丙-1.md"), "丙正文")
+        code, view = _resumes_view()
+        self.assertEqual(code, 200, view)
+        _need_node()
+        out = web_probe.run_index(
+            "RESUME_VIEW = __fixture;\n"
+            "out.free = String(rsSuggestName(" + _js_value("甲") + "));\n"
+            "out.taken = String(rsSuggestName(" + _js_value("乙") + "));\n"
+            "out.unreg = String(rsSuggestName(" + _js_value("丙") + "));\n",
+            view)
+        self.assertEqual(out["free"], "甲-1.md", "`-1` 空着却跳到了别的后缀")
+        self.assertEqual(out["taken"], "乙-2.md")               # 乙-1 已被一个未移出的版本占着
+        self.assertEqual(out["unreg"], "丙-2.md")               # 丙-1 被盘上那份没登记版本的文件占着
+
+
+class ResumePurgeWordingTest(IsolatedCase):
+    """修 4：彻底删的文案要说清**到底删了什么**、**什么还留在盘上**。
+
+    `resumelib.purge` 只删「这条记录 + **这一版自己的**快照」；这一版自己的内容文件
+    `resumes/<名字>.md`（整个族谱的最新版容器）**留在盘上**，当这个名字再没有任何登记版本时，
+    它会以「盘上有文件 · 还没登记版本」的形态**重新出现在列表里**（`app.py:1542`）。
+    旧文案只说「别的版本 / 别的简历的文件一律不动」，用户会以为"我的文件被删了"，看到一个
+    自己的文件又冒出来时只会更慌。
+    """
+
+    def test_the_second_confirmation_says_what_stays_on_disk(self):
+        _need_node()
+        out = web_probe.run_index(
+            # 第一句「是」→ 去看第二句；第二句「否」→ 就此打住（一个请求都不发）
+            "__confirmQueue.push(true, false);\n"
+            "purgeResumeVersion('rv_0003', " + _js_value("族谱.md 第 3 次修改") + ");\n"
+            "out.confirms = __confirms.slice();\n")
+        msgs = out["confirms"]
+        self.assertEqual(len(msgs), 2, "两次确认的文案没走到第二句：%r" % (msgs,))
+        second = msgs[1]
+        self.assertIn("记录", second)                 # 删了什么：这条记录
+        self.assertIn("快照", second)                 # 删了什么：它自己的快照
+        self.assertIn("留在盘上", second)              # 什么还在
+        self.assertIn("resumes/", second)             # 说清是哪个文件还在
+        self.assertIn("还没登记版本", second)          # 会以什么形态重新出现
+        self.assertIn("重新出现", second)
+
+
+class ResumeUnregisteredRowTest(IsolatedCase):
+    """修 6①：`rsUnregRowHtml` 写了 `data-unreg` 却**从不绑定**（死属性）→ 删掉，行照旧渲染。
+
+    断言切的是**这一个函数体**（不是"整页里有没有某字符串"），并且配一条正向断言：行还在、
+    「编辑」入口还在（`renderResumeTree` 里那行 `[data-edit]` 绑定就是它的入口）。
+    """
+
+    def test_the_row_no_longer_carries_a_dead_attribute(self):
+        body = _js_fn_body("rsUnregRowHtml", "n")
+        self.assertNotIn("data-unreg", body, "死属性又回来了：写了但没有任何地方绑定它")
+        self.assertIn("data-edit=", body, "行的「编辑」入口没了（那一行才是它的入口）")
+        self.assertIn("盘上有文件 · 还没登记版本", body)
+        self.assertIn("list.querySelectorAll('[data-edit]')", _js_fn_body("renderResumeTree", "r"),
+                      "「编辑」按钮不再被绑定 → 这一行就没救了")
+
+
+class ResumeLoadShapeGuardTest(IsolatedCase):
+    """修 6③：`loadResumes()` 的 **render 也要兜住**（200 但缺字段 → 结构化错误提示，不许抛）。
+
+    为什么必须兜：调用点多数**没有 await**（`web/index.html:2605` 的 `loadResumes();`），
+    抛出去就是一条没人接的 rejected promise —— 界面上什么都不显示，用户以为"我没有简历"。
+    这条用 Node 探针**真跑**，并把 `unhandledRejection` 一并收上来断言：那条假绿正是
+    "抛了但你看不见"。
+    """
+
+    def _load(self, response):
+        _need_node()
+        return web_probe.run_index(
+            "__fetchJson = " + _js_value(response) + ";\n"
+            "loadResumes();\n"                       # ← 故意**不 await**：页面里就是这么调的
+            "await new Promise(function(r){ setTimeout(r, 20); });\n"
+            "out.list = String(document.querySelector('#resumeList').innerHTML);\n"
+            "out.sel = String(document.querySelector('#resumeSel').innerHTML);\n")
+
+    def test_a_200_without_the_resumes_field_shows_a_structured_error(self):
+        out = self._load({"ok": True})               # 200，但**没有** resumes / unregistered
+        self.assertEqual(out["unexpected"], [], "未 await 的调用抛了一条没人接的 rejected promise")
+        self.assertIn("简历列表读取失败", out["list"], "缺字段时界面没有明说读取失败：%r" % (out,))
+        self.assertIn("resumes", out["list"], "没有说清缺的是哪个字段：%r" % (out["list"],))
+        self.assertIn("简历读取失败", out["sel"], "下拉没有显示读取失败：%r" % (out["sel"],))
+
+    def test_a_render_that_throws_is_caught_instead_of_rejecting(self):
+        out = self._load({"ok": True, "resumes": [None], "unregistered": []})   # 渲染时必抛
+        self.assertEqual(out["unexpected"], [], "渲染失败抛成了一条没人接的 rejected promise")
+        self.assertIn("简历列表渲染失败", out["list"], "渲染失败没有被转成结构化提示：%r" % (out,))
 
 
 if __name__ == "__main__":

@@ -1647,18 +1647,40 @@ function resumePickOf(version, name){
   return {key: v || ('file:' + n), name: n, version: v};
 }
 
-/* 简历下拉。字段名就在下面两行（`ResumeSelectWiringTest` 从**这段真源码**里正则读它：
-   读错字段 → 下拉里就没有那份简历 → 用户一份都选不了）。
-   ⚠️ 分析请求必须带上版本 id：`r.resumes` 那一行的 value 就是 `v.id`。 */
+/* 简历下拉：**一份简历（一个族谱）只给一个选项**，`version` = 该族谱的**当前版**
+   （= `resumelib.current_of(root)` 那一版：族谱内 rev 最大的**未移出**版本）。
+
+   为什么不能每版一个选项（3 版族谱实测：三行同名选项，value = rv_0001 / rv_0002 / rv_0003）：
+   `do_analyze` **永远读 `resumes/<名字>.md`** —— 那个文件装的是该族谱的**最新版正文**；
+   而 `resume_id` 是要写进报告与 `jobs.json` 的「这次用了哪一版」，同时还是查重的另一半粒度
+   （同 JD × 简历版本）。把历史版做成可选项，用户（或默认选中的第一项 = 最老那一版）就会得到
+   「记录说用了 rv_0001、模型读的是 rv_0003 正文」这句**假话**，同一份 JD 还会**误 409**
+   （前端没有 409 出口 → 死路）。所以这里只给当前版，后端 `do_analyze` 也只认当前版。
+
+   已移出的族谱**一个选项都不给**（移出 = 不能继续用）；`unregistered`（盘上有文件、还没登记
+   版本）那条路保持不变：`version` 为空，分析请求如实**不带** `resume_id`。
+
+   ⚠️ 分析请求必须带上版本 id：`r.resumes` 那一行的 value 就是**当前版**的 `v.id`。 */
 function renderResumePicker(r){
-  const versionRows = r.resumes.map(v=>v.removed ? null : resumePickOf(v.id, String(v.name || '') + '.md')).filter(Boolean);
-  const unregRows = r.unregistered.map(n=>resumePickOf('', n));
+  const all = Array.isArray(r.resumes) ? r.resumes : [];
+  // 一个族谱一项：`resumeLineages` 组内已按 rev 升序排好，最后一条就是当前版（已移出的不参与）
+  const versionRows = resumeLineages(all.filter(v=>!v.removed)).map(rows=>{
+    const cur = rows[rows.length - 1];
+    return resumePickOf(cur.id, String(cur.name || '') + '.md');
+  });
+  const unregRows = (Array.isArray(r.unregistered) ? r.unregistered : []).map(n=>resumePickOf('', n));
   RESUME_PICKS = versionRows.concat(unregRows);
   const sel = $('#resumeSel');
   if(!sel) return;
+  const keep = String(sel.value == null ? '' : sel.value);   // 重渲染前用户选的那一项（空 = 还没选过）
   sel.innerHTML = RESUME_PICKS.length
     ? RESUME_PICKS.map(p=>'<option value="'+esc(p.key)+'">'+esc(p.name)+'</option>').join('')
     : '<option value="">（无简历，请先新建）</option>';
+  // 修 2：`innerHTML` 一重写，浏览器就把 select 打回**第一项**（= 最早那一版）。本页有 5 个
+  // 重渲染触发点（★ 选定 / 移出 / 彻底删 / 恢复 / 保存），于是一趟简历 tab 回来，分析页的下拉
+  // 已经**静默换成另一项** —— 用户可能分析错的简历/版本。原值还在新列表里就选回去；
+  // 原值没了（那一族谱被移出）才如实回落到第一项，绝不保留一个已不存在的值。
+  if(keep && RESUME_PICKS.some(p=>p.key === keep)) sel.value = keep;
 }
 
 /* 按族谱（root_id）分组，族谱内按 rev 升序 → 母版 → 子版 → 孙版。 */
@@ -1751,7 +1773,7 @@ function rsRemovedRowHtml(v){
 
 function rsUnregRowHtml(n){
   const name = String(n || '');
-  return '<div class="item rrow" data-unreg="' + esc(name) + '" style="margin-left:0">' +
+  return '<div class="item rrow" style="margin-left:0">' +
     '<span class="nm">' + esc(name) + '</span>' +
     '<span class="mt">盘上有文件 · 还没登记版本</span>' +
     '<span class="mt">保存后成为「第 1 次修改」</span>' +
@@ -1794,27 +1816,46 @@ function renderResumeTree(r){
   list.querySelectorAll('[data-restore]').forEach(b=>b.addEventListener('click', ()=>restoreResumeVersion(b.dataset.restore)));
 }
 
+/* 读不到 / 读不懂 / 渲染不了简历列表时的**统一收尾**：两处都明说失败。
+
+   绝不留下一个空列表 + 空下拉冒充"你没有简历"（那会让用户以为自己的简历丢了）。
+   `loadResumes()` 的调用点多数**没有 await**（`loadResumes();`），所以这条路径
+   **必须自己兜住**，抛出去就是一条没人接的 rejected promise —— 界面上什么都不显示。 */
+function rsLoadFailed(msg){
+  const list = $('#resumeList');
+  if(list) list.innerHTML = '<div class="empty">简历列表读取失败：' + esc(msg) + '</div>';
+  const sel = $('#resumeSel');
+  if(sel) sel.innerHTML = '<option value="">（简历读取失败）</option>';
+  logUI('resume.load_failed', {error: msg}, 'error');
+}
+
 async function loadResumes(){
   let r;
   try{
     // `include_removed=1`：已移出的族谱要能看见（否则「移出」是死路：没有恢复入口）
     r = await fetch('/api/resumes?include_removed=1').then(x=>x.json());
   }catch(e){
-    $('#resumeList').innerHTML = '<div class="empty">简历列表读取失败：' + esc(e.message) + '</div>';
-    $('#resumeSel').innerHTML = '<option value="">（简历读取失败）</option>';
-    logUI('resume.load_failed', {error: e.message}, 'error');
+    rsLoadFailed(e.message);
     return;
   }
   if(!r || r.ok === false){
-    const err = (r && r.error) || '服务没有返回简历列表';
-    $('#resumeList').innerHTML = '<div class="empty">简历列表读取失败：' + esc(err) + '</div>';
-    $('#resumeSel').innerHTML = '<option value="">（简历读取失败）</option>';
-    logUI('resume.load_failed', {error: err}, 'error');
+    rsLoadFailed((r && r.error) || '服务没有返回简历列表');
+    return;
+  }
+  // 修 6③：**200 但缺字段**也是一条失败路径（服务端改了形状 / 代理截了响应）。
+  // 不判就会在下面 `r.resumes.map` 里抛，而调用点不 await → 静默的 rejected promise。
+  if(!Array.isArray(r.resumes) || !Array.isArray(r.unregistered)){
+    rsLoadFailed('服务返回的简历列表不完整（缺 resumes / unregistered 字段）');
     return;
   }
   RESUME_VIEW = r;
-  renderResumePicker(r);
-  renderResumeTree(r);
+  try{
+    renderResumePicker(r);
+    renderResumeTree(r);
+  }catch(e){
+    // 渲染也要兜住（数据形状对不上、某个元素没了都会在这里抛）
+    rsLoadFailed('简历列表渲染失败：' + e.message);
+  }
 }
 
 /* ---- 弹层（只绑一次：同 `ivInit` 的守卫写法） ---- */
@@ -1943,9 +1984,12 @@ async function purgeResumeVersion(id, label){
   if(!id) return;
   if(!confirm('彻底删除「' + label + '」？\n\n会删掉这条版本记录与**它自己的**母版快照 —— 这一步不可恢复。')) return;
   if(!confirm('再确认一次：彻底删除「' + label + '」。\n\n' +
-      '① 不可恢复（记录与快照都删掉）；\n' +
+      '① 不可恢复：删掉的是【这条版本记录】与【这一版自己的】母版快照；\n' +
       '② 「这一版已经在某次分析里用过」这个**事实不可撤销** —— 那些历史报告里仍然留着它的版本号与显示名；\n' +
-      '③ 别的版本 / 别的简历的文件一律不动。\n\n确定彻底删除？')) return;
+      '③ 这一版自己的内容文件 resumes/<名字>.md 会**留在盘上**（它是整个族谱的「最新版容器」，' +
+        '本操作不删它）；当这个名字再没有任何登记版本时，它会以「盘上有文件 · 还没登记版本」的形态' +
+        '重新出现在列表里 —— 那不是没删干净；\n' +
+      '④ 别的版本 / 别的简历的文件一律不动。\n\n确定彻底删除？')) return;
   let r;
   try{
     r = await fetch('/api/resumes/purge', {method:'POST', headers:{'Content-Type':'application/json'},
@@ -2005,11 +2049,14 @@ async function editResumeFile(fileName){
 }
 
 /* ---- 保存：延续 / 新开（**默认不选，绝不自动延续**） ---- */
+/* 新开一份独立的：建议名从**第一个空闲后缀**起（`-1` 也要用 —— 从 `-2` 起会白白跳过它，
+   用户看到的就是一个莫名其妙的「-2」）。占用的判定与 `create_version` 的重名校验同口径：
+   未移出的版本 + 盘上还没登记版本的文件（已移出的名字可以再用，所以不算占用）。 */
 function rsSuggestName(stem){
   const taken = {};
   rsVersions().forEach(v=>{ if(!v.removed) taken[String(v.name || '')] = 1; });
   ((RESUME_VIEW && RESUME_VIEW.unregistered) || []).forEach(n=>{ taken[rsStem(n)] = 1; });
-  let i = 2;
+  let i = 1;
   while(taken[stem + '-' + i] && i < 999) i++;
   return stem + '-' + i + '.md';
 }
@@ -2047,16 +2094,21 @@ async function rsSubmitSave(fileName, content, parentId, opts){
 
 function rsAskContinue(fileName, content, mother){
   const stem = rsStem(fileName);
-  const fam = rsLiveFamily(stem).filter(v=>!v.removed);
+  // 预览的「第 N 次修改」必须与 `create_version` **同一口径**：它取的是**含已移出**的最大 rev
+  // （`resumelib.py:182-187, 355`）—— 移出列表**不删文件**，那一版仍然占着这个序号。
+  // 只看未移出的话，"最高的那一版已移出"时预览会**小于**真正落盘的值（罕见但会骗人）。
   let top = 0;
-  fam.forEach(v=>{ top = Math.max(top, Number(v.rev) || 1); });
+  rsLiveFamily(stem).forEach(v=>{ top = Math.max(top, Number(v.rev) || 1); });
   const suggested = rsSuggestName(stem);
   $('#rsPickTitle').textContent = '「' + stem + '」已选定母简历（第 ' + (Number(mother.rev) || 1) + ' 次修改）—— 这一版怎么存？';
   $('#rsPickBody').innerHTML =
     '<div class="hintline">内容有变化。这里<b>默认什么都不选</b>：不点下面两个按钮就不保存，也<b>绝不自动延续</b>。</div>' +
     '<div class="row" style="margin-top:14px">' +
       '<button class="btn" id="rsPickContinue">延续（成为子简历）</button>' +
-      '<span class="hintline" style="margin:0">同一族谱里续一版 → <b>第 ' + (top + 1) + ' 次修改</b>，覆盖前先把母版原文留成快照</span>' +
+      // 修 3：快照**不是**无条件写的 —— 母版原文为 `missing`（没保留）/ `mismatch`（与记录不符）时
+      // `create_version` **故意不写**（`resumelib.py:369-384`）。这里只能承诺做得到的事。
+      '<span class="hintline" style="margin:0">同一族谱里续一版 → <b>第 ' + (top + 1) + ' 次修改</b>，' +
+        '覆盖前<b>只有母版原文可用</b>时才会把它留成快照（原文未保留 / 与记录不符时<b>不写快照</b>，只留变更说明）</span>' +
     '</div>' +
     '<div class="row" style="margin-top:18px">' +
       '<input type="text" id="rsPickName" class="grow" value="' + esc(suggested) + '">' +
