@@ -362,8 +362,12 @@ def create_version(name, content, parent_id=None, note=""):
                 # 必须**确定**母版原文才敢写快照：m_kind=="missing" 时读出来是空串，
                 # 拿它当快照就是"假装留了档"；m_kind=="mismatch" 时磁盘上的东西已经不是母版
                 # 那一版了（程序外改过），照写就是把被改过的内容冒充成"母版原文"存进不可变快照。
+                # **"母版原文是不是确定"的责任只在 `_read_in` / `_kind_on_disk`**（shas 不符就报
+                # mismatch）—— 这里只认它的结论。此前还在这儿把 `m_text` 与同一个文件比了一遍
+                # （`m_text == store.read_text(file_path, "")`：同一个文件读两遍、恒真），
+                # 那是"一处忘了比 sha 就静默拿错内容"那条教训的残留，已按规格删掉。
                 # 已在盘上的快照一律不重写（不可变）。
-                if m_kind in ("latest", "mother") and m_text == store.read_text(file_path, ""):
+                if m_kind in ("latest", "mother"):
                     _write_content(snap_path, m_text)
                     mother["mother_file"] = _snapshot_rel(mid)
         _write_content(file_path, text)

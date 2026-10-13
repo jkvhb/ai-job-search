@@ -30,6 +30,7 @@ import interview
 import llm
 import log
 import outcome
+import resumelib
 import search as search_mod
 import store
 
@@ -298,7 +299,11 @@ def _job_merged_into(job):
 JD_FIELDS = ("job_title", "job_category", "location", "salary", "company", "hr_name", "phone",
              "address", "status", "verdict", "notes", "jd_text_file", "jd_image", "source_type",
              "source_link", "outcome_at", "outcome_reason", "outcome_ai")
-ANALYSIS_FIELDS = ("id", "jd_id", "resume", "score", "report", "created_at", "merged_into")
+# `resume_id`（阶段 4C）= 这次分析用的是**哪一版**简历（`resumelib` 的版本 id，如 `rv_0001`），
+# 与 `resume`（显示名）并存：显示名兼容旧报告与旧界面，版本 id 才是"取回那一版"的凭据。
+# **它同时是查重的另一半粒度**（见 `find_analyze_duplicate`）：同 JD + 同版本才算重复。
+# 老分析**没有**这个键（不是空串）→ 界面显示「版本未知（早于版本库）」，绝不猜。
+ANALYSIS_FIELDS = ("id", "jd_id", "resume", "resume_id", "score", "report", "created_at", "merged_into")
 
 # 视图窗口（见 `_job_view_window`）：惰性打一次补丁，之后按线程分发。
 # `_STORE_PATCH_LOCK` 只保护「打补丁」这一步（幂等，不在窗口期持有）。
@@ -729,18 +734,46 @@ def _jd_record_of(jd_id, data, source_bits, link, jd_text_file, jd_image_url, ba
     }
 
 
-def find_analyze_duplicate(jd_text, overwrite_id=""):
+def _duplicate_of_resume(rows, resume_id):
+    """该 JD 下**同一版简历**的那条已有分析（没有 → `None`）。阶段 4C 的查重粒度。
+
+    三条规则（规格 §6.2）：
+
+    - 同 JD + **不同** `resume_id` → **不是重复**（用户的核心用法：几份简历比同一个岗位）
+    - 同 JD + **同一** `resume_id` → 重复（409）
+    - 任一侧**没有** `resume_id`（老数据 / 老前端）→ **不判重复**（宁可多建，也不误拦）
+
+    为什么老数据不判重复：`resume_id` 是"这次用的是哪一版"的唯一凭据。老记录里没有它，
+    就**无法判断**新旧两次是不是同一份简历 —— 拿显示名去猜会把"同一份简历的第 2 版"判成重复，
+    正是要修的那个 409。查不到就不拦，用户最多多一条分析；拦错了用户会**卡死**（前端没有出口）。
+    """
+    want = str(resume_id or "").strip()
+    if not want:
+        return None
+    for r in reversed(rows):                       # 最新的那条优先（弹窗要显示最近一次的分数/报告）
+        rid = str(r.get("resume_id") or "").strip()
+        if rid and rid == want:
+            return r
+    return None
+
+
+def find_analyze_duplicate(jd_text, overwrite_id="", resume_id=""):
     """分析前查重（§6）。**只读**：不写任何文件、不调模型、不调搜索。
 
-    - 返回 `None`  → 照常分析（未命中 / 带了 allow_duplicate / overwrite 已校验通过）
+    - 返回 `None`  → 照常分析（未命中 / 版本不同 / 版本未知 / 带了 allow_duplicate / overwrite 已校验通过）
     - 抛 `BadOverwrite`      → `overwrite` 不可用（不存在 / 已合并 / 不相似）→ 400
     - 抛 `DuplicateSubmission` → 命中且没带任何选择 → 409
 
     `overwrite_id` 非空时必须**真的**是相似的那一条（用 jobdup 复核一次）：
     否则前端传错 id 就会把这次分析的结果写到一条**无关岗位**上。
 
-    **命中的粒度是 JD**（阶段 4A）：返回的 `job_id` / `jd_id` 都是**已有 JD 的 id** ——
-    前端拿它当 `overwrite` 发回来就走「沿用原身份」那一支，不会再算成一个新岗位。
+    **命中的粒度是 (JD 指纹 × `resume_id`)**（阶段 4C 改，此前只看 JD）：返回的
+    `job_id` / `jd_id` 都是**已有 JD 的 id** —— 前端拿它当 `overwrite` 发回来就走「沿用原身份」
+    那一支，不会再算成一个新岗位；`report` / `score` / `resume_id` 是**命中的那条分析**的，
+    给前端的 409 弹窗显示"你要覆盖的是哪一份"。
+
+    为什么粒度必须带简历（用户今天被它卡死）：他 C 阶段的核心用法是「同一个岗位拿三份简历
+    分别分析」，而旧实现只看 JD 文本 → 第二份简历被判重复 → **409**，前端又没有出口。
     """
     overwrite_id = str(overwrite_id or "").strip()
     if overwrite_id:
@@ -759,16 +792,23 @@ def find_analyze_duplicate(jd_text, overwrite_id=""):
     if hit is None:
         return None
     jd_id, score = hit
-    jd = jdid.find_jd(jd_id) or {}
     rows = _analysis_records_of(jd_id)
-    latest = rows[-1] if rows else {}
+    dup = _duplicate_of_resume(rows, resume_id)
+    if dup is None:
+        # 同一份 JD 但**这一版简历没分析过**（或没有版本号可比）→ 不是重复，正常新建。
+        return None
+    jd = jdid.find_jd(jd_id) or {}
     return {
         # `job_id` 留着是为了老前端（阶段 3.6 的弹窗读它）；两者现在都是 **JD id**
         "job_id": jd_id,
         "jd_id": jd_id,
         "job_title": str(jd.get("job_title") or ""),
-        "created_at": str(latest.get("created_at") or jd.get("created_at") or ""),
-        "score": latest.get("score") if latest else jd.get("score"),
+        "created_at": str(dup.get("created_at") or jd.get("created_at") or ""),
+        "score": dup.get("score"),
+        # 前端弹窗（阶段 4C 的 409 出口）要显示"覆盖的是哪一份分析"，这两项此前没有
+        "report": str(dup.get("report") or ""),
+        "resume": str(dup.get("resume") or ""),
+        "resume_id": str(dup.get("resume_id") or ""),
         "similarity": score,
         "suggestions": list(ANALYZE_DUP_SUGGESTIONS),
     }
@@ -798,6 +838,82 @@ def save_jd_source(job_id, jd_text, image_data_url):
         except Exception:
             jd_image_url = ""
     return jd_text_file, jd_image_url
+
+
+# ---------------------------------------------------------------- 简历版本库（阶段 4C）
+# 版本记录、族谱、母版快照、sha 核对**全在 `resumelib`**（它只读写 `resumes.json` 与
+# `resumes/` 下的文件）。这里只做三件事：把 HTTP 的参数翻成它的调用、把它的 `ValueError`
+# 翻成 400/404/409、把结果翻成 JSON。**绝不在 app.py 里自己写 `resumes.json` 或简历文件** ——
+# 两处各写一份就是本阶段要根除的"保存 = 静默覆盖、没有版本记录"。
+_RESUME_EXTS = (".md", ".txt")
+# 「延续」（= 在选定母版的基础上改）的 `lineage` 取值。中文与英文都收：前端写哪个词都行，
+# 但**真正决定族谱的是 `parent_id`**（前端选了"延续"就发它）。`lineage` 只是让"延续"这个
+# 选择在没有 parent_id 时也能落地（母亲 = 已被「选定继续优化」的那一版）。
+_LINEAGE_CONTINUE = ("continue", "child", "延续", "子版")
+
+
+def _resume_files():
+    """磁盘上真实的简历文件名（与老实现同一口径，供前端下拉 / 老前端使用）。"""
+    d = store.p_path("resumes")
+    if not os.path.isdir(d):
+        return []
+    return sorted(f for f in os.listdir(d) if f.lower().endswith(_RESUME_EXTS))
+
+
+def _version_of_name(name):
+    """按简历**名字**找它当前的版本记录（`name` 不含扩展名）；找不到回 `None`。
+
+    一个名字在**未移出**的版本里是唯一的（`resumelib.create_version` 校验），所以这里最多
+    命中一个族谱；同一族谱里取 rev 最大的那一版（`current_of`）。
+    """
+    want = os.path.splitext(store.safe_name(name))[0]
+    if not want:
+        return None
+    for rec in resumelib.list_versions():
+        if str(rec.get("name") or "") == want:
+            cur = resumelib.current_of(rec.get("root_id"))
+            return cur if cur is not None else rec
+    return None
+
+
+def save_resume_version(name, content, parent_id="", lineage=""):
+    """保存一份简历并登记版本（**唯一**的写简历路径，规格 §4.1/4.2）。
+
+    走 `resumelib.create_version`：留母版快照、记 sha / 时间 / rev。**绝不** `store.write_text`
+    直接写简历文件 —— 那条路没有版本记录（"保存 = 截断覆盖"，Task 2 要根除的）。
+
+    `parent_id` 非空 = **延续**（同一族谱，覆盖前留母版快照）；空 = **新开一份独立的**
+    （独立根、rev=1）。`lineage` 只在没给 `parent_id` 时起作用：说的是"延续"就解析出
+    该简历被「选定继续优化」的那一版当母亲（没有选定的母版 → `ValueError`，明确告诉用户）。
+
+    会抛 `ValueError`（路由翻成 400）：名字为空 / 重名（未移出的）/ 父版本不存在 /
+    父版本已移出 / 延续时改了名字 / 要延续却没有选定的母版。
+    """
+    clean = os.path.splitext(store.safe_name(name))[0].strip()
+    if not clean:
+        raise ValueError("文件名不能为空")
+    pid = str(parent_id or "").strip()
+    mode = "new"
+    if pid:
+        mode = "continue"
+    elif str(lineage or "").strip().lower() in _LINEAGE_CONTINUE:
+        mother = _mother_of_name(clean)
+        if mother is None:
+            raise ValueError("这份简历还没有「选定继续优化」的母版：先选定一份，或选「新开一份独立的」")
+        pid = str(mother.get("id") or "")
+        mode = "continue"
+    rec = resumelib.create_version(clean, content, parent_id=pid or None)
+    log.log_event("resume.save", name=rec.get("name"), id=rec.get("id"), rev=rec.get("rev"),
+                  parent_id=rec.get("parent_id"), mode=mode, chars=len(content or ""))
+    return rec
+
+
+def _mother_of_name(name):
+    """名字所属族谱里 `chosen` 为真的那一版（没有 → `None`）。"""
+    for rec in resumelib.list_versions():
+        if str(rec.get("name") or "") == name:
+            return resumelib.mother_of(rec.get("root_id"))
+    return None
 
 
 # ---------------------------------------------------------------- 入参口径
@@ -880,13 +996,18 @@ def _discard_orphan_jd(jd_id):
 
 
 def do_analyze(jd_text, image_data_url, resume_name, link="", overwrite_id="", allow_duplicate=False,
-               refresh_jd_facts=False):
+               refresh_jd_facts=False, resume_id=""):
     """跑一次 JD 分析并出报告。`overwrite_id` 非空 = 「覆盖」：结果写回那条已有记录。
 
     `allow_duplicate` 为真 = 用户已在查重提示里选过「仍然新建」→ **跳过查重**，照常新建。
 
     `refresh_jd_facts` 为真 = 用户要求**重算 JD 级事实**（目前只有知识地图）→ 忽略缓存
     （`jdfacts.resolve(..., refresh=True)`）。不传 = 有缓存就复用（这是本阶段的全部收益）。
+
+    `resume_id`（阶段 4C）= 这次用的是**哪一版**简历（`resumelib` 的版本 id）。它是查重的
+    另一半粒度（同 JD + 同版本才判重复），并落进分析记录 —— 报告因此能追溯到"用的哪一版"。
+    **老调用方不传**（空串）→ 记录里**不写**这个键 = "版本未知（早于版本库）"，界面据此显示，
+    **绝不猜**一个填上去。
 
     ⚠️ 两个布尔参数都过 **`_as_bool`**（唯一的真值口径）：HTTP body 里它们是字符串是常态
     （`"false"` / `"0"`），而 `bool("false") is True` → 白烧一次真算（206 秒 + ~53 次搜索）
@@ -902,6 +1023,7 @@ def do_analyze(jd_text, image_data_url, resume_name, link="", overwrite_id="", a
     jd_text = (jd_text or "").strip()
     link = (link or "").strip()
     overwrite_id = str(overwrite_id or "").strip()
+    resume_id = str(resume_id or "").strip()
     allow_duplicate = _as_bool(allow_duplicate)
     refresh_jd_facts = _as_bool(refresh_jd_facts)
 
@@ -939,7 +1061,7 @@ def do_analyze(jd_text, image_data_url, resume_name, link="", overwrite_id="", a
         # 命中且什么都没带 → DuplicateSubmission（路由回 409，模型与搜索一次都不调）。
         # `allow_duplicate` 是用户已经看过提示后做出的选择：跳过判定（§6 表格第一行之外的那支）。
         if not allow_duplicate:
-            dup = find_analyze_duplicate(jd_text, overwrite_id)
+            dup = find_analyze_duplicate(jd_text, overwrite_id, resume_id)
             if dup is not None:
                 raise DuplicateSubmission(dup)
 
@@ -959,6 +1081,10 @@ def do_analyze(jd_text, image_data_url, resume_name, link="", overwrite_id="", a
         if not os.path.exists(rp):
             raise RuntimeError("找不到简历：%s" % resume_name)
         resume = store.read_text(rp)
+        # 简历的**显示名**（文件名去掉扩展名）：报告数据、分析记录与报告文件名都用它。
+        # 与 `resumelib` 里的版本 `name` 同一口径（`create_version` 存的就是这个 stem），
+        # 所以界面上"报告用的哪一版"与简历库里的那一版对得上。
+        resume_display = os.path.splitext(store.safe_name(resume_name))[0]
 
         tm = cfg["text_model"]
         messages = [
@@ -994,6 +1120,12 @@ def do_analyze(jd_text, image_data_url, resume_name, link="", overwrite_id="", a
         if data is None:
             raise RuntimeError("模型返回的 JSON 无法解析，自动修复也未成功：%s" % last_err)
         d = normalize(data, resume_name, " + ".join(source_bits) or "文本输入")
+        # 报告数据里同时带**显示名**与**版本 id**（规格 §3）：报告因此能回答"用的是哪一版"。
+        # 显示名兼容旧报告（此前 REPORT_DATA 里根本没有 `resume`）；版本 id **只在有时才写** ——
+        # 老调用方不传时写一个空串，界面就分不清"老分析"与"没钉上版本"，只能显示"版本未知"。
+        d["resume"] = resume_display
+        if resume_id:
+            d["resume_id"] = resume_id
 
         # ---- JD 稳定身份（阶段 4A）：分析挂在 JD 下，不再挂在报告文件名下 ----
         # 顺序是契约的一部分：**先定 JD 身份（可能复用已有 JD），再出报告、再写记录** ——
@@ -1105,8 +1237,20 @@ def do_analyze(jd_text, image_data_url, resume_name, link="", overwrite_id="", a
             # 覆盖：沿用原记录的 created_at（同一条记录的新分析，不是新记录）
             "created_at": created_at_kept or datetime.now().strftime("%Y-%m-%d %H:%M"),
             "score": d["score"],
-            "resume": os.path.splitext(store.safe_name(resume_name))[0],
+            "resume": resume_display,
         }
+        # `resume_id` **只在真有的时候写**：写空串等于记录里出现一个"看起来钉过版本"的空值，
+        # 界面就分不清「老分析（早于版本库）」与「新分析但没给版本号」（规格 §3：老数据显示
+        # "版本未知"，绝不猜）。这一行是它**真正落盘**的地方（`_analysis_fields` 只在
+        # `ANALYSIS_FIELDS` 里挑键，键不在记录上就写不出任何东西）。
+        if resume_id:
+            rec["resume_id"] = resume_id
+        elif overwrite_job is not None and "resume_id" in overwrite_job:
+            # 覆盖**同一条记录**时 `store.upsert_job` 是**合并**：不写这个键，上一次的版本号就会
+            # 留在记录上 —— 那等于说"这次分析用的是 rv_0001"，而这次用的可能根本不是它。
+            # 宁可如实退回"版本未知"（空值），也绝不背着一句假话（`_duplicate_of_resume` 与
+            # 界面都按"空 = 没有版本"处理）。
+            rec["resume_id"] = ""
         _save_analysis(rec)
         log.log_event("analyze.success", ms=int((time.time() - t_start) * 1000), repair_rounds=repairs,
                   report=fname, jd=jd_id, job_title=jd_rec["job_title"], score=rec["score"],
@@ -1346,14 +1490,81 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, store.load_config())
 
         if p == "/api/resumes":
+            # `?name=` 是**老前端**按文件名读正文的路（阶段 4C 起改用
+            # `/api/resumes/file?version=<id>`；这条留着不删，读盘是无副作用的）。
             if "name" in q:
                 name = store.safe_name(q["name"][0])
                 fp = os.path.join(store.p_path("resumes"), name)
                 if not os.path.exists(fp):
                     return self._send(404, {"error": "找不到该简历"})
                 return self._send(200, {"name": name, "content": store.read_text(fp)})
-            files = sorted(f for f in (os.listdir(store.p_path("resumes")) if os.path.isdir(store.p_path("resumes")) else []) if f.lower().endswith((".md", ".txt")))
-            return self._send(200, {"resumes": files})
+            # 阶段 4C：返回**族谱元数据**（版本列表 + id/name/rev/at/chosen/removed/mother_file/ai_diff）。
+            # 默认**不含已移出**（移出 = 不再出现在列表里，规格 §4.6）；要连已移出一起看就带
+            # `include_removed=1`。`files` 是磁盘上真实的简历文件名（老前端 / 分析下拉要用），
+            # `unregistered` 是**盘上有文件但还没有版本记录**的那些 —— 迁移（Task 5）之前它们
+            # 就是用户全部的简历，界面必须看得见，绝不能因为"没有版本记录"就当成不存在。
+            include_removed = _as_bool(q.get("include_removed", ["0"])[0])
+            try:
+                versions = resumelib.list_versions(include_removed=include_removed)
+            except Exception as e:
+                # do_GET 没有外层 try（见 /api/knowledge 的注释）：不兜底就是连接裸断
+                log.log_exc("resume.list_error", e)
+                return self._send(500, {"ok": False, "error": "简历版本库读取失败：%s" % e})
+            files = _resume_files()
+            registered = {str(r.get("name") or "") for r in versions}
+            return self._send(200, {
+                "ok": True,
+                "resumes": versions,
+                "files": files,
+                "unregistered": [f for f in files if os.path.splitext(f)[0] not in registered],
+                "include_removed": include_removed,
+            })
+
+        if p == "/api/resumes/file":
+            # 取回某一版**原文**（规格 §4.5）。四种 kind 各有各的说法（阶段 4C 的诚实边界）：
+            #   latest / mother → 原文；missing → **明确说明"原文未保留"**（绝不发一个空文件冒充）；
+            #   mismatch → **如实说"内容与记录不符"** + 内容与两个 sha 都亮出来（§8.2）。
+            vid = str(q.get("version", [""])[0]).strip()
+            if not vid:
+                return self._send(400, {"ok": False, "error": "缺少 version（要取哪一版？）"})
+            try:
+                text, path, kind = resumelib.read_version(vid)
+            except ValueError as e:
+                return self._send(404, {"ok": False, "error": str(e)})
+            rec = resumelib.by_id(vid) or {}
+            out = {
+                "ok": kind in ("latest", "mother"),
+                "kind": kind,
+                "version": vid,
+                "name": str(rec.get("name") or ""),
+                "rev": rec.get("rev"),
+                "at": str(rec.get("at") or ""),
+                "path": path,
+                # 旧版原文不保留（用户已定的取舍）→ 那一版只有 AI 写的变更说明与当时的分数，
+                # 所以这两项**任何 kind 都给**（missing 时它们就是全部信息）。
+                "ai_diff": rec.get("ai_diff") or {},
+                "ai_diff_error": str(rec.get("ai_diff_error") or ""),
+            }
+            if kind == "missing":
+                # ⚠️ **不返回 text**：原文从来没保留（历史版）是**事实**，但空串会被调用方
+                # 当"读到了、只是内容为空"用 —— 这里必须靠一句明确的话分辨（规格 §8.1）。
+                out["error"] = ("旧版原文未保留：每个族谱只留母版与最新版原文，"
+                                "这一版只有变更说明与当时的分数（绝不假装能取回）")
+                return self._send(200, out)
+            if kind == "mismatch":
+                # 内容照常给（用户要能对账），但**绝不当它是这一版的原文**：记录的 sha 与实测的
+                # 都亮出来，让"被程序外改过"这件事无处可藏（规格 §8.2）。
+                out["error"] = ("内容与记录不符：磁盘上这份内容不是这一版（可能被程序外修改过，"
+                                "或该文件已被别的同名简历覆盖）——不要当作这一版原文使用")
+                out["sha256"] = str(rec.get("sha256") or "")
+                out["actual_sha256"] = resumelib.sha256_of(text)
+                out["text"] = text
+                log.log_event("resume.file_mismatch", level="warn", version=vid,
+                              name=out["name"], path=path)
+                return self._send(200, out)
+            out["sha256"] = str(rec.get("sha256") or "")
+            out["text"] = text
+            return self._send(200, out)
 
         if p == "/api/reports":
             out = []
@@ -1708,15 +1919,42 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"ok": True})
 
         if p == "/api/resumes":
-            name = store.safe_name(body.get("name"))
-            if not name:
-                return self._send(400, {"ok": False, "error": "文件名不能为空"})
-            if not name.lower().endswith((".md", ".txt")):
-                name += ".md"
-            content = body.get("content") or ""
-            store.write_text(os.path.join(store.p_path("resumes"), name), content)
-            log.log_event("resume.save", name=name, chars=len(content))
-            return self._send(200, {"ok": True, "name": name})
+            # 保存/上传一份简历（规格 §4.1/4.2）。**必须走 `resumelib.create_version`**：
+            # 老实现是 `store.write_text` 直接截断覆盖 —— 没有版本记录、没有母版快照、没有 sha，
+            # 报告里"用的是哪一版"从此无从查起（本阶段要根除的那条路）。
+            try:
+                rec = save_resume_version(body.get("name"), body.get("content") or "",
+                                          parent_id=body.get("parent_id") or "",
+                                          lineage=body.get("lineage") or "")
+            except ValueError as e:
+                log.log_event("resume.save_rejected", level="warn", name=body.get("name"),
+                              error=str(e))
+                return self._send(400, {"ok": False, "error": str(e)})
+            return self._send(200, {"ok": True, "name": rec.get("name"), "resume": rec,
+                                    "id": rec.get("id"), "rev": rec.get("rev"),
+                                    "parent_id": rec.get("parent_id")})
+
+        if p in ("/api/resumes/choose", "/api/resumes/restore", "/api/resumes/purge"):
+            # 三个「改一条版本记录」的动作。它们**只动 `resumes.json`**（purge 只删自己那份快照）：
+            # 简历文件与别人的文件一律不碰（规格 §4.6 的反假绿要求）。
+            vid = str(body.get("version") or "").strip()
+            if not vid:
+                return self._send(400, {"ok": False, "error": "缺少 version（要操作哪一版？）"})
+            fn = {"choose": resumelib.choose, "restore": resumelib.restore,
+                  "purge": resumelib.purge}[p.rsplit("/", 1)[1]]
+            try:
+                rec = fn(vid)
+            except ValueError as e:
+                msg = str(e)
+                # 「找不到」= 404（那条记录不存在）；「名字被占用」= 409（冲突，用户改名后重试）；
+                # 其余（已移出的不能选为母版…）= 400。
+                status = 404 if "找不到" in msg else (409 if "占用" in msg else 400)
+                log.log_event("resume.%s_rejected" % p.rsplit("/", 1)[1], level="warn",
+                              version=vid, status=status, error=msg)
+                return self._send(status, {"ok": False, "error": msg})
+            log.log_event("resume.%s" % p.rsplit("/", 1)[1], version=vid, name=rec.get("name"))
+            return self._send(200, {"ok": True, "version": vid, "resume": rec,
+                                    "name": rec.get("name")})
 
         if p == "/api/jobs/update":
             # 走有效台账：已合并的记录在列表里看不到，写接口也不能悄悄改它
@@ -1945,10 +2183,15 @@ class Handler(BaseHTTPRequestHandler):
                                    # 绝不能被 `bool()` 当**真**（那会白烧 206 秒 / 悄悄跳过查重）
                                    allow_duplicate=_as_bool(body.get("allow_duplicate")),
                                    # 用户想更新知识地图时带 true → 忽略缓存重算（透传给 jdfacts.resolve）
-                                   refresh_jd_facts=_as_bool(body.get("refresh_jd_facts")))
+                                   refresh_jd_facts=_as_bool(body.get("refresh_jd_facts")),
+                                   # 这次用的是哪一版简历（`resumelib` 的版本 id，如 rv_0001）：
+                                   # 查重的另一半粒度 + 落进分析记录（阶段 4C）。老前端不传 → 空串。
+                                   resume_id=body.get("resume_id") or "")
                 return self._send(200, {"ok": True, "report": fname})
             except DuplicateSubmission as e:
+                # 命中的凭据是 (JD × 简历版本)，日志里也带上版本号：事后才查得出"为什么判了重复"
                 log.log_event("analyze.duplicate", level="warn", job=e.duplicate.get("job_id"),
+                              resume_id=e.duplicate.get("resume_id"),
                               similarity=round(e.duplicate.get("similarity") or 0, 4))
                 return self._send(409, {"ok": False, "duplicate": e.duplicate})
             except BadOverwrite as e:
@@ -1975,13 +2218,25 @@ class Handler(BaseHTTPRequestHandler):
         u = urlparse(self.path)
         q = parse_qs(u.query)
         if u.path == "/api/resumes":
-            name = store.safe_name(q.get("name", [""])[0])
-            fp = os.path.join(store.p_path("resumes"), name)
-            if name and os.path.exists(fp):
-                os.remove(fp)
-                log.log_event("resume.delete", name=name)
-                return self._send(200, {"ok": True})
-            return self._send(404, {"ok": False, "error": "找不到该简历"})
+            # 阶段 4C：**「删除」= 移出列表，不是删文件**（规格 §4.6）。
+            # 老实现 `os.remove` 是**永久删、无副本**；现在文件、母版快照、变更说明全部保留，
+            # 只是不再出现在列表里（也不能再用于分析）。彻底删是另一个显式动作
+            # （`POST /api/resumes/purge` + 前端二次确认）。
+            vid = str(q.get("version", [""])[0]).strip()
+            if not vid:
+                # 老前端按**文件名**删：解析成那份简历当前的版本 —— 语义仍然是"移出列表"，
+                # 绝不 `os.remove`（哪怕调用方是旧代码）。
+                rec = _version_of_name(q.get("name", [""])[0])
+                if rec is None:
+                    return self._send(404, {"ok": False, "error": "找不到该简历"})
+                vid = str(rec.get("id") or "")
+            try:
+                rec = resumelib.remove(vid)
+            except ValueError as e:
+                return self._send(404, {"ok": False, "error": str(e)})
+            log.log_event("resume.remove", version=vid, name=rec.get("name"))
+            return self._send(200, {"ok": True, "removed": rec, "name": rec.get("name"),
+                                    "note": "已移出列表；简历文件与母版快照仍留在盘上"})
         if u.path == "/api/jobs":
             job_id = store.safe_name(q.get("id", [""])[0])
             jobs = store.load_jobs()

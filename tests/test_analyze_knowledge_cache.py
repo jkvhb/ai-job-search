@@ -527,11 +527,16 @@ class AnalyzeOrphanJdTest(_AnalyzeCase):
         return ident[0]["data"]["jd"]
 
     def test_the_reviewers_repro_is_exactly_this_shape(self):
-        """先把**审查者实测的那个局面**原样钉住（关掉善后）：孤儿 + 重提 409。
+        """先把**审查者实测的那个局面**原样钉住（关掉善后）：孤儿就是那个形状。
 
-        没有这条，「修好了」就只是一个说法 —— 它同时证明：孤儿真的长成
-        `id/seq/created_at/updated_at/id_history`（没有 `jd_facts`、没有分析），
-        而重提同一份 JD 真的会 409（前端没有 `allow_duplicate` 出口 = 用户被卡死）。
+        没有这条，「修好了」就只是一个说法 —— 它证明：孤儿真的长成
+        `id/seq/created_at/updated_at/id_history`（没有 `jd_facts`、没有分析）。
+
+        ⚠️ 阶段 4C 起，「重提同一份 JD」**不再 409**：查重粒度改成 (JD 指纹 × 简历版本)，
+        而一条分析都没有的孤儿**没有任何版本可比** → 不判重复（规格 §6.2「宁可多建，也不误拦」）。
+        这条断言因此改成钉**新行为**：重提照常分析、并且**复用**那个孤儿身份（不另建一个 JD）。
+        善后仍然必要 —— 不是为了让重提能过，而是别把一条没有 `jd_facts`、没有分析的半成品记录
+        永久的留在 `jds.json` 里（它占着 JD id，还会被 `_similar_saved_jd` 认作"已有的那个岗位"）。
         """
         self._other_jd()
         self._patch(app, "_discard_orphan_jd", lambda jd_id: False)   # 关掉善后，看原始局面
@@ -542,12 +547,13 @@ class AnalyzeOrphanJdTest(_AnalyzeCase):
         self.assertEqual(sorted(orphan), ["created_at", "id", "id_history", "seq", "updated_at"],
                          "孤儿形状与审查者报告的不一样：%r" % (sorted(orphan),))
         self.assertEqual(orphan["id"], orphan_id)
-        # 重提同一份 JD → 409（命中这个只有原文、没有身份的孤儿）
+        # 重提同一份 JD：不再 409（阶段 4C 的粒度下没有可比的版本）→ 照常分析
         h = self._raw()
-        self.assertEqual(h._status, 409, "重提居然没 409？那这条测试没复现出问题：%r" % (h._body,))
-        self.assertEqual(h._body["duplicate"]["job_id"], orphan_id)
-        self.assertEqual(h._body["duplicate"]["job_title"], "")
-        self.assertIsNone(h._body["duplicate"]["score"])
+        self.assertEqual(h._status, 200, h._body)
+        self.assertNotIn("duplicate", h._body)
+        # 而且**复用**那个孤儿身份：没有因此多出一个 JD
+        self.assertEqual(sorted(j["id"] for j in jdid.load_jds()["jds"]),
+                         sorted([self.OTHER, orphan_id]))
 
     def test_a_crash_between_the_text_and_the_record_leaves_no_orphan(self):
         other = self._other_jd()

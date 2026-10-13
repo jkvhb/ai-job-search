@@ -381,6 +381,58 @@ class MismatchTest(IsolatedCase):
                          "resumes/%s/%s.md" % (resumelib.SNAPSHOT_DIR, a2["id"]))
 
 
+class SnapshotCertaintyAfterCleanupTest(IsolatedCase):
+    """清理掉那半条**恒真**的空守卫之后的行为对照（Task 2 的第 4 项）。
+
+    被删掉的是 `create_version` 里 `m_text == store.read_text(file_path, "")` 这半条：
+    它把**同一个文件读两遍**，恒真，且让「必须确认母版原文」这句真话的责任分散在两处。
+    确认的责任现在**只在** `_read_in` / `_kind_on_disk`（也就是 `m_kind`）：
+
+    ① **正常延续仍然写快照**（清理不许把功能删没）——逐字等于覆盖前那份；
+    ② 母版原文**不确定**时绝不写快照 —— `mismatch` 时读出来的是**别人的内容**，
+       写进"不可变快照"就是"假装留了档"。②就是这条清理的反向对照：
+       把 `m_kind in ("latest", "mother")` 也一并删掉（变异⑤）→ ②必红。
+    """
+
+    def _snap_path(self, version_id):
+        return store.p_path("resumes", resumelib.SNAPSHOT_DIR, version_id + ".md")
+
+    def _write_outside_resumelib(self, rel_path, text):
+        """模拟"程序外"改文件：绕开 resumelib，只用裸 open。"""
+        with open(store.p_path(rel_path), "w", encoding="utf-8", newline="") as f:
+            f.write(text)
+
+    def test_a_normal_continuation_still_writes_the_mother_snapshot(self):
+        v1 = resumelib.create_version("母版", "第一版内容")
+        resumelib.choose(v1["id"])
+        resumelib.create_version("母版", "第二版内容", parent_id=v1["id"])
+        snap = resumelib.by_id(v1["id"])["mother_file"]
+        self.assertEqual(snap, "resumes/%s/%s.md" % (resumelib.SNAPSHOT_DIR, v1["id"]))
+        with open(self._snap_path(v1["id"]), "rb") as f:
+            self.assertEqual(f.read(), "第一版内容".encode("utf-8"))
+
+    def test_a_tampered_mother_is_never_snapshotted_as_if_it_were_the_mother(self):
+        v1 = resumelib.create_version("母版", "第一版内容")
+        resumelib.choose(v1["id"])
+        self._write_outside_resumelib("resumes/母版.md", "别人手改的内容")
+        self.assertEqual(resumelib.read_version(v1["id"])[2], "mismatch")     # 前提：确认失败了
+        resumelib.create_version("母版", "第二版内容", parent_id=v1["id"])
+        self.assertFalse(os.path.exists(self._snap_path(v1["id"])),
+                         "把被程序外改过的内容冒充「母版原文」存进了不可变快照")
+        self.assertIsNone(resumelib.by_id(v1["id"])["mother_file"])           # 记录也没谎报留了档
+
+    def test_a_mother_whose_text_was_never_kept_is_not_snapshotted_as_an_empty_file(self):
+        v1 = resumelib.create_version("母版", "第一版内容")
+        v2 = resumelib.create_version("母版", "第二版内容", parent_id=v1["id"])
+        resumelib.create_version("母版", "第三版内容", parent_id=v2["id"])
+        resumelib.choose(v2["id"])                       # 母版 = v2（历史版，原文没保留）
+        self.assertEqual(resumelib.read_version(v2["id"])[2], "missing")
+        resumelib.create_version("母版", "第四版内容", parent_id=v1["id"])
+        self.assertFalse(os.path.exists(self._snap_path(v2["id"])),
+                         "给「原文没保留」的母版写了一个空快照（假装留了档）")
+        self.assertIsNone(resumelib.by_id(v2["id"])["mother_file"])
+
+
 if __name__ == "__main__":
     import unittest
     unittest.main()

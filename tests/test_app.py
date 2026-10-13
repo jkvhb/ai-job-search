@@ -23,6 +23,7 @@ import interview
 import jdid
 import kb
 import outcome
+import resumelib
 import store
 
 from tests.base import IsolatedCase
@@ -277,7 +278,9 @@ def _sandbox_handler(method, path, body: bytes, headers=None):
     h._send = lambda code, obj=None, ctype="application/json; charset=utf-8", raw=False: (
         setattr(h, "_status", code), setattr(h, "_body", obj), setattr(h, "_ctype", ctype), obj)[-1]
     h._send_file = lambda p, ctype: (setattr(h, "_status", 200), setattr(h, "_sent_file", p), None)[-1]
-    (app.Handler.do_GET if method == "GET" else app.Handler.do_POST)(h)
+    # DELETE 也要走沙箱：`/api/resumes` 的「移出列表」与 `os.remove` 的区别正是要测的东西。
+    {"GET": app.Handler.do_GET, "POST": app.Handler.do_POST,
+     "DELETE": app.Handler.do_DELETE}.get(method, app.Handler.do_POST)(h)
     return h
 
 
@@ -1358,10 +1361,13 @@ class AnalyzeDedupTest(_AnalyzeRouteCase):
     """§6 分析前查重：409 命中 / allow_duplicate 放行 / overwrite 写回原记录 / 非法 overwrite 400。"""
 
     def test_duplicate_returns_409_without_calling_the_model_or_search(self):
-        self._old_job()
+        # 阶段 4C：查重粒度 = (JD 指纹 × **简历版本**)。所以"已有那条分析"与"这次提交"都必须
+        # 带上**同一个** `resume_id` 才叫重复（老数据没有 `resume_id` → 不判重复，规格 §6.2）。
+        self._old_job(resume_id="rv_0001")
         calls = self._patch_analyze_deps()
         code, body = self._post_json("/api/analyze",
-                                     {"jd_text": self.LONG, "source_type": "粘贴文本"})
+                                     {"jd_text": self.LONG, "source_type": "粘贴文本",
+                                      "resume_id": "rv_0001"})
         # ① 状态码：409（不是 200 的 {"ok":false,"error":...}，更不是 500）
         self.assertEqual(code, 409)
         # ② 响应体的**具体内容**（不是「error 里有某个词」）
@@ -1468,9 +1474,10 @@ class AnalyzeDedupTest(_AnalyzeRouteCase):
 
     def test_duplicate_detection_also_runs_for_linked_jds(self):
         """带 link 也在分析之前查重：抓正文（1 次，这一步跑不掉）之后立刻命中，**模型 0 次**。"""
-        self._old_job(text=self.LONG)
+        self._old_job(text=self.LONG, resume_id="rv_0001")
         calls = self._patch_analyze_deps()
-        code, body = self._post_json("/api/analyze", {"link": "https://example.com/jd"})
+        code, body = self._post_json("/api/analyze",
+                                     {"link": "https://example.com/jd", "resume_id": "rv_0001"})
         self.assertEqual(code, 409)
         self.assertEqual(body["duplicate"]["job_id"], "j-old")
         self.assertEqual(calls["search"], 1)          # 抓正文那次已经发生（命中是在拿到文本之后）
@@ -1598,13 +1605,16 @@ class AnalyzeFlagTruthinessTest(_AnalyzeRouteCase):
 
     def test_allow_duplicate_falsy_values_still_hit_the_duplicate_check(self):
         """`"allow_duplicate": "false"` 曾经 = **真** → 悄悄跳过查重（该 409 的没 409）。"""
-        self._old_job()
+        # 阶段 4C：判重复还要看简历版本 —— 这条用例喂的是**同一版**（`rv_0001`），
+        # 所以"该 409 的"仍然是 409，测的还是 `allow_duplicate` 的真值口径。
+        self._old_job(resume_id="rv_0001")
         calls = self._deps()
         for value in self.FALSY:
             with self.subTest(value=value):
                 code, body = self._post_json("/api/analyze",
                                              {"jd_text": self.LONG, "resume_name": self._resume(),
-                                              "source_type": "粘贴文本", "allow_duplicate": value})
+                                              "source_type": "粘贴文本", "allow_duplicate": value,
+                                              "resume_id": "rv_0001"})
                 self.assertEqual(code, 409, "`allow_duplicate`=%r 被当成了真" % (value,))
                 self.assertEqual(body["duplicate"]["job_id"], "j-old")
                 # 查重命中时**一个额度都不花**（这批假值全都在调模型/搜索之前返回）
@@ -2108,6 +2118,330 @@ class JobViewWindowTest(_AnalyzeRouteCase):
                 self.assertEqual(store.find_job(self.AID)["job_title"], "视频标注质检")
             self.assertEqual(store.find_job(self.AID)["job_title"], "视频标注质检")   # 外层还在
         self.assertFalse(getattr(app._VIEW_LOCAL, "active", False))
+
+
+# --------------------------------------------- 简历版本库接线（Task 2）+ 查重粒度 (JD × 简历)
+# 规格 §6.1（路由）/ §6.2（查重粒度）/ §4.6（删除语义）/ §8（诚实边界）。
+# 防假绿：
+#   ① 查重那几条同时钉 **状态码 + duplicate 的具体字段 + (llm,search,knowledge) 调用计数**；
+#   ② 取回那几条钉 **kind 与 text 的个体值**（绝不写「整页 HTML 里有没有某字符串」）；
+#   ③ 删除那条**逐字**断言盘上文件 —— 只断言「文件还在」会被「被清空 / 被换成别人」蒙过去。
+class ResumeDedupGranularityTest(_AnalyzeRouteCase):
+    """§6.2：查重粒度 = **(JD 指纹 × resume_id)**。这条正是今天**卡死用户**的那个 bug。"""
+
+    def _analyze(self, jd_text=None, resume="我的简历.md", **extra):
+        body = {"jd_text": jd_text or self.LONG, "resume_name": self._resume(resume)}
+        body.update(extra)
+        return self._post_json("/api/analyze", body)
+
+    def test_the_same_jd_with_a_different_resume_version_is_not_a_duplicate(self):
+        """**本次核心**：一个岗位 × 多份简历。第二份简历绝不能被判「重复」。
+
+        旧实现只看 JD 文本 → 第二份简历拿到的是一句「重复」（409），而前端全仓没有
+        `allow_duplicate` / `overwrite` 入口 → 用户看到「失败」且无法继续。
+        """
+        calls = self._patch_analyze_deps()
+        code1, body1 = self._analyze(resume="简历A.md", resume_id="rv_0001")
+        self.assertEqual(code1, 200, body1)
+        # 第二份简历：**不传 allow_duplicate**（用户没做过任何选择，就该照常分析）
+        code2, body2 = self._analyze(resume="简历B.md", resume_id="rv_0002")
+        self.assertEqual(code2, 200, body2)                    # ← 旧代码这里 409
+        self.assertNotEqual(body1["report"], body2["report"])   # 两次分析各有各的报告
+        self.assertGreaterEqual(calls["llm"], 2)
+
+        jds = jdid.load_jds()
+        self.assertEqual(len(jds["jds"]), 1, "同一份 JD 换简历绝不能建出第二个 JD")
+        jobs = store.load_jobs()
+        self.assertEqual(len(jobs), 2, "两次分析 = 两条分析记录")
+        jd_id = jds["jds"][0]["id"]
+        self.assertEqual([j["jd_id"] for j in jobs], [jd_id, jd_id])      # 逐条，不是只断数量
+        self.assertEqual(sorted(j["resume_id"] for j in jobs), ["rv_0001", "rv_0002"])
+        self.assertEqual(sorted(j["resume"] for j in jobs), ["简历A", "简历B"])
+
+    def test_the_same_jd_with_the_same_resume_version_is_still_a_duplicate(self):
+        """同一 JD + **同一版**简历 → 409，且**一个额度都不花**（查重在花钱之前）。"""
+        self._old_job(resume_id="rv_0001")
+        calls = self._patch_analyze_deps()
+        code, body = self._analyze(resume="我的简历.md", resume_id="rv_0001")
+        self.assertEqual(code, 409, body)
+        dup = body["duplicate"]
+        self.assertEqual(dup["job_id"], "j-old")
+        self.assertEqual(dup["jd_id"], "j-old")
+        self.assertEqual(dup["job_title"], "语音/文本评测")
+        self.assertEqual(dup["created_at"], "2026-10-03 00:30")     # 命中的是**这一条**
+        self.assertEqual(dup["score"], 75.0)
+        self.assertEqual(dup["report"], "j-old.html")               # 前端弹窗要用
+        self.assertEqual(dup["resume_id"], "rv_0001")
+        self.assertEqual(dup["suggestions"], ["overwrite", "new"])
+        self.assertEqual((calls["llm"], calls["search"], calls["knowledge"]), (0, 0, 0))
+        self.assertEqual(len(store.load_jobs()), 1)                 # 没多建
+
+    def test_an_old_analysis_without_a_resume_id_never_blocks(self):
+        """老数据（分析记录**没有** `resume_id`）→ 不判重复：宁可多建，也不误拦（规格 §6.2）。"""
+        self._old_job()                                    # resume="旧简历"，**没有** resume_id
+        self.assertNotIn("resume_id", store.load_jobs()[0])
+        self._patch_analyze_deps()
+        # 两种请求都不许拦：① 带了版本号；② 连版本号都没带（老前端）。
+        # 简历**名字**故意与老记录逐字相同 —— 证明让它过去的是「那一版没有版本记录」，不是名字不同。
+        for extra in ({"resume_id": "rv_0001"}, {}):
+            with self.subTest(extra=extra):
+                code, body = self._analyze(resume="旧简历.md", **extra)
+                self.assertEqual(code, 200, body)
+        self.assertEqual(len(store.load_jobs()), 3)
+
+    def test_a_new_analysis_records_the_resume_id_it_used(self):
+        """新分析把**这一版**钉进 `jobs.json`；报告数据里同时带 `resume` 与 `resume_id`。"""
+        self._patch_analyze_deps()
+        code, body = self._analyze(resume="我的简历.md", resume_id="rv_0007")
+        self.assertEqual(code, 200, body)
+        rec = store.load_jobs()[0]
+        self.assertEqual(rec["resume_id"], "rv_0007")        # ← 真正落盘的那一行
+        self.assertEqual(rec["resume"], "我的简历")           # 显示名（兼容旧报告）
+        data = kb.read_report_data(os.path.join(store.p_path("reports"), body["report"]))
+        self.assertEqual(data.get("resume_id"), "rv_0007")
+        self.assertEqual(data.get("resume"), "我的简历")
+
+    def test_an_old_analysis_without_a_resume_id_reads_as_version_unknown(self):
+        """反向：老记录**不许**被补上一个猜出来的 `resume_id`（界面显示「版本未知（早于版本库）」）。"""
+        self._old_job()
+        self.assertNotIn("resume_id", store.load_jobs()[0])
+        self._patch_analyze_deps()
+        code, body = self._analyze(resume="另一份.md", resume_id="rv_0002")
+        self.assertEqual(code, 200, body)
+        old = [j for j in store.load_jobs() if j["id"] == "j-old"][0]
+        self.assertNotIn("resume_id", old)                   # 没被"顺手"改成新版本号
+
+    def test_overwriting_without_a_version_does_not_keep_the_old_pin(self):
+        """覆盖同一条记录时没给版本 → **不许留着上一次的版本号**（那会是一句假话）。
+
+        `store.upsert_job` 是合并写：不显式清掉，上一版的 `resume_id` 会留在这次分析头上，
+        而这次用的可能是**另一份**简历（`resume` 显示名都被改成新的了）。
+        """
+        self._old_job(resume_id="rv_0001")
+        self._patch_analyze_deps()
+        code, body = self._post_json("/api/analyze",
+                                     {"jd_text": self.LONG, "source_type": "粘贴文本",
+                                      "resume_name": self._resume("另一份.md"), "overwrite": "j-old"})
+        self.assertEqual(code, 200, body)
+        rec = store.load_jobs()[0]
+        self.assertEqual(rec["id"], "j-old")
+        self.assertEqual(rec["resume"], "另一份")            # 写回了同一条记录
+        self.assertFalse(rec.get("resume_id"),
+                         "覆盖后还背着上一版的版本号：%r" % (rec.get("resume_id"),))
+
+
+class ResumeVersionRouteTest(IsolatedCase):
+    """§6.1 简历版本路由：族谱元数据 / 取回（四种 kind）/ 选定 / 移出 / 彻底删。"""
+
+    def _handler(self, method, path, obj=None):
+        raw = json.dumps(obj, ensure_ascii=False).encode("utf-8") if obj is not None else b""
+        headers = {"Content-Length": str(len(raw)),
+                   "Content-Type": "application/json; charset=utf-8"}
+        h = _sandbox_handler(method, path, raw, headers)
+        return h._status, h._body
+
+    def _get(self, path):
+        return self._handler("GET", path)
+
+    def _post(self, path, obj):
+        return self._handler("POST", path, obj)
+
+    def _delete(self, path):
+        return self._handler("DELETE", path)
+
+    def _save(self, name, content, **extra):
+        body = {"name": name, "content": content}
+        body.update(extra)
+        code, resp = self._post("/api/resumes", body)
+        return code, resp
+
+    def _new(self, name, content, **extra):
+        """保存并断言成功，返回新版本记录。"""
+        code, body = self._save(name, content, **extra)
+        self.assertEqual(code, 200, body)
+        return body["resume"]
+
+    def _snap_path(self, rel):
+        return store.p_path(rel)
+
+    def test_get_returns_lineage_metadata_and_hides_removed_by_default(self):
+        v1 = self._new("母版.md", "第一版内容")
+        v2 = self._new("母版.md", "第二版内容", parent_id=v1["id"])
+        self.assertEqual((v2["rev"], v2["parent_id"], v2["root_id"]),
+                         (2, v1["id"], v1["id"]))
+
+        code, body = self._get("/api/resumes")
+        self.assertEqual(code, 200)
+        self.assertEqual([r["id"] for r in body["resumes"]], [v1["id"], v2["id"]])
+        row = [r for r in body["resumes"] if r["id"] == v1["id"]][0]
+        for k in ("id", "name", "rev", "at", "chosen", "removed", "mother_file", "ai_diff"):
+            self.assertIn(k, row)                                  # 前端要的族谱元数据逐项都在
+        self.assertEqual((row["name"], row["rev"], row["removed"], row["chosen"]),
+                         ("母版", 1, False, False))
+        self.assertEqual(body["files"], ["母版.md"])               # 磁盘上的文件名照旧给
+
+        # 移出后**默认列表里不再有它**（← 变异③「移出后列表仍显示它」会把这两条打红）
+        code, body = self._delete("/api/resumes?version=" + v1["id"])
+        self.assertEqual(code, 200, body)
+        code, body = self._get("/api/resumes")
+        self.assertEqual([r["id"] for r in body["resumes"]], [v2["id"]])
+        self.assertEqual(body["files"], ["母版.md"])               # 文件还在盘上（下一步逐字断言）
+        code, body = self._get("/api/resumes?include_removed=1")
+        self.assertEqual([r["id"] for r in body["resumes"]], [v1["id"], v2["id"]])
+
+    def test_unregistered_files_on_disk_are_reported_not_hidden(self):
+        """迁移之前（Task 5 之前）盘上就有简历文件、`resumes.json` 还没有 —— 界面必须看得见它们。"""
+        store.ensure_profile()
+        store.write_text(os.path.join(store.p_path("resumes"), "周汉钦-母版.md"), "老简历正文")
+        code, body = self._get("/api/resumes")
+        self.assertEqual(code, 200)
+        self.assertEqual(body["files"], ["周汉钦-母版.md"])
+        self.assertEqual(body["unregistered"], ["周汉钦-母版.md"])   # 没有版本记录 → 如实标出
+        self.assertEqual(body["resumes"], [])
+
+    def test_delete_moves_the_version_out_and_keeps_every_file_verbatim(self):
+        """§4.6「删除」= 移出列表：文件一律保留（母版快照与变更说明都在）。**逐字**断言。"""
+        v1 = self._new("母版.md", "第一版内容")
+        code, body = self._post("/api/resumes/choose", {"version": v1["id"]})
+        self.assertEqual(code, 200, body)
+        v2 = self._new("母版.md", "第二版内容", parent_id=v1["id"])
+        snap_rel = resumelib.by_id(v1["id"])["mother_file"]
+        self.assertTrue(snap_rel)
+
+        code, body = self._delete("/api/resumes?version=" + v1["id"])
+        self.assertEqual(code, 200, body)
+        self.assertTrue(resumelib.by_id(v1["id"])["removed"])
+
+        # 逐字：不是「文件还在」——「还在」会被「被清空 / 被换成别人」蒙过去（← 变异② os.remove）
+        with open(self._snap_path("resumes/母版.md"), "rb") as f:
+            self.assertEqual(f.read(), "第二版内容".encode("utf-8"))
+        with open(self._snap_path(snap_rel), "rb") as f:
+            self.assertEqual(f.read(), "第一版内容".encode("utf-8"))
+        self.assertEqual(len(resumelib.list_versions(include_removed=True)), 2)   # 记录也还在
+
+    def test_delete_by_name_still_moves_out_the_current_version(self):
+        """老前端（按文件名删）也**只移出列表**：文件一字不动。"""
+        self._new("母版.md", "内容")
+        code, body = self._delete("/api/resumes?name=" + quote("母版.md"))
+        self.assertEqual(code, 200, body)
+        self.assertEqual(store.read_text(self._snap_path("resumes/母版.md")), "内容")
+        self.assertEqual(resumelib.list_versions(), [])
+
+    def test_the_file_route_serves_the_latest_and_the_mother_verbatim(self):
+        v1 = self._new("母版.md", "第一版内容")
+        self._post("/api/resumes/choose", {"version": v1["id"]})
+        v2 = self._new("母版.md", "第二版内容", parent_id=v1["id"])
+        code, body = self._get("/api/resumes/file?version=" + v2["id"])
+        self.assertEqual((code, body["kind"], body["text"], body["ok"]), (200, "latest", "第二版内容", True))
+        code, body = self._get("/api/resumes/file?version=" + v1["id"])
+        self.assertEqual((code, body["kind"], body["text"], body["ok"]), (200, "mother", "第一版内容", True))
+
+    def test_the_file_route_says_the_text_was_never_kept_instead_of_serving_an_empty_file(self):
+        """§8.1 旧版原文不保留（用户已定的取舍）：**明确说明**，绝不用空串冒充原文。"""
+        v1 = self._new("母版.md", "第一版内容")
+        self._post("/api/resumes/choose", {"version": v1["id"]})
+        v2 = self._new("母版.md", "第二版内容", parent_id=v1["id"])
+        self._new("母版.md", "第三版内容", parent_id=v2["id"])
+
+        code, body = self._get("/api/resumes/file?version=" + v2["id"])
+        self.assertEqual(code, 200)
+        self.assertEqual(body["kind"], "missing")
+        self.assertFalse(body["ok"])
+        self.assertIn("原文未保留", body["error"])        # 明确说明，不是沉默
+        self.assertNotIn("text", body)                    # ← 绝不给一个空串冒充原文
+
+    def test_the_file_route_flags_content_that_no_longer_matches_the_record(self):
+        """§8.2 程序外改过 → 如实说「不符」+ 亮出内容与两个 sha，绝不静默当正常版本。"""
+        v1 = self._new("母版.md", "原始内容")
+        with open(self._snap_path("resumes/母版.md"), "w", encoding="utf-8", newline="") as f:
+            f.write("别人手改的内容")                      # 模拟程序外改文件
+        code, body = self._get("/api/resumes/file?version=" + v1["id"])
+        self.assertEqual(code, 200)
+        self.assertEqual(body["kind"], "mismatch")
+        self.assertFalse(body["ok"])
+        self.assertIn("不符", body["error"])
+        self.assertEqual(body["text"], "别人手改的内容")   # 内容照常亮出来对账
+        self.assertEqual(body["sha256"], v1["sha256"])     # 记录里的
+        self.assertEqual(body["actual_sha256"], resumelib.sha256_of("别人手改的内容"))
+        self.assertNotEqual(body["actual_sha256"], body["sha256"])
+
+    def test_saving_goes_through_create_version_so_a_record_always_appears(self):
+        """§4.1 保存必须走 `resumelib.create_version`（留快照、记 sha/时间/rev）。"""
+        code, body = self._save("母版.md", "第一版内容")
+        self.assertEqual(code, 200, body)
+        doc = resumelib.load_resumes()
+        self.assertEqual(len(doc["resumes"]), 1)     # ← 旧实现直接 store.write_text：这里 0 条
+        rec = doc["resumes"][0]
+        self.assertEqual((rec["name"], rec["rev"], rec["file"]), ("母版", 1, "resumes/母版.md"))
+        self.assertEqual(rec["sha256"], resumelib.sha256_of("第一版内容"))
+        self.assertEqual(rec["size"], len("第一版内容".encode("utf-8")))
+        self.assertEqual(body["resume"]["id"], rec["id"])            # 路由返回新记录
+        self.assertEqual(store.read_text(self._snap_path("resumes/母版.md")), "第一版内容")
+
+    def test_a_second_new_root_with_the_same_name_is_rejected_not_silently_overwritten(self):
+        """同名「新开」→ 明确报错（绝不静默覆盖别人的文件）。"""
+        self._new("母版.md", "第一版内容")
+        code, body = self._save("母版.md", "别的内容")               # 不带 parent_id = 新开
+        self.assertEqual(code, 400, body)
+        self.assertIn("母版", str(body.get("error")))
+        self.assertEqual(store.read_text(self._snap_path("resumes/母版.md")), "第一版内容")
+
+    def test_a_continuation_without_parent_id_resolves_the_chosen_mother(self):
+        """`lineage="延续"`：母亲 = 这份简历里被「选定继续优化」的那一版。"""
+        v1 = self._new("母版.md", "第一版内容")
+        self._post("/api/resumes/choose", {"version": v1["id"]})
+        v2 = self._new("母版.md", "第二版内容", lineage="延续")
+        self.assertEqual(v2["parent_id"], v1["id"])
+        self.assertEqual(v2["rev"], 2)
+        with open(self._snap_path(resumelib.by_id(v1["id"])["mother_file"]), "rb") as f:
+            self.assertEqual(f.read(), "第一版内容".encode("utf-8"))   # 覆盖前那份逐字留下
+
+    def test_choose_purge_and_restore_routes(self):
+        v1 = self._new("甲.md", "A1")
+        v2 = self._new("甲.md", "A2", parent_id=v1["id"])
+        other = self._new("乙.md", "B1")
+
+        code, body = self._post("/api/resumes/choose", {"version": v1["id"]})
+        self.assertEqual(code, 200, body)
+        self.assertTrue(resumelib.by_id(v1["id"])["chosen"])
+        self.assertFalse(resumelib.by_id(v2["id"])["chosen"])        # 同族谱只能一个
+
+        # 彻底删：记录没了，**别人的文件逐字未变**（反假绿）
+        before = store.read_text(self._snap_path("resumes/乙.md"))
+        code, body = self._post("/api/resumes/purge", {"version": v1["id"]})
+        self.assertEqual(code, 200, body)
+        self.assertIsNone(resumelib.by_id(v1["id"]))
+        self.assertEqual(store.read_text(self._snap_path("resumes/乙.md")), before)
+        self.assertIsNotNone(resumelib.by_id(other["id"]))
+
+        # 恢复：移出 → 放回
+        code, body = self._delete("/api/resumes?version=" + v2["id"])
+        self.assertEqual(code, 200, body)
+        self.assertTrue(resumelib.by_id(v2["id"])["removed"])
+        code, body = self._post("/api/resumes/restore", {"version": v2["id"]})
+        self.assertEqual(code, 200, body)
+        self.assertFalse(resumelib.by_id(v2["id"])["removed"])
+
+        # 找不到的版本 → 404（不是 200 的静默成功）
+        for path in ("/api/resumes/choose", "/api/resumes/restore", "/api/resumes/purge"):
+            with self.subTest(path=path):
+                code, body = self._post(path, {"version": "rv_9999"})
+                self.assertEqual(code, 404, body)
+        code, body = self._get("/api/resumes/file?version=rv_9999")
+        self.assertEqual(code, 404, body)
+        code, body = self._get("/api/resumes/file")
+        self.assertEqual(code, 400, body)
+
+    def test_restore_refuses_a_name_taken_by_a_live_resume(self):
+        """恢复时名字被占用 → 409，且**不许**把记录硬塞回列表（界面会看到两份同名简历）。"""
+        v1 = self._new("甲.md", "A1")
+        code, body = self._delete("/api/resumes?version=" + v1["id"])
+        self.assertEqual(code, 200, body)
+        self._new("甲.md", "B1")                                     # 名字空出来了 → 同名新开
+        code, body = self._post("/api/resumes/restore", {"version": v1["id"]})
+        self.assertEqual(code, 409, body)
+        self.assertIn("占用", body["error"])
+        self.assertTrue(resumelib.by_id(v1["id"])["removed"])        # 还在移出状态
 
 
 if __name__ == "__main__":
