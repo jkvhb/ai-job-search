@@ -42,12 +42,16 @@ class KeysTest(IsolatedCase):
         self.assertNotIn("首", kbreuse._keys_of_term("响应延迟（首）"))
 
     def test_keys_are_deduplicated_and_keep_order(self):
-        """同一把键重复出现时只留一个（保序）。
+        """去重与保序。
 
-        ⚠️ **别拿 `WER（WER）` 当例子**：`kb.normalize_id("WER（WER）")` 是 `"werwer"`
-        （括号只是被去掉，不是被替换），所以 `_keys_of_term` 会给 `["werwer", "wer"]` ——
-        那不是"去重"。真正能验证去重的是"**同一个括号缩写出现两次**"。
+        ⚠️ **两级去重，别混为一谈**（第一版 docstring 就是这么写错的）：
+        - `_paren_keys` 自己去重**括号之间**的重复（所以 `（WER）（WER）` → 只剩 `wer`）；
+        - `_keys_of_term` 去重**"全名键"与"括号键"之间**的重复 ——
+          它只在**术语本身就是那个括号**时可达：`（WER）` 的 `normalize_id` 正好也是 `wer`，
+          于是第二把键会被拦下。**这条断言就是给这个分支补牙的**。
         """
+        self.assertEqual(kbreuse._keys_of_term("（WER）"), ["wer"])
+        self.assertEqual(kbreuse._keys_of_term("（ASR）"), ["asr"])
         self.assertEqual(kbreuse._keys_of_term("AB（WER）CD（WER）"),
                          ["abwercdwer", "wer"])
 
