@@ -4468,14 +4468,81 @@ class JdDeleteFrontendTest(LedgerWithReportsCase):
             "out.text = jdPurgeConfirmText(__fixture.p, jdPurgeLines(__fixture.p));\n",
             {"p": p})
         text = out["text"]
+        # ② 区只许出现**真会删**的文件
+        self.assertIn("②", text)
         sec2 = text.split("②", 1)[1].split("③", 1)[0]
         self.assertNotIn("a1.html", sec2, "要保留的文件被列进了「即将删除」：%r" % (sec2,))
         self.assertNotIn(absent, sec2, "不在盘上的文件被列进了「即将删除」：%r" % (sec2,))
-        # 但都必须在④/⑤里点名（如实告知，不是删掉不提）
-        self.assertIn("a1.html", text.split("④", 1)[1] if "④" in text else "")
-        self.assertIn(absent, text.split("⑤", 1)[1] if "⑤" in text else "")
         # ② 里至少要有一份**真会删**的文件（否则上面两条断言可能"因为 ② 是空的"而恒真）
         self.assertIn(self.JD_ID + ".txt", sec2, sec2)
+        # ④ 区（**只看 ④ 到 ⑤ 之间**：扫"从 ④ 往后"的话，把名字印在 ⑤ 也能过）
+        self.assertIn("④", text)
+        sec4 = text.split("④", 1)[1].split("⑤", 1)[0] if "⑤" in text else text.split("④", 1)[1]
+        self.assertIn("a1.html", sec4, "要保留的文件没在 ④ 里点名：%r" % (sec4,))
+        # ⑤ 区只该有"不在盘上"的
+        if "⑤" in text:
+            sec5 = text.split("⑤", 1)[1]
+            self.assertIn(absent, sec5, "不在盘上的文件没在 ⑤ 里点名：%r" % (sec5,))
+            self.assertNotIn("a1.html", sec5, "要保留的文件混进了 ⑤：%r" % (sec5,))
+        # ④ 里必须写**这一份自己的**原因，不能拿别的文件的原因糊过去
+        self.assertIn("别的 JD", sec4, sec4)
+
+    def test_the_second_confirmation_writes_each_kept_files_own_reason(self):
+        """④ 区每份保留文件要带**它自己的** `why`（后端给的是两种不同的原因）。
+
+        原先 ④ 把 `kept[0].why` 写成整段的共同原因 —— 一份"报告被别的 JD 用"
+        和一份"JD 原文被别的 JD 用"混在一起时，解释就串了。
+        """
+        _need_node()
+        p = {"id": "JD_X", "files": [
+            {"name": "共用报告.html", "where": "reports", "kind": "analysis_report",
+             "exists": True, "kept": True, "note": "",
+             "why": "还有**别的 JD** 的分析在引用这份报告：留着它，绝不删别人的东西"},
+            {"name": "共用原文.txt", "where": "jd", "kind": "jd_text", "exists": True,
+             "kept": True, "note": "JD 原文",
+             "why": "还有**别的 JD** 的记录点名了这份文件：留着它，绝不删别人的东西"},
+            {"name": "真删.html", "where": "reports", "kind": "analysis_report",
+             "exists": True, "kept": False, "note": "", "why": ""}]}
+        out = web_probe.run_index(
+            "out.text = jdPurgeConfirmText(__fixture.p, jdPurgeLines(__fixture.p));\n",
+            {"p": p})
+        text = out["text"]
+        sec4 = text.split("④", 1)[1]
+        # 每份保留文件**各自一行**，并带各自的原因（"分析在引用" vs "记录点名了"）
+        lines = [ln.strip() for ln in sec4.split("\n")]
+        self.assertTrue(any("共用报告.html" in ln and "的分析在引用" in ln for ln in lines),
+                        "报告的原因不对：%r" % (sec4,))
+        self.assertTrue(any("共用原文.txt" in ln and "的记录点名了" in ln for ln in lines),
+                        "原文的原因不对：%r" % (sec4,))
+
+    def test_every_failure_code_says_its_own_thing(self):
+        """四种失败各自的说法都要对得上，尤其**不许把没删过的说成"已回滚"**。
+
+        `code="failed"` 才是"已回滚"，`not_found` / `stale` / `unreadable` 都是**什么都没动**。
+        原先只有一句无条件的"删除失败（已回滚）"，对后三种就是假话。
+        """
+        _need_node()
+        p = self._preview()
+        cases = [
+            ("failed", "删除失败（已回滚）"),
+            ("backup_failed", "一个字节都没动"),
+            ("not_found", "什么都没动"),
+            ("stale", "什么都没动"),
+            ("unreadable", "什么都没动"),
+            ("", "什么都没动"),                       # 未知 code 也不能声称回滚
+        ]
+        for code, want in cases:
+            res = {"ok": False, "id": self.JD_ID, "error": "后端原话", "backup": ""}
+            if code:
+                res["code"] = code
+            out = self._failed_purge_probe(res)
+            text = "\n".join(out["toasts"]) + "\n".join(out["alerts"])
+            self.assertIn(want, text, "code=%r 少了自己的说法：%r" % (code, text))
+            if code != "failed":
+                self.assertNotIn("已回滚", text,
+                                 "code=%r 不该说「已回滚」：%r" % (code, text))
+            # 后端的原话必须原样转述（不许被前端的概括吞掉）
+            self.assertIn("后端原话", text, "code=%r 没转述后端的话：%r" % (code, text))
 
     def test_the_success_alert_writes_each_skipped_files_own_reason(self):
         """成功弹窗里"保留未删"的原因要**逐个照抄后端给的 `why`**，不能概括成一句。

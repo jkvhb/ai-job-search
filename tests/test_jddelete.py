@@ -18,6 +18,7 @@
 6. **边界**：删不存在的 JD → 明确错误（不是崩）；没分析 → 照样能删；
    报告文件缺失 → 如实说明（advisories）而不是静默跳过。
 """
+import glob
 import hashlib
 import json
 import os
@@ -584,6 +585,33 @@ class JdPurgeFileScopeTest(_PurgeCase):
         self.assertTrue(res["ok"], res)
         self.assertFalse(os.path.exists(self._jd_file(JD_A + ".txt")))
 
+    def test_a_phantom_conventional_name_is_not_invented_when_no_file_exists(self):
+        """约定名**不在盘上**时，不许凭空列一个"JD 原文（不在盘上）"出来。
+
+        这不是假想形状 —— **用户真实数据里就有一条**：`jd_text_file` 是 `""`（`app.py`
+        写演示数据时那样），而 `jd/<那个 id>.txt` 从来不存在。若把约定名无条件列出来，
+        预演会对它输出一行"JD 原文：xxx.txt（**不在盘上**）"，让用户以为**丢了东西**。
+        "不在盘上"只对**被字段点名**的文件有意义（那才是真不一致）。
+        """
+        jd_id = "示例_演示岗_80分_0012"
+        jdid.upsert_jd({"id": jd_id, "job_title": "演示岗", "jd_text_file": "", "jd_image": ""})
+        self.assertFalse(os.path.exists(self._jd_file(jd_id + ".txt")), "夹具前提：约定名不存在")
+        p = jddelete.preview_purge(jd_id)
+        names = [f["name"] for f in p["files"]]
+        self.assertNotIn(jd_id + ".txt", names,
+                         "凭空造了一个不存在的原文文件：%r" % (p["files"],))
+        self.assertNotIn("missing_jd_file",
+                         [a["kind"] for a in p["advisories"]], p["advisories"])
+        self.assertEqual(names, [], "这个 JD 没有原文也没有分析，不该有任何文件：%r" % (names,))
+
+    def test_a_field_named_file_that_is_missing_is_still_reported(self):
+        """反方向：**字段点名**了却不在盘上 → 必须如实说（不能因为上一条就一起静默掉）。"""
+        os.remove(self._jd_file(JD_A + ".txt"))
+        p = jddelete.preview_purge(JD_A)
+        self.assertIn(JD_A + ".txt", [f["name"] for f in p["files"]])
+        self.assertIn("missing_jd_file", [a["kind"] for a in p["advisories"]], p["advisories"])
+        self.assertIn("不在盘上", self._advisories_text(p))
+
     def test_a_jd_text_file_another_jd_names_is_not_deleted(self):
         """别的 JD **点名**要用的原文/截图，删 A 时不许删掉。
 
@@ -713,6 +741,171 @@ class JdPurgePreviewPinningTest(_PurgeCase):
         self.assertEqual(kinds[A1 + ".html"], "analysis_report")
         self.assertEqual(kinds[JD_A + ".txt"], "jd_text")
         self.assertEqual(kinds[JD_A + ".jpg"], "jd_image")
+
+
+class JdPurgeStage2Test(_PurgeCase):
+    """阶段 2（代码质量）独立审查抓到的洞：都在这一批里钉住。"""
+
+    def test_the_backup_keeps_each_interview_record_apart_under_a_named_profile(self):
+        """**非默认 profile** 下备份也要按原目录结构放 —— 不许把面试记录撞成一个文件。
+
+        这一条是审查者实证的假绿：`tests/base.py` 把 profile 钉成 `default`，而 `default`
+        下 `store.profile_dir()` 与 `store.p_path()` 恰好是同一个目录 —— 于是
+        `_copy_state_into_backup` 用错基准（`profile_dir()` = `profiles/default`）在测试里
+        **完全看不出来**，而在真实的多 profile 场景下会把每个相对路径算成 `..\\..\\...`、
+        全部退回 basename：**所有 `status.json` 撞成同一个文件**，有记录的字节从备份里丢掉，
+        manifest 还会出现两条同路径、不同 sha 的自相矛盾条目。
+        """
+        store.set_current_profile("dave")          # 隔离根下的另一个 profile
+        jd_id = "本科_丁单位_标注_文本_武汉_8-10K_0003"
+        jdid.upsert_jd({"id": jd_id, "job_title": "丁岗", "jd_text_file": jd_id + ".txt"})
+        store.write_text(store.p_path("jd", jd_id + ".txt"), "丁岗 JD 原文")
+        app._save_analysis({"id": "d1", "jd_id": jd_id, "report": "d1.html", "score": 70.0,
+                            "resume": "简历戊", "created_at": "2026-10-02 09:00"})
+        store.write_text(store.p_path("reports", "d1.html"), _report_html("丁岗"))
+        with open(store.jobs_path(), "rb") as f:
+            jobs_before = f.read()
+        # 两条**内容不同**的面试记录：备份里必须各占一份
+        store.save_interview_json("iv_a", "status.json",
+                                  {"state": "done", "job_id": jd_id, "title": "第一次"})
+        store.save_interview_json("iv_b", "status.json",
+                                  {"state": "done", "job_id": jd_id, "title": "第二次"})
+        paths = {"iv_a": store.interview_file("iv_a", "status.json"),
+                 "iv_b": store.interview_file("iv_b", "status.json")}
+        raws = {k: open(p, "rb").read() for k, p in paths.items()}
+        self.assertNotEqual(raws["iv_a"], raws["iv_b"], "夹具前提：两条记录内容必须不同")
+
+        res = jddelete.purge_jd(jd_id)
+        self.assertTrue(res["ok"], res)
+        state = os.path.join(res["backup"], jddelete.DIR_STATE)
+        # ① 两条记录各自一份、逐字节相同
+        for iv_id, raw in raws.items():
+            p = os.path.join(state, "interviews", iv_id, "status.json")
+            self.assertTrue(os.path.isfile(p),
+                            "备份里没有 %s（撞成一个文件了？）：%r"
+                            % (iv_id, sorted(os.listdir(state))))
+            with open(p, "rb") as f:
+                self.assertEqual(f.read(), raw, iv_id)
+        # ② manifest 不许有重名条目（同路径两条 = 自相矛盾）
+        with open(os.path.join(res["backup"], "manifest.json"), encoding="utf-8") as f:
+            man = json.load(f)
+        rels = [e["path"] for e in man["files"]]
+        self.assertEqual(len(rels), len(set(rels)), "manifest 里有重名条目：%r" % (rels,))
+        # ③ 备份里那份 `jobs.json` 是**这个 profile** 的（不是 default 的）
+        with open(os.path.join(state, "jobs.json"), "rb") as f:
+            self.assertEqual(f.read(), jobs_before)
+
+    def test_an_unreadable_jds_library_blocks_the_purge_instead_of_wiping_it(self):
+        """`jds.json` 读不出来 → **拒绝删除**（与台账同族，一步之遥就会丢掉整个 JD 库）。
+
+        第 2b 步会把 `jds.json` 整份重写成 `jdid.load_jds()` 读到的那个库，而那个函数
+        在任何读/解析失败时都返回**空库** —— 于是"读不出来"会被落成一份空 JD 库：
+        所有岗位的 JD 记录（状态、结果、原文文件名）一次没了。
+        今天用户数据够不到这条（`jds.json` 还不存在），但 `身份迁移.py` 一跑它就会存在。
+        """
+        bad = b'{"jds": [ {"id": "A_0001"}  <<<CORRUPT>>>'
+        with open(jdid._jds_path(), "wb") as f:              # noqa: SLF001
+            f.write(bad)
+        p = jddelete.preview_purge(JD_A)
+        self.assertFalse(p["can_purge"], p)
+        self.assertIn("jds.json", p["unreadable"])
+        with self.assertRaises(jddelete.JdPurgeError) as ctx:
+            jddelete.purge_jd(JD_A)
+        self.assertEqual(ctx.exception.code, "unreadable")
+        with open(jdid._jds_path(), "rb") as f:              # noqa: SLF001
+            self.assertEqual(f.read(), bad, "JD 库被覆盖成空了")
+        # 报告与原文一个都没动
+        self.assertTrue(os.path.exists(self._report(A1 + ".html")))
+        self.assertTrue(os.path.exists(self._jd_file(JD_A + ".txt")))
+
+    def test_purging_does_not_create_a_jds_file_that_did_not_exist(self):
+        """`jds.json` 原本不存在时，删除不该**顺手造一个**出来。
+
+        （用户真实数据现在就是"没有 `jds.json`"的形态）删除的副作用只该是"东西变少"，
+        不是"平白多一个文件"。原先第 2b 步无条件 `save_jds()`，会写出一份空库。
+        """
+        path = jdid._jds_path()                              # noqa: SLF001
+        if os.path.exists(path):
+            os.remove(path)
+        res = jddelete.purge_jd(JD_A)
+        self.assertTrue(res["ok"], res)
+        self.assertFalse(os.path.exists(path), "删除顺手造了一个 jds.json 出来")
+        self.assertEqual([j.get("id") for j in store.load_jobs()], [B1])
+
+    def test_a_backup_stage_failure_is_always_reported_as_backup_failed(self):
+        """备份阶段失败（**哪怕抛的是 `JdPurgeError`**）→ 一律报 `backup_failed`。
+
+        这一段发生在任何删除之前。报成 `failed` 会让前端说"删除失败（已回滚）"——
+        而那时**根本没删过东西、也没回滚过**。审查者实证：备份 sha 不符那条走的就是这个洞
+        （`_copy_into_backup` 抛的 `JdPurgeError` 用的是默认 `code="failed"`）。
+
+        顺带钉住：半截备份目录必须被清掉（否则用户会看到一个**没用**的"备份"）。
+        """
+        def boom(entry, dest):
+            raise jddelete.JdPurgeError("备份出的文件与盘上的不一致（sha256 不符）：x")
+        with mock.patch.object(jddelete, "_copy_into_backup", side_effect=boom):
+            with self.assertRaises(jddelete.JdPurgeError) as ctx:
+                jddelete.purge_jd(JD_A)
+        self.assertEqual(ctx.exception.code, "backup_failed")
+        # 什么都没动
+        self.assertTrue(os.path.exists(self._report(A1 + ".html")))
+        self.assertTrue(os.path.exists(self._jd_file(JD_A + ".txt")))
+        # 半截备份目录也不许留下（`test_app` 那条只断言了 code，没断言这个）
+        leftovers = glob.glob(os.path.join(store.profiles_root(),
+                                           jddelete.BACKUP_PREFIX + "_*"))
+        self.assertEqual(leftovers, [], "留下了半截备份目录：%r" % (leftovers,))
+
+    def test_an_unreadable_knowledge_base_is_reported_but_does_not_block(self):
+        """知识库读不出来 → **如实说明引用没清**，但**不阻止**删除。
+
+        与台账的差别很清楚：这个文件**不会被覆盖**（`kb_touched` 保持 0 → 根本不写它），
+        所以坏着也不会丢数据；可"引用还指着已删的岗位"这件事必须说出来 ——
+        否则用户以为引用清干净了。这就是"算不出来的就说算不出来"。
+        """
+        bad = '{"nodes": [ <<<CORRUPT>>>'.encode("utf-8")
+        with open(store.knowledge_path(), "wb") as f:
+            f.write(bad)
+        p = jddelete.preview_purge(JD_A)
+        self.assertTrue(p["can_purge"], "知识库坏掉不该阻止删除：%r" % (p,))
+        self.assertIn("knowledge.json", p["knowledge_err"])
+        self.assertIn("unreadable_knowledge",
+                      [a["kind"] for a in p["advisories"]], p["advisories"])
+        res = jddelete.purge_jd(JD_A)
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(res["kb_nodes"], 0)
+        # 坏文件**没有**被重写（内容一字不变）—— 这是"不阻止"的前提
+        with open(store.knowledge_path(), "rb") as f:
+            self.assertEqual(f.read(), bad)
+
+    def test_an_interview_record_appearing_mid_transaction_is_refused_not_rewritten(self):
+        """事务中途新出现的面试记录 → **拒绝**（在动手前退出），绝不改写一份没留底的文件。
+
+        原来第 2d 步**重新 glob** 一遍面试记录：新出现的那条会被清空 `job_id`，而它
+        **既不在快照里、也不在备份里**，回滚也救不回来 —— 改一份没有留底的用户文件，
+        直接违反"先备份再改"这条底线。现在动手前先比对一次，不一致就拒绝。
+        """
+        real = jddelete._copy_state_into_backup
+
+        def inject(dest, snapshots, jd_id):
+            out = real(dest, snapshots, jd_id)
+            store.save_interview_json("iv_late", "status.json",
+                                      {"state": "done", "job_id": JD_A, "title": "迟到的记录"})
+            return out
+
+        with mock.patch.object(jddelete, "_copy_state_into_backup", side_effect=inject):
+            with self.assertRaises(jddelete.JdPurgeError) as ctx:
+                jddelete.purge_jd(JD_A)
+        self.assertEqual(ctx.exception.code, "stale")
+        # 拒绝发生在**任何删除之前**：报告与原文一个都没动
+        self.assertTrue(os.path.exists(self._report(A1 + ".html")))
+        self.assertTrue(os.path.exists(self._jd_file(JD_A + ".txt")))
+        # 而且那条迟到的记录**没有被改写**
+        st = store.load_interview_json("iv_late", "status.json", None)
+        self.assertEqual(st.get("job_id"), JD_A, "改写了一条没有留底的面试记录")
+        # 半截备份也不留
+        leftovers = glob.glob(os.path.join(store.profiles_root(),
+                                           jddelete.BACKUP_PREFIX + "_*"))
+        self.assertEqual(leftovers, [], "留下了半截备份目录：%r" % (leftovers,))
 
 
 class JdPurgeFingerprintTest(_PurgeCase):

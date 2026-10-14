@@ -139,6 +139,62 @@ def _readable_jobs_or_raise():
     return rows
 
 
+def _jds_or_error():
+    """`(JD 库, 读不出来的原因)` —— **和 `_jobs_or_error` 同一族**，理由也同一族。
+
+    为什么不能直接用 `jdid.load_jds()`：那个函数在任何读/解析失败时都返回一份**空库**
+    （`jdid.py` 的"绝不抛异常"契约）。而删除的第 2b 步会 `jdid.save_jds(...)` 把
+    `jds.json` **整份重写**成它读到的那个库 —— 于是"读不出来"会被落成一份空 JD 库：
+    **所有岗位的 JD 记录（原文文件名、截图、状态、结果）一次没了**。
+
+    今天用户真实数据**够不到**这条（`jds.json` 还不存在），但 `身份迁移.py` 一跑、
+    这个文件一存在，它就和 F1 那条一样致命 —— 所以现在就堵上。
+    """
+    path = jdid._jds_path()                                   # noqa: SLF001
+    if not os.path.exists(path):
+        return {"version": 1, "seq": 0, "jds": []}, ""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        return {"version": 1, "seq": 0, "jds": []}, "JD 库 `jds.json` 读不出来：%s" % e
+    if not isinstance(data, dict) or not isinstance(data.get("jds"), list):
+        return {"version": 1, "seq": 0, "jds": []}, (
+            "JD 库 `jds.json` 的结构不对（应当是含 `jds` 列表的对象）—— 它坏了，"
+            "而删除会把它整份覆盖掉")
+    return jdid.load_jds(), ""
+
+
+def _readable_jds_or_raise():
+    """删除**真正落盘**之前用；与 `_readable_jobs_or_raise` 同理。"""
+    data, err = _jds_or_error()
+    if err:
+        raise JdPurgeError("%s。**拒绝删除**：继续下去会把整份 JD 库覆盖成空，"
+                           "所有岗位的 JD 记录都会没掉。请先把 `jds.json` 修好"
+                           "（或从别处恢复）再删。" % err, code="unreadable")
+    return data
+
+
+def _knowledge_or_error():
+    """`(知识库数据, 读不出来的原因)` —— 只用于**如实说明**，不用来拒绝删除。
+
+    知识库坏掉**不会丢数据**（`kb_touched` 会保持 0，于是根本不会写它），
+    但"引用没清干净"这件事必须说出来：否则用户以为引用清了、其实还指着那个已删的岗位。
+    与 F1 的差别就在这里 —— 那里会把坏文件**覆盖**掉，这里不会。
+    """
+    path = store.knowledge_path()
+    if not os.path.exists(path):
+        return {"nodes": []}, ""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        return {"nodes": []}, "知识库 `knowledge.json` 读不出来：%s" % e
+    if not isinstance(data, dict) or not isinstance(data.get("nodes"), list):
+        return {"nodes": []}, "知识库 `knowledge.json` 的结构不对（应当是含 `nodes` 列表的对象）"
+    return data, ""
+
+
 def _digest(text):
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
 
@@ -235,9 +291,15 @@ def _names_referenced_by_others(jd_id, key):
     return out
 
 
-def _kb_hits(jd_id):
-    """知识库里 `from_jds[].id == jd_id` 的卡片：**只读**（绝不顺手 `ensure_kb` 改库）。"""
-    data = store.load_knowledge()
+def _kb_hits(jd_id, data=None):
+    """知识库里 `from_jds[].id == jd_id` 的卡片：**只读**（绝不顺手 `ensure_kb` 改库）。
+
+    `data` 由调用方传进来（`_knowledge_or_error()` 的严格读结果）—— 这样知识库
+    **读不出来**时，预演报的是"读不出来"而不是一个**看起来很正常的 0 命中**
+    （那会让用户以为引用本来就没有，而"算不出来的就说算不出来"是本模块的明文口径）。
+    """
+    if data is None:
+        data = store.load_knowledge()
     out = []
     for node in (data.get("nodes") if isinstance(data, dict) else []) or []:
         if not isinstance(node, dict):
@@ -274,17 +336,26 @@ def _file_entry(where, name, kind, note=""):
 def _plan(jd_id):
     """**只读**地算出一份完整删除计划（内部形状；对外由 `preview_purge` 摊平）。
 
-    `unreadable` 非空 = `jobs.json` 在盘上却读不出来（**不能当成"这个 JD 没有分析"**）。
+    `unreadable` 非空 = **会被这次删除整份覆盖的那几份文件里有读不出来的**
+    （`jobs.json` / `jds.json`）—— **不能当成"这个 JD 没有分析 / 没有 JD 记录"**。
     这时 `found=True` 但 `can_purge=False`：用户要看得到"读不出来"这件事本身，
     而不是一句误导性的"找不到这个岗位"。
+
+    `knowledge_err` 非空**不阻止**删除（那个文件不会被覆盖，坏着也不会丢数据），
+    但它要作为 advisory 说出来：否则用户以为引用清干净了，其实还指着已删的岗位。
     """
     jd_id = _text(jd_id)
     jd = jdid.find_jd(jd_id) if jd_id else None
-    rows, unreadable = _jobs_or_error()
+    rows, jobs_err = _jobs_or_error()
+    _jds_data, jds_err = _jds_or_error()
+    _kb_data, kb_err = _knowledge_or_error()
+    # 两个"会被覆盖"的文件的读失败合并成一个 `unreadable`（对外只暴露一个字段）。
+    unreadable = "；".join(x for x in (jobs_err, jds_err) if x)
     analyses = _analyses_of(jd_id, rows) if jd_id else []
     if jd is None and not analyses:
         if unreadable:
             return {"id": jd_id, "jd": None, "found": True, "unreadable": unreadable,
+                    "knowledge_err": kb_err,
                     "analyses": [], "files": [], "kb_cards": [], "interviews": [],
                     "advisories": [{"kind": "unreadable_jobs", "message": unreadable}]}
         return {"id": jd_id, "jd": None, "found": False, "analyses": [], "files": [],
@@ -293,6 +364,10 @@ def _plan(jd_id):
     files, seen, advisories = [], set(), []
     if unreadable:
         advisories.append({"kind": "unreadable_jobs", "message": unreadable})
+    if kb_err:
+        advisories.append({"kind": "unreadable_knowledge", "message":
+                           "%s —— 这次**不会**清理指向它的引用（卡片保留、文件不重写），"
+                           "但删除本身照做" % kb_err})
     # ① 每一条分析的报告文件（**逐条**列，哪怕两条分析引同一份也只列一次并说明）
     survivors = _referenced_by_survivors(jd_id, rows)
     for rec in analyses:
@@ -323,18 +398,39 @@ def _plan(jd_id):
     #    * `jds.json` 的 JD 记录（迁移**之后**的形状：JD 级字段搬到了那里）；
     #    * **分析记录自己**（迁移**之前**的形状：`jd_text_file` / `jd_image` 还在 `jobs.json`
     #      的那条记录上）；
-    #    * `jd/<JD id>.txt` 这条**约定**（字段为空时原文仍然按它命名，与 `app._jd_text_path`
-    #      同一口径 —— 那个函数就有这个兜底，本模块原先没有，于是两边对"这个 JD 的原文叫
-    #      什么"有两种答案）。
+    #    * `jd/<JD id>.txt` 这条**约定**（原文没有字段点名它时，按约定就住在这儿）。
     #    只认前两个来源的话，字段为空（`app.py` 写演示数据时就是 `""`）的老记录会
     #    **只列报告、不列原文** —— 那正是"少列"：用户以为删干净了，`jd/` 下的原文还躺在盘上
     #    （本项目对"少列"的代价说得很清楚：用户不知道自己删了什么）。
+    #
+    #    ⚠️ 与 `app._jd_text_path` 的关系要说准（别写"同一口径"就算了）：那个函数用的是
+    #    **回退**语义 —— 字段有值就只认字段，空了才用约定名；这里是**并集**语义 ——
+    #    字段点到的**全都列**，再加上"约定名且确实存在"的那一个。差异只在一个场合出现：
+    #    记录点名了 `old.txt`、而 `<JD id>.txt` **也在盘上** —— 此时两边都会删/读，
+    #    但我们**两个都列**。宽出来的这一列是**刻意**的：多列一个只是多问一句，
+    #    少列一个是"用户以为删干净了、文件还在"（本模块最贵的错）。
     for key, kind, label in (("jd_text_file", "jd_text", "JD 原文"),
                              ("jd_image", "jd_image", "原截图")):
-        # 约定名只对 JD 原文成立（截图没有 `<id>.jpg` 这条约定）。
-        fallback = (jd_id + ".txt") if key == "jd_text_file" else ""
+        # 显式点名的（JD 记录 + **每一条**分析记录）
+        names = _jd_file_names_of(jd, analyses, key)
+        named = set(names)
+        # 约定名 `jd/<JD id>.txt`：**只在它真的存在时**才列，并说明是"按约定找到的"。
+        # 为什么加这个条件：这是**我们猜**的位置，猜错了没有什么可报告的；而"字段点名了
+        # 却不在盘上"是**真不一致**，那个必须如实说（下面的 `missing_jd_file`）。
+        # 现实例子（用户真实数据里就有）：`app.py` 写演示数据时 `jd_text_file` 是 `""`，
+        # 该 JD **从来就没有原文** —— 不加这个条件，预演会对它凭空输出一行
+        # "JD 原文：xxx.txt（**不在盘上**）"，让用户以为丢了东西。
+        conventional = store.safe_name(jd_id + ".txt") if key == "jd_text_file" else ""
+        if conventional and conventional not in named:
+            path = os.path.join(store.p_path(DIR_JD), conventional)
+            if os.path.isfile(path):
+                names.append(conventional)
+                advisories.append({"kind": "conventional_jd_file", "message":
+                                   "%s**没有任何字段点名**，但按约定 `jd/<JD id>.txt` 确实在盘上"
+                                   "（`app._jd_text_path` 也是这么找的）—— 按约定列出它"
+                                   % label})
         others = _names_referenced_by_others(jd_id, key)
-        for name in _jd_file_names_of(jd, analyses, key, fallback=fallback):
+        for name in names:
             if (DIR_JD, name) in seen:
                 continue
             seen.add((DIR_JD, name))
@@ -346,27 +442,31 @@ def _plan(jd_id):
                                    "%s「%s」还有别的 JD 的记录在用 —— **保留不删**"
                                    % (label, name)})
             elif not entry["exists"]:
+                # 走到这里的一定是**被字段点名**的：那才是不一致，必须说
                 advisories.append({"kind": "missing_jd_file", "message":
-                                   "%s文件「%s」**不在盘上** —— 预演里照旧列出它，不是静默跳过"
-                                   % (label, name)})
+                                   "%s文件「%s」**不在盘上**（记录里点名了它）—— "
+                                   "预演里照旧列出它，不是静默跳过" % (label, name)})
             files.append(entry)
     return {"id": jd_id, "jd": jd, "found": True, "unreadable": unreadable,
+            "knowledge_err": kb_err,
             "analyses": analyses, "files": files,
-            "kb_cards": _kb_hits(jd_id), "interviews": _interview_hits(jd_id),
+            "kb_cards": _kb_hits(jd_id, _kb_data), "interviews": _interview_hits(jd_id),
             "advisories": advisories}
 
 
-def _jd_file_names_of(jd, analyses, key, fallback=""):
-    """该 JD 的 `jd_text_file` / `jd_image` 文件名（去重、保持出现顺序）。
+def _jd_file_names_of(jd, analyses, key):
+    """该 JD **被字段点名**的 `jd_text_file` / `jd_image` 文件名（去重、保持出现顺序）。
 
-    JD 记录里有就用它的；**同时还收**分析记录上的同名键（迁移前的老记录把 JD 级字段留在
-    `jobs.json` 上）；最后再加上 `fallback`（`jd/<JD id>.txt` 这条约定名）。
-    只要有一个来源点到，这个文件就**必须**出现在预演清单里 —— 少列比多列危险得多。
+    两个来源都要收：`jds.json` 的 JD 记录（迁移**之后**的形状），以及**分析记录自己**
+    （迁移**之前**的形状：字段还在 `jobs.json` 上）。而且**每一条**分析都要看 ——
+    只读第一条会漏掉后面几条各自带的原文/截图。
+
+    约定名（`jd/<JD id>.txt`）**不在这里**：它需要"文件是否真的存在"这个信息才能决定要不要
+    列出来，所以由 `_plan` 处理（见那里的注释）。
     """
     out, seen = [], set()
-    names = [store.safe_name((src or {}).get(key)) for src in [jd] + list(analyses)]
-    names.append(store.safe_name(fallback))
-    for name in names:
+    for src in [jd] + list(analyses):
+        name = store.safe_name((src or {}).get(key))
         if name and name not in seen:
             seen.add(name)
             out.append(name)
@@ -392,13 +492,16 @@ def preview_purge(jd_id):
       "not_found": "..."}          # 找不到时非空（给用户看的那句话）
     ```
 
-    **`can_purge=false` 只有一个原因**：`unreadable` 非空 —— `jobs.json` 在盘上却读不出来。
-    这时**必须拒绝删除**：删除会用 `save_jobs()` 把整份台账覆盖成它读到的那个列表，
-    而"读不出来"被当成空就会把**所有岗位的所有分析记录**一次抹掉（且不可回滚）。
+    **`can_purge=false` 有**两个**原因**（前端只认这一个字段，不必区分）：
+      1. `found=false`（**这个 ID 根本不存在**）—— 路由对那一支回 404；
+      2. `unreadable` 非空：**会被这次删除整份覆盖**的文件在盘上却读不出来
+         （`jobs.json` 或 `jds.json`）。
+    第 2 条**必须拒绝删除**：删除会把那两份文件**整份重写**成它读到的内容，而"读不出来"
+    被当成空就会把**所有岗位的所有分析记录 / 所有 JD 记录**一次抹掉（且不可回滚）。
     前端见到 `can_purge !== true` 就要停手，别拿这份"看起来只有 0 条分析"的清单往下走。
 
-    **算不出来的就说算不出来**：读不出报告名、文件不在盘上、报告被别的 JD 共用，
-    都进 `advisories`，绝不静默吞掉。
+    **算不出来的就说算不出来**：读不出报告名、文件不在盘上、报告被别的 JD 共用、
+    `knowledge.json` 读不出来，都进 `advisories`，绝不静默吞掉。
     """
     plan = _plan(jd_id)
     jd_id = plan["id"]
@@ -406,7 +509,7 @@ def preview_purge(jd_id):
         reason = ("JD 库里没有这个 ID，也没有挂在它下面的分析：%s"
                   % (jd_id or "（空 id）"))
         return {"ok": True, "id": jd_id, "found": False, "jd_exists": False,
-                "can_purge": False, "unreadable": "", "fingerprint": "",
+                "can_purge": False, "unreadable": "", "knowledge_err": "", "fingerprint": "",
                 "not_found": reason, "reason": reason,
                 "jd_record": None, "analyses": [], "files": [],
                 "refs": {"knowledge": {"hits": 0, "cards": [], "cards_kept": 0, "note": ""},
@@ -436,9 +539,12 @@ def preview_purge(jd_id):
     unreadable = str(plan.get("unreadable") or "")
     return {
         "ok": True, "id": jd_id, "found": True, "jd_exists": plan["jd"] is not None,
-        # 台账读不出来 → **明确不许删**。前端必须看这个字段（`can_purge !== true` 就停手），
-        # 否则它会照着这份"看起来只有 0 条分析"的清单走下去，把整份台账覆盖成空。
+        # 台账 / JD 库读不出来 → **明确不许删**。前端必须看这个字段（`can_purge !== true`
+        # 就停手），否则它会照着这份"看起来只有 0 条分析"的清单走下去，把整份文件覆盖成空。
         "can_purge": not unreadable, "unreadable": unreadable,
+        # 知识库读不出来**不阻止**删除（它不会被覆盖），但要如实说 —— 否则用户以为
+        # 引用清干净了，其实还指着已删的岗位。
+        "knowledge_err": str(plan.get("knowledge_err") or ""),
         "reason": "", "not_found": "",
         "fingerprint": _fingerprint_of(plan),
         "jd_record": plan["jd"],
@@ -509,7 +615,14 @@ def _copy_state_into_backup(dest, snapshots, jd_id):
     只备份**存在且读得出来**的那些 —— 读不出来的不能在备份里凭空造一份假的。
     """
     entries = []
-    base = store.profile_dir()
+    # 基准必须是**当前 profile 目录**（`store.p_path()`）—— 快照路径就是从它来的。
+    # 这里**不能**用 `store.profile_dir()`：那个函数无参时给的是 `profiles/default`
+    # （`store.py:38-41`），而 `p_path()` 无参时给的是 `profiles/<当前 profile>`
+    # （`store.py:69-71`）。两者在默认 profile 下碰巧相同，于是**非默认 profile 会把
+    # 每个相对路径都算成 `..\..\...`** → 全部退回 basename →
+    # **所有面试记录的 `status.json` 撞成备份里的同一个文件**，有记录的字节直接丢掉，
+    # 而 manifest 里会出现两条同路径、不同 sha 的条目（自相矛盾）。
+    base = store.p_path()
     for path, snap in snapshots:
         existed, raw = snap if isinstance(snap, tuple) else (True, snap)
         if not existed or raw is None:
@@ -518,9 +631,14 @@ def _copy_state_into_backup(dest, snapshots, jd_id):
             inner = os.path.relpath(path, base)
         except ValueError:                     # 不同盘符（理论上不会发生）
             inner = os.path.basename(path)
-        if inner.startswith(".."):             # 不在 profile 下的，退回文件名，别写到备份外面去
+        if inner.startswith(".."):
+            # 不在这个 profile 下的（理论上不该有）：退回文件名，别写到备份外面去。
+            # 但**同名会互相覆盖**，所以下面还要查重 —— 宁可报错，也不静默丢一份文件。
             inner = os.path.basename(path)
         rel = os.path.join(DIR_STATE, inner)
+        if any(e["path"] == rel for e in entries):
+            raise JdPurgeError("备份路径撞车了（两个不同的文件都落在 %s）—— "
+                               "宁可备份失败也不静默丢掉一份" % rel)
         out = os.path.join(dest, rel)
         os.makedirs(os.path.dirname(out), exist_ok=True)
         with open(out, "wb") as f:
@@ -544,22 +662,6 @@ def _remove(path):
     os.remove(path)
 
 
-def _read_bytes(path):
-    """整个文件的**原始字节**；读不到（不存在/不是文件/没权限）→ `None`。
-
-    **为什么不能用 `store.read_text` 来留底**：它走文本模式，Windows 上
-    `open(..., "w")` 会把 `\n` 写成 `\r\n`（Python 的换行符自动转换）。
-    于是一份 **LF-only** 的文件经"读→写"往返之后 sha 就变了 ——
-    `_rollback` 自称的「逐字节还原」对它**不成立**，而回滚正是
-    "数据必须与动手之前一模一样"的最后一道保险。所以留底与还原**一律走二进制**。
-    """
-    try:
-        with open(path, "rb") as f:
-            return f.read()
-    except OSError:
-        return None
-
-
 def _snapshot(path):
     """留底：`(留底之前它存在吗, 原始字节 | None)`。
 
@@ -568,6 +670,11 @@ def _snapshot(path):
     否则一次读失败（杀毒软件锁文件、权限、IO 错误）就会让回滚把用户的 `jobs.json` 删掉。
     所以这里先问"它在不在"，再去读；读失败时返回 `(True, None)`，回滚据此只报"没把握"，
     绝不动它。
+
+    **为什么不能用 `store.read_text` 留底**：它走文本模式，Windows 上 `open(..., "w")`
+    会把 `\n` 写成 `\r\n`（Python 的换行符自动转换）。于是一份 **LF-only** 的文件经
+    "读→写"往返之后 sha 就变了 —— `_rollback` 自称的「逐字节还原」对它**不成立**，
+    而回滚正是"数据必须与动手之前一模一样"的最后一道保险。所以留底与还原**一律走二进制**。
     """
     if not os.path.isfile(path):
         return (False, None)
@@ -602,13 +709,17 @@ def _tick():
             raise OSError("注入的删除失败（测试用）")
 
 
-def _strip_references(jd_id):
+def _strip_references(jd_id, planned_interviews, kb_data):
     """在内存里把知识库与面试记录的引用清掉，返回 `(kb_data, kb_touched, iv_updates)`。
 
     **只清引用**：知识库卡片保留（只去掉 `from_jds` 里指向它的条目）、
     面试记录保留（只把 `job_id` 清空）—— 这两条都是规格里的硬要求。
+
+    **面试记录只动 `planned_interviews` 里那几个路径**（那是留过底、也进过备份的那批）。
+    原先这里**重新 glob 一遍**：事务中途新出现的记录会被改写，而它**既不在快照里、
+    也不在备份里、回滚也救不回来** —— 改一份没有留底的用户文件是不能接受的。
+    （新出现的那种由调用方在动手前先比对一次，见 `_purge_locked`。）
     """
-    kb_data = store.load_knowledge()
     kb_touched = 0
     for node in (kb_data.get("nodes") if isinstance(kb_data, dict) else []) or []:
         if not isinstance(node, dict):
@@ -621,7 +732,7 @@ def _strip_references(jd_id):
             node["from_jds"] = kept
             kb_touched += 1
     iv_updates = []
-    for hit in _interview_hits(jd_id):
+    for hit in planned_interviews:
         st = store.read_json(hit["path"], None)
         if isinstance(st, dict):
             st = dict(st)
@@ -683,14 +794,18 @@ def _purge_locked(jd_id, plan):
 
     jd_path, jobs_path = jdid._jds_path(), store.jobs_path()   # noqa: SLF001
     kb_path = store.knowledge_path()
+    jds_existed = os.path.exists(jd_path)
     # 留底一律用 `_snapshot`（**原始字节** + "原来在不在"）：文本模式在 Windows 上会把
     # LF 写成 CRLF，那样"逐字节回滚"就是假的；而"读不出来"又必须与"原来没有"分开
     # （后者回滚要删掉它，前者绝不能碰）—— 两个坑都在 `_snapshot` 的注释里。
     originals = {p: _snapshot(p) for p in (jd_path, jobs_path, kb_path)}
-    # **读不出来就拒绝执行**：后面那步 `save_jobs(kept_jobs)` 会把整份台账覆盖掉，
-    # 而 `store.load_jobs()` 把"读不出来"报成 `[]` —— 那会把所有岗位的所有分析一次抹掉，
-    # 且 `jobs.json` 原先不在备份里，回滚也救不回来（见 `_readable_jobs_or_raise`）。
+    # **读不出来就拒绝执行**：后面那两步 `save_jobs` / `save_jds` 会把这两个文件**整份覆盖**，
+    # 而 `store.load_jobs()` / `jdid.load_jds()` 都把"读不出来"报成**空** —— 那会把
+    # 所有岗位的分析记录 / 所有 JD 记录一次抹掉（见两个 `_readable_*_or_raise`）。
     jobs_before = _readable_jobs_or_raise()
+    jds_before = _readable_jds_or_raise()
+    # 知识库坏掉**不阻止删除**（不会被覆盖，坏着也不丢数据），只如实说明。
+    kb_data, kb_err = _knowledge_or_error()
     target_ids = set(str(r.get("id") or "") for r in plan["analyses"])   # 只用于回报与日志
     iv_before = {}
     for hit in plan["interviews"]:
@@ -710,10 +825,18 @@ def _purge_locked(jd_id, plan):
         # 备份这一步失败 = **一个字节都还没动**。把半截备份删掉，绝不留误导性的"备份"。
         shutil.rmtree(backup, ignore_errors=True)
         log.log_exc("jd.purge_backup_failed", e, jd=jd_id)
-        if isinstance(e, JdPurgeError):
-            raise
-        raise JdPurgeError("备份失败，**没有删除任何东西**：%s" % e, code="backup_failed")
+        # **对外的 code 一律 `backup_failed`**，不管里面抛的是哪种 `JdPurgeError`：
+        # 这一段发生在任何删除之前，报 `failed` 会让前端说"已回滚"（那时根本没回滚过）。
+        msg = str(e) if isinstance(e, JdPurgeError) else "备份失败，**没有删除任何东西**：%s" % e
+        raise JdPurgeError(msg, code="backup_failed") from e
     # ---- 2) 事务：删文件 → 删记录 → 清引用 ----
+    # 动手前最后一道闸门：要改的面试记录必须还是**留过底的那几条**。
+    # 事务中途新出现的记录既不在快照里、也不在备份里 —— 改它就是改一份没有留底的文件。
+    now_iv = set(h["path"] for h in _interview_hits(jd_id))
+    if now_iv != set(iv_before):
+        shutil.rmtree(backup, ignore_errors=True)      # 还没动过任何东西 → 半截备份也别留
+        raise JdPurgeError("面试记录在预演之后变了（多了或少了一条挂在本岗位上的记录）："
+                           "拒绝按旧清单删除。请重新预演、重新确认。", code="stale")
     mtimes = {}
     for entry in to_delete:
         src = os.path.join(store.p_path(entry["where"]), entry["name"])
@@ -725,10 +848,15 @@ def _purge_locked(jd_id, plan):
             _remove(os.path.join(store.p_path(entry["where"]), entry["name"]))
             removed.append(entry)
             _tick()
-        # 2b) `jds.json` 里该 JD 的记录
-        data = jdid.load_jds()
-        data["jds"] = [r for r in data["jds"] if r.get("id") != jd_id]
-        jdid.save_jds(data)
+        # 2b) `jds.json` 里该 JD 的记录。
+        # **只在"确实要改动它"时才写**：`jds.json` 原来不存在、而这条 JD 也没有记录时，
+        # 写成一份空库就是**删东西顺手造一个文件出来**（用户的 `data/` 会平白多一个文件，
+        # 而且和"删除"该有的效果无关）。`_tick()` 照旧调用，注入点的步数含义不变。
+        kept_jds = [r for r in jds_before["jds"] if r.get("id") != jd_id]
+        if jds_existed or len(kept_jds) != len(jds_before["jds"]):
+            jds_next = dict(jds_before)
+            jds_next["jds"] = kept_jds
+            jdid.save_jds(jds_next)
         _tick()
         # 2c) `jobs.json` 里它的分析（**逐条**，只删属于这个 JD 的）。
         # 判据与 `_analyses_of` **同一口径**（`jd_id or id`），**不是**"id 落在一个集合里"：
@@ -740,7 +868,7 @@ def _purge_locked(jd_id, plan):
         store.save_jobs(kept_jobs)
         _tick()
         # 2d) 引用：知识库只清 `from_jds` 条目、面试记录只清 `job_id`
-        kb_data, kb_touched, iv_updates = _strip_references(jd_id)
+        kb_data, kb_touched, iv_updates = _strip_references(jd_id, plan["interviews"], kb_data)
         if kb_touched:
             store.save_knowledge(kb_data)
         _tick()
@@ -788,7 +916,7 @@ def _rollback(backup, originals, mtimes, to_delete, iv_before):
     mtime 也一起还原：它是「分析用的简历内容比文件新/旧」这类判断的依据。
 
     JSON 与面试记录一律用 `_write_bytes`（**二进制**）写回，不用 `store.write_text`：
-    文本模式会把 LF 改成 CRLF，那样"逐字节"就是假的（见 `_read_bytes`）。
+    文本模式会把 LF 改成 CRLF，那样"逐字节"就是假的（见 `_snapshot`）。
 
     **"原来没有"才删，"读不出来"碰都不碰**：留底时读失败的文件（`raw is None` 但
     `existed` 为真）我们**没有**可信的原样内容 —— 这时删掉它等于"用一次读失败换掉用户
