@@ -399,9 +399,11 @@ class SnapshotCertaintyAfterCleanupTest(IsolatedCase):
     确认的责任现在**只在** `_read_in` / `_kind_on_disk`（也就是 `m_kind`）：
 
     ① **正常延续仍然写快照**（清理不许把功能删没）——逐字等于覆盖前那份；
-    ② 母版原文**不确定**时绝不写快照 —— `mismatch` 时读出来的是**别人的内容**，
-       写进"不可变快照"就是"假装留了档"。②就是这条清理的反向对照：
-       把 `m_kind in ("latest", "mother")` 也一并删掉（变异⑤）→ ②必红。
+    ② 母版原文**核对不通过**（`mismatch`）时：盘上那份字节**照样存**（Task 1.8 的口径：
+       那是用户写的东西，覆盖掉就没地方找了），但**绝不记 `mother_file`** ——
+       不声称它是母版原文，`read_version` 仍如实报 `mismatch`。**存档 ≠ 冒充**。
+       ② 是 `m_kind in ("latest", "mother")` 这道闸的反向对照：
+       把它改成恒真（变异⑤）→ ②必红。
     """
 
     def _snap_path(self, version_id):
@@ -421,17 +423,30 @@ class SnapshotCertaintyAfterCleanupTest(IsolatedCase):
         with open(self._snap_path(v1["id"]), "rb") as f:
             self.assertEqual(f.read(), "第一版内容".encode("utf-8"))
 
-    def test_a_tampered_mother_is_never_snapshotted_as_if_it_were_the_mother(self):
+    def test_a_tampered_mother_is_archived_without_claiming_to_be_the_mother(self):
+        """口径（Task 1.8）：被程序外改过的内容**存字节但不冒充**母版原文。
+
+        老断言（"不确定就一个快照都不写"）已被新口径推翻：不写就等于把用户盘上那份东西
+        直接丢掉，而"不冒充"这件事**只需要不记 `mother_file`** —— 记录才是那句话的载体。
+        """
         v1 = resumelib.create_version("母版", "第一版内容")
         resumelib.choose(v1["id"])
         self._write_outside_resumelib("resumes/母版.md", "别人手改的内容")
         self.assertEqual(resumelib.read_version(v1["id"])[2], "mismatch")     # 前提：确认失败了
         resumelib.create_version("母版", "第二版内容", parent_id=v1["id"])
-        self.assertFalse(os.path.exists(self._snap_path(v1["id"])),
-                         "把被程序外改过的内容冒充「母版原文」存进了不可变快照")
-        self.assertIsNone(resumelib.by_id(v1["id"])["mother_file"])           # 记录也没谎报留了档
+        with open(self._snap_path(v1["id"]), "rb") as f:
+            self.assertEqual(f.read(), "别人手改的内容".encode("utf-8"),
+                             "覆盖前必须先把盘上那份字节存下来")
+        self.assertIsNone(resumelib.by_id(v1["id"])["mother_file"])           # 记录没谎报留了档
+        self.assertEqual(resumelib.read_version(v1["id"])[2], "mismatch")     # 也没有冒充成母版原文
 
     def test_a_mother_whose_text_was_never_kept_is_not_snapshotted_as_an_empty_file(self):
+        """`missing` 是"存字节"那条口径**唯一的例外**：盘上装的是**别人那一版**的东西。
+
+        这一版的原文从来没保留过（`read_version` 如实报 `missing`）。此时若把
+        ``<名字>.md`` 里那份字节写进它的快照，`read_version` 就会改口报 `mismatch`
+        并把**别人那一版的内容**当成这一版的"存档"亮给用户 —— 张冠李戴。
+        """
         v1 = resumelib.create_version("母版", "第一版内容")
         v2 = resumelib.create_version("母版", "第二版内容", parent_id=v1["id"])
         resumelib.create_version("母版", "第三版内容", parent_id=v2["id"])
@@ -439,8 +454,9 @@ class SnapshotCertaintyAfterCleanupTest(IsolatedCase):
         self.assertEqual(resumelib.read_version(v2["id"])[2], "missing")
         resumelib.create_version("母版", "第四版内容", parent_id=v1["id"])
         self.assertFalse(os.path.exists(self._snap_path(v2["id"])),
-                         "给「原文没保留」的母版写了一个空快照（假装留了档）")
+                         "把「别人那一版」的内容记到这一版名下（missing 会被说成 mismatch）")
         self.assertIsNone(resumelib.by_id(v2["id"])["mother_file"])
+        self.assertEqual(resumelib.read_version(v2["id"])[2], "missing")   # 仍如实说"没保留"
 
 
 class MotherSnapshotPrecedenceTest(IsolatedCase):
@@ -654,6 +670,97 @@ class AiDiffTest(IsolatedCase):
         self.assertEqual(resumelib.by_id(v2["id"])["ai_diff"],
                          {"summary": "补了项目",
                           "changes": [{"where": "项目经历", "what": "新增语音Agent项目"}]})
+
+
+class SnapshotByteFidelityTest(IsolatedCase):
+    """快照必须**逐字节**等于被覆盖掉的那份原文。
+
+    洞在读侧：`_read_in` 走 `store.read_text` —— 非 UTF-8 解码失败被兜成空串（写出 0 字节"假存档"），
+    CRLF 被归一成 LF（快照与原文不再逐字节相等）。`_write_content` 反而是保真的（`newline=""`）。
+    """
+
+    def _snap_path(self, version_id):
+        return store.p_path("resumes", resumelib.SNAPSHOT_DIR, version_id + ".md")
+
+    def _drop_sha(self, version_id):
+        """抹掉记录里的 sha256（模拟"老记录 / 人工改坏"），让 `_kind_on_disk` 只能维持 ok_kind。"""
+        doc = resumelib.load_resumes()
+        for r in doc.get("resumes", []):
+            if r.get("id") == version_id:
+                r.pop("sha256", None)
+        resumelib.save_resumes(doc)
+
+    def test_a_non_utf8_mother_without_a_fingerprint_is_archived_byte_faithfully(self):
+        v1 = resumelib.create_version("母版", "第一版内容")
+        resumelib.choose(v1["id"])
+        raw = "我的简历：十个项目经验".encode("gbk")
+        with open(store.p_path("resumes", "母版.md"), "wb") as f:
+            f.write(raw)
+        self._drop_sha(v1["id"])
+
+        resumelib.create_version("母版", "第二版内容", parent_id=v1["id"])
+
+        snap = self._snap_path(v1["id"])
+        self.assertTrue(os.path.exists(snap), "母版原文必须先被存档再覆盖")
+        with open(snap, "rb") as f:
+            self.assertEqual(f.read(), raw, "快照必须逐字节等于原文（老实现写出 0 字节假存档）")
+        self.assertNotEqual(os.path.getsize(snap), 0, "绝不许留一个 0 字节的假存档")
+
+    def test_a_crlf_mother_is_archived_byte_faithfully(self):
+        v1 = resumelib.create_version("母版", "第一行\n第二行")
+        resumelib.choose(v1["id"])
+        raw = "第一行\r\n第二行".encode("utf-8")
+        with open(store.p_path("resumes", "母版.md"), "wb") as f:
+            f.write(raw)
+
+        resumelib.create_version("母版", "第二版内容", parent_id=v1["id"])
+
+        with open(self._snap_path(v1["id"]), "rb") as f:
+            self.assertEqual(f.read(), raw, "CRLF 的原文也必须逐字节进快照（老实现被归一成 LF）")
+
+    def test_a_mismatched_mother_is_still_archived_but_not_claimed_as_the_mother(self):
+        """核对不通过时：**字节照样留着**（不丢用户写的东西），但**不假装**它是母版原文。
+
+        `read_version` 会如实报 `mismatch` —— **存档 ≠ 冒充**。
+        """
+        v1 = resumelib.create_version("母版", "第一版内容")
+        resumelib.choose(v1["id"])
+        raw = "被别的工具改过的内容".encode("gbk")
+        with open(store.p_path("resumes", "母版.md"), "wb") as f:
+            f.write(raw)                       # sha256 保持不动 → 必然对不上
+
+        resumelib.create_version("母版", "第二版内容", parent_id=v1["id"])
+
+        snap = self._snap_path(v1["id"])
+        self.assertTrue(os.path.exists(snap), "覆盖前必须先把盘上那份字节存下来")
+        with open(snap, "rb") as f:
+            self.assertEqual(f.read(), raw)
+        _text, _path, kind = resumelib.read_version(v1["id"])
+        self.assertEqual(kind, "mismatch", "不许把对不上的内容冒充成母版原文")
+        self.assertIsNone(resumelib.by_id(v1["id"]).get("mother_file"),
+                          "核对不通过时不许记 mother_file")
+
+    def test_an_emptied_mother_file_never_becomes_a_zero_byte_fake_archive(self):
+        """**"有字节才存档"那条闸的钉子**（`if raw:` 被改成恒真时必须变红）。
+
+        盘上那份母版文件被别的东西清成 0 字节时：**没有字节可存** —— 那就一个快照文件都不该有。
+        否则 `resumes/快照/<id>.md` 会是一个 0 字节文件，而 `read_version` 里"有快照就走快照"
+        的顺序会让这一版从此被当成"存过档"，可档里什么都没有 —— 又一个"以为留了档其实没留"。
+        """
+        v1 = resumelib.create_version("母版", "第一版内容")
+        resumelib.choose(v1["id"])
+        with open(store.p_path("resumes", "母版.md"), "wb") as f:
+            f.write(b"")                        # 程序外被清空（sha256 保持不动）
+
+        resumelib.create_version("母版", "第二版内容", parent_id=v1["id"])
+
+        self.assertFalse(os.path.exists(self._snap_path(v1["id"])),
+                         "0 字节不是「存档」：不许留下一个空的假快照")
+        self.assertIsNone(resumelib.by_id(v1["id"]).get("mother_file"))
+        # 没有快照时，v1 已经不是 `<名字>.md` 的主人了（v2 才是）→ 如实报 missing。
+        # 若留下一份 0 字节假快照，"有快照先读快照"那条顺序会让它变成 mismatch ——
+        # 拿一个空档冒充「存过」，正是要钉死的事。
+        self.assertEqual(resumelib.read_version(v1["id"])[2], "missing")
 
 
 if __name__ == "__main__":

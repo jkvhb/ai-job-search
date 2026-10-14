@@ -411,5 +411,57 @@ class MergeRollbackNonUtf8Test(IsolatedCase):
                              "回滚必须逐字节还原 —— 不许把 GBK 的知识库写成空的")
 
 
+class MergeSnapshotReadFailureTest(IsolatedCase):
+    """快照时刻**读不出来**（被锁/权限）→ 合并失败，且**不许**留下一个空备份冒充原像。
+
+    夹具与断言照 `MergeRollbackTest`（同一套 keep/drop + 知识库 + 面试记录）。
+    注入点在 `jobdup._snapshot`：原像一律按**原始字节**读（`store.read_bytes`）；
+    老实现 `read_text(path, "")` 会把"读失败"静默兜成 `""` → 备份写成 0 字节 →
+    这一刻的"原像"根本不存在，回滚反而把知识库清成空的（连备份里都没有原文）。
+    """
+
+    def test_a_read_failure_at_snapshot_time_leaves_no_empty_backup(self):
+        store.upsert_job({"id": "keep", "job_title": "k", "created_at": "2026-10-03 00:30"})
+        store.upsert_job({"id": "drop", "job_title": "d", "created_at": "2026-10-08 16:40"})
+        store.write_text(store.p_path("jd", "keep.txt"), FindDuplicatesTest.LONG)
+        store.write_text(store.p_path("jd", "drop.txt"), FindDuplicatesTest.SHORT)
+        for jid in ("keep", "drop"):
+            kb.absorb([{"term": "语音识别", "layer": 0, "sources": [], "timeline": [],
+                        "related": [], "interview_questions": []}], {"id": jid})
+        store.save_interview_json("iv1", "status.json", {"state": "done", "job_id": "drop"})
+        kb_path = store.knowledge_path()
+        jobs_path = store.jobs_path()
+        with open(kb_path, "rb") as f:
+            kb_raw = f.read()
+        with open(jobs_path, "rb") as f:
+            jobs_raw = f.read()
+        self.assertNotEqual(kb_raw, b"{}", "夹具前提：知识库本身不是空结构")
+        real = store.read_bytes
+
+        def flaky(p):
+            if p == kb_path:
+                raise PermissionError(13, "拒绝访问")
+            return real(p)
+
+        with mock.patch.object(store, "read_bytes", flaky):
+            res = jobdup.merge_jobs("keep", "drop")
+
+        self.assertFalse(res["ok"], "快照读不出来时绝不能当成合并成功")
+        # 失败点必须**正好落在知识库那一步**（台账的原像已经按字节存好了）：这条同时钉住
+        # "原像是按字节读的" —— 若 `_snapshot` 用 `read_text`，`write_bytes` 会在写**台账**
+        # 备份时就抛 `a bytes-like object is required`，盘上只会留一个 0 字节的 jobs 备份，
+        # 这条断言就会红（实测：这一次的注入根本走不到）。
+        baks = glob.glob(jobs_path + ".bak-*")
+        self.assertEqual(len(baks), 1, "台账的原像应当已经存下（失败点在它后面那一步）")
+        with open(baks[0], "rb") as f:
+            self.assertEqual(f.read(), jobs_raw, "原像必须逐字节等于台账原文，不许是 0 字节空档")
+        self.assertEqual(glob.glob(kb_path + ".bak-*"), [],
+                         "读不出原文就不许留下空备份（0 字节的「原像」比没有更危险）")
+        with open(kb_path, "rb") as f:
+            self.assertEqual(f.read(), kb_raw, "整个合并必须中止，知识库逐字节不变")
+        self.assertEqual([x["id"] for x in store.load_knowledge()["nodes"][0]["from_jds"]],
+                         ["keep", "drop"], "引用一条都没被改跑")
+
+
 if __name__ == "__main__":
     unittest.main()

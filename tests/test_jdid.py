@@ -643,6 +643,35 @@ class RenameJdTest(IsolatedCase):
         self.assertEqual(frm[0]["job_title"], "新")   # 保留本来就在的那一条
 
 
+    def test_a_read_failure_at_snapshot_time_leaves_the_bytes_untouched(self):
+        """快照时刻**读不出来**（被锁/权限）→ 整体中止，`jds.json` 一个字节都不许动。
+
+        这是"原像按字节读"那条修复**唯一可达**的触发点：老实现 `read_text(..., None)`
+        把"读失败"静默兜成 `None`，而 `None` 在回滚里表示"这个文件本来不存在" →
+        回滚把 285 字节的台账写成 `{}`（2 字节）——**用户的 JD 库被清空，连备份里也没有原文**。
+        （静态的"GBK jds.json"反而不可达：那会让 `load_jds` 返回空库，`rename_jd` 在
+        "库里没有这个 ID"就退出，一个字节都没写。）
+        """
+        self._fixture()
+        path = store.p_path("jds.json")
+        with open(path, "rb") as f:
+            raw = f.read()
+        self.assertNotEqual(raw, b"{}", "夹具前提：台账本身不是空结构")
+        real = store.read_bytes
+
+        def flaky(p):
+            if p == path:
+                raise PermissionError(13, "拒绝访问")
+            return real(p)
+
+        with mock.patch.object(store, "read_bytes", flaky):
+            with self.assertRaises(ValueError):
+                jdid.rename_jd(self.OLD, self.NEW)
+
+        with open(path, "rb") as f:
+            self.assertEqual(f.read(), raw, "中止时台账必须逐字节不变")
+
+
 class JdsStoreTest(IsolatedCase):
     def test_roundtrip_and_junk_tolerance(self):
         store.write_json(store.p_path("jds.json"), {"version": 1, "seq": 0, "jds": "不是列表"})

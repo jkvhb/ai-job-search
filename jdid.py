@@ -647,7 +647,9 @@ def rename_jd(old_id, new_id, key=None):
 
     先在内存里算完全部改动、校验通过后**逐文件落盘**；中途任一步抛错就用内存里的原像
     把已写的文件回滚（先 jds.json 后知识库），绝不留「jds 改了、引用没改」的半改状态。
-    **原像按原始字节保存**：非 UTF-8 的文件（读不出来）不能被当成"本来不存在"，
+    **原像按原始字节保存**：**读不出来**（被锁 / 权限 / 任何异常）绝不能被当成"本来不存在"、
+    更不许被兜成空内容 —— 回滚会反过来把用户的文件写成 `{}`（回归测试见
+    `tests/test_jdid.py::RenameJdTest::test_a_read_failure_at_snapshot_time_leaves_the_bytes_untouched`）；
     换行也不许被文本模式换掉 —— 回滚的语义是"和动手之前一模一样"。
     """
     old = _text(old_id)
@@ -705,9 +707,14 @@ def rename_jd(old_id, new_id, key=None):
                     jobs_moved += 1
 
             # ---- 7) 落盘（逐文件；失败用内存原像回滚已写的文件）----
-            # 原像一律按**原始字节**读（`read_bytes`，读不出来返回 None 表示"本来不存在"）：
-            # 用 `read_text` 的话，非 UTF-8 的 jds.json 会被解码兜成 None，回滚时就被判成
-            # "本来没有"、直接写成 `{}` —— 用户的台账被清空，连备份里也没有原文（实测）。
+            # 原像一律按**原始字节**读（`read_bytes`，读不出来返回 None 表示"本来不存在"）。
+            # 这里真正的风险不是"非 UTF-8 的 jds.json"（那条静态路径**不可达**：GBK 的
+            # jds.json 会让 `load_jds` 返回空库、`rename_jd` 在"库里没有这个 ID"就退出，
+            # 一个字节都没写），而是**取原像这一步本身读失败**（文件被锁 / 权限）。
+            # 用 `read_text(..., None)` 会把"读失败"静默兜成 `None`，而 `None` 在下面的
+            # 回滚里表示"这个文件本来不存在" → 回滚把 285 字节的台账写成 `{}`（2 字节），
+            # 用户的 JD 库被清空、连备份里也没有原文。回归测试：
+            # `tests/test_jdid.py::RenameJdTest::test_a_read_failure_at_snapshot_time_leaves_the_bytes_untouched`。
             written = []      # [(path, 原始字节 或 None)]
             try:
                 written.append((_jds_path(key), store.read_bytes(_jds_path(key))))

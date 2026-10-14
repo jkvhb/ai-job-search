@@ -11,10 +11,18 @@
 
 两条最容易写歪的规则（写歪了就是"以为留了档其实没留"）：
 
-1. **快照的唯一触发条件**：当且仅当「母版的内容 == 此刻 ``<名字>.md`` 的内容」
-   **且** 快照文件不存在 → 才写。**已存在不重写**（快照一经生成即**不可变**，
-   这是它能当"参照原点"的前提）。推论：族谱 ``母(v1) → 子(v2) → 孙(v3)`` 里，
-   v3 生成时**不产生新快照、也不重写 v1 的快照**。
+1. **快照的唯一触发条件**：当且仅当「快照文件不存在」**且**「``<名字>.md``
+   存在且盘上有字节」**且**「这一版的原文不是 ``missing``」→ 才写。
+   **已存在不重写**（快照一经生成即**不可变**，这是它能当"参照原点"的前提）。
+   推论：族谱 ``母(v1) → 子(v2) → 孙(v3)`` 里，v3 生成时**不产生新快照、
+   也不重写 v1 的快照**。
+   存下来的永远是**盘上那份原始字节**（``store.read_bytes``，不是文本读：
+   非 UTF-8 解码失败会被兜成空串、CRLF 会被归一成 LF —— 两种都会造出
+   "与原文不逐字节相等"的假档）。**存档 ≠ 冒充**（Task 1.8 定的口径）：
+   核对不通过时（``mismatch``：程序外改过 / 非 UTF-8 读不出来）字节**照样留**
+   —— 那是用户写的东西，覆盖掉就没地方找了 —— 但**不记 ``mother_file``**、
+   即不声称它是母版原文，``read_version`` 之后会如实报 ``mismatch``。
+   只有 ``missing`` 不写：那时盘上装的是**别人那一版**的内容，写进去就是张冠李戴。
    另外，延续**必须沿用族谱的名字**：换了名字，"即将被覆盖的 ``<名字>.md``"
    就不是母亲那一份，条件永远不成立 → 这里直接报错（见 ``create_version``）。
 
@@ -128,7 +136,9 @@ def _write_content(path, text):
 
     ``newline=""`` 很关键：默认的换行转换会把 ``\\n`` 写成 ``\\r\\n``（Windows），
     于是"磁盘字节数"与"内容的 UTF-8 字节数"对不上，``size`` / ``sha256`` 也不再是
-    同一份内容的指纹。也正因为这样，快照与母版原文是**逐字节**相等的。
+    同一份内容的指纹。**写侧**因此是保真的 —— 但快照要真的"与原文逐字节相等"，
+    还得**读侧**也按字节（快照走 ``store.read_bytes`` / ``write_bytes``：
+    文本读会把 CRLF 归一成 LF、把非 UTF-8 兜成空串，见 ``create_version``）。
     """
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8", newline="") as f:
@@ -332,7 +342,8 @@ def create_version(name, content, parent_id=None, note=""):
 
     新开（``parent_id=None``）：独立根，``rev=1``，本族谱的第一个版本。
     延续（``parent_id`` 非空）：同一族谱，覆盖 ``<名字>.md`` **之前**
-    按"快照的唯一触发条件"留下母版原文。
+    按"快照的唯一触发条件"留下母版原文 —— 留的是**盘上那份原始字节**
+    （核对不通过也留，但那时不记 ``mother_file``：存档 ≠ 冒充）。
 
     会抛 ``ValueError`` 的情形：名字为空／重名（未移出的）／父版本不存在／
     父版本已移出（移出的族谱不能延续）／延续时改了名字。
@@ -379,19 +390,36 @@ def create_version(name, content, parent_id=None, note=""):
         if mother is not None:
             mid = _clean_id(mother.get("id"))
             snap_path = _snapshot_path(mid)
+            # 已在盘上的快照一律不重写：快照一经生成即**不可变**，这是它能当"参照原点"的前提。
             if not os.path.exists(snap_path) and os.path.exists(file_path):
-                m_text, _m_path, m_kind = _read_in(recs, mid)
-                # 必须**确定**母版原文才敢写快照：m_kind=="missing" 时读出来是空串，
-                # 拿它当快照就是"假装留了档"；m_kind=="mismatch" 时磁盘上的东西已经不是母版
-                # 那一版了（程序外改过），照写就是把被改过的内容冒充成"母版原文"存进不可变快照。
-                # **"母版原文是不是确定"的责任只在 `_read_in` / `_kind_on_disk`**（shas 不符就报
-                # mismatch）—— 这里只认它的结论。此前还在这儿把 `m_text` 与同一个文件比了一遍
-                # （`m_text == store.read_text(file_path, "")`：同一个文件读两遍、恒真），
-                # 那是"一处忘了比 sha 就静默拿错内容"那条教训的残留，已按规格删掉。
-                # 已在盘上的快照一律不重写（不可变）。
-                if m_kind in ("latest", "mother"):
-                    _write_content(snap_path, m_text)
-                    mother["mother_file"] = _snapshot_rel(mid)
+                # 只借 `_read_in` 的**结论**（`m_kind`）；它的 `text` 是文本读的产物，
+                # 这里**故意不用**：那正是本块的洞（见下）。
+                _m_text, _m_path, m_kind = _read_in(recs, mid)
+                # 快照必须**按字节**留原文：`_read_in` 走的是文本读（`store.read_text`）。
+                # 非 UTF-8 文件解码失败会被兜成空串（→ `_write_content(snap, "")` 写出
+                # 0 字节"假存档"，而库里还记着 `mother_file` 指向它 = 静默"以为留了档"）；
+                # CRLF 会被归一成 LF（→ 快照与原文不再逐字节相等，而 `_write_content` 的
+                # docstring 明确承诺过"逐字节相等"）。写侧本来就是保真的（`newline=""`），
+                # 所以只用把**读**换成 `store.read_bytes` 即可。
+                #
+                # 口径（Task 1.8 改）：**存档 ≠ 冒充**。
+                # - 盘上有字节就存下来 —— 那是用户写的东西，覆盖掉就没地方找了，
+                #   哪怕核对不通过（`mismatch`：程序外改过 / 非 UTF-8 读不出来）；
+                # - "这是母版原文"这句话**只在核对通过时**才说（`mother_file` 只在
+                #   `latest` / `mother` 时记）。不记 `mother_file` 时 `read_version` 会
+                #   如实报 `mismatch`，界面照旧会亮出"内容与记录不符"。
+                # 唯一的例外是 `missing`：那时 `<名字>.md` 里装的**不是这一版**的东西
+                # （这一版的原文根本没保留过），把别人的字节记到这一版的快照名下就是
+                # 张冠李戴 —— `read_version` 会把**别人那一版的内容**当成这一版报
+                # `mismatch`，原本如实的 `missing` 反而被弄丢了。
+                if m_kind != "missing":
+                    raw = store.read_bytes(file_path)
+                    # 0 字节没什么可留的：写一个空快照只会让"有快照就走快照"那条顺序
+                    # 把这一版说成"存过档"，档里却什么都没有 —— 又一个"以为留了档"。
+                    if raw:
+                        store.write_bytes(snap_path, raw)
+                        if m_kind in ("latest", "mother"):
+                            mother["mother_file"] = _snapshot_rel(mid)
         _write_content(file_path, text)
         rec = {
             "id": new_id,

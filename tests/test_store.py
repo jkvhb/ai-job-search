@@ -358,6 +358,21 @@ class ReportStateNonUtf8Test(IsolatedCase):
         self.assertTrue(store.load_report_state(rid)["checks"].get("a"))
 
 
+class WriteBytesParentDirsTest(IsolatedCase):
+    """`write_bytes()` 也要建父目录（与 `write_text` 一致）。
+
+    零覆盖盲区：独立复查的变异 M-D 把 `os.makedirs` 那行删掉、**全量 900 条仍全绿** ——
+    也就是说没有任何测试钉住它。而备份/回滚路径全靠它：目录不在时 `open(path, "wb")`
+    直接 `FileNotFoundError`，回滚就会在"救数据"的路上再炸一次（那时连原像都写不下去）。
+    """
+
+    def test_write_bytes_creates_missing_parent_directories(self):
+        path = os.path.join(store.profile_dir(), "新建的一层", "再一层", "x.bin")
+        store.write_bytes(path, b"\x00\x01abc")
+        with open(path, "rb") as f:
+            self.assertEqual(f.read(), b"\x00\x01abc")
+
+
 class ContentBytesPresentUnreadableTest(IsolatedCase):
     """**存在但打不开**（权限/被锁）→ 必须当成"有内容"（fail-safe），不是"没有"。"""
 
