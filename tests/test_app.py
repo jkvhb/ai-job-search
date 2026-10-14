@@ -2401,6 +2401,31 @@ class ResumeVersionMustBeCurrentTest(_AnalyzeRouteCase):
         self.assertEqual(store.load_jobs()[0]["resume_id"], v3["id"])   # ← 真正落盘的那一行
 
 
+class AnalyzeUnreadableResumeTest(_AnalyzeRouteCase):
+    """修 5②（Task 1.10）：简历**读不出来**时分析必须明确失败，绝不拿一份空简历喂给模型。
+
+    旧实现 `resume = store.read_text(rp)` 会把非 UTF-8（解码失败）兜成空串，于是模型收到的是
+    「【候选人简历】(空)」—— 报告照样生成，用户以为分析的是自己那份简历。
+    """
+
+    def test_an_unreadable_resume_fails_loudly_without_calling_the_model(self):
+        store.ensure_profile()
+        path = os.path.join(store.p_path("resumes"), "读不出来的简历.md")
+        with open(path, "wb") as f:
+            f.write("候选人简历正文".encode("gbk"))
+        calls = self._patch_analyze_deps()
+
+        code, body = self._post_json("/api/analyze",
+                                     {"jd_text": self.LONG, "source_type": "粘贴文本",
+                                      "resume_name": "读不出来的简历.md"})
+        self.assertEqual(code, 200, body)                    # 路由既有口径：业务失败也是 200 + ok:false
+        self.assertFalse(body.get("ok"), body)
+        self.assertIn("读不出来", str(body.get("error")))
+        self.assertEqual(calls["llm"], 0, "读不出来就该当场停：一个额度都不花")
+        self.assertEqual((calls["search"], calls["knowledge"]), (0, 0))
+        self.assertEqual(store.load_jobs(), [])              # 没有留下半条分析记录
+
+
 class ResumeVersionRouteTest(IsolatedCase):
     """§6.1 简历版本路由：族谱元数据 / 取回（四种 kind）/ 选定 / 移出 / 彻底删。"""
 
@@ -2793,6 +2818,54 @@ class ResumeVersionRouteTest(IsolatedCase):
         self.assertIn("占用", body["error"])
         self.assertTrue(resumelib.by_id(v1["id"])["removed"])        # 还在移出状态
 
+    def test_the_name_route_never_serves_an_unreadable_file_as_empty_text(self):
+        """修 5①（Task 1.10）：`GET /api/resumes?name=` 对**非 UTF-8** 文件曾回
+        `200 {"content": ""}` —— 前端 `editResumeFile` 会把空串填进编辑框，用户一保存就把
+        真文件覆盖成空的（**用户可见的破坏路径**）。
+
+        现在必须回一句明确的错误（前端 `if(!d || d.error) alert(...)` 能显示），**绝不**回空串。
+        """
+        store.ensure_profile()
+        path = os.path.join(store.p_path("resumes"), "读不出来.md")
+        with open(path, "wb") as f:
+            f.write("我的简历：十个项目经验".encode("gbk"))
+        before = _disk_bytes(path)
+
+        code, body = self._get("/api/resumes?name=" + quote("读不出来.md"))
+        self.assertEqual(code, 500, body)
+        self.assertFalse(body.get("ok"))
+        self.assertIn("读不出来", str(body.get("error")))
+        self.assertNotIn("content", body, "绝不能回一个空串让前端填进编辑框（保存即覆盖）")
+        self.assertEqual(_disk_bytes(path), before)          # 只读：一个字节都没动
+
+    def test_an_unreadable_mother_file_is_409_with_the_human_sentence_not_a_bare_500(self):
+        """修 6（Task 1.10）：`POST /api/resumes` 此前只接 `ValueError`，于是"母版原文留不了档"
+        那条 `RuntimeError` 掉进 `do_POST` 的兜底 → **HTTP 500 + 「服务器内部错误：…」前缀**（复查实测）。
+
+        现在路由接住它并回 **409**：这是「目标文件当前的状态与这次保存冲突」（被别的程序占用 /
+        读不出来），而且**只**把那句人话显示给用户 —— 用户看到的不是"服务器内部错误"。
+        """
+        v1 = self._new("母版.md", "原文内容")
+        code, body = self._post("/api/resumes/choose", {"version": v1["id"]})
+        self.assertEqual(code, 200, body)
+        path = store.p_path("resumes", "母版.md")
+        real = store.read_bytes
+
+        def fake(p):
+            if os.path.abspath(str(p)) == os.path.abspath(path):
+                raise PermissionError(13, "拒绝访问")
+            return real(p)
+
+        with mock.patch.object(store, "read_bytes", side_effect=fake):
+            code, body = self._save("母版.md", "第二版内容", parent_id=v1["id"])
+
+        self.assertEqual(code, 409, body)                    # ← 修之前：500
+        self.assertFalse(body.get("ok"))
+        self.assertIn("留档", str(body.get("error")))          # 那句人话原样给用户
+        self.assertNotIn("服务器内部错误", str(body.get("error")))
+        self.assertEqual(store.read_text(path), "原文内容", "读不出来就不覆盖")
+        self.assertEqual(len(resumelib.load_resumes()["resumes"]), 1, "这次保存整体中止")
+
 
 # ---------------- 前端接线（修 1 / 修 2 / 修 3 / 修 4 / 修 5 / 修 6）+ 阶段 4C：简历下拉 ----------------
 #
@@ -3092,8 +3165,14 @@ class ResumeContinueModalTest(IsolatedCase):
         code, view = _resumes_view()
         self.assertEqual(code, 200, view)
         body = _continue_modal(view, "族谱")["body"]
-        self.assertNotIn("覆盖前先把母版原文留成快照", body,
-                         "弹窗又在无条件承诺留快照（这一版原文从来没保留过时并不写）")
+        # 化石清理（Task 1.10 第 8 条）：原来钉的那句「覆盖前先把母版原文留成快照」**只在**
+        # `43c2c8f:web/index.html` 出现过、且早在 `cbf87cb` 就被删掉了 —— 从本任务基线起，
+        # 这个字面量只存在于这条断言自己里，等于永远为真的空断言。
+        # 换成 `cbf87cb` 真正写进过界面的旧口径：「只有母版原文可用」时才留快照
+        # （它承诺了下半句「与记录不符时不写快照」，那条 Task 1.9 已实测推翻 —— 现在照样留，只是不冒充）。
+        self.assertNotIn("只有母版原文可用", body,
+                         "旧口径又回来了：它承诺「只有母版原文可用时才留快照」，"
+                         "而 Task 1.9 已推翻「与记录不符就不写」—— 现在不符时字节照样留（只是不冒充）")
         self.assertNotIn("不写快照", body,
                          "Task 1.9：盘上那份与记录不符时**字节照样留** ——"
                          "老文案「与记录不符时不写快照」是句假话，不许再回到弹窗里")

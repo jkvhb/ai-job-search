@@ -1203,7 +1203,15 @@ def do_analyze(jd_text, image_data_url, resume_name, link="", overwrite_id="", a
         rp = os.path.join(store.p_path("resumes"), store.safe_name(resume_name))
         if not os.path.exists(rp):
             raise RuntimeError("找不到简历：%s" % resume_name)
-        resume = store.read_text(rp)
+        resume = store.read_text(rp, "")
+        # ⚠️ **"读不出来"绝不是"简历是空的"**（Task 1.10 修 5②）：非 UTF-8 / 被锁的简历文件在
+        # `read_text` 里解码失败会被兜成空串，旧实现把这份**空简历**喂给模型 → 报告是照着空简历
+        # 写的，用户还以为分析的是自己那份。这里按**原始字节**判：有字节却读不出文本 → 明确失败
+        # （路由回 `ok:false` + 这句人话），**一个额度都不花**。
+        if not resume and store.content_bytes_present(rp):
+            raise RuntimeError("简历「%s」读不出来（不是空的）：文件里有字节，但不是 UTF-8 文本、"
+                               "或读不出内容 —— 绝不拿一份空简历去分析。"
+                               "请把它另存为 UTF-8 的 .md / .txt 后重试。" % resume_name)
         # 简历的**显示名**（文件名去掉扩展名）：报告数据、分析记录与报告文件名都用它。
         # 与 `resumelib` 里的版本 `name` 同一口径（`create_version` 存的就是这个 stem），
         # 所以界面上"报告用的哪一版"与简历库里的那一版对得上。
@@ -1620,7 +1628,20 @@ class Handler(BaseHTTPRequestHandler):
                 fp = os.path.join(store.p_path("resumes"), name)
                 if not os.path.exists(fp):
                     return self._send(404, {"error": "找不到该简历"})
-                return self._send(200, {"name": name, "content": store.read_text(fp)})
+                # ⚠️ **"读不出来"绝不是"文件是空的"**（Task 1.10 修 5①）：旧实现把
+                # `store.read_text(fp)` 的空串直接回给前端，而 `editResumeFile` 会把它填进
+                # 编辑框 —— 用户一保存就把**真文件覆盖成空的**（非 UTF-8 / 被锁的文件实测过）。
+                # 所以先按**原始字节**判"里面有没有东西"：有字节却读不出文本 → 明确报错，
+                # 一个字节的内容都不回（前端 `if(!d || d.error) alert(...)` 会把这句显示出来）。
+                content = store.read_text(fp, "")
+                if not content and store.content_bytes_present(fp):
+                    log.log_event("resume.read_failed", level="warn", name=name)
+                    return self._send(500, {"ok": False, "name": name,
+                                            "error": "简历「%s」读不出来（不是空的）：文件里有字节，"
+                                                     "但不是 UTF-8 文本、或读不出内容。"
+                                                     "为避免你保存时把真文件覆盖成空的，这次不回内容 —— "
+                                                     "请把它另存为 UTF-8 的 .md / .txt 再试。" % name})
+                return self._send(200, {"name": name, "content": content})
             # 阶段 4C：返回**族谱元数据**（版本列表 + id/name/rev/at/chosen/removed/mother_file/ai_diff）。
             # 默认**不含已移出**（移出 = 不再出现在列表里，规格 §4.6）；要连已移出一起看就带
             # `include_removed=1`。`files` 是磁盘上真实的简历文件名（老前端 / 分析下拉要用），
@@ -2084,6 +2105,15 @@ class Handler(BaseHTTPRequestHandler):
                 log.log_event("resume.save_rejected", level="warn", name=body.get("name"),
                               error=str(e))
                 return self._send(400, {"ok": False, "error": str(e)})
+            except RuntimeError as e:
+                # 「母版原文读不出来 → 中止本次保存」是 `resumelib.create_version` **唯一**会抛
+                # `RuntimeError` 的地方（Task 1.10 修 6）。它的性质是**冲突**而不是"服务器内部错误"：
+                # 目标文件**当前的状态**（被别的程序占用 / 读不出来）与这次保存冲突 → **409**，
+                # 而且**只**把那句人话给用户。旧实现漏接它 → 掉进 `do_POST` 的兜底
+                # （HTTP 500 + 前缀「服务器内部错误：…」，复查实测过）。
+                log.log_event("resume.save_conflict", level="warn", name=body.get("name"),
+                              error=str(e))
+                return self._send(409, {"ok": False, "error": str(e)})
             return self._send(200, {"ok": True, "name": rec.get("name"), "resume": rec,
                                     "id": rec.get("id"), "rev": rec.get("rev"),
                                     "parent_id": rec.get("parent_id")})

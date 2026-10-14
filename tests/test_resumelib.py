@@ -846,6 +846,143 @@ class SnapshotByteFidelityTest(IsolatedCase):
         self.assertEqual([r["id"] for r in resumelib.list_versions()], [v1["id"]],
                          "这次保存整体中止：不许留下一条没有内容的版本记录")
 
+    def test_a_repaired_stale_snapshot_keeps_the_bytes_it_overwrites_aside(self):
+        """修正一份"按记录判断过时"的快照之前，旧快照的字节必须先留档（Task 1.10 第 2 条）。
+
+        复查实测的**不可逆**路径：把母版记录里的 ``sha256`` 改成**盘上那份**（记录被人工改坏），
+        `read_version` 于是报 `latest`（在记录看来盘上那份就是这一版）→ 续一次就把**真快照**
+        覆盖成盘上那份、还记上 `mother_file`。真快照的字节从此**永久消失**。
+        "按记录判断"的证明力全在记录里：记录坏了，判断就错 —— 所以覆盖前必须留档。
+        """
+        v1 = resumelib.create_version("母版", "第一版内容")
+        resumelib.choose(v1["id"])
+        v2 = resumelib.create_version("母版", "第二版内容", parent_id=v1["id"])
+        snap = self._snap_path(v1["id"])
+        with open(snap, "rb") as f:
+            true_mother_bytes = f.read()
+        self.assertEqual(true_mother_bytes, "第一版内容".encode("utf-8"))
+        resumelib.purge(v2["id"])            # 记录没了 → 文件主人退回 v1（盘上仍是第二版内容）
+        disk = store.p_path("resumes", "母版.md")
+        doc = resumelib.load_resumes()       # 人工把记录的 sha256 改成盘上那份（复查实测那一步）
+        for r in doc["resumes"]:
+            if r.get("id") == v1["id"]:
+                r["sha256"] = resumelib.sha256_of(store.read_text(disk))
+        resumelib.save_resumes(doc)
+        self.assertEqual(resumelib.read_version(v1["id"])[2], "latest")   # 前提（在记录看来）
+
+        resumelib.create_version("母版", "第三版内容", parent_id=v1["id"])
+
+        side = [f for f in os.listdir(os.path.dirname(snap))
+                if f.startswith(v1["id"] + ".md.stale-")]
+        self.assertEqual(len(side), 1,
+                         "旧快照被覆盖前必须先改名留档（<id>.md.stale-<8位>）：%r" % (side,))
+        with open(os.path.join(os.path.dirname(snap), side[0]), "rb") as f:
+            self.assertEqual(f.read(), true_mother_bytes, "真快照的字节不许静默丢掉")
+        # 修正本身照旧生效（Task 1.9 的功能不能因为留档就没了）
+        with open(snap, "rb") as f:
+            self.assertEqual(f.read(), "第二版内容".encode("utf-8"))
+
+    def test_neither_the_snapshot_nor_the_live_file_is_this_version_keeps_the_snapshot_untouched(self):
+        """`m_kind in ("latest", "mother")` 这道闸（Task 1.10 第 7 条）。
+
+        **两边都不是这一版时，绝不拿盘上那份去改写参照原点**。
+        变异取证：把这半个条件去掉，`stale` 会在"快照被改坏 **且** 盘上那份也不是这一版"时
+        也为真 → **子版/别人的内容被写进快照**（复查实测过）。
+        """
+        v1 = resumelib.create_version("母版", "第一版内容")
+        resumelib.choose(v1["id"])
+        v2 = resumelib.create_version("母版", "第二版内容", parent_id=v1["id"])
+        snap = self._snap_path(v1["id"])
+        with open(snap, "w", encoding="utf-8", newline="") as f:
+            f.write("快照被改坏")                      # 快照不是这一版
+        with open(store.p_path("resumes", "母版.md"), "w", encoding="utf-8", newline="") as f:
+            f.write("盘上那份也不是这一版")              # 盘上那份也不是
+        self.assertEqual(resumelib.read_version(v1["id"])[2], "mismatch")     # 前提
+        old = 1000000000                     # 把 mtime 钉在过去：重写必然改变它
+        os.utime(snap, (old, old))
+        before_mtime, before_bytes = os.stat(snap).st_mtime_ns, store.read_bytes(snap)
+
+        v3 = resumelib.create_version("母版", "第三版内容", parent_id=v1["id"])
+
+        self.assertEqual(v3["rev"], 3)                     # 续版照常发生
+        self.assertEqual(os.stat(snap).st_mtime_ns, before_mtime, "快照一个字节都不许动")
+        self.assertEqual(store.read_bytes(snap), before_bytes)
+        self.assertEqual(store.read_bytes(snap), "快照被改坏".encode("utf-8"))
+
+
+class ReadPathFingerprintGateTest(IsolatedCase):
+    """Task 1.10 第 1/9 条：**读路径的每一条出口都要过"没有 sha256 就不认盘上那份"这道闸**。
+
+    旧实现（Task 1.9）只在"快照有字节却读不出来"那一支过闸：抹掉记录的 `sha256` 之后，
+    `read_version` 会把 `<名字>.md` 里**别人的内容**当成"最新版原文"报出去（界面标题就写着
+    「最新版原文」）；"文件主人"那一支更直接：文件**有字节却读不出来**时 `store.read_text`
+    给空串，没有 sha 可核对时就被当成"这一版就是最新版、内容是空的"。
+    两条都是同一个思维习惯：**"读不出来"被当成"文件是空的"**。
+
+    反方向的边界（第 9 条）同样要钉住：0 字节 / 纯空白的快照是**合法**的历史残留
+    （Task 1.8 之前的实现真能写出 0 字节快照），那时唯一诚实的答案是 `mother` + 空文本。
+    """
+
+    def _snap_path(self, version_id):
+        return store.p_path("resumes", resumelib.SNAPSHOT_DIR, version_id + ".md")
+
+    def _drop_sha(self, version_id):
+        doc = resumelib.load_resumes()
+        for r in doc.get("resumes", []):
+            if r.get("id") == version_id:
+                r.pop("sha256", None)
+        resumelib.save_resumes(doc)
+
+    def test_an_unreadable_snapshot_without_a_fingerprint_never_reports_the_live_file_as_this_version(self):
+        v1 = resumelib.create_version("母版", "第一版内容")
+        resumelib.choose(v1["id"])
+        v2 = resumelib.create_version("母版", "第二版内容", parent_id=v1["id"])
+        snap = self._snap_path(v1["id"])
+        with open(snap, "wb") as f:
+            f.write("母版原文（GBK）".encode("gbk"))     # 快照**有字节却读不出来**
+        self._drop_sha(v1["id"])                        # 记录也没有指纹 → 没有任何依据
+        resumelib.purge(v2["id"])                       # 文件主人退回 v1（盘上仍是第二版内容）
+
+        text, path, kind = resumelib.read_version(v1["id"])
+        self.assertEqual(kind, "mismatch",
+                         "没有 sha256 时绝不能改口说「盘上那份是这一版的最新版原文」")
+        self.assertEqual(text, "")
+        self.assertNotEqual(text, "第二版内容", "把 <名字>.md 里别人的内容当成了这一版的正文")
+        self.assertEqual(path, snap, "既然读不出来，就该指着快照（那份读不出来的东西）说话")
+
+    def test_an_unreadable_live_file_without_a_fingerprint_is_a_mismatch_not_an_empty_latest(self):
+        v1 = resumelib.create_version("独苗", "原始内容")
+        path = store.p_path("resumes", "独苗.md")
+        with open(path, "wb") as f:
+            f.write("读不出来的字节".encode("gbk"))
+        self._drop_sha(v1["id"])
+
+        text, got_path, kind = resumelib.read_version(v1["id"])
+        self.assertEqual(kind, "mismatch",
+                         "文件**有字节却读不出来**，绝不能说成「最新版、内容是空的」")
+        self.assertEqual(text, "")
+        self.assertEqual(got_path, path, "内容读不出来也要指出是哪个文件出事")
+
+    def test_a_zero_byte_snapshot_without_a_fingerprint_is_still_a_legal_empty_mother(self):
+        v1 = resumelib.create_version("母版", "第一版内容")
+        resumelib.choose(v1["id"])
+        resumelib.create_version("母版", "第二版内容", parent_id=v1["id"])
+        snap = self._snap_path(v1["id"])
+        with open(snap, "wb") as f:
+            f.write(b"")                        # Task 1.8 之前真能造出 0 字节快照
+        self._drop_sha(v1["id"])
+
+        text, path, kind = resumelib.read_version(v1["id"])
+        self.assertEqual((text, kind), ("", "mother"),
+                         "0 字节快照是**合法空档**，不是「读不出来」（写成 if not text: mismatch 就错了）")
+        self.assertEqual(path, snap)
+
+        # 纯空白同理：`content_bytes_present` 按 `strip()` 判"有没有可丢的字节" → 也算空档
+        with open(snap, "wb") as f:
+            f.write("\n".encode("utf-8"))
+        self.assertEqual(resumelib.read_version(v1["id"])[2], "mother",
+                         "纯空白快照同样是合法空档，不是「读不出来」")
+
 
 if __name__ == "__main__":
     import unittest
