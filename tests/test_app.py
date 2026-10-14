@@ -3822,24 +3822,29 @@ class ResumeTextVerificationWordingTest(IsolatedCase):
     def _get(self, path):
         return self._handler("GET", path)
 
-    def _new(self, name, content):
-        raw = json.dumps({"name": name, "content": content},
-                         ensure_ascii=False).encode("utf-8")
+    def _new(self, name, content, **extra):
+        body = {"name": name, "content": content}
+        body.update(extra)
+        raw = json.dumps(body, ensure_ascii=False).encode("utf-8")
         h = _sandbox_handler("POST", "/api/resumes", raw,
                              {"Content-Length": str(len(raw)),
                               "Content-Type": "application/json; charset=utf-8"})
         self.assertEqual(h._status, 200, h._body)
         return h._body["resume"]
 
+    def _drop_sha(self, version_id):
+        """抹掉记录里的 `sha256`（模拟"老记录 / 人工改坏"）：`_kind_on_disk` 只能维持 ok_kind。"""
+        doc = resumelib.load_resumes()
+        for r in doc.get("resumes", []):
+            if r.get("id") == version_id:
+                r.pop("sha256", None)
+        resumelib.save_resumes(doc)
+
     def test_the_file_route_marks_a_version_without_a_fingerprint_as_unverified(self):
         v1 = self._new("独苗.md", "原始内容")
         with open(store.p_path("resumes", "独苗.md"), "w", encoding="utf-8", newline="") as f:
             f.write("别人那一版的内容")            # 盘上那份已经不是这一版了
-        doc = resumelib.load_resumes()             # 记录里也没有指纹 → 无从核对
-        for r in doc.get("resumes", []):
-            if r.get("id") == v1["id"]:
-                r.pop("sha256", None)
-        resumelib.save_resumes(doc)
+        self._drop_sha(v1["id"])                   # 记录里也没有指纹 → 无从核对
 
         code, body = self._get("/api/resumes/file?version=" + v1["id"])
         self.assertEqual(code, 200, body)
@@ -3870,6 +3875,39 @@ class ResumeTextVerificationWordingTest(IsolatedCase):
         self.assertIn("最新版原文", out["title"],
                       "核对过的版本照旧要说「最新版原文」（不许因为 D 就一律改成含糊措辞）：%r"
                       % (out["title"],))
+
+    def test_a_mother_snapshot_without_a_fingerprint_is_not_called_the_mother_text(self):
+        """D 的另一半：**快照**那一支同样没有指纹依据（`mother` 也只是"维持"）。
+
+        与上一条同一形状，只是"别人那一版"装在**母版快照**里：记录里没有 `sha256` 时
+        `_kind_on_disk` 只能维持 `mother`，界面若照旧在**标题**上写「母版原文」、正文说
+        「从母版快照读回，是这一族谱的参照原点」，用户就会拿着别人的内容当母版原文用
+        （`mother` 比 `latest` 更危险：它被当作"参照原点"）。
+        """
+        v1 = self._new("母版.md", "第一版内容")
+        code, _ = self._handler("POST", "/api/resumes/choose", {"version": v1["id"]})
+        self.assertEqual(code, 200)
+        self._new("母版.md", "第二版内容", parent_id=v1["id"])     # 生成 v1 的母版快照
+        snap = store.p_path("resumes", resumelib.SNAPSHOT_DIR, v1["id"] + ".md")
+        self.assertTrue(os.path.exists(snap), "前提：v1 的快照已经留下")
+        with open(snap, "w", encoding="utf-8", newline="") as f:
+            f.write("别人那一版的内容")            # 快照里那份已经不是这一版了（但读得出来）
+        self._drop_sha(v1["id"])                   # 记录里也没有指纹 → 无从核对
+
+        code, body = self._get("/api/resumes/file?version=" + v1["id"])
+        self.assertEqual(code, 200, body)
+        self.assertEqual(body["kind"], "mother", body)      # 前提：快照优先，且读侧只能"维持"
+        self.assertEqual(body["text"], "别人那一版的内容")
+        self.assertFalse(body["verified"], "没有指纹却报「核对过」：%r" % (body,))
+
+        out = _resume_text_view(v1["id"], body)
+        self.assertEqual(out["unexpected"], [])
+        self.assertNotIn("母版原文", out["title"],
+                         "没有指纹、快照里又不是这一版，标题却断言「母版原文」——用户可见的假话：%r"
+                         % (out["title"],))
+        self.assertIn("未核对", out["title"],
+                      "标题要如实说「内容未核对」：%r" % (out["title"],))
+        self.assertIn("未核对", out["body"], "正文也要说清没有指纹：%r" % (out["body"],))
 
 
 # 变更说明的三种情形（规格 §8.3/§8.4）：后端**真数据**喂进 `rsDiffText` 的**渲染结果**。
