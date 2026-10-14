@@ -402,16 +402,14 @@ def create_version(name, content, parent_id=None, note=""):
                 # docstring 明确承诺过"逐字节相等"）。写侧本来就是保真的（`newline=""`），
                 # 所以只用把**读**换成 `store.read_bytes` 即可。
                 #
-                # 口径（Task 1.8 改）：**存档 ≠ 冒充**。
-                # - 盘上有字节就存下来 —— 那是用户写的东西，覆盖掉就没地方找了，
-                #   哪怕核对不通过（`mismatch`：程序外改过 / 非 UTF-8 读不出来）；
-                # - "这是母版原文"这句话**只在核对通过时**才说（`mother_file` 只在
-                #   `latest` / `mother` 时记）。不记 `mother_file` 时 `read_version` 会
-                #   如实报 `mismatch`，界面照旧会亮出"内容与记录不符"。
-                # 唯一的例外是 `missing`：那时 `<名字>.md` 里装的**不是这一版**的东西
-                # （这一版的原文根本没保留过），把别人的字节记到这一版的快照名下就是
-                # 张冠李戴 —— `read_version` 会把**别人那一版的内容**当成这一版报
-                # `mismatch`，原本如实的 `missing` 反而被弄丢了。
+                # 口径（Task 1.8）**三条**，一一对应 `m_kind`：
+                # - `latest` / `mother` → 存字节 **+ 记** `mother_file`（核对通过：它就是母版原文）
+                # - `mismatch`         → 存字节、**不记** `mother_file`（**存档 ≠ 冒充**：
+                #   字节是用户写的东西，覆盖掉就没地方找了；但"这是母版原文"这句话不说，
+                #   `read_version` 会如实报 mismatch，界面照旧亮出"内容与记录不符"）
+                # - `missing`          → **不存**（那时 `<名字>.md` 里装的是**别人那一版**
+                #   的东西 —— 这一版的原文根本没保留过；存进去就是张冠李戴，
+                #   `read_version` 会把别人的内容当成这一版的"存档"亮出来）
                 if m_kind != "missing":
                     raw = store.read_bytes(file_path)
                     # 0 字节没什么可留的：写一个空快照只会让"有快照就走快照"那条顺序
