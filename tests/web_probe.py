@@ -86,20 +86,66 @@ function firstOptionValue(html){
   return m ? m[1] : '';
 }
 
+/* ---- 委派按钮：让 `box.querySelectorAll('[data-x]')` 真的返回**渲染出来的**按钮 ----
+   不实现这个，`renderJobs()` 里那一串
+   `box.querySelectorAll('[data-jddel]').forEach(b=>b.addEventListener('click',...))`
+   就永远是**空循环** —— 于是"按钮渲染出来了、但绑定是死的"在测试里看不出来：
+   页面里有个 btn、源码里也有那行字符串、测试全绿，点下去什么都不会发生。
+   这正是本项目出过两次的事故类型（后端全绿、前端悄悄坏掉），所以垫片必须把按钮造出来，
+   并且 `click()` 要能调到真正注册的监听器。 */
+function camelOf(attr){
+  return attr.replace(/^data-/, '').replace(/-([a-z])/g, (_s, c) => c.toUpperCase());
+}
+function buttonsIn(html, sel){
+  const m = /^\[(data-[a-z0-9-]+)\]$/.exec(String(sel || '').trim());
+  if (!m) return [];
+  const attr = m[1], out = [];
+  const re = /<button\b([^>]*)>/g;
+  let hit;
+  while ((hit = re.exec(String(html == null ? '' : html)))) {
+    const d = new RegExp('\\b' + attr + '="([^"]*)"').exec(hit[1]);
+    if (!d) continue;
+    const handlers = {};
+    out.push({
+      dataset: { [camelOf(attr)]: d[1] },
+      _handlers: handlers,
+      addEventListener(type, fn){ (handlers[type] = handlers[type] || []).push(fn); },
+      removeEventListener(){}, setAttribute(){}, getAttribute(){ return null; },
+      focus(){}, click(){ (handlers.click || []).slice().forEach(fn => fn()); }
+    });
+  }
+  return out;
+}
+
 function mkEl(key){
+  /* 按钮缓存：**同一个 innerHTML 下，反复 `querySelectorAll` 必须拿到同一批对象**。
+     真实 DOM 就是这样：`renderJobs()` 先拿到按钮、注册监听器，测试再拿一次、`click()` ——
+     拿到的是**同一个**按钮，所以点得响。若每次新建对象，"注册的那批"和"点的那批"不是一批，
+     点击永远是空的（我第一版垫片就栽在这：断言全过、click 什么都不发生）。
+     `innerHTML` 一换就作废旧缓存 —— 这也正是真实 DOM 的语义（换 innerHTML 即丢监听器），
+     `renderJobs` 的注释明确依赖这一点。 */
+  const btnCache = {};
   const el = {
-    _html: '', value: '', textContent: '', hidden: false, className: '', src: '', files: null,
+    _html: '', _htmlRev: 0, value: '', textContent: '', hidden: false, className: '',
+    src: '', files: null,
     dataset: {}, style: {}, options: [], selectedIndex: 0,
     classList: { add(){}, remove(){}, toggle(){}, contains(){ return false; } },
     addEventListener(){}, removeEventListener(){}, appendChild(){}, removeChild(){},
     insertBefore(){}, focus(){}, click(){}, setAttribute(){}, getAttribute(){ return null; },
-    querySelector(){ return null; }, querySelectorAll(){ return []; }, getContext(){ return null; },
+    querySelector(){ return null; },
+    querySelectorAll(sel){
+      const k = String(sel) + '@' + el._htmlRev;
+      if (!btnCache[k]) btnCache[k] = buttonsIn(el._html, sel);
+      return btnCache[k];
+    },
+    getContext(){ return null; },
     add(){}, remove(){}
   };
   Object.defineProperty(el, 'innerHTML', {
     get(){ return el._html; },
     set(v){
       el._html = String(v == null ? '' : v);
+      el._htmlRev++;
       if (SELECTS.has(key)) el.value = firstOptionValue(el._html);
     }
   });

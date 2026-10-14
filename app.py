@@ -2176,12 +2176,20 @@ class Handler(BaseHTTPRequestHandler):
                                         expect_fingerprint=str(body.get("confirm_fingerprint") or ""))
             except jddelete.JdPurgeError as e:
                 msg = str(e)
+                code = str(getattr(e, "code", "") or "")
                 # 状态码取异常上的 **code**（不解析文案）：not_found → 404；
-                # stale（用户确认的清单已经变了）→ 409；备份/删除/回滚失败 → 500。
-                status = {"not_found": 404, "stale": 409}.get(getattr(e, "code", ""), 500)
+                # stale / unreadable → 409（当前状态不允许按这份清单删，重试也没用，
+                # 得先把数据修好）；备份/删除/回滚失败 → 500。
+                status = {"not_found": 404, "stale": 409, "unreadable": 409}.get(code, 500)
                 log.log_event("jd.purge_rejected", level="warn", jd=jd_id,
-                              status=status, error=msg)
-                return self._send(status, {"ok": False, "id": jd_id, "error": msg})
+                              status=status, code=code, error=msg)
+                # `code` 与 `backup` 都回给前端：前端的三种失败要求完全不同 ——
+                # `backup_failed`（一个字节都没动）、`failed`（已回滚）、
+                # `rollback_failed`（**数据可能不是原样，要人工从 backup 恢复**）。
+                # 混成一句话就会出现"已回滚：回滚也失败了"这种自相矛盾的提示。
+                return self._send(status, {"ok": False, "id": jd_id, "code": code,
+                                           "backup": str(getattr(e, "backup", "") or ""),
+                                           "error": msg})
             log.log_event("jd.purge_done", jd=jd_id, backup=os.path.basename(res["backup"]),
                           files=len(res["removed_files"]), analyses=len(res["analyses"]),
                           skipped=len(res["skipped_files"]))

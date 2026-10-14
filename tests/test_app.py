@@ -20,6 +20,7 @@ from urllib.parse import quote
 
 import app
 import interview
+import jddelete
 import jdid
 import kb
 import llm
@@ -4273,6 +4274,39 @@ class JdPurgeRouteTest(LedgerWithReportsCase):
         self.assertEqual(code, 400, body)
         self.assertFalse(body["ok"])
 
+    def test_a_failed_rollback_is_500_with_its_code_and_backup_path(self):
+        """回滚**也**失败 → 500，响应体里带 `code` 与备份目录。
+
+        前端靠这两个字段分流：`backup_failed`（一个字节都没动）/ `failed`（已回滚）/
+        `rollback_failed`（**数据可能不是原样，要人工从 backup 恢复**）。
+        没有 `code` 的话前端只能靠文案猜，一旦有人改文案就悄悄错一类提示。
+        """
+        self._two_analyses()
+        jddelete._FAIL_AFTER = 1
+        try:
+            with mock.patch.object(jddelete, "_rollback", return_value=False):
+                code, body = self._post_json("/api/jd/purge", {"id": self.JD_ID})
+        finally:
+            jddelete._FAIL_AFTER = 0
+        self.assertEqual(code, 500, body)
+        self.assertFalse(body["ok"])
+        self.assertEqual(body["code"], "rollback_failed", body)
+        self.assertTrue(body["backup"], "回滚失败却没把备份目录回给前端：%r" % (body,))
+        self.assertTrue(os.path.isdir(body["backup"]), body["backup"])
+
+    def test_a_backup_failure_says_nothing_was_touched_and_carries_its_code(self):
+        """备份就没成功 → 500 + `backup_failed`（**一个字节都没动**，与"已回滚"是两回事）。"""
+        self._two_analyses()
+        with mock.patch.object(jddelete, "_copy_into_backup",
+                               side_effect=OSError("磁盘满了")):
+            code, body = self._post_json("/api/jd/purge", {"id": self.JD_ID})
+        self.assertEqual(code, 500, body)
+        self.assertEqual(body["code"], "backup_failed", body)
+        self.assertIn("没有删除任何东西", body["error"])
+        # 真的一个字节都没动
+        self.assertIsNotNone(jdid.find_jd(self.JD_ID))
+        self.assertTrue(os.path.exists(os.path.join(store.p_path("reports"), "a1.html")))
+
 
 _PURGE_PROBE_JS = """
 function attrOf(html, name){
@@ -4377,6 +4411,148 @@ class JdDeleteFrontendTest(LedgerWithReportsCase):
         for a in p["analyses"]:
             self.assertIn(a["id"], second, second)
 
+    def test_the_second_confirmation_lists_files_one_per_line_with_their_kind(self):
+        """② 里每份文件**各自一行**、并带**它自己的**类型标签（不是一句通吃的"报告文件"）。
+
+        审查者实证的变异：把逐条列出改成用 `、` join 成一行 —— **17 个测试照样全绿**，
+        因为原断言是 `assertIn(name, 整段文字)`，对"逐条"这件事**毫无约束**。
+        所以这里要求"存在一行**以该文件名结尾**"，并要求同行带对类型标签。
+        """
+        _need_node()
+        p = self._preview()
+        out = web_probe.run_index(
+            "out.text = jdPurgeConfirmText(__fixture.p, jdPurgeLines(__fixture.p));\n",
+            {"p": p})
+        text = out["text"]
+        self.assertTrue(text, "确认文案是空的（下面的断言会变成恒真的假绿）")
+        # **只看 ② 区**：① 区（`jdPurgeLines`）本来就逐条列文件名，把整段文案拿来找
+        # "有一行以这个名字结尾"会被 ① 满足 —— 那样 M1 那个变异（② 用 `、` join 成一行）
+        # 照样绿，等于没测。（我第一版就是这么写的，变异当场打脸。）
+        self.assertIn("②", text)
+        sec2 = text.split("②", 1)[1].split("③", 1)[0]
+        lines = [ln.strip() for ln in sec2.split("\n")]
+        want_kind = {"jd_text": "JD 原文", "jd_image": "原截图", "analysis_report": "报告文件"}
+        checked = 0
+        for f in p["files"]:
+            if f["kept"] or not f["exists"]:
+                continue
+            checked += 1
+            self.assertTrue(any(ln.endswith(f["name"]) for ln in lines),
+                            "文件 %s 在②区里没有单独占据一行：%r" % (f["name"], sec2))
+            self.assertTrue(
+                any(want_kind[f["kind"]] in ln and ln.endswith(f["name"]) for ln in lines),
+                "文件 %s 的类型标签不是它自己的（要 %s）：%r" % (f["name"], want_kind[f["kind"]], sec2))
+        self.assertGreaterEqual(checked, 3, "夹具里要删的文件太少，这条测试没在测东西")
+
+    def test_the_second_confirmation_does_not_call_kept_or_absent_files_deleted(self):
+        """`kept`（还有别的岗位在用）与**不在盘上**的文件，不许列在"即将删除"下面。
+
+        原先 ② 的标题是"将被删除的报告文件"，却把这两类也列了进去 —— 而 ④ 又说 `kept`
+        那些**留着**：同一段话自相矛盾，用户没法知道到底删哪几个。
+        正确做法是**照样点名**，但放在④/⑤里说明白。
+        """
+        _need_node()
+        self._row_fixture()
+        absent = "a2.html"
+        os.remove(os.path.join(store.p_path("reports"), absent))          # → 不在盘上
+        app._save_analysis({"id": "别的岗的一条", "jd_id": "别的岗位_0009",
+                            "report": "a1.html", "created_at": "2026-10-07 09:00",
+                            "score": 70.0, "resume": "简历丁"})           # → a1.html 被保留
+        code, p = self._get("/api/jd/purge_preview?jd=" + quote(self.JD_ID))
+        self.assertEqual(code, 200, p)
+        kinds = {f["name"]: f for f in p["files"]}
+        self.assertTrue(kinds["a1.html"]["kept"], "夹具不对：a1.html 应当被判为保留")
+        self.assertFalse(kinds[absent]["exists"], "夹具不对：a2.html 应当不在盘上")
+
+        out = web_probe.run_index(
+            "out.text = jdPurgeConfirmText(__fixture.p, jdPurgeLines(__fixture.p));\n",
+            {"p": p})
+        text = out["text"]
+        sec2 = text.split("②", 1)[1].split("③", 1)[0]
+        self.assertNotIn("a1.html", sec2, "要保留的文件被列进了「即将删除」：%r" % (sec2,))
+        self.assertNotIn(absent, sec2, "不在盘上的文件被列进了「即将删除」：%r" % (sec2,))
+        # 但都必须在④/⑤里点名（如实告知，不是删掉不提）
+        self.assertIn("a1.html", text.split("④", 1)[1] if "④" in text else "")
+        self.assertIn(absent, text.split("⑤", 1)[1] if "⑤" in text else "")
+        # ② 里至少要有一份**真会删**的文件（否则上面两条断言可能"因为 ② 是空的"而恒真）
+        self.assertIn(self.JD_ID + ".txt", sec2, sec2)
+
+    def test_the_success_alert_writes_each_skipped_files_own_reason(self):
+        """成功弹窗里"保留未删"的原因要**逐个照抄后端给的 `why`**，不能概括成一句。
+
+        `jddelete` 会给出两种不同的原因（"还有别的 JD 在用" / "文件不在盘上"），
+        前端原先对**所有** `skipped_files` 都硬写"（还有别的岗位在用）" ——
+        对第二种就是假话，而这句话正是用户判断"我到底删掉了什么"的依据。
+        """
+        _need_node()
+        p = self._preview()
+        out = web_probe.run_index(
+            _PURGE_PROBE_JS +
+            "captureToasts();\n"
+            "var calls = [];\n"
+            "fetch = function(url, opt){\n"
+            "  var u = String(url);\n"
+            "  calls.push(String(url));\n"
+            "  if(u.indexOf('/api/jd/purge_preview') === 0)\n"
+            "    return Promise.resolve({ok:true, json:function(){ return Promise.resolve(__fixture.p); }});\n"
+            "  if(u.indexOf('/api/jd/purge') === 0)\n"
+            "    return Promise.resolve({ok:true, json:function(){ return Promise.resolve(__fixture.res); }});\n"
+            "  return Promise.resolve({ok:true, json:function(){ return Promise.resolve({ok:true, jds:[]}); }});\n"
+            "};\n"
+            "__confirmQueue.push(true, true);\n"
+            "await jdDelete(__fixture.id);\n"
+            "out.alerts = __alerts.slice();\n",
+            {"id": self.JD_ID, "p": p,
+             "res": {"ok": True, "id": self.JD_ID,
+                     "backup": "E:/x/data/profiles/删除备份_20261013_120000",
+                     "removed_files": [{"name": "a1.html"}],
+                     "skipped_files": [
+                         {"name": "共用报告.html", "why": "还有**别的 JD** 的分析在引用这份报告"},
+                         {"name": "早就没了.html", "why": "文件不在盘上（可能已被手工删掉）"}]}})
+        self.assertEqual(len(out["alerts"]), 1, out)
+        text = out["alerts"][0]
+        self.assertIn("共用报告.html", text)
+        self.assertIn("早就没了.html", text)
+        # 两种原因都要**照实**写出来，而不是一句"（还有别的岗位在用）"糊过去
+        self.assertIn("还有**别的 JD** 的分析在引用这份报告", text)
+        self.assertIn("文件不在盘上（可能已被手工删掉）", text)
+
+    def test_clicking_the_delete_button_really_invokes_the_purge_flow(self):
+        """点那个按钮**真的**会走删除流程（不是"渲染了个按钮 + 源码里有行字符串"）。
+
+        审查者实证的变异：把绑定改成空函数 `()=>{ }`，**17 个前端/路由测试照样全绿** ——
+        因为垫片的 `querySelectorAll` 永远返回 `[]`，"死按钮"根本走不到。
+        垫片补上真实按钮解析之后，这条测试用 `click()` 真正点一次。
+        """
+        _need_node()
+        row = self._row_fixture()
+        p = self._preview()
+        out = web_probe.run_index(
+            _PURGE_PROBE_JS +
+            "captureToasts();\n"
+            "var calls = [];\n"
+            "fetch = function(url, opt){\n"
+            "  calls.push(String(url));\n"
+            "  return Promise.resolve({ok:true, json:function(){ return Promise.resolve(__fixture.p); }});\n"
+            "};\n"
+            "JOBS = [__fixture.row];\n"
+            "renderJobs();\n"
+            "var btns = document.querySelector('#jobList').querySelectorAll('[data-jddel]');\n"
+            "out.btnCount = btns.length;\n"
+            "out.btnValue = btns.length ? btns[0].dataset.jddel : null;\n"
+            "__confirmQueue.push(true, false);\n"      # 第一句"是"→去预演；第二句"否"→打住
+            "if(btns.length) btns[0].click();\n"
+            "await new Promise(function(r){ setTimeout(r, 0); });\n"
+            "out.calls = bizCalls(calls.map(function(u){ return {url: u}; }));\n",
+            {"row": row, "p": p})
+        self.assertEqual(out["btnCount"], 1, "卡片里没找到删除按钮：%r" % (out,))
+        self.assertEqual(out["btnValue"], self.JD_ID)
+        self.assertTrue(out["calls"], "点了删除按钮却一个请求都没发（绑定是死的）")
+        # 台账渲染本身也会发 `/api/interview/list`（每个岗位一次），所以不能盯 `calls[0]`
+        purge = [c["url"] for c in out["calls"] if "/api/jd/purge" in c["url"]]
+        self.assertTrue(purge, "点了删除按钮却没发预演请求（绑定是死的）：%r" % (out["calls"],))
+        self.assertIn("/api/jd/purge_preview", purge[0])
+
     def test_delete_flow_uses_the_real_preview_and_refreshes_the_ledger(self):
         _need_node()
         p = self._preview()
@@ -4433,6 +4609,12 @@ class JdDeleteFrontendTest(LedgerWithReportsCase):
         self.assertIn("/api/jds", out["calls"][2]["url"])
 
     def test_a_failed_purge_is_reported_and_never_says_deleted(self):
+        """请求**发出去但结果拿不到**（网络中断）时的说法。
+
+        这一支最容易被写成谎话：请求可能已经在服务端跑完了（甚至已经删掉了），只是回包没
+        拿到。所以"已回滚"和"一个字节都没动"**都不能说** —— 唯一诚实的是"不知道，去看台账"，
+        而且程序要**替用户把台账刷新出来**，别让他自己猜。
+        """
         _need_node()
         p = self._preview()
         out = web_probe.run_index(
@@ -4457,9 +4639,116 @@ class JdDeleteFrontendTest(LedgerWithReportsCase):
         self.assertEqual(out["unexpected"], [], "catch 没兜住：%r" % (out["unexpected"],))
         self.assertEqual(out["alerts"], [], "失败了却弹了「已删除」的提示")
         self.assertTrue(out["toasts"], "失败时一句提示都没有")
-        self.assertIn("删除失败", "\n".join(out["toasts"]))
-        self.assertNotIn("已真删除", "\n".join(out["toasts"]))
-        self.assertEqual(len(out["calls"]), 2, out["calls"])       # 预演 + 删除；**不刷新台账**
+        text = "\n".join(out["toasts"])
+        self.assertNotIn("已真删除", text)
+        self.assertNotIn("已回滚", text, "结果未知却说「已回滚」：%r" % (text,))
+        self.assertNotIn("一个字节都没动", text, "结果未知却说「什么都没动」：%r" % (text,))
+        self.assertIn("不知道", text)
+        # 程序要**替用户把状态查清楚**：预演 + 删除 + 刷新台账
+        self.assertEqual(len(out["calls"]), 3, out["calls"])
+        self.assertIn("/api/jds", out["calls"][2]["url"])
+
+    def test_an_unreadable_ledger_stops_the_flow_before_any_delete_request(self):
+        """预演说 `can_purge=false`（台账读不出来）→ **一个删除请求都不许发**。
+
+        这条闸门非有不可：台账读不出来时清单看起来"只有 0 条分析"，照它删下去会把
+        整份台账覆盖成空（所有岗位的分析记录全没）。用 alert 而不是 toast：
+        这是要用户去修文件的，不能 3 秒后自己消失。
+        """
+        _need_node()
+        blocked = {"ok": True, "id": self.JD_ID, "found": True, "can_purge": False,
+                   "unreadable": "台账文件 `jobs.json` 读不出来：Expecting value",
+                   "reason": "", "not_found": "", "fingerprint": "deadbeef",
+                   "jd_record": None, "analyses": [], "files": [],
+                   "refs": {"knowledge": {"hits": 0, "cards": [], "cards_kept": 0, "note": ""},
+                            "interviews": {"hits": 0, "records": []}},
+                   "summary": {"analyses": 0, "files": 0, "reports": 0, "kb_hits": 0,
+                               "interviews": 0},
+                   "advisories": [{"kind": "unreadable_jobs",
+                                   "message": "台账文件 `jobs.json` 读不出来：Expecting value"}]}
+        out = web_probe.run_index(
+            _PURGE_PROBE_JS +
+            "captureToasts();\n"
+            "var calls = [];\n"
+            "fetch = function(url, opt){\n"
+            "  var u = String(url);\n"
+            "  calls.push(u);\n"
+            "  if(u.indexOf('/api/jd/purge_preview') === 0)\n"
+            "    return Promise.resolve({ok:true, json:function(){ return Promise.resolve(__fixture.p); }});\n"
+            "  return Promise.resolve({ok:true, json:function(){ return Promise.resolve({ok:true, jds:[]}); }});\n"
+            "};\n"
+            "__confirmQueue.push(true, true);\n"
+            "await jdDelete(__fixture.id);\n"
+            "out.alerts = __alerts.slice();\n"
+            "out.toasts = __TOASTS.slice();\n"
+            "out.confirms = __confirms.slice();\n"
+            "out.calls = bizCalls(calls.map(function(u){ return {url: u}; }));\n",
+            {"id": self.JD_ID, "p": blocked})
+        self.assertEqual(out["unexpected"], [], "catch 没兜住：%r" % (out["unexpected"],))
+        # 只发了那一个预演请求；**没有任何** /api/jd/purge
+        self.assertEqual(len(out["calls"]), 1, out["calls"])
+        self.assertNotIn("/api/jd/purge?", out["calls"][0]["url"])
+        # 没有第二次确认（连清单都不该给用户看）
+        self.assertEqual(len(out["confirms"]), 1, out["confirms"])
+        self.assertEqual(len(out["alerts"]), 1, "没用 alert 说清楚：%r" % (out,))
+        self.assertIn("不能删", out["alerts"][0])
+        self.assertIn("读不出来", out["alerts"][0])
+
+    def _failed_purge_probe(self, res):
+        """后端返回 `{ok:false, code, backup, error}` 时，前端到底说了什么。"""
+        _need_node()
+        p = self._preview()
+        return web_probe.run_index(
+            _PURGE_PROBE_JS +
+            "captureToasts();\n"
+            "var calls = [];\n"
+            "fetch = function(url, opt){\n"
+            "  var u = String(url);\n"
+            "  calls.push(u);\n"
+            "  if(u.indexOf('/api/jd/purge_preview') === 0)\n"
+            "    return Promise.resolve({ok:true, json:function(){ return Promise.resolve(__fixture.p); }});\n"
+            "  if(u.indexOf('/api/jd/purge') === 0)\n"
+            "    return Promise.resolve({ok:true, json:function(){ return Promise.resolve(__fixture.res); }});\n"
+            "  return Promise.resolve({ok:true, json:function(){ return Promise.resolve({ok:true, jds:[]}); }});\n"
+            "};\n"
+            "__confirmQueue.push(true, true);\n"
+            "await jdDelete(__fixture.id);\n"
+            "out.alerts = __alerts.slice();\n"
+            "out.toasts = __TOASTS.slice();\n"
+            "out.calls = bizCalls(calls.map(function(u){ return {url: u}; }));\n",
+            {"id": self.JD_ID, "p": p, "res": res})
+
+    def test_a_failed_rollback_uses_an_alert_and_never_says_rolled_back(self):
+        """`rollback_failed`：**数据可能不是原样**，只说一个 3 秒就消失的 toast 是不够的。
+
+        断言读的是**弹窗/提示的真实文本**（探针捕获的运行时值），不是"整页里有没有某个
+        字符串" —— 后者会被 `index.html` 源码里那句 `'删除失败（已回滚）'` 直接满足（假绿）。
+        """
+        bk = "E:/x/data/profiles/删除备份_20261013_120000"
+        out = self._failed_purge_probe(
+            {"ok": False, "id": self.JD_ID, "code": "rollback_failed", "backup": bk,
+             "error": "删除失败：boom（**回滚也失败了**，请手工从 %s 恢复）" % bk})
+        self.assertEqual(out["unexpected"], [], "catch 没兜住：%r" % (out["unexpected"],))
+        self.assertEqual(len(out["alerts"]), 1,
+                         "回滚失败没有用 alert —— 用户会错过「要手工恢复」这句话：%r" % (out,))
+        text = out["alerts"][0]
+        self.assertIn(bk, text, "备份路径没给到用户，就没法自救了：%r" % (text,))
+        self.assertNotIn("已回滚", text,
+                         "回滚失败还说「已回滚」—— 用户会以为数据没事：%r" % (text,))
+        self.assertEqual(out["toasts"], [],
+                         "只弹了一个会自己消失的 toast：%r" % (out["toasts"],))
+
+    def test_a_failed_backup_says_nothing_was_touched_and_not_rolled_back(self):
+        """`backup_failed`：备份就没成功 = **一个字节都没动**，说"已回滚"是多说的。"""
+        out = self._failed_purge_probe(
+            {"ok": False, "id": self.JD_ID, "code": "backup_failed", "backup": "",
+             "error": "备份失败，**没有删除任何东西**：磁盘满了"})
+        self.assertEqual(out["alerts"], [], "备份失败不该弹「要手工恢复」的告警")
+        text = "\n".join(out["toasts"])
+        self.assertTrue(text, "备份失败时一句提示都没有")
+        self.assertIn("一个字节都没动", text)
+        self.assertNotIn("已回滚", text,
+                         "备份都没成功却说「已回滚」：%r" % (text,))
 
     def test_a_failed_preview_says_so_and_sends_no_delete_request(self):
         _need_node()

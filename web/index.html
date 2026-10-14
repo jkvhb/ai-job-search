@@ -1004,20 +1004,33 @@ function jdPurgeLines(p){
   return L;
 }
 
-/* 二次确认的整段文案（**逐条**列出将被删除的文件；不在盘上的 / 要保留的照样点名）。 */
+/* 文件类型的中文标签（预演与确认里各文件都点名，不能一律叫"报告文件"）。 */
+function jdFileKindLabel(f){
+  return f.kind === 'jd_text' ? 'JD 原文' : (f.kind === 'jd_image' ? '原截图' : '报告文件');
+}
+
+/* 二次确认的整段文案。
+   ② 只列**真的会被删**的文件：`kept`（还有别的岗位在用）与不存在于盘上的都必须排除 ——
+   把它们列在"将被删除"下面是**撒谎**（④ 又说它们留着，同一段话自相矛盾）。
+   保留 / 缺失的那些照样点名，只是放在该放的位置（④⑤）。 */
 function jdPurgeConfirmText(p, lines){
-  const reports = (p.files || []).filter(function(f){ return f.kind === 'analysis_report'; });
-  const kept = (p.files || []).filter(function(f){ return f.kept; });
+  const all = (p.files || []);
+  const willGo = all.filter(function(f){ return !f.kept && f.exists; });
+  const kept = all.filter(function(f){ return f.kept; });
+  const absent = all.filter(function(f){ return !f.kept && !f.exists; });
   return '再确认一次：真删除这个岗位「' + String(p.id || '') + '」\n\n'
     + '① 即将删除（逐条）：\n' + lines.join('\n') + '\n\n'
-    + '② 将被删除的报告文件（逐条）：\n'
-    + (reports.length ? reports.map(function(f){ return '   - ' + String(f.name || ''); }).join('\n')
-                      : '   （没有报告文件）') + '\n\n'
+    + '② 即将删除的文件（逐条）：\n'
+    + (willGo.length ? willGo.map(function(f){
+          return '   - [' + jdFileKindLabel(f) + '] ' + String(f.name || ''); }).join('\n')
+                      : '   （没有文件要删）') + '\n\n'
     + '③ 功能语义是**不可恢复**：台账记录、分析记录、报告文件与 JD 原文都会从工作目录里删掉。\n'
     + '   工具会在删除前于磁盘上另留一份带时间戳的安全备份（路径会在删完后显示给你）——\n'
     + '   那是可回滚的余地，**不代表"磁盘上还有原件"**。\n'
-    + (kept.length ? '④ 这几份还**留着**（还有别的岗位在用）：'
+    + (kept.length ? '④ 这几份**保留不删**（' + String(kept[0].why || '还有别的岗位在用') + '）：'
         + kept.map(function(f){ return String(f.name || ''); }).join('、') + '\n' : '')
+    + (absent.length ? '⑤ 这几份**已经不在盘上**（记录照删，没有文件可删）：'
+        + absent.map(function(f){ return String(f.name || ''); }).join('、') + '\n' : '')
     + '\n确定真删除？';
 }
 
@@ -1038,6 +1051,16 @@ async function jdDelete(id){
     logUI('jd.purge_preview_failed', {jd: id, error: why}, 'error');
     return;
   }
+  // 预演自己说"不能删"就必须停手。`can_purge=false` 现在只有一个原因：台账读不出来 ——
+  // 这时清单看起来"只有 0 条分析"，照它删下去会把**整份台账覆盖成空**（所有岗位都没了）。
+  // 用 alert：这不是"3 秒后可以忘掉"的提示，是要用户去修文件的。
+  if(p.can_purge !== true){
+    alert('这个岗位现在**不能删** —— 预演都不能保证清单是对的。\n\n'
+      + String(p.unreadable || '预演说这份清单不可信') + '\n\n'
+      + '什么都没删。请先把台账文件修好（或从备份恢复）再试。');
+    logUI('jd.purge_blocked', {jd: id}, 'error');
+    return;
+  }
   const lines = jdPurgeLines(p);
   if(!confirm(jdPurgeConfirmText(p, lines))){          // 第二次确认：清单**逐条**摆在眼前
     logUI('jd.purge_cancelled', {jd: id});
@@ -1051,9 +1074,48 @@ async function jdDelete(id){
   }catch(e){ err2 = (e && e.message) || '网络中断（服务没在跑？）'; }
   if(err2 || !r || r.ok !== true){
     const why = err2 || (r && r.error) || '服务无响应';
-    // 失败时**绝不**说"已删除"：后端的失败路径已经逐字节回滚，这里如实转述它的话
-    toast('删除失败（已回滚）：' + why);
-    logUI('jd.purge_failed', {jd: id, error: why}, 'error');
+    const code = String((r && r.code) || '');
+    const bk = String((r && r.backup) || '');
+    // 失败时**绝不**说"已删除"。三种失败对用户的要求**完全不同**，必须分开说：
+    //   ① rollback_failed → **数据可能不是动手之前的样子**，要人工介入。
+    //      只能用 alert：路径要能复制、这句话不能 3 秒后自己消失。
+    //      **绝不能说"已回滚"** —— 那和后端那句"回滚也失败了"直接打架，
+    //      而用户会因此以为没事（这是本功能最不能出的错）。
+    //   ② backup_failed → 备份就没成功，**一个字节都没动**（说"已回滚"是多说的）。
+    //   ③ 其余（failed / 网络中断）→ 后端已经从备份逐字节回滚，如实转述它的话。
+    if(code === 'rollback_failed'){
+      alert('删除失败，而且**从备份回滚也失败了** ——\n'
+        + '数据可能已经不是动手之前的样子，需要你手工处理。\n\n'
+        + why + '\n\n'
+        + (bk ? '备份目录（从这里把文件手工拷回来）：\n' + bk + '\n\n' : '')
+        + '请先别再对这个岗位做任何操作。');
+      logUI('jd.purge_rollback_failed', {jd: id, error: why, backup: bk}, 'error');
+      return;
+    }
+    if(code === 'backup_failed'){
+      toast('删除失败（一个字节都没动）：' + why);
+      logUI('jd.purge_backup_failed', {jd: id, error: why}, 'error');
+      return;
+    }
+    if(err2){
+      // **网络中断 = 结果未知**：请求可能已经在服务端跑完了（甚至已经删掉了），
+      // 只是回包没拿到。这时说"已回滚"或"什么都没动"都是**编** ——
+      // 唯一诚实的说法是"不知道，去台账里看"，并且别盲目重试。
+      toast('删除请求的结果**不知道**（' + why + '）—— 请刷新台账确认到底删掉没有，'
+        + '别急着再点一次删除。');
+      logUI('jd.purge_unknown', {jd: id, error: why}, 'error');
+      loadJobs();
+      return;
+    }
+    if(code === 'failed'){
+      toast('删除失败（已回滚）：' + why);
+      logUI('jd.purge_failed', {jd: id, error: why}, 'error');
+      return;
+    }
+    // `unreadable` / `stale` / `not_found` / 未知 code：都**没有**动过文件，
+    // 所以一个字都不许说"已回滚"（那是 `failed` 专属的说法）。
+    toast('删除失败（什么都没动）：' + why);
+    logUI('jd.purge_rejected', {jd: id, code: code, error: why}, 'error');
     return;
   }
   // 如实说清：功能语义不可恢复，但盘上另有一份安全备份，路径在这里。
@@ -1062,10 +1124,13 @@ async function jdDelete(id){
   alert('已真删除岗位「' + id + '」\n\n'
     + '· 删除的文件：' + String((r.removed_files || []).length) + ' 个\n'
     + ((r.skipped_files || []).length
-        ? '· 保留未删：' + (r.skipped_files || []).map(function(s){ return String(s.name || ''); }).join('、')
-          + '（还有别的岗位在用）\n' : '')
-    + '\n⚠️ 功能语义是**不可恢复**：台账记录、分析记录、报告文件与 JD 原文都已经从工作目录里删除。\n'
-    + '工具在磁盘上另留了一份安全备份（不是"原件还在"，只是可回滚的余地）：\n'
+        ? '· 保留未删（各自的原因照实写出来，不概括成一句）：\n'
+          + (r.skipped_files || []).map(function(s){
+              return '   - ' + String(s.name || '') + '（' + String(s.why || '未说明') + '）';
+            }).join('\n') + '\n' : '')
+    + '\n功能语义是**不可恢复**：台账记录、分析记录、报告文件与 JD 原文都已经从工作目录里删除。\n'
+    + '工具在磁盘上另留了一份安全备份（不是"原件还在"，只是可回滚的余地；\n'
+    + '里面连这次改过的 JSON 与面试记录都有原样副本）：\n'
     + bk + '\n\n'
     + '确认无误后可以自行删除这个备份目录。');
   logUI('jd.purged', {jd: id, backup: bk, files: (r.removed_files || []).length});
