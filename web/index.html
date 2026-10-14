@@ -2524,10 +2524,14 @@ function rsAskContinue(fileName, content, mother){
     '<div class="hintline">内容有变化。这里<b>默认什么都不选</b>：不点下面两个按钮就不保存，也<b>绝不自动延续</b>。</div>' +
     '<div class="row" style="margin-top:14px">' +
       '<button class="btn" id="rsPickContinue">延续（成为子简历）</button>' +
-      // 修 3：快照**不是**无条件写的 —— 母版原文为 `missing`（没保留）/ `mismatch`（与记录不符）时
-      // `create_version` **故意不写**（`resumelib.py:369-384`）。这里只能承诺做得到的事。
+      // 修 3 / Task 1.8~1.9：覆盖前**按字节**留快照 —— 不是"不符就不写"。只有母版原文是 `missing`
+      //（这一版从来没保留过）时才不写；盘上那份与记录不符（被程序外改过 / 非 UTF-8 读不出来）时
+      // **字节照样留**（免得覆盖后无处可找），但那时**不记** `mother_file`、界面如实提示
+      //「内容与记录不符」（存档 ≠ 冒充）。这里只能承诺做得到的事（`resumelib.create_version`）。
       '<span class="hintline" style="margin:0">同一族谱里续一版 → <b>第 ' + (top + 1) + ' 次修改</b>，' +
-        '覆盖前<b>只有母版原文可用</b>时才会把它留成快照（原文未保留 / 与记录不符时<b>不写快照</b>，只留变更说明）</span>' +
+        '覆盖前会尽量把母版原文留成快照：只有盘上那份<b>就是母版原文</b>时才记为「母版原文的存档」；' +
+        '若与记录<b>不符</b>（被程序外改过），字节<b>照样保留</b>（免得覆盖后无处可找），' +
+        '但不会说它是母版原文 —— 取回时会如实提示「内容与记录不符」。只有这一版原文<b>从来没保留过</b>时才不留</span>' +
     '</div>' +
     '<div class="row" style="margin-top:18px">' +
       '<input type="text" id="rsPickName" class="grow" value="' + esc(suggested) + '">' +

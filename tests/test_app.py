@@ -3082,16 +3082,24 @@ class ResumeContinueModalTest(IsolatedCase):
         return v1, v2, v3
 
     def test_the_snapshot_promise_is_conditional(self):
-        """修 3：母版原文为 `missing` / `mismatch` 时 `create_version` **故意不写快照**
-        （`resumelib.py:369-384`）→「覆盖前先把母版原文留成快照」这句话并不总成立。"""
+        """修 3 / Task 1.9：快照**不是**无条件写的，也**不是**"与记录不符就不写"。
+
+        盘上那份与记录不符时字节**照样留**（存档 ≠ 冒充）；只有"这一版原文从来没保留过"
+        才不留。弹窗只能承诺做得到的事：说清「什么时候才**记为**母版原文的存档」、
+        「不符时字节**照样保留**」、「**从来没保留过**时才不留」。
+        """
         self._family()
         code, view = _resumes_view()
         self.assertEqual(code, 200, view)
         body = _continue_modal(view, "族谱")["body"]
         self.assertNotIn("覆盖前先把母版原文留成快照", body,
-                         "弹窗又在无条件承诺留快照（母版原文不可用时并不写快照）")
-        self.assertIn("母版原文可用", body, "没有说清「什么时候才留快照」")
-        self.assertIn("不写快照", body, "没有说清原文不可用时会怎样（只留变更说明）")
+                         "弹窗又在无条件承诺留快照（这一版原文从来没保留过时并不写）")
+        self.assertNotIn("不写快照", body,
+                         "Task 1.9：盘上那份与记录不符时**字节照样留** ——"
+                         "老文案「与记录不符时不写快照」是句假话，不许再回到弹窗里")
+        self.assertIn("就是母版原文", body, "没有说清「什么时候才记为母版原文的存档」")
+        self.assertIn("照样保留", body, "没有说清「与记录不符时字节照样保留」")
+        self.assertIn("从来没保留过", body, "没有说清「什么时候才不留」")
 
     def test_the_preview_revision_matches_what_is_really_written(self):
         """修 5：预览与 `create_version` **同一口径（含已移出）**。

@@ -359,11 +359,15 @@ class ReportStateNonUtf8Test(IsolatedCase):
 
 
 class WriteBytesParentDirsTest(IsolatedCase):
-    """`write_bytes()` 也要建父目录（与 `write_text` 一致）。
+    """`write_bytes()` 也要建父目录（与 `write_text` 一致）—— 这条断言就是它**唯一**的钉子。
 
-    零覆盖盲区：独立复查的变异 M-D 把 `os.makedirs` 那行删掉、**全量 900 条仍全绿** ——
-    也就是说没有任何测试钉住它。而备份/回滚路径全靠它：目录不在时 `open(path, "wb")`
-    直接 `FileNotFoundError`，回滚就会在"救数据"的路上再炸一次（那时连原像都写不下去）。
+    （**更正**：早先这里写着"独立复查的变异 M-D 把 `os.makedirs` 那行删掉、**全量 900 条仍全绿**
+    —— 也就是说没有任何测试钉住它"。那句话**不可复现**，已撤回：本机实测删掉那行会
+    **16 FAIL / 34 ERROR**，钉住它的测试多的是。留这条注是为了不再重复一句没验证过的立论 ——
+    下面这条断言是**直接钉子**，不需要拿"全量仍全绿"当理由。）
+
+    为什么非钉不可：备份/回滚路径全靠它 —— 目录不在时 `open(path, "wb")` 直接
+    `FileNotFoundError`，回滚就会在"救数据"的路上再炸一次（那时连原像都写不下去）。
     """
 
     def test_write_bytes_creates_missing_parent_directories(self):

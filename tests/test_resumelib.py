@@ -706,6 +706,13 @@ class SnapshotByteFidelityTest(IsolatedCase):
             self.assertEqual(f.read(), raw, "快照必须逐字节等于原文（老实现写出 0 字节假存档）")
         self.assertNotEqual(os.path.getsize(snap), 0, "绝不许留一个 0 字节的假存档")
 
+        # 读侧的另一半（Task 1.9 / I-2）：快照**有字节却读不出来**（非 UTF-8）时，
+        # 绝不能说成"存过档、内容是空的" —— 那份空串会被界面当成一份空简历显示出来。
+        # 这正是"文件读不出来被当成文件是空的"，只是搬到了快照的读侧。
+        _text, _p, kind = resumelib.read_version(v1["id"])
+        self.assertEqual(kind, "mismatch",
+                         "快照读不出来时不许说'存过档、内容是空的'（那会让界面显示空简历）")
+
     def test_a_crlf_mother_is_archived_byte_faithfully(self):
         v1 = resumelib.create_version("母版", "第一行\n第二行")
         resumelib.choose(v1["id"])
@@ -761,6 +768,83 @@ class SnapshotByteFidelityTest(IsolatedCase):
         # 若留下一份 0 字节假快照，"有快照先读快照"那条顺序会让它变成 mismatch ——
         # 拿一个空档冒充「存过」，正是要钉死的事。
         self.assertEqual(resumelib.read_version(v1["id"])[2], "missing")
+
+    def test_a_provably_stale_snapshot_is_repaired_when_the_true_mother_returns(self):
+        """坏字节占位后，若真正的母版内容回到了盘上，快照必须能被修正。
+
+        不加这条例外 → 盘上与记录一致了、`read_version` 还一直喊 `mismatch`（假红），
+        真原文也再也补不进去（复查实测）。
+        """
+        v1 = resumelib.create_version("母版", "原文内容")
+        resumelib.choose(v1["id"])
+        with open(store.p_path("resumes", "母版.md"), "w", encoding="utf-8", newline="") as f:
+            f.write("被改坏的内容")
+        v2 = resumelib.create_version("母版", "第二版内容", parent_id=v1["id"])
+        self.assertIsNone(resumelib.by_id(v1["id"])["mother_file"])       # 没冒充（口径不变）
+        resumelib.purge(v2["id"])
+        with open(store.p_path("resumes", "母版.md"), "w", encoding="utf-8", newline="") as f:
+            f.write("原文内容")
+        self.assertEqual(resumelib.read_version(v1["id"])[2], "latest")   # 前提：盘上就是它
+        resumelib.create_version("母版", "第三版内容", parent_id=v1["id"])
+        with open(self._snap_path(v1["id"]), "rb") as f:
+            self.assertEqual(f.read(), "原文内容".encode("utf-8"), "真原文必须能补存进快照")
+        # 修正后的快照**就是**母版原文 → 这条记录可以（也应当）重新记上存档位置。
+        self.assertEqual(resumelib.by_id(v1["id"])["mother_file"],
+                         "resumes/%s/%s.md" % (resumelib.SNAPSHOT_DIR, v1["id"]))
+        self.assertEqual(resumelib.read_version(v1["id"])[2], "mother")
+
+    def test_a_stale_snapshot_is_never_rewritten_without_a_fingerprint(self):
+        """记录**没有** `sha256` 时，"快照过时"这件事**没有依据** → 一个字节都不许动。
+
+        变异的钉子：把 `stale` 判定里的 `bool(expected)` 去掉，本测试必须变红
+        （那时只要"快照文本的 sha != 空串"就成立 = 恒真，于是空有形状就重写快照）。
+        宁可不动，也绝不凭猜测改写一份自称"不可变的参照原点"。
+        """
+        v1 = resumelib.create_version("母版", "原文内容")
+        resumelib.choose(v1["id"])
+        v2 = resumelib.create_version("母版", "第二版内容", parent_id=v1["id"])
+        snap = self._snap_path(v1["id"])
+        self.assertTrue(os.path.exists(snap))
+        old = 1000000000                      # 2001-09-09：把 mtime 钉在过去，重写必然改变它
+        os.utime(snap, (old, old))
+        before = os.stat(snap).st_mtime_ns
+
+        self._drop_sha(v1["id"])              # 人工改坏 / 老记录：没有内容指纹
+        # 造出"看起来过时"的形状：盘上那份与快照不同（但记录里没有 sha 可以证明谁对）
+        store.write_text(store.p_path("resumes", "母版.md"), "程序外改过的内容")
+
+        resumelib.create_version("母版", "第三版内容", parent_id=v1["id"])
+
+        self.assertEqual(os.stat(snap).st_mtime_ns, before,
+                         "没有 sha256 就没有依据 → 快照一个字节都不许重写")
+        with open(snap, "rb") as f:
+            self.assertEqual(f.read(), "原文内容".encode("utf-8"))
+
+    def test_an_unreadable_mother_file_aborts_the_save_instead_of_overwriting_it(self):
+        """母版原文**读不出来**（被别的程序锁住 / 权限）→ 中止本次保存，绝不覆盖它。
+
+        方向更安全（宁可这次不保存，也绝不把用户那份东西冲掉），但必须**说清楚**：
+        不兜住 `OSError` 的话它一路穿到 `app.py` 变成裸 500（用户只看到「服务器内部错误」）。
+        """
+        v1 = resumelib.create_version("母版", "原文内容")
+        resumelib.choose(v1["id"])
+        path = store.p_path("resumes", "母版.md")
+        real_read_bytes = store.read_bytes
+
+        def fake_read_bytes(p):
+            if os.path.abspath(str(p)) == os.path.abspath(path):
+                raise PermissionError(13, "拒绝访问")
+            return real_read_bytes(p)
+
+        with mock.patch.object(store, "read_bytes", side_effect=fake_read_bytes):
+            with self.assertRaises(RuntimeError) as ctx:
+                resumelib.create_version("母版", "第二版内容", parent_id=v1["id"])
+
+        self.assertIn("留档", str(ctx.exception))                       # 说人话，不是裸异常文本
+        self.assertEqual(store.read_text(path), "原文内容", "读不出来就不覆盖：绝不能把那份冲掉")
+        self.assertFalse(os.path.exists(self._snap_path(v1["id"])), "没留成档就别留半个快照")
+        self.assertEqual([r["id"] for r in resumelib.list_versions()], [v1["id"]],
+                         "这次保存整体中止：不许留下一条没有内容的版本记录")
 
 
 if __name__ == "__main__":
