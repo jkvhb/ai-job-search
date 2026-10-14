@@ -153,9 +153,12 @@ class ReadKnowledgeStrictTest(IsolatedCase):
         bad = b'{"nodes": [ <<<CORRUPT>>>'
         with open(store.knowledge_path(), "wb") as f:
             f.write(bad)
+        before = sorted(os.listdir(store.profile_dir()))
         store.read_knowledge_strict()
         with open(store.knowledge_path(), "rb") as f:
-            self.assertEqual(f.read(), bad, "只读：坏文件原样留着")
+            self.assertEqual(f.read(), bad, "只读：坏文件原样留原路径")
+        self.assertEqual(sorted(os.listdir(store.profile_dir())), before,
+                         "只读：不许多写/改名任何文件（如隔离副本）")
 
 
 if __name__ == "__main__":

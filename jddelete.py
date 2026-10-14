@@ -181,6 +181,8 @@ def _knowledge_or_error():
     实现已收归 `store.read_knowledge_strict()`（"读不出来 ≠ 没有"这条规则只准有一份）。
     为什么删除**不**因它而停下：知识库坏掉不会丢数据（`kb_touched` 保持 0，于是根本不会写它），
     但"引用没清干净"必须说出来。
+    与 F1 的差别就在这里：F1 那条路会把坏文件**覆盖**掉（所以必须拦住），
+    这条路**不写**知识库，所以只需说清楚。
     """
     return store.read_knowledge_strict()
 
