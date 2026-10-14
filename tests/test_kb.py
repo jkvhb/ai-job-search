@@ -1782,3 +1782,40 @@ class InterviewFeedbackTest(IsolatedCase):
         self.assertEqual(q[0], "甲概念")
         # 反证：按术语升序（同分时的 tie-break）「乙概念」本排在前面，只有因子能把它压下去
         self.assertLess("乙概念", "甲概念")
+
+
+class KbAbsorbNonUtf8Test(IsolatedCase):
+    """GBK 写坏的库 + 一次 absorb → **用户的卡必须还在**（在被备份走的那份里）。
+
+    这是本任务的核心回归：老实现下用户的整个库会被内存里的空库顶掉
+    （实测：卡全没了，而且连备份都没有）。
+    """
+
+    def _cards(self):
+        return [{"id": "语音识别", "term": "语音识别", "definition": "把语音转文字",
+                 "plain_explanation": "通俗", "layer": 0,
+                 "sources": [{"url": "https://w"}], "timeline": [], "related": [],
+                 "interview_questions": [], "confidence": "verified",
+                 "state": "待学习", "from_jds": []}]
+
+    def test_absorb_quarantines_a_non_utf8_library_instead_of_wiping_it(self):
+        path = store.knowledge_path()
+        raw = json.dumps({"nodes": self._cards()}, ensure_ascii=False).encode("gbk")
+        with open(path, "wb") as f:
+            f.write(raw)
+        node = {"id": "新概念", "term": "新概念", "definition": "d", "plain_explanation": "p",
+                "layer": 0, "sources": [{"url": "u"}], "timeline": [], "related": [],
+                "interview_questions": [], "confidence": "verified", "state": "待学习"}
+        kb.absorb([node], {"id": "新岗位", "job_title": "新岗位", "company": "",
+                           "date": "2026-10-15"})
+
+        # ① 用户的字节必须被**完整**备份下来（能原样恢复他原来的卡）
+        folder = os.path.dirname(path)
+        backups = [f for f in os.listdir(folder) if ".corrupt-" in f]
+        self.assertEqual(len(backups), 1, "坏库必须先被改名备份，绝不能直接覆盖")
+        with open(os.path.join(folder, backups[0]), "rb") as f:
+            self.assertEqual(f.read(), raw, "备份必须逐字节等于原文")
+        with open(os.path.join(folder, backups[0]), encoding="gbk") as f:
+            self.assertIn("语音识别", f.read(), "用户的卡必须能从这个备份里恢复")
+        # ② 本次照样沉淀成功（库坏了也不能不干活）
+        self.assertIn("新概念", [n.get("term") for n in store.load_knowledge()["nodes"]])

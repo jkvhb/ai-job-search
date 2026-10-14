@@ -1,8 +1,11 @@
 # -*- coding: utf-8 -*-
 import glob
+import json
 import os
 import unittest
 
+import jddelete
+import kb
 import store
 
 from tests.base import IsolatedCase
@@ -149,16 +152,125 @@ class ReadKnowledgeStrictTest(IsolatedCase):
         self.assertEqual(data, {"nodes": []})
         self.assertTrue(err, "结构不对也算读不出来")
 
+    def test_the_reason_names_the_file_that_was_actually_read(self):
+        """调用方传别的 path 时，原因里必须出现**那个**文件名，不能写死 knowledge.json。
+
+        文案原先写死 `knowledge.json`：读 `别处的库.json` 失败时，用户看到的却是
+        "知识库 `knowledge.json` 读不出来"，照着这句话去修就修错了文件。
+        结构不对那一句同理（同一个写死的地方）。
+        """
+        other = os.path.join(self.tmp, "别处的库.json")
+        with open(other, "wb") as f:
+            f.write(b'{"nodes": [ <<<CORRUPT>>>')
+        _, err = store.read_knowledge_strict(other)
+        self.assertIn("别处的库.json", err)
+        self.assertNotIn("knowledge.json", err)
+        store.write_text(other, '{"nodes": "not-a-list"}')
+        _, err2 = store.read_knowledge_strict(other)
+        self.assertIn("别处的库.json", err2)
+        self.assertNotIn("knowledge.json", err2)
+
     def test_it_does_not_write_anything(self):
         bad = b'{"nodes": [ <<<CORRUPT>>>'
         with open(store.knowledge_path(), "wb") as f:
             f.write(bad)
-        before = sorted(os.listdir(store.profile_dir()))
+        # 用 knowledge_path() 反推目录，而不是 profile_dir()：后者是"无参回落硬编码 default"，
+        # 知识库真正落在 current_profile() 下，两者当前恰好相同纯属碰巧。
+        folder = os.path.dirname(store.knowledge_path())
+        before = sorted(os.listdir(folder))
         store.read_knowledge_strict()
         with open(store.knowledge_path(), "rb") as f:
             self.assertEqual(f.read(), bad, "只读：坏文件原样留原路径")
-        self.assertEqual(sorted(os.listdir(store.profile_dir())), before,
+        self.assertEqual(sorted(os.listdir(folder)), before,
                          "只读：不许多写/改名任何文件（如隔离副本）")
+
+
+class KnowledgeSafeToWriteTest(IsolatedCase):
+    """`(可写, 原因)` 的六种情形 —— 「读不出来 ≠ 空」这条规则**唯一**的写盘判据。"""
+
+    def _write(self, blob):
+        with open(store.knowledge_path(), "wb") as f:
+            f.write(blob)
+
+    def test_a_missing_file_is_safe(self):
+        self.assertEqual(store.knowledge_safe_to_write(), (True, ""))
+
+    def test_a_valid_file_is_safe(self):
+        store.save_knowledge({"nodes": [{"id": "a", "term": "A"}]})
+        self.assertEqual(store.knowledge_safe_to_write(), (True, ""))
+
+    def test_an_empty_or_whitespace_only_file_is_safe(self):
+        """没有**字节**可丢 → 可以写（0 字节 / 纯空白**不是**损坏，别为它造垃圾备份）。"""
+        for blob in (b"", b"   \n  ", b"\r\n"):
+            with self.subTest(blob=blob):
+                self._write(blob)
+                ok, err = store.knowledge_safe_to_write()
+                self.assertTrue(ok, "空文件不该被当成损坏：%r" % (blob,))
+                self.assertEqual(err, "")
+
+    def test_a_truncated_json_file_is_not_safe(self):
+        self._write(b'{"nodes": [ <<<CORRUPT>>>')
+        ok, err = store.knowledge_safe_to_write()
+        self.assertFalse(ok, "有内容却读不出来 → 绝不能写盘")
+        self.assertIn("knowledge.json", err)
+
+    def test_a_non_utf8_file_is_not_safe(self):
+        """**这条是本任务的全部理由**：GBK 写坏的库里有用户的整库，绝不能被空库顶掉。
+
+        老判据在这里会误判成"空文件"（解码失败被兜成空串）→ 不备份、直接写盘 → 数据丢。
+        """
+        self._write(json.dumps({"nodes": [{"id": "语音识别", "term": "语音识别"}]},
+                               ensure_ascii=False).encode("gbk"))
+        ok, err = store.knowledge_safe_to_write()
+        self.assertFalse(ok, "非 UTF-8 文件有字节 → 不可写盘")
+        self.assertIn("读不出来", err)
+
+    def test_a_wrong_shape_file_is_not_safe(self):
+        self._write(b'{"nodes": "not-a-list"}')
+        self.assertFalse(store.knowledge_safe_to_write()[0])
+
+    def test_it_does_not_write_anything(self):
+        bad = b'{"nodes": [ <<<CORRUPT>>>'
+        self._write(bad)
+        folder = os.path.dirname(store.knowledge_path())
+        before = sorted(os.listdir(folder))
+        store.knowledge_safe_to_write()
+        with open(store.knowledge_path(), "rb") as f:
+            self.assertEqual(f.read(), bad, "只读：坏文件原样留原路径")
+        self.assertEqual(sorted(os.listdir(folder)), before, "只读：不许多写/改名任何文件")
+
+
+class SingleImplementationGuardTest(IsolatedCase):
+    """「这条规则只准有一份实现」的守卫：别人把它内联回去，这些测试就会红。"""
+
+    def test_jddelete_follows_the_shared_implementation(self):
+        real, calls = store.read_knowledge_strict, []
+
+        def spy(path=None):
+            calls.append(path)
+            return {"nodes": []}, "哨兵：故意报一个读不出来的原因"
+
+        store.read_knowledge_strict = spy
+        try:
+            self.assertEqual(jddelete._knowledge_or_error(),
+                             ({"nodes": []}, "哨兵：故意报一个读不出来的原因"))
+            self.assertTrue(calls, "jddelete 没有走共享实现（有人把逻辑内联回去了）")
+        finally:
+            store.read_knowledge_strict = real
+
+    def test_kb_quarantine_follows_the_shared_implementation(self):
+        real, seen = store.knowledge_safe_to_write, []
+
+        def spy(path=None):
+            seen.append(1)
+            return True, ""
+
+        store.knowledge_safe_to_write = spy
+        try:
+            self.assertTrue(kb._quarantine_corrupt_kb())
+            self.assertEqual(len(seen), 1, "kb 没有走共享判据（有人把它内联回去了）")
+        finally:
+            store.knowledge_safe_to_write = real
 
 
 if __name__ == "__main__":

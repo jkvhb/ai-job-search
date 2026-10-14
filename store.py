@@ -222,10 +222,47 @@ def read_knowledge_strict(path=None):
         with open(p, "r", encoding="utf-8") as f:
             data = json.load(f)
     except Exception as e:
-        return {"nodes": []}, "知识库 `knowledge.json` 读不出来：%s" % e
+        # 文件名必须插值：调用方可以传别的 path，写死 knowledge.json 会让用户照着这句话
+        # 去修**另一个**文件（本函数是通用判据，不是 knowledge.json 专用）。
+        return {"nodes": []}, "知识库 `%s` 读不出来：%s" % (os.path.basename(p), e)
     if not isinstance(data, dict) or not isinstance(data.get("nodes"), list):
-        return {"nodes": []}, "知识库 `knowledge.json` 的结构不对（应当是含 `nodes` 列表的对象）"
+        return {"nodes": []}, "知识库 `%s` 的结构不对（应当是含 `nodes` 列表的对象）" % (os.path.basename(p),)
     return data, ""
+
+
+def _has_content_bytes(path):
+    """这个文件里有没有**可丢的字节**？
+
+    ⚠️ **必须看原始字节**，绝不能用解码后的字符串：非 UTF-8 文件（比如被 GBK 写坏的
+    `knowledge.json`）在 `read_text` 里解码会失败、并被兜成默认空串，于是
+    "有内容但读不出来"被误判成"空文件，没有可丢的数据"。这正是本函数存在的唯一理由
+    （实测：GBK 的库会被内存里的空库顶掉，用户的卡全没）。
+    """
+    try:
+        with open(path, "rb") as f:
+            return bool(f.read().strip())
+    except OSError:
+        return False
+
+
+def knowledge_safe_to_write(path=None):
+    """知识库当前是否可以**安全写盘**？返回 `(可写, 原因)`。
+
+    可写 = **读得出来**，**或者**文件里根本没有可丢的内容（不存在 / 0 字节 / 纯空白）。
+    其余（有字节、却读不出来）→ 不可写：调用方必须先备份或放弃本次写盘，
+    **绝不能**把内存里那份（`load_knowledge()` 给的 `{"nodes": []}`）写回去。
+
+    这是「读不出来 ≠ 空」这条规则**唯一**的实现（`kb` / `jobdup` / `身份迁移` 都用它）。
+    注意它与 `read_knowledge_strict` 的分工不同：那个回答"读得出来吗"，
+    这个回答"写上去会不会丢东西" —— 0 字节的文件读不出来，但写上去不丢任何东西。
+    """
+    p = path or knowledge_path()
+    _data, err = read_knowledge_strict(p)
+    if not err:
+        return True, ""
+    if not _has_content_bytes(p):
+        return True, ""
+    return False, err
 
 
 def save_knowledge(kb, key=None):

@@ -521,10 +521,10 @@ def _build_knowledge(new_ids, jd_by_id):
       缺了才从 JD 记录补
     - 「有内容但解析失败」→ 抛错中止，绝不用空库顶掉（同 `jobdup._repoint_kb`）
     """
-    path = store.knowledge_path()
-    if store.read_json(path, None) is None and store.read_text(path, "").strip():
-        raise RuntimeError("knowledge.json 读不出来（有内容但解析失败）："
-                           "已放弃本次迁移，绝不写成空库")
+    ok, reason = store.knowledge_safe_to_write()
+    if not ok:
+        raise RuntimeError("knowledge.json 读不出来（有内容但读不出来）："
+                           "已放弃本次迁移，绝不写成空库。原因：%s" % reason)
     data = store.load_knowledge()
     touched = 0
     for node in data.get("nodes") or []:

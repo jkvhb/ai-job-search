@@ -309,18 +309,18 @@ def _merge_into(card, node):
 def _quarantine_corrupt_kb():
     """损坏的 knowledge.json 先改名备份，绝不当空库静默覆盖。返回 True = 可以继续写盘。
 
-    store.read_json 把「解析失败」和「文件为空」都归成 None，而 absorb 末尾会把内存里的库写回
-    文件 —— 一次坏读就等于清空用户全部积累。判据必须是「文件有内容 **且** 解析失败」：
-    正常的空库 {"nodes": []} 解析成功，绝不会被误备份走。
+    判据收归 `store.knowledge_safe_to_write()`（唯一实现）。**老判据为什么是错的**：
+    它用 `store.read_text(path, "").strip()` 判断"有没有内容"，而非 UTF-8 文件
+    **解码失败会被兜成空串** → "有内容但读不出来"（比如 GBK 写坏的库）被误判成"空文件"，
+    于是不备份、直接写盘，用户的整个库就被内存里的空库顶掉了（实测复现过）。
 
     改名失败时返回 False（调用方 absorb 会放弃这次写盘）：宁可这次不沉淀，
     也绝不能让坏文件被内存里的空库顶掉。
     """
     path = store.knowledge_path()
-    if store.read_json(path, None) is not None:
+    ok, reason = store.knowledge_safe_to_write()
+    if ok:
         return True
-    if not store.read_text(path, "").strip():
-        return True                  # 文件不存在或为空：没有可丢的数据
     # 文件名带自增序号：同秒内两次隔离（或两个进程）绝不能互相覆盖备份
     seq = next(_QUARANTINE_SEQ)
     backup = "%s.corrupt-%s-%d-%04d" % (path, datetime.now().strftime("%Y%m%d%H%M%S"),
@@ -330,7 +330,8 @@ def _quarantine_corrupt_kb():
     except OSError as e:
         log.log_event("kb.corrupt_backup_failed", level="warn", error=str(e))
         return False
-    log.log_event("kb.corrupt_backup", level="warn", backup=os.path.basename(backup))
+    log.log_event("kb.corrupt_backup", level="warn", backup=os.path.basename(backup),
+                  reason=reason[:200])
     return True
 
 

@@ -242,11 +242,12 @@ def _repoint_kb(keep_id, drop_id):
 
     损坏的 `knowledge.json`（有内容但解析失败）直接抛错：`load_knowledge` 会把坏文件静默归成
     `{"nodes": []}`，照它写回就等于把用户的整个库清空（本项目真实丢过 97 张卡）。
-    判据照 `kb._quarantine_corrupt_kb`。
+    判据走 `store.knowledge_safe_to_write()`（唯一实现）。
     """
-    path = store.knowledge_path()
-    if store.read_json(path, None) is None and store.read_text(path, "").strip():
-        raise RuntimeError("knowledge.json 读不出来（有内容但解析失败）：已放弃本次合并，绝不写成空库")
+    ok, reason = store.knowledge_safe_to_write()
+    if not ok:
+        raise RuntimeError("knowledge.json 读不出来（有内容但读不出来）："
+                           "已放弃本次合并，绝不写成空库。原因：%s" % reason)
     data = store.load_knowledge()
     nodes = data.get("nodes") if isinstance(data, dict) else None
     repointed = deduped = 0
