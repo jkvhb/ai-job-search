@@ -1636,7 +1636,11 @@ class Handler(BaseHTTPRequestHandler):
                 content = store.read_text(fp, "")
                 if not content and store.content_bytes_present(fp):
                     log.log_event("resume.read_failed", level="warn", name=name)
-                    return self._send(500, {"ok": False, "name": name,
+                    # **409**（M-4，Task 1.10b）：这是"盘上那份东西现在的状态与这次读取冲突"
+                    # （文件里有字节、但不是 UTF-8 文本），与同轮的姊妹场景（`POST /api/resumes`
+                    # 接不住的母版原文 → 409）同一口径。**500 是句假话**：「服务器内部错误」
+                    # 会让用户以为是程序坏了，其实是他的文件不是 UTF-8。
+                    return self._send(409, {"ok": False, "name": name,
                                             "error": "简历「%s」读不出来（不是空的）：文件里有字节，"
                                                      "但不是 UTF-8 文本、或读不出内容。"
                                                      "为避免你保存时把真文件覆盖成空的，这次不回内容 —— "
@@ -2105,14 +2109,16 @@ class Handler(BaseHTTPRequestHandler):
                 log.log_event("resume.save_rejected", level="warn", name=body.get("name"),
                               error=str(e))
                 return self._send(400, {"ok": False, "error": str(e)})
-            except RuntimeError as e:
-                # 「母版原文读不出来 → 中止本次保存」是 `resumelib.create_version` **唯一**会抛
-                # `RuntimeError` 的地方（Task 1.10 修 6）。它的性质是**冲突**而不是"服务器内部错误"：
+            except resumelib.SnapshotArchiveError as e:
+                # 「没能给（旧）快照留档 → 中止本次保存」是 `resumelib.create_version` 抛出的
+                # **专用**异常（Task 1.10b 修 M-9）。它的性质是**冲突**而不是"服务器内部错误"：
                 # 目标文件**当前的状态**（被别的程序占用 / 读不出来）与这次保存冲突 → **409**，
-                # 而且**只**把那句人话给用户。旧实现漏接它 → 掉进 `do_POST` 的兜底
-                # （HTTP 500 + 前缀「服务器内部错误：…」，复查实测过）。
+                # 而且**只**把那句人话给用户。
+                # ⚠️ **必须只 catch 这一种**：这里用裸 `RuntimeError` 的话，将来 `ai_diff_of`
+                # 之类的地方冒出任何 `RuntimeError`，都会把**已经成功落盘**的一次保存
+                # 报成 409「已中止」= 又一句用户可见的假话（Task 1.10b 修 M-9）。
                 log.log_event("resume.save_conflict", level="warn", name=body.get("name"),
-                              error=str(e))
+                              error=str(e), cause=str(getattr(e, "cause", "") or ""))
                 return self._send(409, {"ok": False, "error": str(e)})
             return self._send(200, {"ok": True, "name": rec.get("name"), "resume": rec,
                                     "id": rec.get("id"), "rev": rec.get("rev"),

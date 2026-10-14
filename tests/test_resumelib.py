@@ -4,6 +4,7 @@
 继承 IsolatedCase：store.DATA_ROOT 与 log.LOG_FILE 同时被重定向到临时目录，
 绝不在真实 data/ 上跑。
 """
+import hashlib
 import json
 import os
 import threading
@@ -11,10 +12,25 @@ from datetime import datetime
 from unittest import mock
 
 import llm
+import log
 import resumelib
 import store
 
 from tests.base import IsolatedCase
+
+
+def _stale_side_name(snap_path, raw):
+    """旁挂留档的**基本**名字（`<快照路径>.stale-<旧字节 sha 前 8 位>`，与 `resumelib` 同口径）。"""
+    return "%s.stale-%s" % (snap_path, hashlib.sha256(raw).hexdigest()[:8])
+
+
+def _events_text():
+    """隔离根里的事件日志全文（`IsolatedCase` 把 `log.LOG_FILE` 也重定向进临时目录）。"""
+    try:
+        with open(log.LOG_FILE, "r", encoding="utf-8") as f:
+            return f.read()
+    except OSError:
+        return ""
 
 
 class CreateVersionTest(IsolatedCase):
@@ -77,6 +93,38 @@ class ChooseRemovePurgeTest(IsolatedCase):
         resumelib.remove(v1["id"])
         self.assertTrue(os.path.exists(store.p_path("resumes/母版.md")))           # 最新版文件还在
         self.assertTrue(os.path.exists(store.p_path(resumelib.by_id(v1["id"])["mother_file"])))  # 快照还在
+
+    def test_purge_also_clears_this_versions_own_stale_archives(self):
+        """M-5：彻底删某一版时，**它自己的** ``.stale-*`` 留档旁挂也一并清掉（别人的一律不碰）。
+
+        旁挂是"留档"（装的是即将被覆盖的旧快照字节），会累积、可手工删。
+        既然这一版的快照都被彻底删了，它自己的旧副本留着只会让目录越积越多 —— 但**只清
+        这一版 id 前缀**的那些：别人的快照 / 别人的旁挂必须逐字未变（反假绿）。
+        """
+        v1 = resumelib.create_version("甲", "A1")
+        resumelib.choose(v1["id"])
+        v2 = resumelib.create_version("甲", "A2", parent_id=v1["id"])
+        room = store.p_path("resumes", resumelib.SNAPSHOT_DIR)
+        snap = os.path.join(room, v1["id"] + ".md")
+        mine = os.path.join(room, "%s.md.stale-00000000" % v1["id"])
+        mine_bytes = "v1 的旧快照副本".encode("utf-8")
+        store.write_bytes(mine, mine_bytes)
+        other = resumelib.create_version("乙", "B1")
+        resumelib.choose(other["id"])
+        resumelib.create_version("乙", "B2", parent_id=other["id"])
+        theirs = os.path.join(room, "%s.md.stale-00000000" % other["id"])
+        theirs_bytes = "乙的旧快照副本".encode("utf-8")
+        store.write_bytes(theirs, theirs_bytes)
+
+        resumelib.purge(v1["id"])
+
+        self.assertFalse(os.path.exists(mine), "这一版自己的留档旁挂要跟着清掉")
+        self.assertFalse(os.path.exists(snap), "自己的快照照旧删掉")
+        self.assertTrue(os.path.exists(theirs), "别人的留档旁挂一个字节都不许动")
+        self.assertEqual(store.read_bytes(theirs), theirs_bytes)
+        self.assertTrue(os.path.exists(store.p_path("resumes", "甲.md")),
+                        "族谱主文件是「最新版容器」，purge 不删它（老口径不变）")
+        self.assertEqual(resumelib.by_id(v2["id"])["name"], "甲")   # v2 还在（只删了 v1）
 
     def test_purge_removes_only_its_own_snapshot(self):
         v1 = resumelib.create_version("甲", "A1"); resumelib.choose(v1["id"])
@@ -910,6 +958,125 @@ class SnapshotByteFidelityTest(IsolatedCase):
         self.assertEqual(store.read_bytes(snap), "快照被改坏".encode("utf-8"))
 
 
+class SnapshotArchiveFailureTest(IsolatedCase):
+    """Task 1.10b 修 I-1：**留档失败 → 放弃本次修正**（绝不静默把旧快照盖掉，那是不可逆的）。
+
+    三条各自钉住一个错误写法（都在旧实现上实测为红）：
+    ① 出任何岔子都"继续覆盖" → 旧快照的字节**在整棵树里再也搜不到**；
+    ② 旁挂同名就跳过留档（只判存在、不判内容）→ 真快照一样被盖掉；
+    ③ 同名且**内容相同**时不去重复写一份（"已留过档"要看**内容**，不是看名字在不在）。
+    """
+
+    def _snap_path(self, version_id):
+        return store.p_path("resumes", resumelib.SNAPSHOT_DIR, version_id + ".md")
+
+    def _broken_fingerprint(self):
+        """造出"按记录判断快照已过时、而盘上那份恰好就是这一版"的形状。
+
+        与 ``test_a_repaired_stale_snapshot_keeps_the_bytes_it_overwrites_aside`` 同一套动作：
+        人工把母版记录的 ``sha256`` 改成**盘上那份**（记录被改坏）→ ``read_version`` 报 ``latest``
+        → 下一次延续就会走进"修正旧快照"那条路（也正是要先留档的那条路）。
+        """
+        v1 = resumelib.create_version("母版", "第一版内容")
+        resumelib.choose(v1["id"])
+        resumelib.create_version("母版", "第二版内容", parent_id=v1["id"])   # → 留下 v1 的快照
+        resumelib.purge(resumelib.list_versions()[1]["id"])                  # 记录没了 → 主人退回 v1
+        disk = store.p_path("resumes", "母版.md")
+        doc = resumelib.load_resumes()
+        for r in doc["resumes"]:
+            if r.get("id") == v1["id"]:
+                r["sha256"] = resumelib.sha256_of(store.read_text(disk))
+        resumelib.save_resumes(doc)
+        self.assertEqual(resumelib.read_version(v1["id"])[2], "latest", "前置条件：在记录看来盘上就是 v1")
+        return resumelib.by_id(v1["id"]), self._snap_path(v1["id"])
+
+    def test_a_failed_archive_aborts_the_repair_and_leaves_the_old_snapshot_byte_identical(self):
+        """① 留档失败（写旁挂直接抛 `OSError`）→ **放弃本次修正**：旧快照一个字节都没变。"""
+        v1, snap = self._broken_fingerprint()
+        before = store.read_bytes(snap)
+        self.assertTrue(before, "前置条件：旧快照里有字节（不然没什么可丢的）")
+        before_state = resumelib.read_version(v1["id"])     # (text, path, kind)，用来核对"与修正前一致"
+        real_write_bytes = store.write_bytes
+
+        def fake_write_bytes(p, raw):
+            if ".stale-" in str(p):
+                raise OSError(28, "磁盘空间不足")
+            return real_write_bytes(p, raw)
+
+        with mock.patch.object(store, "write_bytes", side_effect=fake_write_bytes):
+            with self.assertRaises(resumelib.SnapshotArchiveError) as ctx:
+                resumelib.create_version("母版", "第三版内容", parent_id=v1["id"])
+
+        self.assertEqual(store.read_bytes(snap), before,
+                         "留档失败却继续写 → 旧快照被永久盖掉（复查实测：整棵树里再也搜不到）")
+        self.assertIn("留档", str(ctx.exception))            # 说人话（路由接成 409 给用户）
+        self.assertEqual(resumelib.read_version(v1["id"]), before_state,
+                         "本次修正已放弃 → 这一版的取回结果必须与修正前**逐字一致**")
+        # 连版本记录都没多出来（整体中止，不是"半保存"）
+        self.assertEqual([r["id"] for r in resumelib.list_versions()], [v1["id"]],
+                         "这次保存整体中止：不许留下一条没有正文的新版本")
+        self.assertIn("不可逆", _events_text(),
+                      "必须留下一句日志说清为什么宁可这次不修（见 resumelib 的 SnapshotArchiveError）")
+
+    def test_a_name_collision_with_different_bytes_is_archived_under_a_new_name(self):
+        """② 旁挂同名但**内容不同** → 换名留档（`-2`）：旧字节一定出现在某一支旁挂里。"""
+        v1, snap = self._broken_fingerprint()
+        before = store.read_bytes(snap)
+        side = _stale_side_name(snap, before)
+        store.write_bytes(side, b"someone else's bytes")      # 重名文件（内容与旧快照不同）
+
+        resumelib.create_version("母版", "第三版内容", parent_id=v1["id"])
+
+        self.assertEqual(store.read_bytes(side), b"someone else's bytes", "别人的同名文件一个字节都不许动")
+        room = os.path.dirname(snap)
+        found = [f for f in os.listdir(room)
+                 if f.startswith(v1["id"] + ".md.stale-") and store.read_bytes(os.path.join(room, f)) == before]
+        self.assertTrue(found,
+                        "重名就跳过留档 → 旧快照被盖掉且**整棵树里再也搜不到**（不可逆）。"
+                        "旁挂目录里现有：%r" % (sorted(os.listdir(room)),))
+        self.assertNotEqual(os.path.basename(found[0]), os.path.basename(side))
+        self.assertEqual(store.read_bytes(snap), "第二版内容".encode("utf-8"), "修正本身照旧生效")
+
+    def test_an_identical_side_file_counts_as_already_archived(self):
+        """③ 旁挂同名且**内容相同** → 不重复留（只 1 个旁挂）。
+
+        "已留过档"的判据是**内容**：同名就跳过（只判存在不判内容）是错的（见上一条），
+        但内容相同还硬写第二份同样是错的（旁挂会无意义地翻倍）。
+        """
+        v1, snap = self._broken_fingerprint()
+        before = store.read_bytes(snap)
+        side = _stale_side_name(snap, before)
+        store.write_bytes(side, before)                      # 旧字节**就是**这一支旁挂里那份
+
+        resumelib.create_version("母版", "第三版内容", parent_id=v1["id"])
+
+        room = os.path.dirname(snap)
+        sides = sorted(f for f in os.listdir(room) if f.startswith(v1["id"] + ".md.stale-"))
+        self.assertEqual(sides, [os.path.basename(side)],
+                         "内容相同 = 已经留过档：不许再写第二份（旁挂只该有 %r）：%r"
+                         % (os.path.basename(side), sides))
+        self.assertEqual(store.read_bytes(side), before, "旧字节仍在（已经留过的那一份）")
+        self.assertEqual(store.read_bytes(snap), "第二版内容".encode("utf-8"), "修正本身照旧生效")
+
+    def test_an_unreadable_old_snapshot_is_a_human_sentence_not_a_bare_oserror(self):
+        """M-3：旧快照**读不出来**时也不许裸 `OSError` 穿出 `create_version`（否则路由只接 409 的那条路走不到）。"""
+        v1, snap = self._broken_fingerprint()
+        before = store.read_bytes(snap)
+        real_read_bytes = store.read_bytes
+
+        def fake_read_bytes(p):
+            if os.path.abspath(str(p)) == os.path.abspath(snap):
+                raise PermissionError(13, "拒绝访问")
+            return real_read_bytes(p)
+
+        with mock.patch.object(store, "read_bytes", side_effect=fake_read_bytes):
+            with self.assertRaises(resumelib.SnapshotArchiveError) as ctx:
+                resumelib.create_version("母版", "第三版内容", parent_id=v1["id"])
+
+        self.assertIn("留档", str(ctx.exception))
+        self.assertEqual(store.read_bytes(snap), before, "读不出来就不修：旧快照一个字节都没变")
+
+
 class ReadPathFingerprintGateTest(IsolatedCase):
     """Task 1.10 第 1/9 条：**读路径的每一条出口都要过"没有 sha256 就不认盘上那份"这道闸**。
 
@@ -962,6 +1129,33 @@ class ReadPathFingerprintGateTest(IsolatedCase):
                          "文件**有字节却读不出来**，绝不能说成「最新版、内容是空的」")
         self.assertEqual(text, "")
         self.assertEqual(got_path, path, "内容读不出来也要指出是哪个文件出事")
+
+    def test_a_deleted_live_file_without_a_fingerprint_is_a_mismatch_not_an_empty_latest(self):
+        """**无 `sha256` + 盘上文件被删** → 必须 `mismatch`（Task 1.10b 修 I-2）。
+
+        旧实现在"文件主人"这一支只问 `not text`：文件**被删**与文件**是空的**都被
+        `store.read_text` 兜成同一个空串，于是记录里没有 `sha256` 时（`_kind_on_disk`
+        无从核对）就报成 `latest` + 空文本，而 `path` 还指着**一个不存在的文件** ——
+        界面（`web/index.html:2349-2353`）标题写「**最新版原文**」、正文空白。
+        这正是铁律那条"读不出来被当成文件是空的"的最难看的一版：**东西都没了**却报成功。
+
+        钉住三种情况的区别：① 文件**不存在** → `mismatch`（"磁盘上的东西不是它了"包括
+        "东西都没了"）；② 文件存在且**有字节**读不出来 → `mismatch`（同上一条测试）；
+        ③ 文件存在且**真的没有可丢的字节** → 照旧（记录有 sha 时由 `_kind_on_disk` 说话）。
+        """
+        v1 = resumelib.create_version("独苗", "原始内容")
+        path = store.p_path("resumes", "独苗.md")
+        self._drop_sha(v1["id"])                 # 记录里没有指纹 → 没有任何可比对的依据
+        os.remove(path)                          # 程序外把文件删了
+        self.assertFalse(os.path.exists(path))   # 前提：真的没了
+
+        text, got_path, kind = resumelib.read_version(v1["id"])
+
+        self.assertEqual(kind, "mismatch",
+                         "文件**不存在**时绝不能说成「最新版原文、内容是空的」——"
+                         "东西都没了，报成 latest 就是一句用户可见的假话")
+        self.assertEqual(text, "")
+        self.assertNotEqual(kind, "missing", "「存过、但盘上那份没了」是 mismatch，不是「从来没存过」")
 
     def test_a_zero_byte_snapshot_without_a_fingerprint_is_still_a_legal_empty_mother(self):
         v1 = resumelib.create_version("母版", "第一版内容")

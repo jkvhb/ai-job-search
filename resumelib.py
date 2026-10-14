@@ -21,9 +21,16 @@
    ``read_version`` 还一直喊 ``mismatch``，真原文也再也补不进去）。
    ⚠️ 记录**没有** ``sha256`` 时**没有依据**判谁对 → 那条例外一律不生效（宁可不动）。
    ⚠️ **证明力全在记录里**：记录被人工改坏（比如把 ``sha256`` 改成盘上那份）时，"过时"这个
-   判断本身就是错的 —— 所以覆盖旧快照之前**必须先把它改名留档**
-   （``<id>.md.stale-<旧字节 sha 前 8 位>``：不删除、也不冒充母版），
+   判断本身就是错的 —— 所以覆盖旧快照之前**必须先把它留档**到一个旁挂文件
+   （``<id>.md.stale-<旧字节 sha 前 8 位>``：直接写副本，不删除、也不冒充母版），
    否则真快照会被**不可逆**地覆盖掉（Task 1.10 第 2 条，复查实测过）。
+   **留档失败 → 放弃本次修正**（抛 ``SnapshotArchiveError``，路由接成 409）：
+   宁可这次不修，也绝不把旧快照静默盖掉（Task 1.10b 修 I-1）。同名旁挂只有在
+   **内容相同**时才算"已经留过档"；内容不同就换名（``-2`` / ``-3`` …）。
+   ⚠️ **旁挂是"留档"，不是"垃圾"**：它会**累积**（同一次覆盖最多多一个），
+   是当前可达的最后一手（删掉就真找不回那份旧快照了）；**可手工删**；
+   **迁移（`简历迁移.py`）不会带走它**（只按简历文件/记录走）。
+   只有 ``purge`` 会顺带清掉**它自己那一版**的旁挂（那一版的快照都被彻底删了，旧副本也没意义）。
    推论：族谱 ``母(v1) → 子(v2) → 孙(v3)`` 里，v3 生成时**不产生新快照**；
    v1 的快照只有在"按记录判断过时"且盘上那份就是 v1 时才被修正（且修正前先留档）。
    存下来的永远是**盘上那份原始字节**（``store.read_bytes``，不是文本读：
@@ -105,6 +112,7 @@ import threading
 from datetime import datetime
 
 import llm
+import log
 import store
 
 RESUMES_FILE = "resumes.json"
@@ -118,6 +126,82 @@ _ID_RE = re.compile(r"^rv_(\d+)$")
 # 后写的那次会把先写的记录整条抹掉，而用户在界面上看不出丢了档。
 # 用 RLock 而不是 Lock：create_version 内部还要调 load_resumes / save_resumes（同线程可重入）。
 _LOCK = threading.RLock()
+
+
+class SnapshotArchiveError(RuntimeError):
+    """「旧快照没能留档」→ **放弃本次修正**（Task 1.10b 修 I-1 第 3 点）。
+
+    为什么必须是一种**专用**异常（而不是裸 `RuntimeError`）：
+    ``app.py`` 的 ``POST /api/resumes`` 只接这一种并回 **409**（冲突：盘上那份东西现在的
+    状态让这次保存做不了）。若它用裸 ``RuntimeError``，将来 ``ai_diff_of`` 之类的地方冒出
+    任何 ``RuntimeError`` 都会被**误报成"这次保存被中止了"** —— 而那次保存其实**已经成功落盘**
+    了。对用户说"没保存"而实际保存了，是本项目最不能犯的那种假话。
+
+    继承 ``RuntimeError`` 只为向后兼容（既有调用方 / 既有测试接的就是 ``RuntimeError``）。
+    """
+
+    def __init__(self, message="", cause=None):
+        super(SnapshotArchiveError, self).__init__(message)
+        self.cause = cause          # 底层 OSError（日志里要用），但**不**并进给用户看的那句话
+
+
+# 旁挂留档最多试到第几号：`<id>.md.stale-<8位>`、`-2` … `-9`。
+# 到顶还给不出不撞的名字 → 当作"没能留档"（宁可这次不修，也绝不静默盖掉旧快照）。
+_SIDE_ARCHIVE_TRIES = 9
+
+# "旁挂文件存在、但读不出来"的哨兵 —— 它**不是** None（None = 文件不存在，那一支可以直接写）。
+_UNREADABLE = object()
+
+
+def _archive_old_snapshot(snap_path, old):
+    """把即将被覆盖的旧快照字节**留档**到旁挂文件；返回真正写进去的路径（失败抛 ``SnapshotArchiveError``）。
+
+    三条硬规则（每条都对应一次实测过的不可逆丢数据）：
+
+    1. **直接写副本**（``store.write_bytes(side, old)``），不靠改名：改名（``os.replace``）一旦
+       失败，旧快照就还在原地、而调用方会接着把它盖掉 —— 那正是复查实测的那条路径。
+    2. **重名不算留过档**：首选名字（``<快照路径>.stale-<旧字节 sha 前 8 位>``）被占用时，
+       只有**内容与旧字节相同**才算"已经留过档"；内容不同就**换一个不撞的后缀**
+       （``-2`` / ``-3`` …）。"只判存在不判内容"= 重名静默跳过留档 = 旧字节被盖掉。
+    3. **留档失败 → 抛异常**（调用方据此**放弃本次修正**）：宁可这次不修，
+       也绝不把旧快照静默盖掉（那是不可逆的）。
+    """
+    room = os.path.dirname(snap_path)
+    base = "%s.stale-%s" % (snap_path, hashlib.sha256(old).hexdigest()[:8])
+    for n in range(1, _SIDE_ARCHIVE_TRIES + 1):
+        side = base if n == 1 else "%s-%d" % (base, n)
+        try:
+            existing = store.read_bytes(side)
+        except OSError:
+            existing = _UNREADABLE          # 存在但读不出来 → **不算**"已留过档"，按新名字留着看
+        if existing is None or existing == old:
+            # 名字空着 → 直接写这一支；同名的内容**与旧字节相同** → 那就是已经留过档了（不重复写）。
+            # ⚠️ 判据必须是**内容**：只判"名字在不在"会在重名时静默跳过留档 → 旧字节被盖掉。
+            return _write_side(side, old)
+    raise SnapshotArchiveError(
+        "没能给旧快照留档（旁挂名字试到 -%d 都被占用了），已中止本次修正：宁可这次不修，"
+        "也绝不把旧快照静默盖掉（那是不可逆的）。可手工清理 %s 下的 .stale-* 旁挂后再试。"
+        % (_SIDE_ARCHIVE_TRIES, room))
+
+
+_UNREADABLE = object()          # （定义见上：旁挂存在但读不出来）
+
+
+def _write_side(side, old):
+    """真正落盘那一行（变异取证要打在**这一行**上：留档失败必须冒泡成 ``SnapshotArchiveError``）。"""
+    try:
+        store.write_bytes(side, old)
+    except OSError as e:
+        # ⚠️ 这里**必须**放弃本次修正：继续往下走就会 `store.write_bytes(snap_path, raw)`
+        # 把旧快照永久盖掉（复查实测：留档失败还被 `pass` 掉时，旧快照内容在整棵树里再也搜不到）。
+        log.log_event("resume.snapshot_archive_failed", level="warn",
+                      side=os.path.basename(side), dir=os.path.dirname(side),
+                      error=str(e), note="宁可这次不修，也绝不把旧快照静默盖掉（那是不可逆的）")
+        raise SnapshotArchiveError(
+            "没能给旧快照留档（%s），已中止本次修正：宁可这次不修，"
+            "也绝不把旧快照静默盖掉（那是不可逆的）。请先确认 %s 没有被别的程序占用。"
+            % (e, os.path.dirname(side)), cause=e)
+    return side
 
 
 # ---------- 路径 / 取值小工具 ----------
@@ -192,8 +276,11 @@ def _kind_on_disk(text, rec, ok_kind):
       程序外用 CRLF 重写、而按文本读回来一致的文件**不会**被判 mismatch（``size`` 才会变）。
     - 记录里没有 ``sha256``（人工改坏 / 老记录）→ 没有可比对的依据，只能维持 ``ok_kind``；
       这里的"不知道"绝不冒充"核对通过"，但也绝不凭空喊 mismatch。
-    - 文件被删时 ``store.read_text`` 给空串 → 与记录不符 → ``mismatch``：
-      "磁盘上的东西不是它了"包括"东西都没了"，这比谎报 ``latest``（text 为空）诚实。
+    - 记录里没有 ``sha256`` 时，**"文件不见了"不会**变成 mismatch：``store.read_text`` 给空串，
+      而"空"与"记录里没有 sha"两条合起来正是"维持 ``ok_kind``"。**文件不存在**这条依据
+      不需要 sha（``os.path.exists`` 就能判）→ 由**调用方**（`_read_in` 的"文件主人"支）
+      先分三种再调本函数（Task 1.10b 修 I-2）。这就是下面那条 ⚠️ 的另一半：
+      本函数**只**能用 sha 说话，"东西在不在 / 读不读得出来"都不归它管。
     - ⚠️ **"读不出来"不归这里管**：记录里**没有** ``sha256`` 时上面那条"维持 ``ok_kind``"
       会把"文件有字节却解不出"（``read_text`` 兜成空串）说成 ``latest`` + 空文本 = 一份**假空简历**。
       那不是 sha 能发现的（没有 sha），只能按**原始字节**判 ——
@@ -336,11 +423,17 @@ def _read_in(recs, version_id):
         text = store.read_text(path, "")
         # 读到了也要**核指纹**：`<名字>.md` 是共享容器，磁盘上的东西可能已经不是这一版了
         # （程序外改过 / purge 留的孤儿被别人覆盖）。不符 → mismatch，绝不谎报 latest。
-        # ⚠️ "文件**有字节**却读不出来"（非 UTF-8 / 读失败）同样**不是** latest：`read_text`
-        # 给的空串与"文件真的是空的"长得一模一样，只有按**字节**看才分得开；记录里没有
-        # `sha256` 时 `_kind_on_disk` 只能维持 ok_kind，于是这里会报出一份**假的空简历**
-        # （界面标题写着「最新版原文」，正文却是空的）—— 实测过。
-        if not text and store.content_bytes_present(path):
+        # ⚠️ Task 1.10b 修 I-2：**先分三种**，"读不出来"和"东西都没了"都不许混进"空内容"：
+        #   ① 文件**不存在** → mismatch。"磁盘上的东西不是它了"包括"**东西都没了**"——
+        #      记录里没有 `sha256` 时（`_kind_on_disk` 无从核对）旧实现会报 `latest` + 空文本，
+        #      而 `path` 还指着**一个不存在的文件**：界面标题写「最新版原文」、正文空白（实测过）。
+        #   ② 文件存在、且按**原始字节**看里面有可丢的字节、却读不出文本（非 UTF-8 / 读失败）
+        #      → mismatch（`read_text` 兜出的空串与"文件真的是空的"长得一模一样，
+        #      只有按字节看才分得开）。
+        #   ③ 文件存在且字节上就是空的（0 字节 / 纯空白）→ **合法内容**，照旧按指纹判（`latest`）。
+        if not os.path.exists(path):
+            kind = "mismatch"
+        elif not text and store.content_bytes_present(path):
             kind = "mismatch"
         else:
             kind = _kind_on_disk(text, rec, "latest")
@@ -419,14 +512,17 @@ def create_version(name, content, parent_id=None, note=""):
     新开（``parent_id=None``）：独立根，``rev=1``，本族谱的第一个版本。
     延续（``parent_id`` 非空）：同一族谱，覆盖 ``<名字>.md`` **之前**
     按"快照的触发条件"留下母版原文（见模块开头；Task 1.9 起还包括"修正一份
-    **按记录判断已过时**的快照"—— Task 1.10 起，修正前先把旧快照的字节改名留档，
-    见 ``<id>.md.stale-<8位>``）—— 留的是**盘上那份原始字节**
-    （核对不通过也留，但那时不记 ``mother_file``：存档 ≠ 冒充）。
+     **按记录判断已过时**的快照“—— Task 1.10 起，修正前先把旧快照的字节留档，
+     见 ``<id>.md.stale-<8位>``；Task 1.10b 起，**留档失败就放弃本次修正**
+     （抛专用异常 ``SnapshotArchiveError``））—— 留的是**盘上那份原始字节**
+     （核对不通过也留，但那时不记 ``mother_file``：存档 ≠ 冒充）。
 
-    会抛 ``ValueError`` 的情形：名字为空／重名（未移出的）／父版本不存在／
-    父版本已移出（移出的族谱不能延续）／延续时改了名字。
-    母版原文**读不出来**（被锁 / 权限）→ 抛 ``RuntimeError`` 并**中止本次保存**
-    （绝不覆盖那份读不出来的东西；消息是人话，`app.py` 的路由把这句接成 **409** 显示给用户）。
+     会抛 ``ValueError`` 的情形：名字为空／重名（未移出的）／父版本不存在／
+     父版本已移出（移出的族谱不能延续）／延续时改了名字。
+     母版原文**读不出来**（被锁 / 权限）**或旧快照没能留档** → 抛
+     ``SnapshotArchiveError``（``RuntimeError`` 的子类）并**中止本次保存**
+     （绝不覆盖那份读不出来的东西，也绝不把旧快照盖掉；消息是人话，
+     `app.py` 的路由**只接这一种**并接成 **409** 显示给用户）。
     """
     text = content if isinstance(content, str) else str(content or "")
     clean = store.safe_name(name)
@@ -513,23 +609,29 @@ def create_version(name, content, parent_id=None, note=""):
                         # 读不出母版原文就**不覆盖**它：宁可这次不保存，也绝不把用户那份东西冲掉。
                         # 翻成一句人话：路由（`app.py` 的 `POST /api/resumes`）把它接成 **409**，
                         # 用户看到的就是这一句，而不是兜底那句「服务器内部错误：…」。
-                        raise RuntimeError("没能给母版留档（读不出来：%s），已中止本次保存；"
-                                           "请先确认那份文件没有被别的程序占用。" % e)
+                        # Task 1.10b 修 M-9：与"旧快照留不了档"共用**同一个专用异常**
+                        # （性质一样：盘上那份东西现在的状态让这次保存做不了），
+                        # 而且路由只接这一种 —— 别的 `RuntimeError` 绝不许被说成"保存已中止"。
+                        raise SnapshotArchiveError("没能给母版留档（读不出来：%s），已中止本次保存；"
+                                                   "请先确认那份文件没有被别的程序占用。" % e, cause=e)
                     # 0 字节没什么可留的：写一个空快照只会让"有快照就走快照"那条顺序
                     # 把这一版说成"存过档"，档里却什么都没有 —— 又一个"以为留了档"。
                     if raw:
                         if stale and os.path.exists(snap_path):
                             # 旧快照的字节也**不许静默丢掉** —— 那是盘上出现过的东西，而"过时"
                             # 这个判断的证明力**全在记录里**（记录被改坏时它就是错的，实测过）。
-                            # 改名到一个旁挂名字（不删除、也不冒充母版），零成本消除这条不可逆路径。
-                            old = store.read_bytes(snap_path) or b""
-                            side = "%s.stale-%s" % (snap_path,
-                                                    hashlib.sha256(old).hexdigest()[:8])
+                            # 留档到一个旁挂名字（不删除、也不冒充母版）。
+                            # ⚠️ Task 1.10b 修 I-1：留档**失败 → 放弃本次修正**（异常由这里抛出，
+                            # 路由接成 409），并且**先读旧字节** —— 读不出来（M-3）同样走这条专用异常，
+                            # 绝不让裸 OSError 穿到 app.py 变成 500。
                             try:
-                                if not os.path.exists(side):
-                                    os.replace(snap_path, side)
-                            except OSError:
-                                pass          # 留档失败不阻断本次修正
+                                old = store.read_bytes(snap_path) or b""
+                            except OSError as e:
+                                raise SnapshotArchiveError(
+                                    "没能给旧快照留档（读不出来：%s），已中止本次修正：宁可这次不修，"
+                                    "也绝不把旧快照静默盖掉（那是不可逆的）。请先确认那份文件没有被别的"
+                                    "程序占用。" % e, cause=e)
+                            _archive_old_snapshot(snap_path, old)
                         store.write_bytes(snap_path, raw)
                         if m_kind in ("latest", "mother"):
                             mother["mother_file"] = _snapshot_rel(mid)
@@ -586,17 +688,27 @@ def read_version(version_id):
     ① 文件被**程序外**改过（手工编辑、外部工具、别的程序写同名文件）；
     ② ``purge`` 彻底删掉某族谱的最新版后 ``resumes/<名字>.md`` 成**孤儿**，随后**另开同名
        简历**覆盖了它 —— 该族谱里仍有记录、仍被认作"文件主人"的版本就会读到**别人的内容**；
-    ③ 手工编辑 ``resumes.json``（记录的 ``sha256`` 与磁盘文件对不上：记录被改了，或文件没跟着改）。
+    ③ 手工编辑 ``resumes.json``（记录的 ``sha256`` 与磁盘文件对不上：记录被改了，或文件没跟着改）；
+    ④ **那个文件被删了**（Task 1.10b 修 I-2）："磁盘上的东西不是它了"包括"**东西都没了**"。
+       记录里**没有** ``sha256`` 时旧实现会报 ``latest`` + 空文本（`path` 还指着不存在的文件），
+       界面标题就写「最新版原文」+ 空正文 —— 一句用户可见的假话。
+
+    **"文件主人"这一支先分三种**（Task 1.10b 修 I-2，`_read_in` ②）：
+    ① 文件**不存在** → ``mismatch``；② 文件存在且 `content_bytes_present` 为真（有字节却解不出）
+    → ``mismatch``；③ 文件存在且字节上就是空的 → **合法空内容**，照旧按指纹判（``latest``）。
 
     两个说不清的边界，如实写在这里：
     - 记录**没有** ``sha256`` 字段时没有可**核对**的依据，"知道的东西是不是这一版"只能维持
       ``latest`` / ``mother``（见 ``_kind_on_disk``）—— "不知道"不冒充"核对通过"。
-      但**"读不出来"另有依据**（`content_bytes_present` 看的是**原始字节**，不需要 sha）：
-      那时一律 ``mismatch``，**不适用**上面那条"维持"（Task 1.10 第 1 条）。
+      但**"读不出来"与"东西在不在"都另有依据**（`content_bytes_present` 看的是**原始字节**、
+      `os.path.exists` 看的是文件在不在，两者都不需要 sha）：那时一律 ``mismatch``，
+      **不适用**上面那条"维持"（Task 1.10 第 1 条 / Task 1.10b 修 I-2）。
     - **0 字节 / 纯空白的快照**是**合法**的历史残留（Task 1.8 之前的实现真能写出 0 字节快照）。
       记录里没有 ``sha256`` 时，它是 ``mother`` + 空文本（"这一版当初留下的就是一份空档"），
       **不是** ``mismatch``。判"文件里有没有字节"只认**原始字节**（``strip()`` 后为空才算空档）——
       写成 ``if not text: mismatch`` 就会把这批合法空档诬成"读不出来"（Task 1.10 第 9 条）。
+      同理 `<名字>.md` 真的是 0 字节时仍是合法的空简历（``latest`` + 空文本），**不是**"读不出来"；
+      但那个文件**不存在**时必须报 ``mismatch``（"没了"和"空的"是两件事）。
 
     **调用方约定（T2/T3 照此做）**：见到 ``mismatch`` 必须显示
     「内容与记录不符（可能被程序外修改过）」，并**把内容与 sha 都亮出来**（记录的 vs 实测的），
@@ -854,11 +966,18 @@ def restore(version_id):
 
 
 def purge(version_id):
-    """彻底删：删记录 + **它自己**的快照文件。**绝不碰**别人的文件（反假绿要求）。
+    """彻底删：删记录 + **它自己**的快照文件（**连同它自己的 ``.stale-*`` 留档旁挂**）。
+    **绝不碰**别人的文件（反假绿要求）。
 
     先落盘记录再删文件：万一写盘失败，快照还在（宁可留多，不可留假）。
     注意：``resumes/<名字>.md`` 是**族谱最新版容器**，本函数不删它 ——
     彻底删掉最新版后，那个文件会留在盘上（孤儿文件，名字在索引里空出来）。
+
+    ``.stale-*`` 旁挂（Task 1.10b 修 I-1）**是"留档"不是"垃圾"**：它装的是"即将被覆盖的
+    旧快照字节"。它们会**累积**（同一次覆盖最多多一个）、**可手工删**（删掉就真找不回了）、
+    **迁移不会带走它**。既然这一版的快照都彻底删了，它自己的留档旁挂也就没有意义了
+    （那些字节本来就是"这一版快照的旧副本"）→ 一并清掉，免得目录里越积越多。
+    ※ **只清这一版 id 前缀**的旁挂：别人的快照 / 别人的旁挂一律不碰。
     """
     vid = _clean_id(version_id)
     with _LOCK:
@@ -870,9 +989,19 @@ def purge(version_id):
         recs.remove(rec)
         save_resumes(doc)
         snap = _snapshot_path(vid)
+        room = os.path.dirname(snap)
+        own = [snap]
         try:
-            if os.path.exists(snap):
-                os.remove(snap)        # 只删 `<版本id>.md` 这一个：它由 id 唯一确定
+            # 只认"文件名以 `<这一版id>.md.stale-` 开头"的那些 —— 按 id 前缀，不按通配符猜名字
+            prefix = "%s.stale-" % os.path.basename(snap)
+            if os.path.isdir(room):
+                own += [os.path.join(room, f) for f in os.listdir(room) if f.startswith(prefix)]
         except OSError:
             pass
+        for p in own:
+            try:
+                if os.path.exists(p):
+                    os.remove(p)
+            except OSError:
+                pass
         return dict(rec)

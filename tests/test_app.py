@@ -2824,6 +2824,10 @@ class ResumeVersionRouteTest(IsolatedCase):
         真文件覆盖成空的（**用户可见的破坏路径**）。
 
         现在必须回一句明确的错误（前端 `if(!d || d.error) alert(...)` 能显示），**绝不**回空串。
+
+        **M-4（Task 1.10b）**：状态码从 500 改成 **409** —— 这不是"服务器内部错误"，
+        而是"盘上那份东西现在的状态与这次读取冲突"（有字节但不是 UTF-8），
+        与同轮的姊妹场景（`POST /api/resumes` 接不住母版原文 → 409）同一口径。
         """
         store.ensure_profile()
         path = os.path.join(store.p_path("resumes"), "读不出来.md")
@@ -2832,7 +2836,7 @@ class ResumeVersionRouteTest(IsolatedCase):
         before = _disk_bytes(path)
 
         code, body = self._get("/api/resumes?name=" + quote("读不出来.md"))
-        self.assertEqual(code, 500, body)
+        self.assertEqual(code, 409, body)                    # ← M-4 修之前：500（"服务器内部错误"是句假话）
         self.assertFalse(body.get("ok"))
         self.assertIn("读不出来", str(body.get("error")))
         self.assertNotIn("content", body, "绝不能回一个空串让前端填进编辑框（保存即覆盖）")
@@ -2865,6 +2869,81 @@ class ResumeVersionRouteTest(IsolatedCase):
         self.assertNotIn("服务器内部错误", str(body.get("error")))
         self.assertEqual(store.read_text(path), "原文内容", "读不出来就不覆盖")
         self.assertEqual(len(resumelib.load_resumes()["resumes"]), 1, "这次保存整体中止")
+
+    def _stale_repair_precondition(self):
+        """造出"按记录判断快照已过时、而盘上那份恰好就是这一版"的形状（= 修正时会先留档）。
+
+        返回 `(v1, snap_path)`：下一次延续就会走进"先留档、再修正旧快照"那条路。
+        """
+        v1 = self._new("母版.md", "原文内容")
+        self._post("/api/resumes/choose", {"version": v1["id"]})
+        v2 = self._new("母版.md", "第二版内容", parent_id=v1["id"])
+        code, body = self._post("/api/resumes/purge", {"version": v2["id"]})
+        self.assertEqual(code, 200, body)                     # 记录没了 → 主人退回 v1
+        snap = store.p_path("resumes", resumelib.SNAPSHOT_DIR, v1["id"] + ".md")
+        disk = store.p_path("resumes", "母版.md")
+        doc = resumelib.load_resumes()                        # 人工把 v1 的 sha 改成盘上那份
+        for r in doc["resumes"]:
+            if r.get("id") == v1["id"]:
+                r["sha256"] = resumelib.sha256_of(store.read_text(disk))
+        resumelib.save_resumes(doc)
+        self.assertEqual(resumelib.read_version(v1["id"])[2], "latest", "前置条件：在记录看来盘上就是 v1")
+        return v1, snap
+
+    def test_a_failed_snapshot_archive_is_409_not_a_bare_500(self):
+        """Task 1.10b 修 M-9：只有「没能留档」这一种冲突才回 **409**（而且旧快照逐字节未变）。
+
+        留档失败时 `create_version` 抛 `resumelib.SnapshotArchiveError` → 路由接住 → 409 +
+        那句人话。变异取证：把 `except resumelib.SnapshotArchiveError` 换回裸
+        `except RuntimeError`，下面的 `test_a_plain_runtime_error_is_not_reported_as_an_aborted_save`
+        会变红（它的 `RuntimeError` 会被误当"保存被中止"）。
+        """
+        v1, snap = self._stale_repair_precondition()
+        before = store.read_bytes(snap)
+        self.assertTrue(before, "前置条件：旧快照里有字节")
+
+        with mock.patch.object(resumelib, "_archive_old_snapshot",
+                               side_effect=resumelib.SnapshotArchiveError(
+                                   "没能给旧快照留档（磁盘满了），已中止本次修正：宁可这次不修，"
+                                   "也绝不把旧快照静默盖掉（那是不可逆的）。")):
+            code, body = self._save("母版.md", "第三版内容", parent_id=v1["id"])
+
+        self.assertEqual(code, 409, body)
+        self.assertFalse(body.get("ok"))
+        self.assertIn("留档", str(body.get("error")))
+        self.assertNotIn("服务器内部错误", str(body.get("error")))
+        self.assertEqual(store.read_bytes(snap), before, "中止 = 旧快照一个字节都不许变")
+        self.assertEqual([r["id"] for r in resumelib.list_versions()], [v1["id"]],
+                         "这次保存整体中止：不许留下一条没有正文的新版本")
+
+    def test_a_plain_runtime_error_is_not_reported_as_an_aborted_save(self):
+        """Task 1.10b 修 M-9 的**反向**钉子：别的 `RuntimeError` 绝不许被说成"保存已中止"。
+
+        `ai_diff_of` 在**新版本已经落盘之后**才被调用。那里冒出任何 `RuntimeError` 时，
+        旧写法（裸 `except RuntimeError`）会回 **409「保存被中止」** —— 而这次保存**已经成功**了
+        （文件与记录都在盘上）。对用户说"没保存"而实际保存了 = 又一句假话，
+        用户会去重做一遍，结果多出一个版本。
+        """
+        v1 = self._new("母版.md", "原文内容")
+        code, body = self._post("/api/resumes/choose", {"version": v1["id"]})
+        self.assertEqual(code, 200, body)
+
+        def boom(*a, **kw):
+            raise RuntimeError("模型那一层炸了")
+
+        with mock.patch.object(resumelib, "ai_diff_of", boom):
+            code, body = self._save("母版.md", "第二版内容", parent_id=v1["id"])
+
+        versions = resumelib.list_versions()
+        self.assertEqual(len(versions), 2, "前提：这次保存**其实已经成功**（新增了第二版）：%r" % (versions,))
+        self.assertEqual(store.read_text(store.p_path("resumes", "母版.md")), "第二版内容",
+                         "前提：新正文已经落盘")
+        # 既然保存其实成功了，就**绝不能**回 409「冲突 / 已中止」那句假话。
+        # 这里用"走兜底 500"钉住：改回 `except RuntimeError` 时它会变成 409，本断言立刻红
+        # （而且那条 409 会把一次**成功**的保存说成"没保存"）。
+        self.assertEqual(code, 500, body)
+        self.assertIn("服务器内部错误", str(body.get("error")),
+                      "别的 RuntimeError 不该被包装成「保存冲突/已中止」那个分支")
 
 
 # ---------------- 前端接线（修 1 / 修 2 / 修 3 / 修 4 / 修 5 / 修 6）+ 阶段 4C：简历下拉 ----------------
