@@ -108,6 +108,7 @@ AI 变更比对（规格 §4.4，见 ``ai_diff_of``）：
 import hashlib
 import os
 import re
+import tempfile
 import threading
 from datetime import datetime
 
@@ -121,6 +122,12 @@ REMOVED = "removed"
 
 _AT_FMT = "%Y-%m-%d %H:%M"
 _ID_RE = re.compile(r"^rv_(\d+)$")
+
+# 旁挂留档的名字形状：`<版本id>.md.stale-` + 旧字节 sha 前 8 位（**小写**十六进制），
+# 重名时再加 `-2` / `-3` …（见 `_archive_old_snapshot`）。
+# `purge` 只按这个**精确形状**清旁挂（Task 1.10c 修 E-5）：按前缀一刀切会把
+# 手工/别的程序用同一前缀命名的东西（`<id>.md.stale-手工说明`）一起删掉 —— 那是别人的字节。
+_SIDE_ARCHIVE_TAIL_RE = re.compile(r"^[0-9a-f]{8}(?:-[0-9]+)?$")
 
 # 读 → 改 → 写 必须整体串行：两个并发保存各自「读到同一份旧 doc」再各自写回，
 # 后写的那次会把先写的记录整条抹掉，而用户在界面上看不出丢了档。
@@ -150,6 +157,8 @@ class SnapshotArchiveError(RuntimeError):
 _SIDE_ARCHIVE_TRIES = 9
 
 # "旁挂文件存在、但读不出来"的哨兵 —— 它**不是** None（None = 文件不存在，那一支可以直接写）。
+# ⚠️ 全模块**只此一处**定义（Task 1.10c 修 E-3：原先在 `_archive_old_snapshot` 后面又写了一遍，
+# 后者盖前者 —— 同一个哨兵两份定义，改一处漏一处就是"读不出来的名字被当成名字空着"）。
 _UNREADABLE = object()
 
 
@@ -184,16 +193,13 @@ def _archive_old_snapshot(snap_path, old):
         % (_SIDE_ARCHIVE_TRIES, room))
 
 
-_UNREADABLE = object()          # （定义见上：旁挂存在但读不出来）
-
-
 def _write_side(side, old):
     """真正落盘那一行（变异取证要打在**这一行**上：留档失败必须冒泡成 ``SnapshotArchiveError``）。"""
     try:
         store.write_bytes(side, old)
     except OSError as e:
-        # ⚠️ 这里**必须**放弃本次修正：继续往下走就会 `store.write_bytes(snap_path, raw)`
-        # 把旧快照永久盖掉（复查实测：留档失败还被 `pass` 掉时，旧快照内容在整棵树里再也搜不到）。
+        # ⚠️ 这里**必须**放弃本次修正：继续往下走就会把旧快照**盖掉**
+        # （复查实测：留档失败还被 `pass` 掉时，旧快照内容在整棵树里再也搜不到）。
         log.log_event("resume.snapshot_archive_failed", level="warn",
                       side=os.path.basename(side), dir=os.path.dirname(side),
                       error=str(e), note="宁可这次不修，也绝不把旧快照静默盖掉（那是不可逆的）")
@@ -202,6 +208,46 @@ def _write_side(side, old):
             "也绝不把旧快照静默盖掉（那是不可逆的）。请先确认 %s 没有被别的程序占用。"
             % (e, os.path.dirname(side)), cause=e)
     return side
+
+
+def _write_snapshot_atomically(snap_path, raw):
+    """把母版原文**原子地**写成快照（临时文件 + ``os.replace``）；失败抛 ``SnapshotArchiveError``。
+
+    为什么必须原子（Task 1.10c 修 E-1）：旧写法是裸的 ``store.write_bytes(snap_path, raw)``，
+    它等于 ``open(path, "wb")`` —— **先把旧快照截断成 0 字节**，然后一段一段往里写。
+    中途失败（磁盘满 / 进程被 kill / 断电）就留下一个**半截快照**，而版本记录仍指着它：
+    用户以为"母版原文留过档"，取回来却是残缺的 —— 又一例"以为留了档其实没留"。
+    临时文件必须与目标**同目录**：``os.replace`` 只在同一文件系统内保证原子（跨盘会退化成复制）。
+
+    失败一律翻成**专用异常**（一句中文人话，``app.py`` 的 ``POST /api/resumes`` 接成 409）：
+    裸 ``OSError`` 穿到路由就是 **500**，用户只看到「服务器内部错误」，对"快照没写成、
+    这次保存已中止"什么都没说清（Task 1.10c 第 E-1 条）。
+    """
+    room = os.path.dirname(snap_path)
+    tmp = ""
+    try:
+        os.makedirs(room, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix=".tmp-", suffix=".md", dir=room)
+        os.close(fd)
+        store.write_bytes(tmp, raw)
+        os.replace(tmp, snap_path)
+        return
+    except OSError as e:
+        log.log_event("resume.snapshot_write_failed", level="warn",
+                      snapshot=os.path.basename(snap_path), dir=room, error=str(e),
+                      note="宁可这次不保存，也绝不留下半截快照（记录会一直指着它）")
+        raise SnapshotArchiveError(
+            "没能写入母版快照（%s），已中止本次保存：宁可这次不保存，也绝不留下一个不完整的"
+            "快照 —— 版本记录会一直指着它，以后取回这一版拿到的却是残缺的内容。"
+            "请先确认 %s 可写、磁盘空间足够。" % (e, room), cause=e)
+    finally:
+        # 失败时别在快照目录里留垃圾（成功时 `os.replace` 已经把临时文件挪走了）
+        if tmp:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
 
 
 # ---------- 路径 / 取值小工具 ----------
@@ -632,7 +678,10 @@ def create_version(name, content, parent_id=None, note=""):
                                     "也绝不把旧快照静默盖掉（那是不可逆的）。请先确认那份文件没有被别的"
                                     "程序占用。" % e, cause=e)
                             _archive_old_snapshot(snap_path, old)
-                        store.write_bytes(snap_path, raw)
+                        # Task 1.10c 修 E-1：**原子**写（临时文件 + `os.replace`）。
+                        # 旧写法 `store.write_bytes(snap_path, raw)` 会先把旧快照截断成 0 字节，
+                        # 中途失败就留下半截快照，而记录仍指着它；而且裸 `OSError` 会变成 500。
+                        _write_snapshot_atomically(snap_path, raw)
                         if m_kind in ("latest", "mother"):
                             mother["mother_file"] = _snapshot_rel(mid)
         _write_content(file_path, text)
@@ -703,6 +752,13 @@ def read_version(version_id):
       但**"读不出来"与"东西在不在"都另有依据**（`content_bytes_present` 看的是**原始字节**、
       `os.path.exists` 看的是文件在不在，两者都不需要 sha）：那时一律 ``mismatch``，
       **不适用**上面那条"维持"（Task 1.10 第 1 条 / Task 1.10b 修 I-2）。
+      ⚠️ **Task 1.10c 修 D：调用方必须分清"维持"与"核对过"**。上面这条"维持"只说明
+      **没有依据推翻**它，**不等于**"这一版的内容被核对过" —— 记录里**没有** ``sha256`` 时，
+      盘上那份完全可能**是别人那一版**（复查枚举出 7 行这种组合），而 ``kind`` 照样是
+      ``latest`` / ``mother``。判据只有一条：记录里**有** ``sha256`` 才算核对过。
+      界面据此措辞：核对过才说「最新版原文」，没有指纹要换成
+      「这一版没有指纹，内容未核对」（``app.py`` 的 ``/api/resumes/file`` 多回的那个
+      ``verified`` 就是这条判据；**本函数的三元组 API 故意不动** —— 它只回答 `kind`）。
     - **0 字节 / 纯空白的快照**是**合法**的历史残留（Task 1.8 之前的实现真能写出 0 字节快照）。
       记录里没有 ``sha256`` 时，它是 ``mother`` + 空文本（"这一版当初留下的就是一份空档"），
       **不是** ``mismatch``。判"文件里有没有字节"只认**原始字节**（``strip()`` 后为空才算空档）——
@@ -992,10 +1048,13 @@ def purge(version_id):
         room = os.path.dirname(snap)
         own = [snap]
         try:
-            # 只认"文件名以 `<这一版id>.md.stale-` 开头"的那些 —— 按 id 前缀，不按通配符猜名字
-            prefix = "%s.stale-" % os.path.basename(snap)
+            # 只认**精确形状**的名字：`<这一版id>.md.stale-` + 8 位十六进制（重名再加 `-N`）。
+            # ⚠️ Task 1.10c 修 E-5：旧写法只判前缀 `startswith(...)` —— 手工/别的程序恰好用同一
+            # 前缀命名时（`<id>.md.stale-手工说明`）会被一起删掉，而本函数承诺"别人的一律不碰"。
+            prefix = "%s.md.stale-" % vid
             if os.path.isdir(room):
-                own += [os.path.join(room, f) for f in os.listdir(room) if f.startswith(prefix)]
+                own += [os.path.join(room, f) for f in os.listdir(room)
+                        if f.startswith(prefix) and _SIDE_ARCHIVE_TAIL_RE.match(f[len(prefix):])]
         except OSError:
             pass
         for p in own:

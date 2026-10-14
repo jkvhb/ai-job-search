@@ -2346,12 +2346,26 @@ async function openResumeText(id){
     logUI('resume.view_mismatch', {id: id});
     return;
   }
-  rsOpenView(d.kind === 'mother' ? '母版原文' : '最新版原文', meta +
-    '<div class="hintline">' + (d.kind === 'mother'
-      ? '从<b>母版快照</b>读回（快照一经生成不可变，是这一族谱的参照原点）。'
-      : '这是这一族谱的<b>最新版原文</b>（<code>' + esc(String(d.path || '')) + '</code>）。') + '</div>' +
+  // D（Task 1.10c）：`kind` 的 `latest` / `mother` 只说明"按现有依据维持"，**不等于**"核对过"。
+  // 记录里**没有** sha256 时，盘上那份完全可能是**别人那一版**（复查枚举出 7 行这种组合）
+  // ——`verified` 假时绝不能断言「最新版原文 / 母版原文」，只能如实说"没有指纹、内容未核对"。
+  const verified = !!d.verified;
+  const title = d.kind === 'mother'
+    ? (verified ? '母版原文' : '母版快照（内容未核对）')
+    : (verified ? '最新版原文' : '这一版原文（未核对）');
+  const hint = d.kind === 'mother'
+    ? (verified
+        ? '从<b>母版快照</b>读回（快照一经生成不可变，是这一族谱的参照原点）。'
+        : '<b>母版快照</b>里的那一份（快照一经生成不可变）—— 但这一版记录里<b>没有指纹（sha256）</b>，'
+          + '内容未核对：它可能已经不是这一版了，别当作母版原文用。')
+    : (verified
+        ? '这是这一族谱的<b>最新版原文</b>（<code>' + esc(String(d.path || '')) + '</code>）。'
+        : '<code>' + esc(String(d.path || '')) + '</code> 里当前的那一份 —— 但这一版记录里'
+          + '<b>没有指纹（sha256）</b>，内容未核对：它可能已经不是这一版了，别当作这一版原文用。');
+  rsOpenView(title, meta +
+    '<div class="hintline">' + hint + '</div>' +
     '<pre class="rstext" data-kind="' + esc(String(d.kind || '')) + '">' + esc(String(d.text == null ? '' : d.text)) + '</pre>');
-  logUI('resume.view_text', {id: id, kind: d.kind || ''});
+  logUI('resume.view_text', {id: id, kind: d.kind || '', verified: verified});
 }
 
 function openResumeDiff(id){
@@ -2529,14 +2543,16 @@ function rsAskContinue(fileName, content, mother){
       // **照样留**（免得覆盖后无处可找），但那时**不记** `mother_file`、界面如实提示
       //「内容与记录不符」（存档 ≠ 冒充）。不留只有两种：① 这一版原文从来没保留过；
       // ② 盘上那份已经不是这一版（文件里装的是更新的那一版 / 别人的内容）—— 那时它不是
-      // 这一版的原文。另外修正一份旧快照前，旧快照的字节会先改名留档（`.stale-<8位>`）。
+      // 这一版的原文。另外修正一份旧快照前，旧快照的字节会先**直接写一份副本**留档
+      //（`.stale-<8位>`；不是"改名"—— 改名一旦失败旧快照就还在原地等着被盖掉）。
       // 这里只能承诺做得到的事（`resumelib.create_version`）。
       '<span class="hintline" style="margin:0">同一族谱里续一版 → <b>第 ' + (top + 1) + ' 次修改</b>，' +
         '覆盖前会尽量把母版原文留成快照：只有盘上那份<b>就是母版原文</b>时才记为「母版原文的存档」；' +
         '此时若它<b>不符</b>记录（被程序外改过），字节<b>照样保留</b>（免得覆盖后无处可找），' +
         '但不会说它是母版原文 —— 取回时会如实提示「内容与记录不符」。' +
         '只有这一版的原文<b>从来没保留过</b>、或盘上那份<b>已经不是这一版</b>时才不留' +
-        '（那已经不是它的原文）；修正一份旧快照前，旧快照的字节也会先改名留档</span>' +
+        '（那已经不是它的原文）；修正一份旧快照前，旧快照的字节也会先<b>直接写一份副本</b>留档' +
+        '（<code>.stale-&lt;8位&gt;</code>，重名换 <code>-2</code>/<code>-3</code>…）</span>' +
     '</div>' +
     '<div class="row" style="margin-top:18px">' +
       '<input type="text" id="rsPickName" class="grow" value="' + esc(suggested) + '">' +

@@ -126,6 +126,40 @@ class ChooseRemovePurgeTest(IsolatedCase):
                         "族谱主文件是「最新版容器」，purge 不删它（老口径不变）")
         self.assertEqual(resumelib.by_id(v2["id"])["name"], "甲")   # v2 还在（只删了 v1）
 
+    def test_purge_only_clears_side_names_that_really_look_like_its_own_archives(self):
+        """E-5（Task 1.10c）：`purge` 清旁挂必须按**精确形状**认名字，不许按前缀一刀切。
+
+        机器写的旁挂只有一种形状：`<版本id>.md.stale-` + **8 位十六进制**（重名时再加 `-N`）。
+        旧实现只判 `f.startswith("<版本id>.md.stale-")`：手工把别的快照命名成
+        `<版本id>.md.stale-手工说明`（或别的程序恰好用了这个前缀）时，`purge` 会把**不是留档的东西**
+        一起删掉 —— 那是别人的字节，本函数对自己承诺过"别人的一律不碰"。
+
+        变异取证：把形状判断放宽回"前缀匹配"，下面两条 `assertTrue` 立刻红。
+        """
+        v1 = resumelib.create_version("甲", "A1")
+        room = store.p_path("resumes", resumelib.SNAPSHOT_DIR)
+        os.makedirs(room, exist_ok=True)
+        own_real = os.path.join(room, "%s.md.stale-0a1b2c3d" % v1["id"])
+        own_numbered = os.path.join(room, "%s.md.stale-0a1b2c3d-2" % v1["id"])
+        handmade = os.path.join(room, "%s.md.stale-手工说明" % v1["id"])
+        other_shape = os.path.join(room, "%s.md.stale-0a1b2c3dZZ" % v1["id"])
+        for p in (own_real, own_numbered, handmade, other_shape):
+            store.write_bytes(p, ("内容：%s" % os.path.basename(p)).encode("utf-8"))
+        handmade_bytes = store.read_bytes(handmade)
+        other_shape_bytes = store.read_bytes(other_shape)
+
+        resumelib.purge(v1["id"])
+
+        self.assertFalse(os.path.exists(own_real), "这一版自己的留档旁挂要跟着清掉（8 位十六进制那支）")
+        self.assertFalse(os.path.exists(own_numbered), "重名换号的那支（`-2`）也是留档，要一起清掉")
+        self.assertTrue(os.path.exists(handmade),
+                        "名字不是留档形状（`.stale-手工说明`）→ 不是机器留的档，绝不许删：%r"
+                        % (sorted(os.listdir(room)),))
+        self.assertEqual(store.read_bytes(handmade), handmade_bytes, "那些字节不是留档，一个字节都不许动")
+        self.assertTrue(os.path.exists(other_shape),
+                        "`.stale-<8位>ZZ` 不是留档形状（多了尾巴）→ 不许删")
+        self.assertEqual(store.read_bytes(other_shape), other_shape_bytes)
+
     def test_purge_removes_only_its_own_snapshot(self):
         v1 = resumelib.create_version("甲", "A1"); resumelib.choose(v1["id"])
         resumelib.create_version("甲", "A2", parent_id=v1["id"])
@@ -923,7 +957,7 @@ class SnapshotByteFidelityTest(IsolatedCase):
         side = [f for f in os.listdir(os.path.dirname(snap))
                 if f.startswith(v1["id"] + ".md.stale-")]
         self.assertEqual(len(side), 1,
-                         "旧快照被覆盖前必须先改名留档（<id>.md.stale-<8位>）：%r" % (side,))
+                         "旧快照被覆盖前必须先留档（**直接写一份副本**到 <id>.md.stale-<8位>）：%r" % (side,))
         with open(os.path.join(os.path.dirname(snap), side[0]), "rb") as f:
             self.assertEqual(f.read(), true_mother_bytes, "真快照的字节不许静默丢掉")
         # 修正本身照旧生效（Task 1.9 的功能不能因为留档就没了）
@@ -957,14 +991,50 @@ class SnapshotByteFidelityTest(IsolatedCase):
         self.assertEqual(store.read_bytes(snap), before_bytes)
         self.assertEqual(store.read_bytes(snap), "快照被改坏".encode("utf-8"))
 
+    def test_a_snapshot_write_failure_is_a_human_sentence_and_leaves_no_half_written_file(self):
+        """E-1（Task 1.10c）：写母版快照必须**原子**（临时文件 + `os.replace`），失败翻成人话。
+
+        旧写法是裸的 `store.write_bytes(snap_path, raw)`（= `open(path, "wb")`）：它**先把旧快照
+        截断成 0 字节**再一段段往里写 —— 中途失败（磁盘满 / 被 kill）就留下一个**半截快照**，
+        而记录仍指着它（"以为留了档，取回来却是残缺的"）；而且裸 `OSError` 穿到
+        `app.py` 的 `/api/resumes` 就是 **500**（用户只看到「服务器内部错误」）。
+
+        这里把 `os.replace` 打坏（模拟换名那一步失败）：
+        - 原子写 → 放弃这次保存、抛**专用异常**（一句中文人话，路由接成 409），盘上**没有半截快照**；
+        - 变异取证：把原子写改回"直接写"（不碰 `os.replace`）→ 本用例的 `assertRaises` 立刻红。
+        """
+        v1 = resumelib.create_version("母版", "第一版内容")
+        resumelib.choose(v1["id"])
+        snap = self._snap_path(v1["id"])
+
+        with mock.patch.object(resumelib.os, "replace", side_effect=OSError(28, "磁盘空间不足")):
+            with self.assertRaises(resumelib.SnapshotArchiveError) as ctx:
+                resumelib.create_version("母版", "第二版内容", parent_id=v1["id"])
+
+        sentence = str(ctx.exception)
+        self.assertIn("快照", sentence)          # 说清楚是哪一步失败（不是裸 Errno 文本）
+        self.assertIn("写", sentence)
+        self.assertFalse(os.path.exists(snap), "写不成的快照不许留半截（更不许留个 0 字节的假档）")
+        room = os.path.dirname(snap)
+        leftovers = [f for f in (os.listdir(room) if os.path.isdir(room) else [])
+                     if f.startswith(".tmp-")]
+        self.assertEqual(leftovers, [], "写失败后不许在快照目录里留临时文件垃圾：%r" % (leftovers,))
+        self.assertEqual(store.read_text(store.p_path("resumes", "母版.md")), "第一版内容",
+                         "这次保存整体中止：母版原文一个字节都不许被写坏")
+        self.assertEqual([r["id"] for r in resumelib.list_versions()], [v1["id"]],
+                         "这次保存整体中止：不许留下一条没有正文的版本记录")
+
 
 class SnapshotArchiveFailureTest(IsolatedCase):
     """Task 1.10b 修 I-1：**留档失败 → 放弃本次修正**（绝不静默把旧快照盖掉，那是不可逆的）。
 
-    三条各自钉住一个错误写法（都在旧实现上实测为红）：
-    ① 出任何岔子都"继续覆盖" → 旧快照的字节**在整棵树里再也搜不到**；
-    ② 旁挂同名就跳过留档（只判存在、不判内容）→ 真快照一样被盖掉；
-    ③ 同名且**内容相同**时不去重复写一份（"已留过档"要看**内容**，不是看名字在不在）。
+    下面三条各自钉住一个写法，但**它们的身份不一样**（上一轮这里写的是"都在旧实现上实测为红"，
+    其中第③条在旧实现上**本来就是绿的** —— 那句话是假的，这里如实说清）：
+    ① 出任何岔子都"继续覆盖" → 旧快照的字节**在整棵树里再也搜不到**（**旧实现的回归钉子**）；
+    ② 旁挂同名就跳过留档（只判存在、不判内容）→ 真快照一样被盖掉（**旧实现的回归钉子**）；
+    ③ 同名且**内容相同**时不去重复写一份 —— 这条锁的是**新契约**（"已留过档"要看**内容**，
+       不是看名字在不在）；旧实现恰好也满足它，所以它在旧实现上**不是红的**，
+       价值在于将来有人把这条改坏时会立刻变红。
     """
 
     def _snap_path(self, version_id):
@@ -1057,6 +1127,42 @@ class SnapshotArchiveFailureTest(IsolatedCase):
                          % (os.path.basename(side), sides))
         self.assertEqual(store.read_bytes(side), before, "旧字节仍在（已经留过的那一份）")
         self.assertEqual(store.read_bytes(snap), "第二版内容".encode("utf-8"), "修正本身照旧生效")
+
+    def test_an_unreadable_side_candidate_name_is_never_reused_and_the_repair_is_abandoned(self):
+        """E-2（Task 1.10c）：旁挂名**存在却读不出来**时，绝不当它"空着"、更不去写它。
+
+        `_archive_old_snapshot` 探测候选旁挂名用的是 `store.read_bytes(side)`：
+        文件不存在 → `None`（名字空着，可以写）；**存在但读不出来** → 抛 `OSError`。
+        旧实现在这条分支上的写法是 `existing = _UNREADABLE`（哨兵，既不是 None 也不等于旧字节）
+        → 换下一个候选名；九个候选全读不出来就**放弃本次修正**。
+        写成 `existing = None`（"读不出来"被当成"名字空着"）的后果：直接往一个**读不出来的文件上写**
+        （权限/被锁时写失败 → 裸 `OSError`；写得进去就是把那份东西盖掉，而它本来可能是别人的留档）。
+
+        这条分支以前没有测试（复查 MUT8 全绿）—— 这里补上：
+        变异取证：把 `_UNREADABLE` 那一支改成"名字可用"（`existing = None`），
+        下面的 `assertRaises` 立刻红（它会去写旁挂并一路把修正做完）。
+        """
+        v1, snap = self._broken_fingerprint()
+        before = store.read_bytes(snap)
+        room = os.path.dirname(snap)
+        real_read_bytes = store.read_bytes
+
+        def fake_read_bytes(p):
+            # 只打坏"探测旁挂名"的读取：那个名字存在、却读不出来
+            if ".stale-" in str(p):
+                raise PermissionError(13, "拒绝访问")
+            return real_read_bytes(p)
+
+        with mock.patch.object(store, "read_bytes", side_effect=fake_read_bytes):
+            with self.assertRaises(resumelib.SnapshotArchiveError) as ctx:
+                resumelib.create_version("母版", "第三版内容", parent_id=v1["id"])
+
+        self.assertIn("留档", str(ctx.exception))          # 说人话（路由接成 409 给用户）
+        self.assertEqual(real_read_bytes(snap), before,
+                         "放弃修正：旧快照一个字节都没变")
+        sides = [f for f in os.listdir(room) if ".stale-" in f]
+        self.assertEqual(sides, [],
+                         "读不出来的名字被当成「空着」了：往一个读不出来的文件上写了东西（%r）" % (sides,))
 
     def test_an_unreadable_old_snapshot_is_a_human_sentence_not_a_bare_oserror(self):
         """M-3：旧快照**读不出来**时也不许裸 `OSError` 穿出 `create_version`（否则路由只接 409 的那条路走不到）。"""

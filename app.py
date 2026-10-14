@@ -1686,10 +1686,18 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError as e:
                 return self._send(404, {"ok": False, "error": str(e)})
             rec = resumelib.by_id(vid) or {}
+            # ⚠️ Task 1.10c 修 D：`kind` 的 `latest` / `mother` 只说明"按现有依据维持"，
+            # **不等于**"这一版的内容核对过" —— 记录里**没有** `sha256` 时盘上那份完全可能
+            # 是**别人那一版**（复查枚举出 7 行这种组合）。所以这里多回一个 `verified`
+            # （= 记录里**有** `sha256`，也就是"核对过"），让界面能说两种不同的话：
+            #   verified 真 → 「最新版原文」；verified 假 → 「这一版没有指纹，内容未核对」。
+            # `read_version` 的三元组 API 故意不动（它只回答 `kind`）。
+            verified = bool(str(rec.get("sha256") or "").strip())
             out = {
                 "ok": kind in ("latest", "mother"),
                 "kind": kind,
                 "version": vid,
+                "verified": verified,
                 "name": str(rec.get("name") or ""),
                 "rev": rec.get("rev"),
                 "at": str(rec.get("at") or ""),

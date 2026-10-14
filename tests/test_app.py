@@ -2935,15 +2935,17 @@ class ResumeVersionRouteTest(IsolatedCase):
             code, body = self._save("母版.md", "第二版内容", parent_id=v1["id"])
 
         versions = resumelib.list_versions()
+        # E-4（Task 1.10c）：落盘证据要**逐项**都在 —— 新增的版本记录 + 新正文都真的写下去了。
         self.assertEqual(len(versions), 2, "前提：这次保存**其实已经成功**（新增了第二版）：%r" % (versions,))
         self.assertEqual(store.read_text(store.p_path("resumes", "母版.md")), "第二版内容",
-                         "前提：新正文已经落盘")
+                         "E-4：新正文必须真的落盘（下面据此断定「409 已中止」是假话）")
         # 既然保存其实成功了，就**绝不能**回 409「冲突 / 已中止」那句假话。
-        # 这里用"走兜底 500"钉住：改回 `except RuntimeError` 时它会变成 409，本断言立刻红
-        # （而且那条 409 会把一次**成功**的保存说成"没保存"）。
-        self.assertEqual(code, 500, body)
-        self.assertIn("服务器内部错误", str(body.get("error")),
-                      "别的 RuntimeError 不该被包装成「保存冲突/已中止」那个分支")
+        # ⚠️ E-4（Task 1.10c）：这里**不许**把"走兜底 500"钉成期望值 ——
+        # "保存成功了却回 500"同样是一句假话（用户会以为没保存、重做一遍，结果多一个版本）。
+        # 要钉的只有一条：**它不是 409**（不是「保存被中止」），而保存确实已落盘（上面两条前提）。
+        self.assertNotEqual(code, 409, body)
+        self.assertNotIn("已中止", str(body.get("error")),
+                         "保存已经落盘，却对用户说「已中止」：%r" % (body,))
 
 
 # ---------------- 前端接线（修 1 / 修 2 / 修 3 / 修 4 / 修 5 / 修 6）+ 阶段 4C：简历下拉 ----------------
@@ -2980,6 +2982,26 @@ def _resumes_view(include_removed=True):
     path = "/api/resumes?include_removed=1" if include_removed else "/api/resumes"
     h = _sandbox_handler("GET", path, b"", {})
     return h._status, h._body
+
+
+def _resume_text_view(vid, resp):
+    """**真跑** `openResumeText()`（取回原文的渲染层）→ 回它渲染出来的标题 + 正文。
+
+    响应**从参数给**：要断言的正是"同一份服务端响应在界面上被说成什么话"（D 的措辞就在这一层）。
+    标题与正文都为空一律报错 —— 否则 `assertNotIn` / `assertIn` 会变成**恒真的假绿**。
+    """
+    _need_node()
+    out = web_probe.run_index(
+        "var q = [__fixture.resp];\n"
+        "fetch = function(){ return Promise.resolve({ok:true, json:function(){"
+        "return Promise.resolve(q.shift() || {});}}); };\n"
+        "await openResumeText(__fixture.vid);\n"
+        "out.title = String($('#rsViewTitle').textContent);\n"
+        "out.body = String($('#rsViewBody').innerHTML);\n",
+        {"vid": vid, "resp": resp})
+    if not out.get("title") and not out.get("body"):
+        raise AssertionError("取回原文的弹窗什么都没渲染（页面为空）：%r" % (out,))
+    return out
 
 
 def _picker_probe(view):
@@ -3236,8 +3258,11 @@ class ResumeContinueModalTest(IsolatedCase):
     def test_the_snapshot_promise_is_conditional(self):
         """修 3 / Task 1.9：快照**不是**无条件写的，也**不是**"与记录不符就不写"。
 
-        盘上那份与记录不符时字节**照样留**（存档 ≠ 冒充）；只有"这一版原文从来没保留过"
-        才不留。弹窗只能承诺做得到的事：说清「什么时候才**记为**母版原文的存档」、
+        盘上那份与记录不符时字节**照样留**（存档 ≠ 冒充）；**两种情形**才不留：
+        ① `missing`（这一版原文**从来没保留过**）；② 盘上那份**已经不是这一版**
+        （快照已经是好的 / 两边都不是这一版）—— 那它就不是这一版的原文（与
+        `resumelib.py:43-46` 的两条口径、以及弹窗自己写的两种情形一致）。
+        弹窗只能承诺做得到的事：说清「什么时候才**记为**母版原文的存档」、
         「不符时字节**照样保留**」、「**从来没保留过**时才不留」。
         """
         self._family()
@@ -3258,6 +3283,12 @@ class ResumeContinueModalTest(IsolatedCase):
         self.assertIn("就是母版原文", body, "没有说清「什么时候才记为母版原文的存档」")
         self.assertIn("照样保留", body, "没有说清「与记录不符时字节照样保留」")
         self.assertIn("从来没保留过", body, "没有说清「什么时候才不留」")
+        # C-1（Task 1.10c）：留档的实现是**直接写一份副本**（`_write_side`），不是改名。
+        # 弹窗（用户可见）曾写"先改名留档" —— 那是**上一版实现**的说法，而且正是复查实测的
+        # 丢数据路径（改名失败时旧快照还在原地等着被盖掉）。文案必须与实现一致。
+        self.assertNotIn("改名", body,
+                         "弹窗又写成「改名留档」了：实现是**直接写一份副本**，"
+                         "改名一旦失败旧快照就还在原地等着被覆盖（复查实测的不可逆丢数据路径）")
 
     def test_the_preview_revision_matches_what_is_really_written(self):
         """修 5：预览与 `create_version` **同一口径（含已移出）**。
@@ -3768,6 +3799,77 @@ class JdDimensionNameFilterTest(_DimTableCase):
         self.assertEqual(len(out["dims"]), 1, "全角/半角被当成了两维：%r" % (out["dims"],))
         body = out["rows"][1:]
         self.assertEqual([r["cells"][1]["text"] for r in body], ["4", "6"])
+
+
+class ResumeTextVerificationWordingTest(IsolatedCase):
+    """D（Task 1.10c）：**无指纹时不许冒充「最新版原文」**（读侧最后一处假话）。
+
+    为什么单独一个类、而不是写进 `ResumeVersionRouteTest`：`ResumeAiDiffRouteTest` 继承它，
+    写进去会**被跑两遍**（同一份断言跑两次没有价值，还会把全量计数弄乱）。
+
+    复查枚举出 7 行组合：记录里**没有** `sha256` 时 `_kind_on_disk` 无从核对，只能维持
+    `latest`/`mother`，而正文其实**不是这一版**。路由因此多回一个 `verified`
+    （= 记录里**有** sha256，也就是"核对过"），界面据它决定措辞。
+    """
+
+    def _handler(self, method, path, obj=None):
+        raw = json.dumps(obj, ensure_ascii=False).encode("utf-8") if obj is not None else b""
+        headers = {"Content-Length": str(len(raw)),
+                   "Content-Type": "application/json; charset=utf-8"}
+        h = _sandbox_handler(method, path, raw, headers)
+        return h._status, h._body
+
+    def _get(self, path):
+        return self._handler("GET", path)
+
+    def _new(self, name, content):
+        raw = json.dumps({"name": name, "content": content},
+                         ensure_ascii=False).encode("utf-8")
+        h = _sandbox_handler("POST", "/api/resumes", raw,
+                             {"Content-Length": str(len(raw)),
+                              "Content-Type": "application/json; charset=utf-8"})
+        self.assertEqual(h._status, 200, h._body)
+        return h._body["resume"]
+
+    def test_the_file_route_marks_a_version_without_a_fingerprint_as_unverified(self):
+        v1 = self._new("独苗.md", "原始内容")
+        with open(store.p_path("resumes", "独苗.md"), "w", encoding="utf-8", newline="") as f:
+            f.write("别人那一版的内容")            # 盘上那份已经不是这一版了
+        doc = resumelib.load_resumes()             # 记录里也没有指纹 → 无从核对
+        for r in doc.get("resumes", []):
+            if r.get("id") == v1["id"]:
+                r.pop("sha256", None)
+        resumelib.save_resumes(doc)
+
+        code, body = self._get("/api/resumes/file?version=" + v1["id"])
+        self.assertEqual(code, 200, body)
+        self.assertEqual(body["kind"], "latest", body)      # 前提：读侧只能"维持"
+        self.assertEqual(body["text"], "别人那一版的内容")    # 前提：正文确实不是这一版
+        self.assertIn("verified", body, "路由没回 verified → 界面只能照旧断言「最新版原文」")
+        self.assertFalse(body["verified"], "没有指纹却报「核对过」：%r" % (body,))
+
+        out = _resume_text_view(v1["id"], body)
+        self.assertEqual(out["unexpected"], [])
+        shown = out["title"] + out["body"]
+        self.assertNotIn("最新版原文", shown,
+                         "没有指纹、正文又不是这一版，界面却照旧断言「最新版原文」——用户可见的假话：%r"
+                         % (shown,))
+        self.assertIn("未核对", shown, "换成不断言的措辞时要真的说出来（「没有指纹、内容未核对」）：%r"
+                      % (shown,))
+
+    def test_a_fingerprinted_version_is_marked_verified_and_still_says_latest(self):
+        """D 的**对照**：有指纹（核对过）时照旧说「最新版原文」—— 诚实措辞不许把正常路径也改糊。"""
+        v1 = self._new("唯一.md", "只有这一版")
+        code, body = self._get("/api/resumes/file?version=" + v1["id"])
+        self.assertEqual((code, body["kind"], body["text"]), (200, "latest", "只有这一版"), body)
+        self.assertIn("verified", body)
+        self.assertTrue(body["verified"], "有 sha256（核对过）却没有报 verified：%r" % (body,))
+
+        out = _resume_text_view(v1["id"], body)
+        self.assertEqual(out["unexpected"], [])
+        self.assertIn("最新版原文", out["title"],
+                      "核对过的版本照旧要说「最新版原文」（不许因为 D 就一律改成含糊措辞）：%r"
+                      % (out["title"],))
 
 
 # 变更说明的三种情形（规格 §8.3/§8.4）：后端**真数据**喂进 `rsDiffText` 的**渲染结果**。
