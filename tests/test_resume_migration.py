@@ -529,5 +529,42 @@ class RollbackTest(MigrationCase):
         self.assertFalse(os.path.exists(store.p_path("resumes.json")))
 
 
+class NonUtf8ResumesDocTest(MigrationCase):
+    """GBK 写坏的 `resumes.json`：迁移**必须中止**，绝不能把它写成一份空的。
+
+    老实现下 `_doc_state()` 会把"解码失败"误读成"文件是空的" → 判定"没什么可丢" →
+    照跑，把空的 `resumes.json` 写回去（原文件虽在整目录备份里，但这违反了脚本自己的契约）。
+    """
+
+    def _gbk_resumes_doc(self):
+        path = store.p_path("resumes.json")
+        raw = json.dumps({"version": 1, "resumes": [
+            {"id": "rv_0001", "name": RESUME_NAME, "root_id": "rv_0001", "parent_id": None,
+             "rev": 1, "at": RESUME_AT, "size": 1, "sha256": "e" * 64,
+             "file": RESUME_NAME + ".md", "chosen": True, "removed": False,
+             "mother_file": None, "note": "", "ai_diff": "", "ai_diff_error": ""}]},
+            ensure_ascii=False).encode("gbk")
+        with open(path, "wb") as f:
+            f.write(raw)
+        return path, raw
+
+    def test_a_gbk_resumes_doc_is_never_overwritten_with_an_empty_one(self):
+        path, raw = self._gbk_resumes_doc()
+        code, _out, err = self.run_cli(["--执行"])
+        self.assertNotEqual(code, 0, "读不出来就必须非零退出，不能假装成功")
+        self.assertIn("有内容但解析失败", err)
+        self.assertEqual(self.disk_bytes(path), raw, "中止时一个字节都不许动")
+
+    def test_an_empty_resumes_doc_is_not_treated_as_corrupt(self):
+        """0 字节**不是**损坏：迁移照常跑（这条防的是"改过头"——把空文件也当中止理由）。"""
+        path = store.p_path("resumes.json")
+        with open(path, "wb") as f:
+            f.write(b"")
+        code, _out, err = self.run_cli(["--执行"])
+        self.assertEqual(code, 0, "空文件不该被当成损坏：%s" % (err or _out,))
+        self.assertTrue(json.loads(store.read_text(path, "{}"))["resumes"],
+                        "空文件 + 盘上有简历 → 应当正常登记出记录")
+
+
 if __name__ == "__main__":
     unittest.main()

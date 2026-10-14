@@ -132,12 +132,15 @@ def _doc_state():
     为什么不走 `resumelib.load_resumes()`：那个会把「没有 id / 名字」的记录**过滤掉**，
     我们照它写回去就等于**静默删掉**用户手改坏的那几条。这里原样取、原样写回。
 
-    「**有内容但解析失败**」→ 直接中止（同 `身份迁移._build_knowledge` 那条铁律）：
-    拿一份空库顶掉用户手改坏的文件，就是**静默丢数据** —— 那是本脚本最不该做的事。
+    「**有内容但解析不出来**」→ 直接中止（同 `身份迁移._build_knowledge` 那条铁律）：
+    拿一份空库顶掉用户手改坏的文件，就是**静默丢数据**。
+    ⚠️ "有没有内容"必须问 `store.content_bytes_present()`（**看原始字节**）——
+    老写法用 `store.read_text(path, "").strip()`，而非 UTF-8 文件解码会失败并被兜成空串，
+    于是"有内容但读不出来"被误判成"空文件"，迁移照跑、把用户记录顶掉。
     """
     path = store.p_path(resumelib.RESUMES_FILE)
     raw = store.read_json(path, None)
-    if raw is None and store.read_text(path, "").strip():
+    if raw is None and store.content_bytes_present(path):
         raise RuntimeError("resumes.json 有内容但解析失败：已放弃本次迁移，"
                            "绝不把它写成空库（先修好或移开这个文件再跑）")
     if not isinstance(raw, dict):

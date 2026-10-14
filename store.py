@@ -230,13 +230,16 @@ def read_knowledge_strict(path=None):
     return data, ""
 
 
-def _has_content_bytes(path):
+def content_bytes_present(path):
     """这个文件里有没有**可丢的字节**？
 
     ⚠️ **必须看原始字节**，绝不能用解码后的字符串：非 UTF-8 文件（比如被 GBK 写坏的
-    `knowledge.json`）在 `read_text` 里解码会失败、并被兜成默认空串，于是
-    "有内容但读不出来"被误判成"空文件，没有可丢的数据"。这正是本函数存在的唯一理由
-    （实测：GBK 的库会被内存里的空库顶掉，用户的卡全没）。
+    `knowledge.json` / `resumes.json`）在 `read_text` 里解码会失败、并被兜成默认空串，
+    于是"有内容但读不出来"被误判成"空文件，没有可丢的数据"。
+    实测过：GBK 的 `knowledge.json` 会被内存里的空库顶掉，用户的卡全没。
+
+    **它是公开的**：现在有两个调用方（知识库 `knowledge_safe_to_write`、简历版本库
+    `简历迁移._doc_state`），这条易错的规则必须只有一份实现。
     """
     try:
         with open(path, "rb") as f:
@@ -260,7 +263,7 @@ def knowledge_safe_to_write(path=None):
     _data, err = read_knowledge_strict(p)
     if not err:
         return True, ""
-    if not _has_content_bytes(p):
+    if not content_bytes_present(p):
         return True, ""
     return False, err
 

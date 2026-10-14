@@ -273,5 +273,35 @@ class SingleImplementationGuardTest(IsolatedCase):
             store.knowledge_safe_to_write = real
 
 
+class ContentBytesPresentTest(IsolatedCase):
+    """`content_bytes_present()` —— "看原始字节"这条易错规则**唯一**的实现。
+
+    它单独被测的理由：现在有两个调用方（知识库、简历版本库），
+    谁把它改回"看解码后的字符串"，两个地方就会一起坏。
+    """
+
+    def _write(self, blob, name="probe.json"):
+        path = os.path.join(store.profile_dir(), name)
+        with open(path, "wb") as f:
+            f.write(blob)
+        return path
+
+    def test_a_missing_file_has_nothing_to_lose(self):
+        self.assertFalse(store.content_bytes_present(
+            os.path.join(store.profile_dir(), "没有这个文件")))
+
+    def test_empty_and_whitespace_only_files_have_nothing_to_lose(self):
+        for blob in (b"", b"   \n  ", b"\r\n"):
+            with self.subTest(blob=blob):
+                self.assertFalse(store.content_bytes_present(self._write(blob)))
+
+    def test_a_non_utf8_file_has_bytes_to_lose(self):
+        """**本函数的全部理由**：GBK 文件解码会失败并被兜成空串，但它的**字节**是可丢的。"""
+        self.assertTrue(store.content_bytes_present(self._write("中文".encode("gbk"))))
+
+    def test_a_valid_file_has_bytes_to_lose(self):
+        self.assertTrue(store.content_bytes_present(self._write(b'{"a": 1}')))
+
+
 if __name__ == "__main__":
     unittest.main()

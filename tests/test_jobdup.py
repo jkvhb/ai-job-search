@@ -257,7 +257,7 @@ class MergeIdempotenceTest(IsolatedCase):
 class MergeCorruptKbTest(IsolatedCase):
     """**计划外补充**：knowledge.json 损坏时绝不写成空库（本项目真实丢过 97 张卡）。
 
-    判据照 kb._quarantine_corrupt_kb：「文件有内容 **且** 解析失败」。
+    判据走 `store.knowledge_safe_to_write()`（唯一实现）。
     """
 
     def test_corrupt_kb_aborts_merge_and_rolls_back(self):
