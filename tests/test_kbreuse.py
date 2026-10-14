@@ -147,3 +147,84 @@ class CompletenessTest(IsolatedCase):
         reusable, missing = kbreuse._card_completeness(self._card(timeline=[]))
         self.assertTrue(reusable, "缺时间线不该让卡片失去复用资格")
         self.assertIn("timeline", missing)
+
+
+class IndexTest(IsolatedCase):
+    def test_lookup_by_exact_normalised_name(self):
+        idx = kbreuse.Index([{"id": "语音识别", "term": "语音识别", "definition": "d"}])
+        card, how = idx.lookup(" 语音识别 ")
+        self.assertIsNotNone(card)
+        self.assertEqual(how, "exact")
+
+    def test_lookup_by_ascii_parenthetical_both_directions(self):
+        """库里叫 `词错率（WER）`、节点叫 `WER` → 命中；反之亦然（spec §5）。"""
+        idx = kbreuse.Index([{"id": "词错率wer", "term": "词错率（WER）", "definition": "d"}])
+        card, how = idx.lookup("WER")
+        self.assertIsNotNone(card, "库里那份的 ASCII 括号要能当别名被查到")
+        self.assertEqual(how, "abbrev")
+
+        idx2 = kbreuse.Index([{"id": "asr", "term": "ASR", "definition": "d"}])
+        card2, how2 = idx2.lookup("语音识别（ASR）")
+        self.assertIsNotNone(card2, "节点自己的 ASCII 括号也要能查到库里的项")
+        self.assertEqual(how2, "abbrev")
+
+    def test_lookup_by_recorded_alias(self):
+        idx = kbreuse.Index([{"id": "语音识别", "term": "语音识别",
+                              "aliases": ["ASR"], "definition": "d"}])
+        card, how = idx.lookup("asr")
+        self.assertIsNotNone(card)
+        self.assertEqual(how, "alias")
+
+    def test_lookup_misses_cleanly(self):
+        idx = kbreuse.Index([{"id": "语音识别", "term": "语音识别", "definition": "d"}])
+        self.assertEqual(idx.lookup("完全不相干的概念"), (None, ""))
+
+    def test_a_card_without_a_term_is_skipped(self):
+        idx = kbreuse.Index([{"id": "", "term": "", "definition": "d"},
+                             {"id": "a", "term": "A", "definition": "d"}])
+        self.assertEqual(len(idx), 1, "没有名字的卡片进不了目录")
+
+    def test_a_contested_key_keeps_the_first_card(self):
+        """同一把键被两张卡占用时**先到先得**（顺序稳定，绝不随机）。"""
+        idx = kbreuse.Index([{"id": "first", "term": "同名", "definition": "d"},
+                             {"id": "second", "term": "同名", "definition": "d"}])
+        card, _ = idx.lookup("同名")
+        self.assertEqual(card["id"], "first")
+
+    def test_a_contested_key_between_two_different_terms_keeps_the_first_card(self):
+        """**为什么需要两条测试**：「先到先得」这条规则要**两条**才钉得住，缺一条就会假绿。
+
+        - `test_a_contested_key_keeps_the_first_card` 用的是**同一个 term**（两张卡都叫「同名」）：
+          它们的 `normalize_id(term)` 是同一把 id，第二张卡在"同一个 id 只进一次"那一步
+          （`if not cid or cid in self.cards: continue`）就被丢掉了，**根本没争到键** ——
+          它钉的其实是**「同 id 去重」**，不是「先到先得」。实测：把
+          `by_key.setdefault(k, c)` 改成 `by_key[k] = c`，全量仍是 `Ran 951 tests ... OK`，
+          它照样绿（**它当时是因为另一个原因绿的**）。
+        - **这条**钉的才是「先到先得」：两个**不同** term、**同一把**键。
+          卡 A 的 `词错率（WER）` 贡献出 `wer`，卡 B 的名字恰好就是 `WER`；两张卡的 id 不同
+          （`词错率wer` / `wer`）→ 都进目录，`wer` 这把键同时被两张卡占着。
+          这时行为才是**可观测**的：改成 `[k] = c` 之后卡 B 会顶掉卡 A，
+          `by_key["wer"]` 与 `lookup("WER")` 都从 `first`/`abbrev` 变成 `second`/`exact`（实测红）。
+        """
+        idx = kbreuse.Index([{"id": "first", "term": "词错率（WER）", "definition": "d"},
+                             {"id": "second", "term": "WER", "definition": "d"}])
+        self.assertEqual(len(idx.cards), 2, "两张卡 term 不同，都该进目录")
+        self.assertEqual(idx.by_key["wer"]["id"], "first", "wer 这把键被两张卡占着")
+        card, how = idx.lookup("WER")
+        self.assertEqual(card["id"], "first", "同一把键被两张卡占用时先到先得")
+        self.assertEqual(how, "abbrev")
+
+    def test_index_from_store_reads_the_real_knowledge_file(self):
+        store.save_knowledge({"nodes": [{"id": "语音识别", "term": "语音识别",
+                                         "definition": "d", "plain_explanation": "p",
+                                         "sources": [{"url": "u"}]}]})
+        idx, err = kbreuse.build_index()
+        self.assertEqual(err, "")
+        self.assertEqual(len(idx), 1)
+
+    def test_index_from_a_corrupt_store_reports_instead_of_pretending_empty(self):
+        with open(store.knowledge_path(), "wb") as f:
+            f.write(b'{"nodes": [ <<<CORRUPT>>>')
+        idx, err = kbreuse.build_index()
+        self.assertEqual(len(idx), 0)
+        self.assertTrue(err, "坏知识库必须给出原因（报告要如实标 ⚠）")

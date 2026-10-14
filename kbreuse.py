@@ -102,3 +102,75 @@ def _card_completeness(card):
         missing.append("timeline")
     reusable = not any(m in ("definition", "plain_explanation", "sources") for m in missing)
     return reusable, missing
+
+
+class Index:
+    """知识库的"名字 → 卡片"目录。一次分析建一次，之后**只读**。
+
+    索引键有三类（spec §5）：卡片的 `normalize_id(term)`、它的 `aliases`、
+    以及它 term 里 ASCII 括号的内容。三者任一命中即算命中。
+    """
+
+    def __init__(self, cards=None):
+        self.cards = {}      # card_id -> card
+        self.by_key = {}     # 查找键 -> card（先到先得）
+        for c in (cards or []):
+            if not isinstance(c, dict):
+                continue
+            cid = kb.normalize_id(c.get("term"))
+            if not cid or cid in self.cards:
+                continue
+            self.cards[cid] = c
+            keys = [cid] + [kb.normalize_id(a) for a in (c.get("aliases") or [])]
+            keys += _paren_keys(c.get("term"))
+            for k in keys:
+                if k:
+                    # 先到先得：同一把键被两张卡占着时保留第一张（顺序稳定，绝不随机）
+                    self.by_key.setdefault(k, c)
+
+    def __len__(self):
+        return len(self.cards)
+
+    def terms_for_judge(self):
+        """喂给模型判定用的"库里已有什么"清单（只带 id / 名字 / 一行定义，省 token）。"""
+        return [{"card_id": cid, "term": str(c.get("term") or ""),
+                 "definition": str(c.get("definition") or "")[:40]}
+                for cid, c in self.cards.items()]
+
+    def lookup(self, term):
+        """`(卡片 或 None, 怎么命中的)`。
+
+        `matched_by` 的**精确定义**（别用"键等于全名"这种代理判断 —— 那会把
+        "节点叫 `WER`、库里叫 `词错率（WER）`"错报成 `exact`）：
+          * `exact`  —— **两边全名去噪后完全相同**（`normalize_id(term) == normalize_id(card.term)`）
+          * `abbrev` —— 通过**任一侧**的 ASCII 括号缩写命中的（如节点 `WER` ↔ 库里 `词错率（WER）`）
+          * `alias`  —— 通过卡片**记录过的** `aliases` 命中的
+        """
+        full = kb.normalize_id(term)
+        node_parens = set(_paren_keys(term))
+        for k in _keys_of_term(term):
+            card = self.by_key.get(k)
+            if card is None:
+                continue
+            card_full = kb.normalize_id((card or {}).get("term"))
+            if full and full == card_full:
+                return card, "exact"
+            if k in node_parens or k in set(_paren_keys((card or {}).get("term"))):
+                return card, "abbrev"
+            return card, "alias"
+        return None, ""
+
+
+def build_index(cards=None):
+    """建目录。`cards=None` 时从磁盘**严格只读**读知识库。
+
+    返回 `(Index, 原因)`：原因非空 = 知识库读不出来。这时**不阻止分析**，
+    只是这次全部走联网，并由调用方把原因如实带进报告标注（spec §9）。
+    """
+    if cards is not None:
+        return Index(cards), ""
+    data, err = store.read_knowledge_strict()
+    if err:
+        log.log_event("kbreuse.kb_unreadable", level="warn", error=err)
+        return Index([]), err
+    return Index(data.get("nodes") or []), ""
