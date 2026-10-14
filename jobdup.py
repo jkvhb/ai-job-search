@@ -202,7 +202,7 @@ def _snapshot(path, ts, backups):
     空快照**不删除**，与其它备份一样保留。
     """
     backup = path + BACKUP_SUFFIX + ts
-    store.write_text(backup, store.read_text(path, ""))
+    store.write_bytes(backup, store.read_bytes(path) or b"")
     backups.append((path, backup))
     return backup
 
@@ -210,13 +210,18 @@ def _snapshot(path, ts, backups):
 def _restore(path, backup):
     """把单个文件写回备份内容。**知识库那一个必须持 `kb._KB_LOCK`** —— 回滚同样是一次
     读-改-写，不加锁会把并发的 absorb 覆盖掉（回滚本来就是为了不丢数据，不能再制造一次丢失）。
+
+    快照按字节（`store.read_bytes` / `write_bytes`），避免解码兜底与换行转换：
+    用 `read_text` 时非 UTF-8 文件会被兜成空串、写回去就把用户的数据清空；`write_text`
+    在 Windows 上还会把 LF 换成 CRLF —— 那两种情况下回滚都不是"逐字节还原"。
     """
-    text = store.read_text(backup, "")
+    raw = store.read_bytes(backup)
+    blob = raw if raw is not None else b""
     if path == store.knowledge_path():
         with kb._KB_LOCK:
-            store.write_text(path, text)
+            store.write_bytes(path, blob)
     else:
-        store.write_text(path, text)
+        store.write_bytes(path, blob)
 
 
 def _rollback(backups):

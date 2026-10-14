@@ -647,6 +647,8 @@ def rename_jd(old_id, new_id, key=None):
 
     先在内存里算完全部改动、校验通过后**逐文件落盘**；中途任一步抛错就用内存里的原像
     把已写的文件回滚（先 jds.json 后知识库），绝不留「jds 改了、引用没改」的半改状态。
+    **原像按原始字节保存**：非 UTF-8 的文件（读不出来）不能被当成"本来不存在"，
+    换行也不许被文本模式换掉 —— 回滚的语义是"和动手之前一模一样"。
     """
     old = _text(old_id)
     new = _text(new_id)
@@ -703,19 +705,22 @@ def rename_jd(old_id, new_id, key=None):
                     jobs_moved += 1
 
             # ---- 7) 落盘（逐文件；失败用内存原像回滚已写的文件）----
-            written = []      # [(path, 原文本 或 None)]
+            # 原像一律按**原始字节**读（`read_bytes`，读不出来返回 None 表示"本来不存在"）：
+            # 用 `read_text` 的话，非 UTF-8 的 jds.json 会被解码兜成 None，回滚时就被判成
+            # "本来没有"、直接写成 `{}` —— 用户的台账被清空，连备份里也没有原文（实测）。
+            written = []      # [(path, 原始字节 或 None)]
             try:
-                written.append((_jds_path(key), store.read_text(_jds_path(key), None)))
+                written.append((_jds_path(key), store.read_bytes(_jds_path(key))))
                 save_jds(updated_jds, key)
                 if kb_touched:
                     written.append((store.knowledge_path(key),
-                                    store.read_text(store.knowledge_path(key), None)))
+                                    store.read_bytes(store.knowledge_path(key))))
                     store.save_knowledge(kb_new, key)
                 for path, st in iv_new:
-                    written.append((path, store.read_text(path, None)))
+                    written.append((path, store.read_bytes(path)))
                     store.write_json(path, st)
                 if jobs_moved:
-                    written.append((store.jobs_path(key), store.read_text(store.jobs_path(key), None)))
+                    written.append((store.jobs_path(key), store.read_bytes(store.jobs_path(key))))
                     store.save_jobs(jobs_new, key)
             except BaseException as e:
                 for path, before in reversed(written):
@@ -723,7 +728,7 @@ def rename_jd(old_id, new_id, key=None):
                         if before is None:
                             store.write_json(path, {} if path.endswith("jds.json") else [])
                         else:
-                            store.write_text(path, before)
+                            store.write_bytes(path, before)
                     except Exception:
                         pass
                 log.log_exc("jdid.rename_failed", e, old=old, new=new)

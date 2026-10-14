@@ -754,5 +754,43 @@ class LockingTest(IsolatedCase):
         self.assertIsNone(jdid.validate_id(NEW, jdid.load_jds()["jds"], exclude_id=NEW))
 
 
+class RenameRollbackByteExactTest(IsolatedCase):
+    """改 ID 失败回滚时，`jds.json` 必须**逐字节**还原。
+
+    老实现用 `read_text` / `write_text` 做快照与回滚：文本模式下换行会被转换
+    （Windows 写文件时 `\\n` → `\\r\\n`），于是一份 LF 的 `jds.json`
+    回滚之后变成 CRLF —— **回滚改变了文件内容**，那不叫还原。
+    """
+
+    OLD = RenameJdTest.OLD
+    NEW = RenameJdTest.NEW
+
+    def _fixture(self):
+        """复用 `RenameJdTest` 的夹具（不继承那个类：否则它的用例会被再跑一遍）。"""
+        RenameJdTest._fixture(self)
+
+    def test_rollback_restores_lf_jds_bytes_exactly(self):
+        self._fixture()                       # RenameJdTest 既有的夹具
+        path = store.p_path("jds.json")
+        raw = store.read_text(path).replace("\r\n", "\n").encode("utf-8")
+        with open(path, "wb") as f:
+            f.write(raw)
+
+        real_write_json = store.write_json
+        iv_path = store.interview_file("iv1", "status.json")
+
+        def flaky(p, obj, *a, **kw):
+            if p == iv_path:
+                raise OSError("注入的写失败")
+            return real_write_json(p, obj, *a, **kw)
+
+        with mock.patch.object(store, "write_json", flaky):
+            with self.assertRaises(ValueError):
+                jdid.rename_jd(self.OLD, self.NEW)
+
+        with open(path, "rb") as f:
+            self.assertEqual(f.read(), raw, "回滚必须逐字节还原（LF 不许被换成 CRLF）")
+
+
 if __name__ == "__main__":
     unittest.main()

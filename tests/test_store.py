@@ -3,6 +3,7 @@ import glob
 import json
 import os
 import unittest
+from unittest import mock
 
 import jddelete
 import kb
@@ -272,6 +273,20 @@ class SingleImplementationGuardTest(IsolatedCase):
         finally:
             store.knowledge_safe_to_write = real
 
+    def test_report_state_quarantine_follows_the_shared_primitive(self):
+        real, seen = store.content_bytes_present, []
+
+        def spy(path):
+            seen.append(path)
+            return False
+
+        store.content_bytes_present = spy
+        try:
+            store._quarantine_report_state(os.path.join(store.profile_dir(), "随便.json"))
+            self.assertTrue(seen, "勾选状态的隔离判据没有走共享原语（有人把它内联回去了）")
+        finally:
+            store.content_bytes_present = real
+
 
 class ContentBytesPresentTest(IsolatedCase):
     """`content_bytes_present()` —— "看原始字节"这条易错规则**唯一**的实现。
@@ -301,6 +316,66 @@ class ContentBytesPresentTest(IsolatedCase):
 
     def test_a_valid_file_has_bytes_to_lose(self):
         self.assertTrue(store.content_bytes_present(self._write(b'{"a": 1}')))
+
+
+class ReportStateNonUtf8Test(IsolatedCase):
+    """GBK 写坏的勾选状态文件：**必须先改名备份**，绝不能被空状态顶掉。
+
+    老判据 `read_text(path, "").strip()` 在 GBK 上会兜成空串 → 误判"没什么可丢" →
+    不备份、直接覆盖 → 用户在该报告里勾的"已掌握"**永久丢失、盘上无任何副本**（实测）。
+    """
+
+    def test_a_non_utf8_state_file_is_quarantined_before_overwriting(self):
+        rid = "20261008_岗A_80分"
+        path = store.report_state_path(rid)
+        raw = json.dumps({"version": 1, "report_id": rid,
+                          "checks": {"know:语音识别": True, "know:词错率（WER）": True}},
+                         ensure_ascii=False).encode("gbk")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(raw)
+
+        store.save_report_state(rid, {"know:新概念": True})
+
+        folder = os.path.dirname(path)
+        backups = [f for f in os.listdir(folder) if ".corrupt-" in f]
+        self.assertEqual(len(backups), 1, "读不出来的状态文件必须先被改名备份")
+        with open(os.path.join(folder, backups[0]), "rb") as f:
+            self.assertEqual(f.read(), raw, "备份必须逐字节等于原文（含中文勾选）")
+        # 本次写入照常成功（状态文件只值几个勾，不值得为它挡掉用户刚做的勾选）
+        self.assertTrue(store.load_report_state(rid)["checks"].get("know:新概念"))
+
+    def test_an_empty_state_file_is_not_quarantined(self):
+        """0 字节不是损坏：正常写入，别造垃圾备份。"""
+        rid = "空状态"
+        path = store.report_state_path(rid)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(b"")
+        store.save_report_state(rid, {"a": True})
+        self.assertEqual([f for f in os.listdir(os.path.dirname(path))
+                          if ".corrupt-" in f], [])
+        self.assertTrue(store.load_report_state(rid)["checks"].get("a"))
+
+
+class ContentBytesPresentUnreadableTest(IsolatedCase):
+    """**存在但打不开**（权限/被锁）→ 必须当成"有内容"（fail-safe），不是"没有"。"""
+
+    def test_an_unreadable_file_counts_as_having_content(self):
+        path = os.path.join(store.profile_dir(), "locked.json")
+        with open(path, "wb") as f:
+            f.write(b'{"a": 1}')
+
+        real_open = open
+
+        def fake_open(p, *a, **kw):
+            if os.path.abspath(str(p)) == os.path.abspath(path) and (not a or a[0] == "rb"):
+                raise PermissionError(13, "拒绝访问")
+            return real_open(p, *a, **kw)
+
+        with mock.patch("builtins.open", fake_open):
+            self.assertTrue(store.content_bytes_present(path),
+                            "读不出来不等于没有内容 —— 不许把'不知道'当成'安全'")
 
 
 if __name__ == "__main__":

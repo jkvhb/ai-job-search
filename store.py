@@ -86,6 +86,28 @@ def write_text(path, content):
         f.write(content)
 
 
+def read_bytes(path):
+    """按**原始字节**读；文件不存在 → `None`（读失败**不**兜成空 —— 那正是数据丢失的来源）。
+
+    ⚠️ **备份 / 回滚必须用它**，不能用 `read_text`：非 UTF-8 文件在 `read_text` 里解码失败
+    会被兜成默认空串，于是"快照"里存的是空 —— 回滚时就把用户的文件写成空的。
+    本项目实测过：`jobdup` 的合并回滚、`jdid` 的改 ID 回滚都会这样。
+    阶段 D 在 `jddelete` 里已经踩过同一个坑（那时连 LF→CRLF 都会被换掉），修法就是"快照按字节"。
+    """
+    try:
+        with open(path, "rb") as f:
+            return f.read()
+    except FileNotFoundError:
+        return None
+
+
+def write_bytes(path, raw):
+    """按**原始字节**写（不做任何编码/换行转换）。父目录不存在则建（与 `write_text` 一致）。"""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(raw)
+
+
 def read_json(path, default=None):
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -244,8 +266,12 @@ def content_bytes_present(path):
     try:
         with open(path, "rb") as f:
             return bool(f.read().strip())
+    except FileNotFoundError:
+        return False          # 真的不存在：没有可丢的数据
     except OSError:
-        return False
+        # **存在但打不开**（权限/被锁）：不知道里面有什么 → 一律当成"有内容"。
+        # 把"不知道"当成"安全"正是这个项目丢过数据的那条思维习惯。
+        return True
 
 
 def knowledge_safe_to_write(path=None):
@@ -297,6 +323,9 @@ def _quarantine_report_state(path):
 
     判据是「文件有内容 **且** 解析失败」：不存在的文件、以及内容为空都直接放行
     （没有可丢的数据），正常的 {"checks": {}} 解析成功也不会被误备份走。
+    "有内容"这件事**必须**走共享原语 `content_bytes_present()`（看原始字节）：内联成
+    `read_text(path, "").strip()` 的话，GBK 写坏的状态文件会被解码兜成空串 → 判成
+    "没什么可丢" → 不备份、直接覆盖 → 用户勾的"已掌握"永久丢失、盘上无任何副本（实测）。
 
     时间戳带微秒（%f）：只用秒级粒度时，同一秒内两次隔离会互相覆盖备份。
 
@@ -304,8 +333,7 @@ def _quarantine_report_state(path):
     日志由调用方（路由）记。改名失败也不阻断本次写入 —— 状态文件只值几个勾，
     为它挡掉用户刚做的勾选不划算（与知识库坏文件的「宁可这次不沉淀」方向不同）。
     """
-    raw = read_text(path, "")
-    if not raw.strip() or read_json(path, None) is not None:
+    if not content_bytes_present(path) or read_json(path, None) is not None:
         return
     backup = "%s.corrupt-%s" % (path, datetime.now().strftime("%Y%m%d%H%M%S%f"))
     try:

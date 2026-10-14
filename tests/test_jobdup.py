@@ -10,6 +10,7 @@ import glob
 import hashlib
 import importlib
 import io
+import json
 import os
 import sys
 import unittest
@@ -377,6 +378,37 @@ class MergeRollbackTest(IsolatedCase):
                          ["keep", "drop"])
         self.assertEqual(store.load_interview_json("iv1", "status.json")["job_id"], "drop")
         self.assertIsNone({j["id"]: j for j in store.load_jobs()}["drop"].get("merged_into"))
+
+
+class MergeRollbackNonUtf8Test(IsolatedCase):
+    """回滚必须**逐字节**还原，哪怕原文件是非 UTF-8。
+
+    老实现 `_snapshot` 是 `write_text(backup, read_text(path, ""))`：GBK 文件被兜成 `""`，
+    **快照里存的就是空** → 回滚把用户的文件写成空的，连备份里也没有原文。
+    """
+
+    def test_rollback_restores_non_utf8_kb_bytes_exactly(self):
+        store.upsert_job({"id": "keep", "job_title": "k", "created_at": "2026-10-03 00:30"})
+        store.upsert_job({"id": "drop", "job_title": "d", "created_at": "2026-10-08 16:40"})
+        store.write_text(store.p_path("jd", "keep.txt"), FindDuplicatesTest.LONG)
+        store.write_text(store.p_path("jd", "drop.txt"), FindDuplicatesTest.SHORT)
+        # 知识库用 **GBK** 写（模拟被非 UTF-8 工具写坏）：里面有用户的卡
+        raw = json.dumps({"version": 1, "nodes": [
+            {"id": "语音识别", "term": "语音识别", "definition": "把语音转文字",
+             "plain_explanation": "通俗", "sources": [{"url": "https://w"}],
+             "from_jds": [{"id": "keep", "job_title": "k", "date": "2026-10-03"}]}]},
+            ensure_ascii=False).encode("gbk")
+        with open(store.knowledge_path(), "wb") as f:
+            f.write(raw)
+
+        with mock.patch.object(store, "save_jobs", side_effect=OSError("disk full")):
+            res = jobdup.merge_jobs("keep", "drop")
+
+        self.assertFalse(res["ok"])
+        self.assertTrue(res["rolled_back"])
+        with open(store.knowledge_path(), "rb") as f:
+            self.assertEqual(f.read(), raw,
+                             "回滚必须逐字节还原 —— 不许把 GBK 的知识库写成空的")
 
 
 if __name__ == "__main__":
