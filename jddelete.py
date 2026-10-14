@@ -178,21 +178,11 @@ def _readable_jds_or_raise():
 def _knowledge_or_error():
     """`(知识库数据, 读不出来的原因)` —— 只用于**如实说明**，不用来拒绝删除。
 
-    知识库坏掉**不会丢数据**（`kb_touched` 会保持 0，于是根本不会写它），
-    但"引用没清干净"这件事必须说出来：否则用户以为引用清了、其实还指着那个已删的岗位。
-    与 F1 的差别就在这里 —— 那里会把坏文件**覆盖**掉，这里不会。
+    实现已收归 `store.read_knowledge_strict()`（"读不出来 ≠ 没有"这条规则只准有一份）。
+    为什么删除**不**因它而停下：知识库坏掉不会丢数据（`kb_touched` 保持 0，于是根本不会写它），
+    但"引用没清干净"必须说出来。
     """
-    path = store.knowledge_path()
-    if not os.path.exists(path):
-        return {"nodes": []}, ""
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception as e:
-        return {"nodes": []}, "知识库 `knowledge.json` 读不出来：%s" % e
-    if not isinstance(data, dict) or not isinstance(data.get("nodes"), list):
-        return {"nodes": []}, "知识库 `knowledge.json` 的结构不对（应当是含 `nodes` 列表的对象）"
-    return data, ""
+    return store.read_knowledge_strict()
 
 
 def _digest(text):

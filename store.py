@@ -205,6 +205,28 @@ def load_knowledge(key=None):
     return d
 
 
+def read_knowledge_strict(path=None):
+    """读知识库，**区分"读不出来"与"没有"**：返回 `(data, 原因)`，原因非空 = 不可信。
+
+    为什么必须有这么一个函数：`load_knowledge()` 在任何读/解析失败时都返回
+    `{"nodes": []}`，而调用方往往会**把它写回去** —— 于是"一次读失败"就等于
+    "用户的全部积累被清空"。这条规则**只准有一份实现**（`jddelete` 与 `kbreuse` 都用它）。
+
+    **只读**：不隔离、不改名、不写盘（坏文件原样留着，等用户或 `kb.absorb` 自己处理）。
+    """
+    p = path or knowledge_path()
+    if not os.path.exists(p):
+        return {"nodes": []}, ""
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        return {"nodes": []}, "知识库 `knowledge.json` 读不出来：%s" % e
+    if not isinstance(data, dict) or not isinstance(data.get("nodes"), list):
+        return {"nodes": []}, "知识库 `knowledge.json` 的结构不对（应当是含 `nodes` 列表的对象）"
+    return data, ""
+
+
 def save_knowledge(kb, key=None):
     write_json(knowledge_path(key), kb)
 

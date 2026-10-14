@@ -117,5 +117,46 @@ class InterviewStoreTest(IsolatedCase):
                          {"state": "?"})
 
 
+class ReadKnowledgeStrictTest(IsolatedCase):
+    """`read_knowledge_strict()`：**区分"读不出来"与"没有"**。
+
+    这条区分是阶段 D 两条数据丢失路径的根因（把"读不出来"当成"空"，然后写回去），
+    所以它只准有一份实现。
+    """
+
+    def test_a_missing_file_is_empty_with_no_reason(self):
+        data, err = store.read_knowledge_strict()
+        self.assertEqual(data, {"nodes": []})
+        self.assertEqual(err, "", "文件不存在不是错误")
+
+    def test_a_valid_file_returns_its_nodes(self):
+        store.save_knowledge({"nodes": [{"id": "a", "term": "A"}]})
+        data, err = store.read_knowledge_strict()
+        self.assertEqual([n["id"] for n in data["nodes"]], ["a"])
+        self.assertEqual(err, "")
+
+    def test_a_corrupt_file_reports_a_reason_instead_of_a_silent_empty(self):
+        with open(store.knowledge_path(), "wb") as f:
+            f.write(b'{"nodes": [ <<<CORRUPT>>>')
+        data, err = store.read_knowledge_strict()
+        self.assertEqual(data, {"nodes": []})
+        self.assertTrue(err, "坏文件必须给出原因，绝不能静默当成空库")
+        self.assertIn("knowledge.json", err)
+
+    def test_a_wrong_shape_reports_a_reason(self):
+        store.write_text(store.knowledge_path(), '{"nodes": "not-a-list"}')
+        data, err = store.read_knowledge_strict()
+        self.assertEqual(data, {"nodes": []})
+        self.assertTrue(err, "结构不对也算读不出来")
+
+    def test_it_does_not_write_anything(self):
+        bad = b'{"nodes": [ <<<CORRUPT>>>'
+        with open(store.knowledge_path(), "wb") as f:
+            f.write(bad)
+        store.read_knowledge_strict()
+        with open(store.knowledge_path(), "rb") as f:
+            self.assertEqual(f.read(), bad, "只读：坏文件原样留着")
+
+
 if __name__ == "__main__":
     unittest.main()
