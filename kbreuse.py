@@ -256,3 +256,103 @@ def build_index(cards=None):
         log.log_event("kbreuse.kb_unreadable", level="warn", error=err)
         return Index([]), err
     return Index(data.get("nodes") or []), ""
+
+
+# 从卡片整条复制到节点上的字段。**刻意不含 `related`**：
+# 它的 `{id}` 指向**上一次分析**的节点（`store.slug`），复制到本次报告里就是断链
+# （本次节点的 related 由模型为这个 JD 头脑风暴产生，指向的 id 都在本次报告里）。
+_COPY_FIELDS = ("definition", "plain_explanation", "category", "sources", "timeline",
+                "interview_questions", "state")
+# `term` 单独处理（取规范名 + 记原写法），`layer` 取 min，`confidence` 按有无来源重算。
+
+
+def _origin_of(card):
+    """这张卡**最早**的 `from_jds` 条目 → `{"job_title","date"}`（报告标注用）。"""
+    rows = [x for x in ((card or {}).get("from_jds") or []) if isinstance(x, dict)]
+    if not rows:
+        return {"job_title": "", "date": ""}
+    first = min(rows, key=lambda x: str(x.get("date") or ""))
+    return {"job_title": str(first.get("job_title") or ""), "date": str(first.get("date") or "")}
+
+
+def _fill_from_card(node, card):
+    """把库里那份**整条**覆盖到节点上，返回节点**原来的**写法（`term_original`）。
+
+    三处刻意不动：
+      * `node["id"]` —— 报告里的关联概念图按它连线，改它会打断 `related`；
+      * `node["related"]` —— 见 `_COPY_FIELDS` 上面的注释；
+      * `node["kb_reuse"]` —— 由调用方 `plan_nodes` 写（这里只管内容）。
+    """
+    original = str(node.get("term") or "")
+    for k in _COPY_FIELDS:
+        if k in card:
+            v = card[k]
+            node[k] = list(v) if isinstance(v, list) else v
+    node["layer"] = min(int(node.get("layer") or 0), int(card.get("layer") or 0))
+    node["confidence"] = "verified" if card.get("sources") else "ai-generated"
+    node["term"] = str(card.get("term") or original)
+    return original
+
+
+def plan_nodes(nodes, index, call=None):
+    """就地做"库优先"：确定性匹配 →（可选）模型判定 → 填充 → 统计。
+
+    返回统计（报告标注与日志都用它），并把 `kb_reuse` 写在每个**命中**的节点上。
+    `call` 是**已经绑好 cfg 的模型调用函数**（`call(messages) -> reply 文本`）；
+    `call=None` = 只做确定性匹配（不花模型调用），这也是模型判定不可用时的降级形态。
+    """
+    nodes = list(nodes or [])
+    stats = {"total": len(nodes), "matched": 0, "reusable": 0, "timeline_reused": 0,
+             "enriched": 0, "searched": len(nodes), "knowledge_error": ""}
+    idx = index if index is not None else Index([])
+    if len(idx) == 0:
+        return stats
+    found = {}      # id(node) -> (card, matched_by)
+    for n in nodes:
+        card, how = idx.lookup(n.get("term"))
+        if card is not None:
+            found[id(n)] = (card, how)
+    rest = [n for n in nodes if id(n) not in found]
+    if call is not None and rest:
+        pairs = judge(rest, idx, call)
+        for n in rest:
+            card = idx.cards.get(pairs.get(str(n.get("term") or "")))
+            if card is not None:
+                found[id(n)] = (card, "assisted")
+    for n in nodes:
+        hit = found.get(id(n))
+        if hit is None:
+            continue
+        card, how = hit
+        reusable, missing = _card_completeness(card)
+        stats["matched"] += 1
+        original = ""
+        if reusable:
+            original = _fill_from_card(n, card)
+            stats["reusable"] += 1
+            if card.get("timeline"):
+                stats["timeline_reused"] += 1
+        else:
+            stats["enriched"] += 1
+        n["kb_reuse"] = {
+            "card_id": kb.normalize_id(card.get("term")),
+            "card_term": str(card.get("term") or ""),
+            # ⚠️ **只在名字真的不同时**才记原写法：同名时留空串。
+            # 不能直接写 `original if reusable else ""` —— 那样同名也会把原名塞进去，
+            # 报告里就会冒出一句多余的「JD 里写作 语音识别」。
+            "term_original": (original if (reusable and original
+                                           and original != str(card.get("term") or "")) else ""),
+            "matched_by": how,
+            "reusable": bool(reusable),
+            "missing": list(missing),
+            "got": ("all" if (reusable and card.get("timeline")) else
+                    ("sources" if reusable else "")),
+            "origin": _origin_of(card),
+        }
+    stats["searched"] = stats["total"] - stats["reusable"]
+    return stats
+
+
+def judge(nodes, index, call):
+    """（Task 5 实现）模型判定。当前是占位版：返回空 = 只做确定性匹配。"""
+    return {}

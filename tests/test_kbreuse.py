@@ -461,3 +461,129 @@ class JudgeTermsTest(IsolatedCase):
     def test_missing_definition_becomes_an_empty_string_not_the_word_none(self):
         idx = kbreuse.Index([{"id": "x", "term": "X", "definition": None}])
         self.assertEqual(idx.terms_for_judge()[0]["definition"], "")
+
+
+class PlanNodesTest(IsolatedCase):
+    def _node(self, term, **kw):
+        n = {"id": store.slug(term), "term": term, "definition": "本次写的定义",
+             "plain_explanation": "本次写的通俗解释", "category": "核心概念", "layer": 0,
+             "sources": [], "timeline": [], "related": [], "interview_questions": [],
+             "confidence": "ai-generated", "state": "待学习"}
+        n.update(kw)
+        return n
+
+    def _card(self, term="语音识别", **kw):
+        c = {"id": kb.normalize_id(term), "term": term,
+             "definition": "库里的定义", "plain_explanation": "库里的通俗解释",
+             "category": "核心概念", "layer": 0,
+             "sources": [{"title": "维基", "url": "https://w"}],
+             "timeline": [{"year": "2010", "text": "库里的时间线"}],
+             "related": [{"id": "别的节点", "relation": "相关"}],
+             "interview_questions": ["会怎么问"], "state": "已掌握",
+             "from_jds": [{"id": "老岗位", "job_title": "语音/文本评测", "date": "2026-10-03"}]}
+        c.update(kw)
+        return c
+
+    def test_a_reusable_hit_is_copied_wholesale_and_marked(self):
+        node = self._node("语音识别")
+        card = self._card()
+        stats = kbreuse.plan_nodes([node], kbreuse.Index([card]))
+        self.assertEqual(stats["reusable"], 1)
+        self.assertEqual(node["definition"], "库里的定义", "整条用库里那份（spec 决策 5）")
+        self.assertEqual(node["plain_explanation"], "库里的通俗解释")
+        self.assertEqual(node["sources"], card["sources"])
+        self.assertEqual(node["timeline"], card["timeline"])
+        self.assertEqual(node["state"], "已掌握")
+        self.assertEqual(node["confidence"], "verified")
+        r = node["kb_reuse"]
+        self.assertTrue(r["reusable"])
+        self.assertEqual(r["card_id"], "语音识别")
+        self.assertEqual(r["matched_by"], "exact")
+        self.assertEqual(r["got"], "all", "库里有时间线 → 时间线也不用跑")
+        self.assertEqual(r["term_original"], "", "同名时原写法留空")
+        self.assertEqual(r["origin"], {"job_title": "语音/文本评测", "date": "2026-10-03"})
+
+    def test_a_hit_without_a_timeline_is_reused_but_needs_the_timeline(self):
+        node = self._node("语音识别")
+        kbreuse.plan_nodes([node], kbreuse.Index([self._card(timeline=[])]))
+        self.assertTrue(node["kb_reuse"]["reusable"])
+        self.assertEqual(node["kb_reuse"]["got"], "sources", "缺时间线 → ④ 还要跑一次补算")
+        self.assertEqual(node["timeline"], [])
+        self.assertIn("timeline", node["kb_reuse"]["missing"])
+
+    def test_an_incomplete_card_is_matched_but_not_reused_and_content_is_untouched(self):
+        node = self._node("语音识别")
+        stats = kbreuse.plan_nodes([node], kbreuse.Index([self._card(sources=[])]))
+        self.assertEqual(stats["matched"], 1)
+        self.assertEqual(stats["reusable"], 0)
+        self.assertEqual(stats["enriched"], 1, "命中但不够格 → 联网并把结果写回那张卡")
+        self.assertFalse(node["kb_reuse"]["reusable"])
+        self.assertIn("sources", node["kb_reuse"]["missing"])
+        self.assertEqual(node["definition"], "本次写的定义", "不够格时**不许改内容**，让 ③④ 去跑")
+        self.assertEqual(node["sources"], [])
+
+    def test_a_different_name_gets_renamed_to_the_canonical_term(self):
+        """身份对齐（spec §7）：名字必须改成库里的规范名，否则写回会新建重复卡。
+
+        ⚠️ **夹具必须让它们真的能命中**（第一版计划在这里错过）：确定性匹配**不可能**知道
+        「ASR」=「语音识别」，所以这里给卡片记一个 `aliases: ["ASR"]` ——
+        于是节点「ASR」能通过**别名**命中「语音识别」，才走到了"改名"这一步。
+        """
+        node = self._node("ASR")
+        kbreuse.plan_nodes([node], kbreuse.Index([self._card(term="语音识别", aliases=["ASR"])]))
+        self.assertEqual(node["kb_reuse"]["matched_by"], "alias")
+        self.assertEqual(node["term"], "语音识别")
+        self.assertEqual(node["kb_reuse"]["term_original"], "ASR")
+        self.assertEqual(node["kb_reuse"]["card_term"], "语音识别")
+
+    def test_the_node_id_is_not_touched(self):
+        """`id` 是报告里关联概念图用的，改它会打断 `related` 引用（spec §7）。
+
+        先断言"确实命中了"，否则这条会因为没命中而**假绿**。
+        """
+        node = self._node("ASR")
+        before = node["id"]
+        kbreuse.plan_nodes([node], kbreuse.Index([self._card(term="语音识别", aliases=["ASR"])]))
+        self.assertIn("kb_reuse", node, "没命中就没有'改不改 id'这回事（假绿）")
+        self.assertEqual(node["term"], "语音识别", "夹具前提：这条确实走了改名")
+        self.assertEqual(node["id"], before)
+
+    def test_related_is_not_copied_from_the_card(self):
+        """卡片的 `related[].id` 指向**上一次分析**的节点，复制过来在本次报告里是断链。"""
+        node = self._node("语音识别")
+        kbreuse.plan_nodes([node], kbreuse.Index([self._card()]))
+        self.assertEqual(node["related"], [], "不复制 related（spec §7）")
+
+    def test_a_miss_is_left_completely_alone(self):
+        node = self._node("完全不相干的概念")
+        stats = kbreuse.plan_nodes([node], kbreuse.Index([self._card()]))
+        self.assertEqual(stats, {"total": 1, "matched": 0, "reusable": 0,
+                                 "timeline_reused": 0, "enriched": 0, "searched": 1,
+                                 "knowledge_error": ""})
+        self.assertNotIn("kb_reuse", node)
+
+    def test_two_nodes_resolving_to_one_card_both_get_reused(self):
+        """确定性同名就是同一个概念，两个都复用（spec §5）。"""
+        a, b = self._node("语音识别"), self._node("语音识别")
+        b["id"] = "另一个-id"
+        stats = kbreuse.plan_nodes([a, b], kbreuse.Index([self._card()]))
+        self.assertEqual(stats["reusable"], 2)
+        self.assertEqual(a["definition"], "库里的定义")
+        self.assertEqual(b["definition"], "库里的定义")
+
+    def test_stats_count_what_will_still_be_searched(self):
+        nodes = [self._node("语音识别"), self._node("词错率（WER）"), self._node("没见过的概念")]
+        idx = kbreuse.Index([self._card(), self._card(term="词错率（WER）", timeline=[])])
+        stats = kbreuse.plan_nodes(nodes, idx)
+        self.assertEqual(stats["total"], 3)
+        self.assertEqual(stats["matched"], 2)
+        self.assertEqual(stats["reusable"], 2, "缺时间线也算 reusable")
+        self.assertEqual(stats["timeline_reused"], 1, "只有库里带时间线的那条省掉 ④")
+        self.assertEqual(stats["searched"], 1, "没命中的那条才是真要联网的")
+
+    def test_an_empty_index_leaves_everything_alone(self):
+        node = self._node("语音识别")
+        stats = kbreuse.plan_nodes([node], kbreuse.Index([]))
+        self.assertEqual(stats["searched"], 1)
+        self.assertNotIn("kb_reuse", node)
+        self.assertEqual(node["definition"], "本次写的定义")
