@@ -4,6 +4,7 @@ import json
 import os
 import re
 import tempfile
+import threading
 from datetime import datetime
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -28,6 +29,33 @@ STATUSES = ["未投递", "已投", "待回复", "面试中", "已拒", "Offer", 
 # 覆盖前留档的命名后缀（与 `jobdup.BACKUP_SUFFIX` 同一风格；`_quarantine_report_state` 用的是
 # `.corrupt-<时间戳>`，那个语义是"读不出来的坏文件先挪走"，与"留一份覆盖前的样子"不同）。
 BACKUP_SUFFIX = ".bak-"
+
+# 每个目标文件**只保留最新几份** `.bak-`，更旧的删掉（轮转）。
+# 为什么是 3：留档的用处是"这次覆盖错了，马上退回上一两次的样子"，最近 3 次足够覆盖真实误操作
+# （连点几次"保存设置"、连跑几次分析）；再多也只是让 profile 目录无上限变大 —— `upsert_job`
+# **每次分析**都留一份，而 `简历迁移` / `身份迁移` 的整目录备份还会把这些 `.bak-` 一起拷走。
+BACKUP_KEEP = 3
+
+# ---------- 并发：读-改-写的整体互斥 ----------
+# 为什么 store 需要锁：`jobs.json` 的读-改-写（`upsert_job` = load → 改 → 整份写回）在并发下会
+# **静默丢台账** —— 两个分析各自读到同一份旧台账、各自写回，后写的把先写的那条顶掉
+# （实测 20 轮 ×2 条 → 20/20 全丢）。而 `jds.json`(`jdid._JD_LOCK`)、`knowledge.json`
+# (`kb._KB_LOCK`)、`resumes.json`(`resumelib._LOCK`)、`log`、`jobdup` 早就有锁，只有台账没有。
+# 锁加在 store 而不是调用方：app / jddelete / jdid / jobdup 四个写者因此共用同一把（包在 app 一层
+# 等于没修，另外三个写者照样互踩）。
+#
+# 用 RLock 而不是 Lock：`upsert_job` 内部要调 `load_jobs` / `save_jobs`，同一线程必须能重入
+# （普通 Lock 会当场死锁）。名字与注释风格照 `kb._KB_LOCK` / `jdid._JD_LOCK`。
+#
+# 锁序：store 是**叶子模块**（不 import 任何别的项目模块），这两把锁永远是**最内层**的锁，
+# 锁序恒为"上层锁 → store 的锁"（`_JD_LOCK` / `_MERGE_LOCK` / `app._STORE_PATCH_LOCK` → 这里），
+# 不存在反向获取，因此不会与既有锁形成环。
+# 为什么分两把（而不是一把罩两个文件）：一把锁只护一个文件，与 `_JD_LOCK`(jds.json) /
+# `_KB_LOCK`(knowledge.json) 同一风格，"这把锁在护谁"一眼可见；且 store 里**没有任何一处**
+# 同时碰台账与配置（两把锁之间零嵌套），所以它们之间不存在锁序问题，分开也不会互相排队 ——
+# "保存设置"没必要等"分析落台账"写盘。
+_JOBS_LOCK = threading.RLock()
+_CONFIG_LOCK = threading.RLock()
 
 
 class ProfileUnreadable(RuntimeError):
@@ -214,33 +242,40 @@ def config_path(key=None):
 
 
 def load_config(key=None):
-    cfg = json.loads(json.dumps(DEFAULT_CONFIG))
-    data = read_json(config_path(key), {})
-    if isinstance(data, dict):
-        for k in ("text_model", "vision_model"):
-            if isinstance(data.get(k), dict):
-                cfg[k].update({kk: vv for kk, vv in data[k].items() if vv is not None})
-        if isinstance(data.get("search_providers"), list):
-            cfg["search_providers"] = data["search_providers"]
-        # 可调项：用户可在 config.json 里改搜索次数上限（bool 是 int 子类，要排除）
-        ms = data.get("max_searches")
-        if isinstance(ms, int) and not isinstance(ms, bool) and ms >= 0:
-            cfg["max_searches"] = ms
-    return cfg
+    """读配置（持 `_CONFIG_LOCK`：与 `save_config` 的整份覆盖互斥，见 `_CONFIG_LOCK` 的注释）。"""
+    with _CONFIG_LOCK:
+        cfg = json.loads(json.dumps(DEFAULT_CONFIG))
+        data = read_json(config_path(key), {})
+        if isinstance(data, dict):
+            for k in ("text_model", "vision_model"):
+                if isinstance(data.get(k), dict):
+                    cfg[k].update({kk: vv for kk, vv in data[k].items() if vv is not None})
+            if isinstance(data.get("search_providers"), list):
+                cfg["search_providers"] = data["search_providers"]
+            # 可调项：用户可在 config.json 里改搜索次数上限（bool 是 int 子类，要排除）
+            ms = data.get("max_searches")
+            if isinstance(ms, int) and not isinstance(ms, bool) and ms >= 0:
+                cfg["max_searches"] = ms
+        return cfg
 
 
 def save_config(cfg, key=None):
-    """写配置。**读不出来时拒绝**（理由见 `config_safe_to_write`），覆盖前留一份 `.bak-`。"""
-    p = config_path(key)
-    ok, err = config_safe_to_write(p)
-    if not ok:
-        raise RuntimeError(
-            "%s。**拒绝保存设置**：`load_config()` 读不出来时回的是默认配置"
-            "（`api_key` 为空、`search_providers` 为空），它**看起来就是「没配过」的样子** ——"
-            "写下去就是真的 API Key 与搜索来源永久消失，盘上没有任何副本。"
-            "请先把 `config.json` 修好（或从别处恢复、把它移开）再保存。" % err)
-    snapshot_before_overwrite(p)
-    write_json(p, cfg)
+    """写配置。**读不出来时拒绝**（理由见 `config_safe_to_write`），覆盖前留一份 `.bak-`。
+
+    ⚠️ 整个"判能不能写 → 留档 → 写盘"在 `_CONFIG_LOCK` 里：判据与写盘之间若挤进另一个写者，
+    留档就不再是"覆盖前"那一份（`jobs.json` 的丢更新就是同一个毛病）。
+    """
+    with _CONFIG_LOCK:
+        p = config_path(key)
+        ok, err = config_safe_to_write(p)
+        if not ok:
+            raise RuntimeError(
+                "%s。**拒绝保存设置**：`load_config()` 读不出来时回的是默认配置"
+                "（`api_key` 为空、`search_providers` 为空），它**看起来就是「没配过」的样子** ——"
+                "写下去就是真的 API Key 与搜索来源永久消失，盘上没有任何副本。"
+                "请先把 `config.json` 修好（或从别处恢复、把它移开）再保存。" % err)
+        snapshot_before_overwrite(p)
+        write_json(p, cfg)
 
 
 def read_config_strict(path=None):
@@ -293,8 +328,10 @@ def jobs_path(key=None):
 
 
 def load_jobs(key=None):
-    d = read_json(jobs_path(key), [])
-    return d if isinstance(d, list) else []
+    """读台账（持 `_JOBS_LOCK`：与 `save_jobs` 的整份覆盖互斥，见 `_JOBS_LOCK` 的注释）。"""
+    with _JOBS_LOCK:
+        d = read_json(jobs_path(key), [])
+        return d if isinstance(d, list) else []
 
 
 def read_jobs_strict(path=None):
@@ -348,38 +385,51 @@ def jobs_safe_to_write(path=None):
 
 
 def save_jobs(jobs, key=None):
-    """写台账。**读不出来时拒绝**（理由见 `jobs_safe_to_write`），覆盖前留一份 `.bak-`。"""
-    p = jobs_path(key)
-    ok, err = jobs_safe_to_write(p)
-    if not ok:
-        raise RuntimeError(
-            "%s。**拒绝写入**：`save_jobs` / `upsert_job` 是**整份覆盖**，而现在内存里那份是从"
-            "读不出来的文件兜出来的空台账 —— 写下去就是所有岗位的分析记录一次性没掉。"
-            "请先把 `jobs.json` 修好（或从别处恢复、把它移开）再保存。" % err)
-    snapshot_before_overwrite(p)
-    write_json(p, jobs)
+    """写台账。**读不出来时拒绝**（理由见 `jobs_safe_to_write`），覆盖前留一份 `.bak-`。
+
+    ⚠️ 整个"判能不能写 → 留档 → 写盘"在 `_JOBS_LOCK` 里（理由见 `_JOBS_LOCK` 的注释）：
+    判据与写盘之间若挤进另一个写者，留下就不是"覆盖前"那一份了。
+    """
+    with _JOBS_LOCK:
+        p = jobs_path(key)
+        ok, err = jobs_safe_to_write(p)
+        if not ok:
+            raise RuntimeError(
+                "%s。**拒绝写入**：`save_jobs` / `upsert_job` 是**整份覆盖**，而现在内存里那份是从"
+                "读不出来的文件兜出来的空台账 —— 写下去就是所有岗位的分析记录一次性没掉。"
+                "请先把 `jobs.json` 修好（或从别处恢复、把它移开）再保存。" % err)
+        snapshot_before_overwrite(p)
+        write_json(p, jobs)
 
 
 def upsert_job(record, key=None):
-    p = jobs_path(key)
-    # ⚠️ 先判"能不能写"再读：读不出来时 `load_jobs()` 给的是 `[]`，
-    # 拿它去 upsert 就是把整份台账换成这一条（老行为，实测丢过）。
-    ok, err = jobs_safe_to_write(p)
-    if not ok:
-        raise RuntimeError(
-            "%s。**拒绝写入**：这次 upsert 会把整份台账覆盖成「这一条 + 读出来的空列表」，"
-            "旧记录会在盘上消失且没有副本。请先把 `jobs.json` 修好"
-            "（或从别处恢复、把它移开）再分析。" % err)
-    jobs = load_jobs(key)
-    for i, j in enumerate(jobs):
-        if j.get("id") == record.get("id"):
-            j.update(record)
-            jobs[i] = j
-            save_jobs(jobs, key)
-            return j
-    jobs.insert(0, record)
-    save_jobs(jobs, key)
-    return record
+    """插入/更新一条分析记录。**整段在 `_JOBS_LOCK` 里**：读 → 改 → 写是一个临界区。
+
+    ⚠️ 锁必须包住整个读-改-写，不能只包 `save_jobs`：`upsert_job` 是分析落盘的**唯一真出口**
+    （`app._write_analysis`、`outcome.py` 都走它），两个并发分析各持一份"读出来的旧台账"，
+    后写的就会把先写的那条**静默**顶掉（实测 20/20 丢）。只锁写盘那一步挡不住这种丢更新
+    —— 那正是"两个写者各自读、各自写"的经典丢失。
+    """
+    with _JOBS_LOCK:
+        p = jobs_path(key)
+        # ⚠️ 先判"能不能写"再读：读不出来时 `load_jobs()` 给的是 `[]`，
+        # 拿它去 upsert 就是把整份台账换成这一条（老行为，实测丢过）。
+        ok, err = jobs_safe_to_write(p)
+        if not ok:
+            raise RuntimeError(
+                "%s。**拒绝写入**：这次 upsert 会把整份台账覆盖成「这一条 + 读出来的空列表」，"
+                "旧记录会在盘上消失且没有副本。请先把 `jobs.json` 修好"
+                "（或从别处恢复、把它移开）再分析。" % err)
+        jobs = load_jobs(key)
+        for i, j in enumerate(jobs):
+            if j.get("id") == record.get("id"):
+                j.update(record)
+                jobs[i] = j
+                save_jobs(jobs, key)
+                return j
+        jobs.insert(0, record)
+        save_jobs(jobs, key)
+        return record
 
 
 def find_job(job_id, key=None):
@@ -472,6 +522,46 @@ def file_has_bytes_to_lose(path):
         return True
 
 
+def _prune_backups(path, keep=BACKUP_KEEP):
+    """只留最新 `keep` 份 `<path>.bak-*`，更旧的删掉；返回被删掉的路径列表。
+
+    "新旧"按**文件名里的时间戳**判断（不是 mtime、也不是文件名本身）：
+    仓库里 `.bak-` 有**两种真实命名**，都以微秒结尾、都是定宽 ——
+      - `snapshot_before_overwrite`：`%Y%m%d%H%M%S%f`（20 位纯数字）
+      - `jobdup._snapshot`：`%Y%m%d_%H%M%S_%f`（22 位、带下划线）
+    直接比文件名时 `_`(0x5F) 比数字大，**同一天的两种格式会交错**，于是"按名字最小"的那个
+    可能并不是最旧的 → 删错一份（`test_rotation_orders_by_timestamp_not_by_filename` 钉住它）。
+    去掉分隔符后两者都是同一个 20 位数字串，字符串比较与时间先后一致。
+    认不出时间戳的名字（本项目的两个写者都不会产生）**排最后、当成最新**：删不掉只是少腾一点
+    空间，删错了就是永久少一份原像（fail-safe）。
+
+    删不掉（被占用/权限）**不抛**：轮转是清理，不该让用户这次写盘因为清理失败而失败
+    （与 `_quarantine_report_state` 同一个取舍）。
+    """
+    prefix = os.path.basename(path) + BACKUP_SUFFIX
+    d = os.path.dirname(path) or "."
+    try:
+        names = [n for n in os.listdir(d) if n.startswith(prefix)]
+    except OSError:
+        return []
+
+    def sort_key(name):
+        digits = re.sub(r"\D", "", name[len(prefix):])
+        return (not digits, digits, name)          # 认不出时间戳的排最后（当成最新）
+
+    names.sort(key=sort_key)
+    keep = max(0, int(keep))
+    removed = []
+    for name in names[:max(0, len(names) - keep)]:
+        full = os.path.join(d, name)
+        try:
+            os.remove(full)
+        except OSError:
+            continue
+        removed.append(full)
+    return removed
+
+
 def snapshot_before_overwrite(path):
     """覆盖前留档：文件**存在且真的有字节** → 复制成同目录 `<path>.bak-<时间戳>`，返回备份路径。
 
@@ -486,6 +576,11 @@ def snapshot_before_overwrite(path):
 
     判据是"**真的有字节**"而不是"有可见内容"：纯空白的老台账也是花过钱的分析留下的痕迹。
 
+    **轮转**：留档之后只保留最新 `BACKUP_KEEP`（= 3）份，更旧的删掉（见 `_prune_backups`）。
+    为什么必须有：本函数是 `upsert_job` 的必经之路，而 `upsert_job` **每次分析**都走
+    —— 连写 6 次就是 6 份；`简历迁移` / `身份迁移` 的整目录备份还会把它们一起拷走，
+    profile 目录因此无上限增长。为什么是 3：够退回最近几次覆盖，又不会无限长。
+
     文件不存在 / 0 字节 → 返回 `None`（合法的第一次，没有旧内容可留）。
     备份**失败就抛**：调用方本来就在写盘路径上，悄悄少一份留档正是
     "以为有兜底、其实没有"那类假安全感（同一目录写不出字节时，紧随其后的写盘多半也会失败，
@@ -495,6 +590,7 @@ def snapshot_before_overwrite(path):
         return None
     backup = "%s%s%s" % (path, BACKUP_SUFFIX, datetime.now().strftime("%Y%m%d%H%M%S%f"))
     write_bytes(backup, read_bytes(path) or b"")
+    _prune_backups(path)
     return backup
 
 

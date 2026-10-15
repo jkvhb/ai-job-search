@@ -53,11 +53,20 @@ def _sha(path):
         return hashlib.sha256(f.read()).hexdigest()
 
 
-def _tree(root, skip=("logs",)):
+def _tree(root, skip=("logs",), keep_backups=False):
     """目录下每个文件的**相对路径 → 内容指纹**（整棵树的指纹）。
 
-    默认跳过 `logs/`：回滚路径**故意**写一条失败日志（那是审计，不是数据），
-    把它算进"逐字节还原"里会让这条断言变成「日志没写」的假红。
+    默认跳过两类**非数据**文件：
+      - `logs/`：回滚路径**故意**写一条失败日志（那是审计，不是数据），
+        把它算进"逐字节还原"里会让这条断言变成「日志没写」的假红。
+      - `<文件>.bak-<时间戳>`：`store.snapshot_before_overwrite` / `jobdup._snapshot` 在
+        **覆盖之前**留的档（`store.BACKUP_SUFFIX`）。它是写入路径的旁路产物：既不是用户原来的
+        数据，也不是回滚该负责的东西 —— 不排除它，「失败 → 回滚 → 整棵树逐字节还原」会因为
+        多出一个 `jobs.json.bak-<ts>` 而**假红**（本次实测）。留档自己的内容与上限（只留最新 3 份）
+        由 `tests/test_store.py` 的轮转用例钉着，不靠这里兜。
+
+    `keep_backups=True` 时**不**排除 `.bak-`：**只读预演**那两条断言要连留档一起指纹
+    （"预演不许在任何地方落盘"当然也包括不许落一份 `.bak-`）。
     """
     out = {}
     for dirpath, _dirs, files in os.walk(root):
@@ -65,6 +74,8 @@ def _tree(root, skip=("logs",)):
         if any(rel_dir == s or rel_dir.startswith(s + os.sep) for s in skip):
             continue
         for fn in sorted(files):
+            if not keep_backups and store.BACKUP_SUFFIX in fn:
+                continue
             p = os.path.join(dirpath, fn)
             out[os.path.relpath(p, root)] = _sha(p)
     return out
@@ -178,10 +189,10 @@ class JdPurgePreviewTest(_PurgeCase):
         self.assertIn("不在盘上", self._advisories_text(p))
 
     def test_preview_is_strictly_read_only(self):
-        before = _tree(store.profile_dir())
+        before = _tree(store.profile_dir(), keep_backups=True)
         jddelete.preview_purge(JD_A)
         jddelete.preview_purge(JD_B)
-        after = _tree(store.profile_dir())
+        after = _tree(store.profile_dir(), keep_backups=True)
         # 逐文件指纹不变（不只比文件数：改了一个字节也要红）
         self.assertEqual(after, before)
 
@@ -685,16 +696,18 @@ class JdPurgePreviewPinningTest(_PurgeCase):
         self.assertTrue(missing["not_found"])
 
     def test_the_preview_writes_nothing_anywhere_under_the_profiles_root(self):
-        """只读预演不许在**任何**地方落盘 —— 包括备份目录。
+        """只读预演不许在**任何**地方落盘 —— 包括备份目录、也包括 `.bak-` 留档。
 
         原断言只指纹 `store.profile_dir()`，而备份落在它的**同级**
         （`profiles/删除备份_*`）：一个"预演也会建备份"的实现不会被抓到。
+        这里显式 `keep_backups=True`：`_tree` 默认忽略 `.bak-`（那是回滚断言的旁路产物），
+        但"预演什么都不写"这条不变量**故意**连留档一起指纹 —— 不许把默认的忽略当成放行。
         """
-        before = _tree(store.profiles_root())
+        before = _tree(store.profiles_root(), keep_backups=True)
         jddelete.preview_purge(JD_A)
         jddelete.preview_purge(JD_B)
         jddelete.preview_purge("根本没有这个 ID_0001")
-        self.assertEqual(_tree(store.profiles_root()), before)
+        self.assertEqual(_tree(store.profiles_root(), keep_backups=True), before)
 
     def test_every_analysis_carrying_jd_files_contributes_its_own(self):
         """**每条**分析自带的 `jd_text_file` / `jd_image` 都要收（不只第一条）。

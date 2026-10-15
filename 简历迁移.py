@@ -410,8 +410,20 @@ def _ignore_previous_backups(_dirpath, names):
 
     备份落在 `data/profiles/简历迁移备份_<ts>/`，是 profile 目录的**兄弟**，真布局下本来就
     拷不进去；这道闸门钉的是**不变量**：备份根将来挪进 profile（或用户手工搬进来）也不会滚雪球。
+
+    ⚠️ 还要挡住 `store.snapshot_before_overwrite` / `jobdup._snapshot` 留在 profile 里的
+    `<文件>.bak-<时间戳>` **文件**：原来的闸门只看**目录**前缀 `简历迁移备份`，这些文件照拷不误
+    ⇒ 每备份一次就把上一次的留档再拷一份，profile 目录无上限增长（`.bak-` 被备份再备份）。
+    它们不是用户的数据（是覆盖前的留档），备份里不需要第二份；留档自身的上限由
+    `store._prune_backups` 轮转（每份目标文件只留最新 3 份）。
     """
-    return [n for n in names if n.startswith(BACKUP_PREFIX)]
+    out = []
+    for n in names:
+        if n.startswith(BACKUP_PREFIX):
+            out.append(n)
+        elif store.BACKUP_SUFFIX in n and not os.path.isdir(os.path.join(_dirpath, n)):
+            out.append(n)
+    return out
 
 
 def _backup_profile():

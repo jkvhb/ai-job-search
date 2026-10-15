@@ -451,9 +451,19 @@ class MergeSnapshotReadFailureTest(IsolatedCase):
         # "原像是按字节读的" —— 若 `_snapshot` 用 `read_text`，`write_bytes` 会在写**台账**
         # 备份时就抛 `a bytes-like object is required`，盘上只会留一个 0 字节的 jobs 备份，
         # 这条断言就会红（实测：这一次的注入根本走不到）。
-        baks = glob.glob(jobs_path + ".bak-*")
-        self.assertEqual(len(baks), 1, "台账的原像应当已经存下（失败点在它后面那一步）")
-        with open(baks[0], "rb") as f:
+        #
+        # ⚠️ 只数**本次合并自己**留下的那一份：夹具里前面两次 `upsert_job` 也各留了
+        # `.bak-<时间戳>`（`store.save_jobs` 的覆盖前留档），所以目录里本来就不止一份 ——
+        # 老断言 `len(...) == 1` 数的是"目录里有几份留档"，会被别的写者的留档干扰（实测 2 != 1）。
+        # 判据改成"内容逐字节等于合并前那份台账"：这正是本条要保护的东西，而且比数数量更不容易
+        # 假绿（若合并漏了台账快照，或者写了个 0 字节的空档，这里都会是 0 份）。
+        baks = sorted(glob.glob(jobs_path + ".bak-*"))
+        mine = [p for p in baks if store.read_bytes(p) == jobs_raw]
+        self.assertEqual(len(mine), 1,
+                         "台账的原像应当**恰好**存下 1 份（失败点在它后面那一步）："
+                         "目录里的留档 = %s，其中与合并前台账逐字节相同的有 %d 份"
+                         % ([os.path.basename(p) for p in baks], len(mine)))
+        with open(mine[0], "rb") as f:
             self.assertEqual(f.read(), jobs_raw, "原像必须逐字节等于台账原文，不许是 0 字节空档")
         self.assertEqual(glob.glob(kb_path + ".bak-*"), [],
                          "读不出原文就不许留下空备份（0 字节的「原像」比没有更危险）")

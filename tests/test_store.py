@@ -1,8 +1,12 @@
 # -*- coding: utf-8 -*-
 import glob
+import importlib
 import json
 import os
+import threading
+import time
 import unittest
+from datetime import datetime, timedelta
 from unittest import mock
 
 import jddelete
@@ -743,6 +747,197 @@ class SetCurrentProfileAtomicTest(IsolatedCase):
             self.assertEqual(f.read(), "张三".encode("utf-8"), "原子写完，文件里没有半截旧值")
         self.assertEqual(glob.glob(os.path.join(os.path.dirname(store.current_profile_file()),
                                                 ".tmp*")), [], "写完不留临时文件")
+
+
+class BackupRotationTest(IsolatedCase):
+    """`.bak-` 轮转：每个目标文件**只留最新 `store.BACKUP_KEEP` 份**，更旧的删掉。
+
+    为什么需要它：`snapshot_before_overwrite` 每次覆盖都留一份，而 `upsert_job`
+    （= `app._write_analysis`、`outcome.py` 的落盘出口）**每次分析**都走它 —— 连写 6 次就是 6 份；
+    `简历迁移` / `身份迁移` 的整目录备份还会把这些 `.bak-` 一起拷走 ⇒ profile 目录无上限增长。
+    """
+
+    def test_the_keep_constant_is_three_with_a_stated_reason(self):
+        """常量必须是模块级的、且值为 3（够覆盖"最近几次覆盖"，又不会无限长）。"""
+        self.assertEqual(store.BACKUP_KEEP, 3)
+        self.assertIn("3", (store.snapshot_before_overwrite.__doc__ or ""),
+                      "轮转份数要写在留档函数的 docstring 里（不然下一个人不知道 3 从哪来）")
+
+    def test_writing_five_times_keeps_exactly_the_three_newest(self):
+        path = store.jobs_path()
+        raws = []
+        for i in range(1, 6):
+            store.save_jobs([{"id": "第%d版" % i, "score": float(i)}])
+            raws.append(store.read_bytes(path))
+
+        baks = glob.glob(path + ".bak-*")
+        self.assertEqual(len(baks), 3,
+                         "连写 5 次只该留 3 份 .bak-，实际：%s"
+                         % sorted(os.path.basename(b) for b in baks))
+        self.assertEqual(sorted(store.read_bytes(b) for b in baks), sorted(raws[1:4]),
+                         "留下的必须是**最近 3 次**覆盖前的样子（按内容断言，不是只看数量）")
+        self.assertNotIn(raws[0], [store.read_bytes(b) for b in baks],
+                         "最旧的那一份（第 1 次写进去的样子）必须被删掉")
+        self.assertEqual(store.read_bytes(path), raws[4], "当前台账仍是最后一次写进去的那份")
+
+    def test_the_analysis_path_upsert_job_rotates_too(self):
+        """连写 6 次**分析**（`upsert_job`）也只留 3 份 —— 这正是实测过的"6 次就 6 份"。
+
+        备份是**每次覆盖前**的内容，所以 6 次 upsert 依次留的是 `[0]`、`[1,0]`、`[2,1,0]`、
+        `[3,2,1,0]`、`[4,3,2,1,0]`；留最新 3 份 ⇒ 首条 id 分别是第 2/3/4 次分析。
+        """
+        for i in range(6):
+            store.upsert_job({"id": "第%d次分析" % i, "score": 80.0})
+
+        baks = glob.glob(store.jobs_path() + ".bak-*")
+        self.assertEqual(len(baks), 3, "连写 6 次分析只该留 3 份 .bak-")
+        firsts = [json.loads(store.read_bytes(b).decode("utf-8"))[0]["id"] for b in baks]
+        self.assertEqual(sorted(firsts), ["第2次分析", "第3次分析", "第4次分析"],
+                         "留的必须是最近 3 份（按内容断言）：%s" % sorted(firsts))
+
+    def test_a_short_history_is_not_deleted_early(self):
+        """目标不存在（合法的第一次）→ 一份都不留；不足 3 份时**一份都不许删**。"""
+        path = store.jobs_path()
+        store.save_jobs([{"id": "第一次"}])
+        self.assertEqual(glob.glob(path + ".bak-*"), [],
+                         "第一次写没有旧内容可留（目标不存在）；0 字节的情况见 "
+                         "UpsertJobRefusesUnreadableLedgerTest.test_a_zero_byte_ledger_is_created")
+        store.save_jobs([{"id": "第二次"}])
+        store.save_jobs([{"id": "第三次"}])
+        self.assertEqual(len(glob.glob(path + ".bak-*")), 2, "只有 2 份时不许提前删")
+
+    def test_rotation_orders_by_timestamp_not_by_filename(self):
+        """仓库里 `.bak-` 有**两种真实命名**，判据必须是时间戳，不是文件名本身。
+
+        `snapshot_before_overwrite` 用 `%Y%m%d%H%M%S%f`（纯数字 20 位），
+        `jobdup._snapshot` 用 `%Y%m%d_%H%M%S_%f`（带下划线）。下划线 `_`(0x5F) 比数字大，
+        直接按文件名排序会把同一天的两种格式**交错** —— 这里造一份"时间上最旧、文件名排序却不是最前"
+        的 jobdup 格式备份，钉住"删的是时间上最旧那份"：按文件名排序会误删另一份。
+        """
+        path = store.jobs_path()
+        store.save_jobs([{"id": "当前台账"}])
+        day = (datetime.now() - timedelta(days=1)).strftime("%Y%m%d")     # 昨天：一定早于下面那次写
+        oldest_jobdup = "%s.bak-%s_010203_000001" % (path, day)           # 时间上最旧
+        store.write_bytes(oldest_jobdup, b"A-oldest-jobdup-format")
+        second = "%s.bak-%s010203000002" % (path, day)                    # 时间上第二旧
+        store.write_bytes(second, b"B-second")
+        store.write_bytes("%s.bak-%s010203000003" % (path, day), b"C-third")
+        # 按**文件名**排序时 B 排在 A 前面（`0` < `_`）⇒ 天真实现会误删 B、留下 A。
+
+        store.save_jobs([{"id": "当前台账", "score": 1.0}])      # 再覆盖一次 → 触发轮转
+
+        names = sorted(os.path.basename(b) for b in glob.glob(path + ".bak-*"))
+        self.assertEqual(len(names), 3, "轮转后应当恰好 3 份：%s" % names)
+        self.assertNotIn(os.path.basename(oldest_jobdup), names,
+                         "被删的必须是**时间上最旧**的那份（按文件名排序会误删 B）：%s" % names)
+        self.assertIn(os.path.basename(second), names,
+                      "时间上不是最旧的那份不许被删（按文件名排序会删掉它）：%s" % names)
+
+
+class WholeProfileBackupKeepsLedgerBackupsOutTest(IsolatedCase):
+    """整目录备份（`简历迁移._backup_profile`）里**不许套 `.bak-` 文件**。
+
+    那条「备份里不套备份」的闸门原本只挡**目录**前缀（`简历迁移备份_*`），挡不住
+    `store.snapshot_before_overwrite` 留在 profile 里的 `.bak-<时间戳>`：每迁移一次就把上一次的
+    留档再拷一份 ⇒ profile 目录无上限增长（`.bak-` 会被备份再备份）。
+
+    ⚠️ 位置说明：这条用例本该落在 `tests/test_resume_migration.py`，但本轮施工的文件纪律只允许改
+    `store.py` / 本文件 / `test_jddelete.py` / `test_jobdup.py`（另一个实现者正在改 `kb` 那条线），
+    所以它落在 store 的测试文件里 —— 判据本身正是"整目录备份与 `store.BACKUP_SUFFIX` 的关系"。
+    """
+
+    def test_ledger_backups_are_not_copied_into_the_backup(self):
+        cli = importlib.import_module("简历迁移")
+        store.ensure_profile()
+        store.save_jobs([{"id": "第一条"}])
+        store.save_jobs([{"id": "第二条"}])                  # 这一步会留下 jobs.json.bak-<ts>
+        store.write_text(store.config_path(), "{}")
+        baks = glob.glob(store.jobs_path() + ".bak-*")
+        self.assertEqual(len(baks), 1, "夹具前提：profile 里真有一份 .bak-（否则这条用例没在测东西）")
+
+        dest = cli._backup_profile()                          # noqa: SLF001 - 被拷的就是它
+
+        copied = sorted(os.path.relpath(os.path.join(dp, fn), dest)
+                        for dp, _dn, fns in os.walk(dest) for fn in fns)
+        self.assertEqual([n for n in copied if ".bak-" in n], [],
+                         "整目录备份把 .bak- 一起拷走了（备份里再套备份 ⇒ 无上限增长）：%s" % copied)
+        # 反假绿：数据文件**必须**照旧拷进去（别把闸门做成"什么都不拷"）
+        self.assertIn("jobs.json", copied)
+        self.assertIn("config.json", copied)
+        self.assertTrue(os.path.exists(baks[0]), "备份是拷贝，原地的 .bak- 不许被动")
+
+
+class UpsertJobConcurrencyTest(IsolatedCase):
+    """P0-5（体检报告 §2 / §10 的 1.9）：`jobs.json` 的**读-改-写必须整体互斥**。
+
+    老实现（`store.py` 里一把锁都没有，而 `jds.json` / `knowledge.json` / `resumes.json` 都有）
+    下这条必红：两个线程各自 `load_jobs()` 读到同一份旧台账、各自插入自己那条、再**整份覆盖**
+    写回 —— 后写的那份把先写的顶掉（主线程实测 20/20 全丢）。报告 §12.3 里那条 20% 的
+    `[WinError 5]` 是同一个根因。
+
+    ⚠️ 这里**故意把竞争窗口拉宽**（在 `store.write_json` 里注入一次 sleep）：断言本身一个字都没
+    放宽（写进去的每一条都必须还在），拉宽的只是"让无锁实现必然露馅"的时序 —— 不拉宽的话
+    GIL + 很小的台账会让无锁实现偶尔侥幸通过，变异取证就杀不掉它。
+    加了锁之后这些 sleep 只发生在**持锁的临界区内部**，另一个线程根本进不来。
+    """
+
+    THREADS = 2
+    PER_THREAD = 5
+    ROUNDS = 20
+    WRITE_DELAY_SECONDS = 0.003
+
+    def _slow_write_json(self, path, obj):
+        time.sleep(self.WRITE_DELAY_SECONDS)
+        return self._real_write_json(path, obj)
+
+    def _writer(self, ids, barrier, errors):
+        try:
+            for i in ids:
+                # 两个线程的**每一次**写入都从同一个时刻出发（与 test_app.py 的线程用例同一做法：
+                # 用 Event/Barrier 定序，不靠 sleep 赌时序）。
+                barrier.wait(30)
+                store.upsert_job({"id": i, "score": 60.0, "resume": "并发夹具"})
+        except BaseException as e:            # noqa: BLE001 - 线程里的异常必须能被断言看到
+            errors[threading.current_thread().name] = e
+
+    def test_concurrent_upserts_lose_nothing(self):
+        self._real_write_json = store.write_json
+        expected, errors = [], {}
+        with mock.patch.object(store, "write_json", self._slow_write_json):
+            for r in range(self.ROUNDS):
+                barrier = threading.Barrier(self.THREADS)
+                ids = [["第%d轮-%s-%d" % (r, who, i) for i in range(self.PER_THREAD)]
+                       for who in ("A", "B")]
+                ts = [threading.Thread(target=self._writer, args=(ids[w], barrier, errors),
+                                       name="writer-%d" % w) for w in range(self.THREADS)]
+                for t in ts:
+                    t.start()
+                for t in ts:
+                    t.join(60)
+                self.assertFalse(any(t.is_alive() for t in ts), "有写线程没跑完（死等）")
+                self.assertEqual(errors, {}, "写线程里抛了异常：%r" % errors)
+                expected.extend(ids[0] + ids[1])
+                got = [j.get("id") for j in store.load_jobs()]
+                self.assertEqual(len(got), len(expected),
+                                 "第 %d 轮之后台账**丢了记录**（丢更新）：期望 %d 条、实际 %d 条"
+                                 % (r + 1, len(expected), len(got)))
+        self.assertEqual(sorted(got), sorted(expected),
+                         "台账里的 id 与写进去的对不上：写了 %d 条、盘上 %d 条"
+                         % (len(expected), len(got)))
+
+    def test_the_locks_are_module_level_reentrant_locks(self):
+        """照 `kb._KB_LOCK` / `jdid._JD_LOCK` 的做法：模块级 **RLock**。
+
+        `upsert_job` 里 load→save 必须在**同一把锁里重入**，普通 `Lock` 会当场死锁；
+        两把锁都是**叶子锁**（store 不 import 任何别的模块），谁都不会去反过来抢
+        `_JD_LOCK` / `_KB_LOCK`，所以锁序恒为"上层锁 → store 的锁"。
+        """
+        for name in ("_JOBS_LOCK", "_CONFIG_LOCK"):
+            self.assertTrue(hasattr(store, name), "缺少模块级锁 %s" % name)
+            lock = getattr(store, name)
+            with lock:
+                with lock:                        # 重入必须不死锁
+                    pass
 
 
 if __name__ == "__main__":
