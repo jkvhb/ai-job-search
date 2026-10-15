@@ -5625,5 +5625,162 @@ class StartupProfilePreconditionTest(IsolatedCase):
             self.assertRaises(ValueError, app.profile_precondition_error)
 
 
+# ------------------------------------------------------- P2-1：来源校验（Host / Origin）
+# 威胁（体检报告 §4 P2-1）：**任意一个你正在浏览的网页**都能对 http://127.0.0.1:8000/api/config
+# 发一个 `text/plain` 的**简单请求**（不触发 CORS 预检），body 里只换 base_url；
+# `cfg[k].update(body[k])` 会**保留你原来的 api_key**，下一次分析就把 key 打给攻击者的地址
+# （不需要读回包）。同一手法还能打 /api/logs/clear（销掉取证线索）、/api/resumes 等；
+# 没有 Host 校验时，域名重绑定下连 `GET /api/config`（**明文回 api_key**）都开着。
+#
+# 修法只能落在服务端（浏览器端做任何判断都不是防线）。本类钉住三件事：
+#   ① 外站 Origin 的请求被拒，且**盘上的 config.json 逐字节没变**（不是"只挡了状态码"）；
+#   ② 非本机 Host 被拒（挡 DNS rebinding），响应体里绝不出现 api_key；
+#   ③ 对照组必须**照常工作**：不带 Origin（命令行 curl / 双击 启动.bat 打开的页面）
+#      与恰好同源的两个写法（127.0.0.1 / localhost）。
+#
+# ⚠️ 缺 Host 的请求**必须放行**（不是"漏了"）：HTTP/1.0 与非浏览器客户端不带它，
+# 本文件的沙箱 handler 与 tests/test_kb.py:1209 也一样不带 —— 判它非法 = 把既有测试与
+# 真实用法一起弄红。而域名重绑定下的浏览器**必定**带 Host（且是攻击者的域名），
+# 所以"缺 Host 放行"不削弱这条防线。
+class ForeignRequestGuardTest(IsolatedCase):
+    ATTACKER_BASE_URL = "https://attacker.invalid/v1"
+    USER_KEY = "sk-user-own-key-must-never-leave-0123456789"
+
+    # ---- 脚手架
+    def _seed_user_config(self):
+        """盘上放一份"用户自己配好的"配置，返回它的原始字节（用来逐字节比对）。"""
+        store.ensure_profile()
+        store.write_json(store.config_path(),
+                         {"text_model": {"base_url": "https://api.deepseek.com/v1",
+                                         "api_key": self.USER_KEY, "model": "deepseek-chat"}})
+        before = _disk_bytes(store.config_path())
+        self.assertIn(self.USER_KEY.encode("utf-8"), before)      # 反证：key 真的在盘上
+        return before
+
+    def _sandbox_get(self, path, headers=None):
+        h = _SandboxedHandler(path)
+        h.headers.update(headers or {})
+        h.do_GET()
+        return h
+
+    def _real_server(self):
+        """真 socket + 真 http.client：Host 由客户端按**真实端口**自动带上（最接近攻击现场）。"""
+        import http.client
+        from http.server import ThreadingHTTPServer
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), app.Handler)
+        self.addCleanup(srv.server_close)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.shutdown)
+        conn = http.client.HTTPConnection("127.0.0.1", srv.server_address[1], timeout=15)
+        self.addCleanup(conn.close)
+        return conn, srv.server_address[1]
+
+    def _post_config(self, conn, headers, base_url=None):
+        raw = json.dumps({"text_model": {"base_url": base_url or self.ATTACKER_BASE_URL}})
+        conn.request("POST", "/api/config", body=raw, headers=headers)
+        r = conn.getresponse()
+        return r.status, r.read().decode("utf-8")
+
+    # ---- ① 真正要防的那件事：跨站请求把模型地址换成攻击者的
+    def test_cross_origin_post_cannot_rewrite_the_model_base_url(self):
+        before = self._seed_user_config()
+        conn, _port = self._real_server()
+
+        # 攻击者页面发的正是这种"简单请求"：text/plain 不触发预检
+        status, body = self._post_config(conn, {"Content-Type": "text/plain",
+                                                "Origin": "http://evil.example"})
+
+        self.assertEqual(status, 403, "跨站请求没被拒（body=%s）" % body)
+        self.assertEqual(_disk_bytes(store.config_path()), before,
+                         "config.json 被跨站请求改掉了：base_url 一换，用户自己的 api_key "
+                         "就会被下一次分析打给攻击者的地址")
+        self.assertNotIn(self.ATTACKER_BASE_URL, body)
+
+    # ---- ② DNS rebinding：非本机 Host，读路径也全关
+    def test_foreign_host_cannot_read_the_config(self):
+        self._seed_user_config()
+        h = self._sandbox_get("/api/config", {"Host": "attacker.example"})
+
+        self.assertEqual(h.code, 403, "Host 不是本机却没被拒（响应=%r）" % h.text()[:200])
+        self.assertNotIn(self.USER_KEY, h.text(), "域名重绑定下 api_key 被明文读走了")
+
+    # ---- 拒绝的响应本身：一句人话 + 一条取证日志
+    def test_foreign_origin_is_rejected_with_a_human_message_and_a_log_line(self):
+        h = self._sandbox_get("/api/config", {"Origin": "http://evil.example"})
+
+        self.assertEqual(h.code, 403)
+        body = h.text()
+        self.assertIn("不是从本机页面", body)     # 用户能据此判断"我是不是被别的网页打了"
+        self.assertIn("http://127.0.0.1:%d" % app.PORT, body)   # 告诉他正常入口是哪个
+        raw = _disk_bytes(log.LOG_FILE).decode("utf-8")
+        self.assertIn("evil.example", raw)        # 记一条日志，便于事后取证
+
+    # ---- ③ 对照组：不带 Origin（命令行 curl / 双击启动）必须照常
+    def test_request_without_origin_is_allowed(self):
+        self._seed_user_config()
+        h = self._sandbox_get("/api/config", {"Host": "127.0.0.1:%d" % app.PORT})
+
+        self.assertEqual(h.code, 200, "不带 Origin 的正常请求被误伤了（命令行/双击场景）")
+        self.assertEqual((h.json_body().get("text_model") or {}).get("api_key"), self.USER_KEY)
+
+    # ---- ④ 对照组：恰好同源（两种写法）必须照常
+    def test_same_origin_is_allowed(self):
+        self._seed_user_config()
+        for host, origin in (("127.0.0.1:%d" % app.PORT, "http://127.0.0.1:%d" % app.PORT),
+                             ("localhost:%d" % app.PORT, "http://localhost:%d" % app.PORT)):
+            h = self._sandbox_get("/api/config", {"Host": host, "Origin": origin})
+            self.assertEqual(h.code, 200, "%s 被误伤了" % origin)
+
+    def test_same_origin_post_over_a_real_socket_still_writes_the_config(self):
+        """同源 POST 必须真的生效 —— 顺带钉住"端口要对"是拿**服务真正监听的端口**比的
+        （这里监听的是临时端口，写死 8000 的话这条就会红）。"""
+        self._seed_user_config()
+        conn, port = self._real_server()
+        new_url = "https://api.example.org/v1"
+
+        status, body = self._post_config(conn,
+                                         {"Content-Type": "application/json",
+                                          "Origin": "http://127.0.0.1:%d" % port},
+                                         base_url=new_url)
+
+        self.assertEqual(status, 200, body)
+        cfg = json.loads(_disk_bytes(store.config_path()).decode("utf-8"))
+        self.assertEqual(cfg["text_model"]["base_url"], new_url)        # 真的写下去了
+        self.assertEqual(cfg["text_model"]["api_key"], self.USER_KEY)   # key 没被动
+
+    # ---- 别的入口/别的破坏面走的是同一个校验
+    def test_foreign_origin_cannot_clear_the_logs(self):
+        log.log_event("canary.before_attack")
+        before = _disk_bytes(log.LOG_FILE)
+        self.assertIn(b"canary.before_attack", before)      # 反证：取证线索原本真的在
+
+        h = _sandbox_handler("POST", "/api/logs/clear", b"", {"Origin": "http://evil.example"})
+
+        self.assertEqual(h._status, 403)
+        # 日志**没被清空**：既没走 logs.cleared，原来的那行也还在
+        # （拒绝本身会追一行取证记录，所以这里比"内容"而不是比"字节"）
+        after = _disk_bytes(log.LOG_FILE)
+        self.assertIn(b"canary.before_attack", after, "取证线索被跨站请求销掉了")
+        self.assertNotIn(b"logs.cleared", after)
+
+    def test_foreign_origin_delete_is_rejected(self):
+        h = _sandbox_handler("DELETE", "/api/resumes?name=x.md", b"",
+                             {"Origin": "http://evil.example"})
+
+        self.assertEqual(h._status, 403)
+
+    # ---- 顺手：nosniff
+    def test_responses_carry_nosniff(self):
+        store.ensure_profile()
+        h = self._sandbox_get("/api/config", {"Host": "127.0.0.1:%d" % app.PORT})
+        self.assertEqual(h.headers_out.get("X-Content-Type-Options"), "nosniff")
+
+        store.write_text(os.path.join(store.p_path("reports"), "nosniff.html"),
+                         "<html><body>没有 REPORT_DATA 快照</body></html>")
+        hf = self._sandbox_get("/reports/nosniff.html", {"Host": "127.0.0.1:%d" % app.PORT})
+        self.assertEqual(hf.code, 200)
+        self.assertEqual(hf.headers_out.get("X-Content-Type-Options"), "nosniff")
+
+
 if __name__ == "__main__":
     unittest.main()

