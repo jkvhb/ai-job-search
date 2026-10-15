@@ -273,9 +273,13 @@ class AnalyzeKnowledgeCacheTest(_AnalyzeCase):
         self.assertNotIn("at", meta2,
                          "生产把非字符串的 knowledge_at 送进了报告（模板守卫形同虚设）：%r" % (meta2,))
         if NODE:      # 没有 Node 的机器上跳过渲染那半句（口径断言上面已经钉过）
-            self.assertEqual(_know_meta_text(self._data_of(r2)),
-                             "📚 知识地图：复用该岗位已缓存的那份（本次没有重新搜索）",
-                             "`5` 被当成日期显示出来了（说了不真实的话）")
+            got = _know_meta_text(self._data_of(r2))
+            # 阶段 E 之后这一行还会追加一句「本次没有重跑「库优先」」（`kb_reuse.not_run`），
+            # 所以这里断言**那半句真话还在**，而不是整行等于它。
+            self.assertIn("📚 知识地图：复用该岗位已缓存的那份（本次没有重新搜索）", got,
+                          "`5` 被当成日期显示出来了（说了不真实的话）：%r" % (got,))
+            self.assertNotIn("生成的那份", got,
+                             "`at` 不可用时不能编一句「X 生成的那份」：%r" % (got,))
         else:
             print("  [skip] 本机没有 Node，跳过 `at` 的渲染断言")
 
@@ -842,6 +846,19 @@ def _know_meta_text(data):
     return html[k + 1:m]
 
 
+def _kreuse_text(data, node_id="n1"):
+    """取某张卡片上**那行出处**自己的文本（没有这一行 → None）。口径同 `_know_meta_text`。
+
+    一样**不许**在整页里搜字符串（模板源码里就写着那些字，那等于搜源码）。
+    """
+    html = _render_page(data)
+    i = html.find('id="kreuse-%s"' % node_id)
+    if i < 0:
+        return None
+    k = html.find('>', i)
+    return html[k + 1:html.find('</div>', k)]
+
+
 def _render_page(data):
     """跑模板 JS，回 `#main` 的 innerHTML（渲染结果本身）。"""
     tmp = None
@@ -955,6 +972,171 @@ class KnowledgeMetaTemplateTest(IsolatedCase):
                 self.assertTrue(got.startswith("📚 知识地图：复用该岗位"),
                                 "at 不可用时的文案说错了：%r" % (got,))
                 self.assertNotIn("生成的那份", got)
+
+
+@unittest.skipUnless(NODE, "本机没有 Node，跳过模板渲染探针")
+class KbReuseTemplateTest(IsolatedCase):
+    """阶段 E 的报告标注（spec §8）：顶部汇总（①跑过/②没跑/③库坏了）+ 卡片逐条出处（④）。
+
+    **最要命的一条**：`not_run`（知识地图来自缓存 / 种子数据，这次根本没跑「库优先」）
+    与「跑了、库是空的（复用 0 条）」是**两件不同的事**，报告里必须分得出来。
+    口径同 `_know_meta_text` / `_kreuse_text`：只断言**那个元素自己的文本**。
+    """
+
+    def _data(self, meta=None, node_extra=None):
+        node = {"id": "n1", "term": "语音识别", "definition": "d", "layer": 0,
+                "sources": [], "timeline": [], "related": [],
+                "interview_questions": [], "confidence": "guess"}
+        node.update(node_extra or {})
+        data = {"job_title": "语音数据质检", "score": 91.5, "verdict": "建议投递",
+                "scores": [{"name": "匹配度", "score": 91.5, "weight": 10}],
+                "knowledge": [node]}
+        if meta is not None:
+            data["knowledge_meta"] = meta
+        return data
+
+    def _line(self, stats, source="computed"):
+        """顶部那一行：`knowledge_meta.source` 与 `kb_reuse` 在**生产里同源**（都来自 jdfacts）。"""
+        return _know_meta_text(self._data({"source": source, "kb_reuse": stats}))
+
+    def _kb(self, **kw):
+        """一张**命中**卡片的 `kb_reuse` 标记（形状与 `kbreuse.plan_nodes` 写的一致）。"""
+        r = {"card_id": "语音识别", "card_term": "语音识别", "term_original": "",
+             "matched_by": "exact", "reusable": True, "missing": [], "got": "all",
+             "origin": {"job_title": "语音/文本评测", "date": "2026-10-03"}}
+        r.update(kw)
+        return r
+
+    # ------------------------------------------------------------ ① 跑过：汇总
+    def test_the_summary_reports_reuse_hits_and_searches(self):
+        got = self._line({"total": 15, "matched": 5, "reusable": 3, "timeline_reused": 2,
+                          "enriched": 2, "searched": 12, "knowledge_error": ""})
+        self.assertIsNotNone(got)
+        self.assertIn("知识库：复用 3 条（含时间线 2 条）", got)
+        self.assertIn("命中 5 条（其中 2 条不够格，已联网补全）", got)
+        self.assertIn("本次联网 12 条", got)
+
+    def test_a_run_against_an_empty_kb_says_zero_reused(self):
+        """**跑了、但库是空的** → 如实说「复用 0 条」（这才轮到这句话出场）。"""
+        got = self._line({"total": 5, "matched": 0, "reusable": 0, "timeline_reused": 0,
+                          "enriched": 0, "searched": 5, "knowledge_error": ""})
+        self.assertIn("复用 0 条", got)
+        self.assertIn("命中 0 条", got)
+        self.assertIn("本次联网 5 条", got)
+
+    # ------------------------------------------------------------ ② 没跑：绝不说 0
+    def test_not_run_never_claims_zero_reused(self):
+        """★ 没跑「库优先」**绝不许**说成「复用了 0 条」—— 那是两件不同的事。"""
+        cases = (
+            ("cache", "cache", "缓存", ""),
+            ("cache", "cached:20261014_语音数据质检_88分", "缓存", "（cached:20261014_语音数据质检_88分）"),
+            ("seeded:20261014_语音数据质检_88分", "seeded:20261014_语音数据质检_88分",
+             "种子数据", "（seeded:20261014_语音数据质检_88分）"),
+        )
+        for meta_src, r_src, how, raw in cases:
+            with self.subTest(source=r_src):
+                got = self._line({"not_run": True, "source": r_src}, source=meta_src)
+                self.assertIsNotNone(got, "not_run 时那一行整个消失了")
+                self.assertNotIn("复用 0 条", got, "把「没跑」说成了「复用了 0 条」")
+                self.assertNotIn("0 条", got, "not_run 不该报任何条数：%r" % (got,))
+                self.assertIn("来自" + how + raw, got)
+                self.assertIn("没有重跑「库优先」", got)
+
+    # ------------------------------------------------------------ ③ 库坏了：如实说
+    def test_an_unreadable_kb_states_the_reason(self):
+        reason = "知识库 knowledge.json 读不出来：Expecting value: line 1 column 1"
+        got = self._line({"total": 15, "matched": 0, "reusable": 0, "timeline_reused": 0,
+                          "enriched": 0, "searched": 15, "knowledge_error": reason})
+        self.assertIsNotNone(got, "库读不出来时那一行整个消失了（假装一切正常）")
+        self.assertIn("⚠ 本次没能查本地知识库：" + reason, got)
+        self.assertIn("已全部改用联网搜索", got)
+
+    def test_the_unreadable_reason_is_escaped(self):
+        got = self._line({"total": 1, "matched": 0, "reusable": 0, "timeline_reused": 0,
+                          "enriched": 0, "searched": 1,
+                          "knowledge_error": "<img src=x onerror=alert(1)>"})
+        self.assertIsNotNone(got)
+        self.assertNotIn("<img", got)
+        self.assertIn("&lt;img", got)
+
+    # ------------------------------------------------------------ 垃圾 / 老报告
+    def test_junk_kb_reuse_is_ignored_not_invented(self):
+        """垃圾 / 形状不对的 `kb_reuse` 一律忽略：不崩，也**绝不编一段统计**出来。"""
+        for junk in ("垃圾", 5, [], [1], True, {}, {"total": "15"}, {"total": None},
+                     {"not_run": "yes"}, {"knowledge_error": 5}, {"reusable": 3}):
+            with self.subTest(junk=junk):
+                got = self._line(junk)
+                self.assertEqual(got, "📚 知识地图：本次新算",
+                                 "垃圾 kb_reuse 被渲染成了统计：%r → %r" % (junk, got))
+
+    def test_a_report_without_kb_reuse_is_unchanged(self):
+        """老形状（缓存 / 播种 / 新算，没有 `kb_reuse`）→ 文案**一字不变**。"""
+        self.assertEqual(_know_meta_text(self._data({"source": "computed"})),
+                         "📚 知识地图：本次新算")
+        self.assertEqual(
+            _know_meta_text(self._data({"source": "cache", "at": "2026-10-03 00:35"})),
+            "📚 知识地图：复用该岗位 2026-10-03 生成的那份（本次没有重新搜索）")
+        self.assertEqual(
+            _know_meta_text(self._data({"reused": True, "source": "seeded:20261003_岗A_75分"})),
+            "📚 知识地图：复用该岗位已有报告里的那份（本次没有重新搜索）")
+
+    # ------------------------------------------------------------ ④ 卡片逐条出处
+    def test_a_reused_card_shows_its_provenance(self):
+        got = _kreuse_text(self._data(node_extra={"kb_reuse": self._kb()}))
+        self.assertIsNotNone(got, "够格复用的卡片没有显示出处那一行")
+        self.assertIn("来源与时间线来自本地知识库", got)
+        self.assertIn("《语音/文本评测》", got)
+        self.assertIn("2026-10-03", got)
+        self.assertIn("本次没有重新搜索", got)
+
+    def test_the_match_method_is_said_in_plain_chinese(self):
+        for code, want in (("exact", "同名命中"), ("alias", "别名命中"),
+                           ("abbrev", "括号缩写命中"), ("assisted", "AI 判定命中")):
+            with self.subTest(matched_by=code):
+                got = _kreuse_text(self._data(node_extra={"kb_reuse": self._kb(matched_by=code)}))
+                self.assertIsNotNone(got)
+                self.assertIn(want, got)
+                self.assertNotIn(code, got, "把英文码直接甩给用户了：%r → %r" % (code, got))
+
+    def test_a_reused_card_says_the_original_jd_wording_and_the_timeline_catch_up(self):
+        got = _kreuse_text(self._data(node_extra={"kb_reuse": self._kb(
+            term_original="ASR", matched_by="assisted", got="sources",
+            origin={"job_title": "", "date": ""})}))
+        self.assertIsNotNone(got)
+        self.assertIn("来源链接来自本地知识库", got)
+        self.assertIn("JD 里写作「ASR」", got)
+        self.assertIn("时间线为本次补算，已写回知识库", got)
+        self.assertNotIn("来源与时间线来自本地知识库", got,
+                         "got=sources 时绝不能说时间线也是库里的")
+
+    def test_a_card_that_was_only_enriched_does_not_claim_the_kb(self):
+        """命中但**不够格**（本次照旧联网）→ 要说出来，但**不许**说内容来自知识库。"""
+        got = _kreuse_text(self._data(node_extra={"kb_reuse": self._kb(
+            reusable=False, missing=["sources"], got="")}))
+        self.assertIsNotNone(got, "命中但不够格的卡片被整个藏掉了")
+        self.assertNotIn("来自本地知识库", got, "内容不是库里的，这样说就是假话")
+        self.assertIn("命中", got)
+        self.assertIn("不够格", got)
+        self.assertIn("来源链接", got)
+        self.assertIn("联网", got)
+
+    def test_a_card_without_the_marker_shows_no_reuse_line(self):
+        self.assertIsNone(_kreuse_text(self._data()), "老报告 / 联网算的卡片不该有这一行")
+
+    def test_junk_card_marker_shows_no_reuse_line(self):
+        for junk in ("垃圾", 5, [], [1], True, {}, {"reusable": "yes"}, {"reusable": None}):
+            with self.subTest(junk=junk):
+                self.assertIsNone(_kreuse_text(self._data(node_extra={"kb_reuse": junk})),
+                                  "垃圾卡片标记渲染出了出处行：%r" % (junk,))
+
+    def test_the_origin_and_the_original_term_are_escaped(self):
+        got = _kreuse_text(self._data(node_extra={"kb_reuse": self._kb(
+            term_original="<b>ASR</b>", origin={"job_title": "<script>", "date": "2026-10-03"})}))
+        self.assertIsNotNone(got)
+        self.assertNotIn("<b>", got)
+        self.assertNotIn("<script>", got)
+        self.assertIn("&lt;b&gt;ASR&lt;/b&gt;", got)
+        self.assertIn("&lt;script&gt;", got)
 
 
 # ---------------------------------------------------------------- 模板铁律

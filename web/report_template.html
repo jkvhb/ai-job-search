@@ -141,6 +141,8 @@
   .klegend i.ring{background:#fff;border:3px solid var(--line);width:13px;height:13px}
   /* 知识地图来源标记（复用/新算）：一行小字，就在那一段卡片上方 */
   .know-meta{font-size:12px;color:var(--muted);margin:0 0 7px 2px}
+  /* 阶段 E：每张卡片上的逐条出处（来自知识库 / 命中但不够格） */
+  .kreuse{font-size:12px;color:var(--muted);margin:6px 0 0 2px}
   .klmeta{font-size:12.5px;color:var(--muted);margin-bottom:10px}
   .klist{display:flex;flex-direction:column;gap:10px;max-height:520px;overflow:auto;padding-right:4px}
   .klgrp{border:1px solid var(--line);border-radius:10px;padding:10px 12px;background:#fcfdff}
@@ -380,6 +382,48 @@ let kView = 'card';        // 'card' | 'list' | 'graph'
 
 function kNode(id){ return KNOW.find(n => n.id === id); }
 
+/* 阶段 E（spec §8）：这一行要回答「这次到底查没查本地知识库」。**三种情形三种话**，
+   混起来的每一种都是对用户说假话：
+     ① 真跑过「库优先」→ 复用 / 命中（含不够格的）/ 本次联网 各几条；
+     ② `not_run` → 知识地图来自缓存或播种，这次**根本没重跑**「库优先」——
+        这时写「复用了 0 条」是假的（读报告的人会以为查过库、只是没查到）；
+     ③ `knowledge_error` 非空 → 库读不出来：**醒目**写出原因 + 说清已全部改用联网。
+   数据一律当**不可信**（报告是快照，用户能手改）：形状不对就什么都不说，
+   绝不拿 0 或默认值编一段统计出来。返回要追加的句子（没有可说的 → 空串）。 */
+function kbReuseNote(m){
+  const r0 = m && m.kb_reuse;
+  const r = (r0 && typeof r0 === 'object' && !Array.isArray(r0)) ? r0 : null;
+  if(!r) return '';
+  const s = v => (typeof v === 'string') ? v.trim() : '';
+  const num = v => (typeof v === 'number' && Number.isFinite(v) && v >= 0) ? Math.floor(v) : null;
+  // ② 这次没跑「库优先」：只说真来源（`source` 原样带上），绝不说「复用 0 条」。
+  if(r.not_run === true){
+    const src = s(r.source);
+    let how = '';
+    if(src === 'cache' || src.indexOf('cached:') === 0) how = '缓存';
+    else if(src.indexOf('seeded:') === 0) how = '种子数据';
+    return '；本次知识地图来自' + (how || '已有数据') + (src ? '（'+esc(src)+'）' : '')
+         + '，本次没有重跑「库优先」';
+  }
+  // ③ 库读不出来（`knowledge_error` 非空）：不许假装一切正常，也不许静默省略这一句。
+  const err = s(r.knowledge_error);
+  if(err) return '；⚠ 本次没能查本地知识库：'+esc(err)+'；已全部改用联网搜索';
+  // ① 真跑过。`total` 不是个可用的数就**什么都不说**（不拿 0 编一段统计）。
+  const total = num(r.total);
+  if(total === null) return '';
+  const matched = num(r.matched) || 0, reused = num(r.reusable) || 0;
+  const tl = num(r.timeline_reused) || 0, enriched = num(r.enriched) || 0;
+  const searched = (num(r.searched) === null) ? Math.max(total - reused, 0) : num(r.searched);
+  let out = '；知识库：复用 '+esc(String(reused))+' 条';
+  if(tl > 0) out += '（含时间线 '+esc(String(tl))+' 条）';
+  out += ' · 命中 '+esc(String(matched))+' 条';
+  // 「不够格」那几条正是 `enriched`（命中、但库里内容不全，本次联网补全并写回）。
+  if(enriched > 0) out += '（其中 '+esc(String(enriched))+' 条不够格，已联网补全）';
+  out += ' · 本次联网 '+esc(String(searched))+' 条';
+  if(searched === 0) out += '（本次没有联网搜索）';
+  return out;
+}
+
 /* 知识地图的来源标记（阶段 4B）：只在**有来源可报**时渲染那一行小字。
    缺失 / 垃圾一律回空 —— 老报告（快照里根本没有 knowledge_meta）绝不能因此崩，
    更不能凭空显示一句「复用/新算」的谎。`at` 是**这份缓存生成于**（不是「首次生成于」：
@@ -404,7 +448,7 @@ function knowMetaLine(){
   } else {
     return '';
   }
-  return '<div class="know-meta" id="knowMeta">'+text+'</div>';
+  return '<div class="know-meta" id="knowMeta">'+text+kbReuseNote(m)+'</div>';
 }
 
 function renderKnowledge(){
@@ -507,6 +551,51 @@ function kListView(){
   return h + '</div>';
 }
 
+/* 阶段 E（spec §8）：卡片上那行逐条出处 —— 「这条最早来自哪个岗位、什么时候；
+   JD 里原本怎么写」。两种命中的话**分开说**（混起来就是假话）：
+     * 够格复用（`reusable === true`）→ 说「来自本地知识库」，并说清是哪一种命中
+       （同名 / 别名 / 括号缩写 / AI 判定，一律**说人话**，绝不把英文码甩给用户）；
+     * 命中但不够格（`reusable === false`）→ **绝不说内容「来自本地知识库」**（那是本次
+       联网搜来的），只如实说「命中了库里的卡、但不够格，这次仍联网补齐」。
+   没有 `kb_reuse`（老报告 / 联网算的卡片）、或标记形状不对（连 `reusable` 都不是布尔）
+   → 回空，绝不编一句话。`id` 是给探针用的：探针取的是**这个元素自己的文本**。 */
+function kReuseLine(n){
+  const r0 = (n && n.kb_reuse);
+  const r = (r0 && typeof r0 === 'object' && !Array.isArray(r0)) ? r0 : null;
+  if(!r) return '';
+  if(r.reusable !== true && r.reusable !== false) return '';   // 形状不对 = 垃圾，不渲染
+  const s = v => (typeof v === 'string') ? v.trim() : '';
+  const by = ({exact:'同名命中', alias:'别名命中',
+               abbrev:'括号缩写命中', assisted:'AI 判定命中'})[s(r.matched_by)] || '';
+  const org = (r.origin && typeof r.origin === 'object' && !Array.isArray(r.origin)) ? r.origin : {};
+  const job = s(org.job_title), date = s(org.date);
+  const from = (job && date) ? '《'+esc(job)+'》· '+esc(date)
+             : (job ? '《'+esc(job)+'》' : esc(date));
+  const orig = s(r.term_original);
+  let out;
+  if(r.reusable === true){
+    // `got` 说清库里给了什么：`all` = 来源 + 时间线都是库里的；`sources` = 只有来源。
+    const what = (r.got === 'all') ? '来源与时间线' : '来源链接';
+    out = '🔁 '+what+'来自本地知识库';
+    const bits = [];
+    if(by) bits.push(by);
+    if(from) bits.push('最早来自 '+from);
+    if(bits.length) out += '（'+bits.join(' · ')+'）';
+    out += '；本次没有重新搜索';
+    if(orig) out += '；JD 里写作「'+esc(orig)+'」';
+    if(r.got === 'sources') out += '；时间线为本次补算，已写回知识库';
+  } else {
+    const miss = Array.isArray(r.missing)
+      ? r.missing.map(k => ({sources:'来源链接', timeline:'时间线', definition:'定义',
+                             plain_explanation:'通俗解释'})[k]).filter(Boolean).join('、')
+      : '';
+    out = '⚠ 命中了本地知识库里的卡片'+(from ? '（最早来自 '+from+'）' : '')
+        + '，但库里内容不够格'+(miss ? '（缺 '+miss+'）' : '')
+        + (by ? '，'+by : '')+'，本次仍全部联网搜索补齐';
+  }
+  return '<div class="kreuse" id="kreuse-'+esc(n.id)+'">'+out+'</div>';
+}
+
 function kCard(n, expanded){
   const badges =
     '<span class="kbadge '+(n.layer===0?'core':'ext')+'">'+(n.layer===0?'核心概念':'扩展知识')+'</span>' +
@@ -545,7 +634,7 @@ function kCard(n, expanded){
       '<span class="kt">'+esc(n.term)+'</span>'+badges+
       '<label class="kchk"><input type="checkbox" data-key="know:'+esc(n.id)+'" '+checked+
         ' onclick="event.stopPropagation()">已掌握</label>'+
-    '</div>'+ plain + def +
+    '</div>'+ kReuseLine(n) + plain + def +
     '<div class="kbody">'+ tl + rel + iq + src +'</div>'+
   '</div>';
 }
