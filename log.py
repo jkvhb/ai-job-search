@@ -24,17 +24,56 @@ _LOG_LOCK = threading.Lock()
 
 
 def log_file_path():
+    """当前 profile 的日志文件路径。
+
+    `store.current_profile()` 在档名文件（`data/current_profile.txt`）**存在却读不出来**时
+    抛 `store.ProfileUnreadable`，这里**不接、不包**，原样冒给调用方 ——
+    理由见本文件 `_initial_log_file()` 的说明（那个异常已经带齐「哪个文件 / 为什么 / 怎么修」，
+    再包一层只会让调用方多猜一层类型；精确的子类让 app 能只接这一种，不靠文案匹配）。
+    """
     return store.p_path("logs", "events.jsonl")
 
 
+# import 期解析失败时**原样留档**的那个异常（None = 一切正常）。见 `_initial_log_file()`。
+LOG_PATH_ERROR = None
+
+
+def _initial_log_file():
+    """import 期的路径解析：档名读不出来时**不抛**，只把错误留档，返回空串占位。
+
+    ⚠️ 为什么这一处必须和 `log_file_path()` 不一样：
+    log 是**所有模块的公共依赖**（jdfacts / jddelete / jdid / jobdup / kb / … 都 import 它，
+    而它们又都在 app 之前被 import），所以 import 期一抛，`import app` 连自己的启动校验
+    都走不到，用户（双击 启动.bat）看到的仍是一坨 traceback —— 正是这次要消掉的东西。
+    库文件也不该替进程决定生死：那会让任何 `import log` 的东西都意外退出。
+
+    **但这不是吞掉**：异常对象原封不动存在 `LOG_PATH_ERROR` 里，`log_file_path()` 照旧抛，
+    由 app 的启动校验统一印人话 + 非零退出（`app.profile_precondition_error()`）。
+    `LOG_FILE` 给空串占位而非 default 的路径 —— 宁可这段时间不写日志，也绝不把日志
+    写进另一个档（那正是「静默串档」）。写日志本来就是「失败不打扰用户」的语义，
+    空路径下它安静地不写。
+    """
+    global LOG_PATH_ERROR
+    try:
+        return log_file_path()
+    except store.ProfileUnreadable as e:
+        LOG_PATH_ERROR = e
+        return ""
+
+
 # 兼容旧引用：模块级 LOG_FILE 由 refresh() 更新
-LOG_FILE = log_file_path()
+LOG_FILE = _initial_log_file()
 
 
 def refresh():
-    """切换 profile 后调用，刷新日志文件路径"""
-    global LOG_FILE
+    """切换 profile 后调用，刷新日志文件路径。
+
+    与 import 期不同，这里是**被显式调用**的：档名读不出来就原样抛给调用方
+    （app 的启动校验会在这之前就拦下，所以正常情况下到不了这里）。
+    """
+    global LOG_FILE, LOG_PATH_ERROR
     LOG_FILE = log_file_path()
+    LOG_PATH_ERROR = None
     return LOG_FILE
 
 

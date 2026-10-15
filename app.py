@@ -43,6 +43,66 @@ try:
 except Exception:
     pass
 
+# ------------------------------------------------------------ 启动前置检查（档名文件）
+# 档名文件（`data/current_profile.txt`）**存在却读不出来**时（记事本按 ANSI/GBK 存过中文档名、
+# 权限/IO 问题…）：印一行人话 + 非零退出。两个"不做"：
+#   - **不裸抛**：用户双击 启动.bat，看到的是一坨 traceback，不知道要修哪个文件；
+#   - **不回退 default**：那正是刚修掉的**静默串档** —— 用户以为在「张三」下面工作，
+#     之后每一次写入（分析/报告/配置/知识/日志）都落进 default，界面上完全看不出来，且不可逆。
+#
+# 退出码取 `2`：`1` 在 Windows 上被强杀的进程也是 1（容易和"跑起来之后出错"混淆），
+# 而 2 是命令行工具对「启动前置条件不满足、什么都没做」的惯例（argparse 的用法错就是 2）。
+PROFILE_UNREADABLE_EXIT = 2
+
+
+def profile_precondition_error():
+    """启动前检查当前档名读不读得出来：没问题返回 None，读不出来返回给用户看的多行说明。
+
+    单独抽成函数是为了能**直接单测**（不必起服务、不必跑子进程），
+    并且让 import 期与 `main()` 两个入口说**同一句话**。
+
+    ⚠️ 只接 `store.ProfileUnreadable`：别的异常原样冒出去。
+    顺手写成 `except Exception` 把真 bug 也包成这句人话，等于把 traceback 藏起来
+    —— 用户看到「档名文件坏了」而真实原因（代码/IO 缺陷）永远查不到。
+    """
+    try:
+        store.current_profile()
+    except store.ProfileUnreadable as e:
+        return _profile_unreadable_message(e)
+    return None
+
+
+def _profile_unreadable_message(exc):
+    """把「档名读不出来」写成三句话说清的人话：哪个文件 / 为什么不能继续 / 怎么修。"""
+    # 底层原因（OS 级的那个）：store.current_profile() 是在 except 块里 raise 的，
+    # 原始异常被自动挂成 __context__；取不到就退回异常本身的文字（信息只多不少）。
+    cause = exc.__context__ or exc
+    return ("[!] 启动中止：当前档名文件读不出来 —— 不启动，也不替你猜一个档。\n"
+            "    哪个文件：%s\n"
+            "    读不出来的原因：%s\n"
+            "    为什么不能继续：宁可不启动，也不把你的数据写进另一个档。继续跑的话，"
+            "之后的每一次写入（分析、报告、配置、知识、日志）都会落进 default，"
+            "界面上看不出来，事后也分不清哪些是串过去的。\n"
+            "    怎么修：把它改成一行 UTF-8 的档名（例如 周汉钦），"
+            "或者删掉它（删掉 = 回到 default）。\n"
+            % (store.current_profile_file(), cause))
+
+
+def _abort_startup(message):
+    """印人话到 stderr，然后**非零退出**（绝不把 traceback 丢给用户）"""
+    sys.stderr.write(message)
+    sys.stderr.flush()
+    raise SystemExit(PROFILE_UNREADABLE_EXIT)
+
+
+# import 期就要拦：下面的 log.refresh() 会解析档名路径，裸抛的话用户看到的还是 traceback。
+# （log 模块自身的 import 期解析不抛、只把错误留档 —— 见 log._initial_log_file()：
+#  它是所有模块的公共依赖，它一抛，这里的校验根本轮不到执行。）
+_PROFILE_ERROR = profile_precondition_error()
+if _PROFILE_ERROR:
+    _abort_startup(_PROFILE_ERROR)
+
+
 ROOT = store.ROOT
 WEB = os.path.join(ROOT, "web")
 TEMPLATE_PATH = os.path.join(WEB, "report_template.html")
@@ -2619,6 +2679,12 @@ def port_in_use(port):
 
 
 def main():
+    # 前置检查必须在**任何**动作之前（包括端口探测）：档名坏了的时候，用户要看到的
+    # 永远是「去修那个文件」，而不是「端口被占用」，更不是一坨 traceback。
+    # import 期已经查过一遍，这里是第二道 —— 档名文件可能在 import 之后才坏掉。
+    _err = profile_precondition_error()
+    if _err:
+        _abort_startup(_err)
     if port_in_use(PORT):
         print("")
         print("[!] 端口 %d 已经被占用 —— 多半是你已经开着一个工具窗口了。" % PORT)

@@ -10,9 +10,12 @@ REPORT_DATA 快照」动态重渲染（模板改进立刻作用到老报告）�
 连接裸断）。DATA_ROOT / LOG_FILE 由 IsolatedCase 隔离，报告文件只写进隔离根的 reports/，
 绝不碰用户真实 data/，也不起真实服务（否则会往用户真实日志追加）。
 """
+import contextlib
 import io
 import json
 import os
+import subprocess
+import sys
 import threading
 import unittest
 from unittest import mock
@@ -26,6 +29,7 @@ import jdid
 import kb
 import kbreuse
 import llm
+import log
 import outcome
 import resumelib
 import store
@@ -5373,6 +5377,168 @@ class JdDeleteFrontendTest(LedgerWithReportsCase):
         self.assertEqual(len(out["calls"]), 1, out["calls"])          # 只预演，没发删除
         self.assertIn("/api/jd/purge_preview", out["calls"][0]["url"])
         self.assertIn("已取消", "\n".join(out["toasts"]))
+
+
+# --------------------------------------- 启动前置检查：档名文件读不出来时的人话 + 非零退出
+# 复现的真实形态：data/current_profile.txt 被记事本按 ANSI/GBK 存过中文档名 ⇒ 存在却读不出来。
+# 从 87cabe9 起 `store.current_profile()` 不再静默回退 default（那个决定是对的），
+# 但 import 期的解析（log / app）会**裸抛**：用户双击启动只看到一坨 traceback。
+#
+# 探针脚本的顺序**绝不能反**：先把 store.DATA_ROOT 指到隔离根，再 import app。
+# app 在 import 期就解析档名（log.refresh()），那一刻 DATA_ROOT 若还是真实的 data/，
+# 探针就会去读用户的真实档名文件（今天刚出过一次「探针没隔离根目录」的事故）。
+_STARTUP_PROBE = '''# -*- coding: utf-8 -*-
+import sys
+sys.path.insert(0, %r)
+import store
+store.DATA_ROOT = %r
+import log
+import app
+# 万一守卫失效：让 main() 立刻返回，而不是真起一个 ThreadingHTTPServer 把用例挂住。
+# 守卫在 main() 的第一行，所以正常情况下这行假实现只会被"越过"、不会被用到。
+app.port_in_use = lambda port: True
+print("APP_IMPORTED_OK")
+print("LOG_FILE=" + log.LOG_FILE)
+'''
+
+_MAIN_PROBE = '''
+print("BEFORE_MAIN")                   # 能打到这行 = import 期（含档名解析）确实走通了
+app.main()
+print("MAIN_RETURNED")
+'''
+
+# import **之后**才把档名文件弄坏（记事本按 GBK 存中文档名）：只有这样才测得到 main() 自己的
+# 那道检查 —— 坏在 import 之前的话，第一道检查就把进程拦掉了，main() 根本进不去。
+_BREAK_AFTER_IMPORT = '''
+import io as _io
+with _io.open(store.current_profile_file(), "wb") as _f:
+    _f.write("周汉钦".encode("gbk"))
+print("PROFILE_BROKEN")
+'''
+
+
+class StartupProfilePreconditionTest(IsolatedCase):
+    """三个入口（log 的 import 期 / app 的 import 期 / app.main()）都要一行人话 + 非零退出。
+
+    子进程探针是**唯一**能证明「import 期也没裸抛」的证据：`unittest` 进程里 app 早就
+    import 过了，import 期那条路径不可能再走一遍。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.repo = os.path.dirname(os.path.abspath(app.__file__))
+
+    # ---- 脚手架
+    def _write_probe(self, extra=""):
+        path = os.path.join(self.tmp, "startup_probe.py")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write((_STARTUP_PROBE % (self.repo, self.tmp)) + extra)
+        return path
+
+    def _run_probe(self, extra=""):
+        """跑探针。带超时 —— 实现被改坏时它可能去起服务，绝不能把用例挂死在这里。"""
+        env = dict(os.environ, PYTHONIOENCODING="utf-8")
+        return subprocess.run([sys.executable, self._write_probe(extra)],
+                              capture_output=True, timeout=90, env=env)
+
+    @staticmethod
+    def _text(raw):
+        # app 在 import 期把 stderr 重配成了 utf-8（见 app.py 顶部），所以按 utf-8 解
+        return raw.decode("utf-8", "replace")
+
+    def _gbk_profile_file(self):
+        fp = store.current_profile_file()
+        with open(fp, "w", encoding="gbk") as f:
+            f.write("周汉钦")
+        with open(fp, "rb") as f:
+            self.assertRaises(UnicodeDecodeError, f.read().decode, "utf-8")
+        return fp
+
+    def _assert_human_abort(self, returncode, stderr):
+        """非零退出 + 三句人话（哪个文件 / 为什么不能继续 / 怎么修）+ 没有 traceback。"""
+        self.assertEqual(returncode, 2,
+                         "退出码应为 2（启动前置条件不满足，什么都没做），实际 %r\nstderr=%s"
+                         % (returncode, stderr))
+        self.assertNotIn("Traceback", stderr, "给用户的是 traceback，不是人话：\n%s" % stderr)
+        self.assertIn("current_profile.txt", stderr)     # 哪个文件坏了
+        self.assertIn("default", stderr)                 # 为什么不能继续（串档）+ 怎么修
+        self.assertIn("UTF-8", stderr)                   # 怎么修
+
+    # ---- 入口 1+2：log 的 import 期 + app 的 import 期
+    def test_import_time_check_exits_nonzero_with_a_human_message(self):
+        self._gbk_profile_file()
+
+        p = self._run_probe()
+
+        self.assertNotIn("APP_IMPORTED_OK", self._text(p.stdout), "档名读不出来却把 app 起来了")
+        self._assert_human_abort(p.returncode, self._text(p.stderr))
+        # **反串档**：中止的同时，default 档里必须一个字节都没被写（日志也不例外）
+        self.assertFalse(os.path.exists(os.path.join(store.profiles_root(), "default",
+                                                     "logs", "events.jsonl")),
+                         "档名坏了却往 default 档里写了东西")
+
+    # ---- 入口 3：app.main()（档名文件在 import 之后才坏掉）
+    def test_main_also_aborts_nonzero_when_the_profile_breaks_after_import(self):
+        # 反证：import 那一刻档名文件还是好的，坏掉发生在 import 之后
+        self.assertEqual(store.current_profile(), "default")
+
+        p = self._run_probe(_BREAK_AFTER_IMPORT + _MAIN_PROBE)
+
+        out = self._text(p.stdout)
+        self.assertIn("APP_IMPORTED_OK", out)     # 反证：import 期确实是好的（走的是第二道检查）
+        self._assert_human_abort(p.returncode, self._text(p.stderr))
+        self.assertIn("PROFILE_BROKEN", out)      # 反证：坏掉确实发生在 import 之后
+        self.assertIn("BEFORE_MAIN", out)         # 反证：这次真的走到了 main()
+        self.assertNotIn("MAIN_RETURNED", out, "档名坏了却把服务起起来了")
+        # 中止得够早：这一趟一个字节都没写进 default 档的日志
+        self.assertFalse(os.path.exists(log.LOG_FILE))
+
+    # ---- 回归钉子：删掉那个文件 = 回到 default，一切照旧
+    def test_removing_the_file_is_a_normal_start(self):
+        fp = store.current_profile_file()
+        self.assertTrue(os.path.exists(fp))          # 反证：文件原本真的在（是 IsolatedCase 建的）
+        os.remove(fp)
+
+        p = self._run_probe(_MAIN_PROBE)
+
+        out = self._text(p.stdout)
+        self.assertEqual(p.returncode, 0, self._text(p.stderr))
+        self.assertIn("APP_IMPORTED_OK", out)
+        self.assertIn("MAIN_RETURNED", out)
+        self.assertNotIn("Traceback", self._text(p.stderr))
+        self.assertIn(os.path.join(store.profiles_root(), "default", "logs"), out)
+
+    def test_a_valid_profile_file_still_starts_and_is_honored(self):
+        """反向的钉子：修法绝不能变成「档名文件存在就拒绝启动」。"""
+        store.set_current_profile("周汉钦")
+
+        p = self._run_probe()
+
+        out = self._text(p.stdout)
+        self.assertEqual(p.returncode, 0, self._text(p.stderr))
+        self.assertIn("APP_IMPORTED_OK", out)
+        self.assertIn(os.path.join(store.profiles_root(), "周汉钦", "logs"), out)
+
+    # ---- 单元层：可单测的校验函数本身
+    def test_precondition_returns_none_when_the_file_is_fine(self):
+        self.assertIsNone(app.profile_precondition_error())
+
+    def test_precondition_returns_the_message_when_the_file_is_broken(self):
+        fp = self._gbk_profile_file()
+        msg = app.profile_precondition_error()
+        self.assertIsInstance(msg, str)
+        for word in (fp, "default", "UTF-8"):
+            self.assertIn(word, msg)
+
+    def test_precondition_does_not_swallow_other_exceptions(self):
+        """**这次改动最容易引入的坏味道**：`except Exception` 顺手把真 bug 也包成同一句人话。
+
+        真 bug（这里用 ValueError 代表）必须原样冒出去 —— 被同一出口吞掉的话，
+        用户看到的是「档名文件坏了」，而真实原因（代码/IO 缺陷）永远查不到。
+        """
+        with mock.patch.object(store, "current_profile",
+                               mock.Mock(side_effect=ValueError("真 bug，不是档名问题"))):
+            self.assertRaises(ValueError, app.profile_precondition_error)
 
 
 if __name__ == "__main__":
