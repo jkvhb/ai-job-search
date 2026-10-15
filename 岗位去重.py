@@ -15,7 +15,7 @@
   - **无参数时严格只读**：不写台账 / 知识库 / 日志 / 备份，一个字节都不写
   - 判定只认 JD 原文（`data/profiles/<profile>/jd/<岗位id>.txt`），缺原文的岗位跳过并计数
   - `--合并` 前必定给 jobs.json / knowledge.json / 受影响的面试 status.json 做带时间戳的备份
-    （**保留不删**）；任一步失败按备份回滚
+    （**每处只保留最新 `store.BACKUP_KEEP`（= 3）份**，更旧的会被轮转删掉）；任一步失败按备份回滚
   - 合并**只标记** `merged_into`：不删岗位记录、不删报告、不删 JD 原文（报告是用户的资产）
 """
 import os
@@ -115,7 +115,8 @@ def do_merge(keep_id, drop_id):
           % (res["kb_repointed"], res["kb_deduplicated"], res["interview_files"]))
     print("  drop 记录已标记 merged_into（**没删记录、没删报告、没删 JD 原文**）")
     print("合并后：multi_jd %s → %s" % (res["multi_jd_before"], _multi_jd()))
-    print("备份保留（确认无误后可自行删除）。")
+    print("备份已留在原处（每处只保留最新 %d 份，更旧的已自动轮转删掉；确认无误后可自行删除）。"
+          % store.BACKUP_KEEP)
     return 0
 
 

@@ -504,16 +504,40 @@ def load_jds(key=None):
 
 
 def save_jds(data, key=None):
-    """原子写 JD 库（走 `store.write_json`）。非 dict 一律当空库写，绝不写坏结构。"""
-    if not isinstance(data, dict):
-        data = {}
-    raw = data.get("jds")
-    out = {"version": _as_int(data.get("version"), 1) or 1,
-           "seq": max(0, _as_int(data.get("seq"), 0)),
-           "jds": [r for r in (raw if isinstance(raw, list) else [])
-                   if isinstance(r, dict) and _text(r.get("id"))]}
-    store.write_json(_jds_path(key), out)
-    return out
+    """原子写 JD 库（走 `store.write_json`）。**读不出来时拒绝**（理由见 `store.jds_safe_to_write`），
+    覆盖前留一份 `.bak-<时间戳>`。非 dict 一律当空库写，绝不写坏结构。
+
+    ⚠️ 判据 + 留档 + 写盘整段在 `_JD_LOCK` 里（与 `store.save_jobs` 同一做法）：判据与写盘之间
+    若挤进另一个写者，留下来的就不是"覆盖前"那一份了。
+
+    为什么必须拒绝：`load_jds()` 的契约是"绝不抛异常"（读失败 → 空库），而本函数是**整份覆盖**
+    —— 于是"一次读失败"就等于整个 JD 库被内存里那份空库顶掉。**实测**：GBK 的 2 条记录库上
+    只剩新那一条 / `next_seq` 把它清成空库，且盘上没有任何副本。
+
+    **异常类型选 `RuntimeError`**（三个写入口一致）：全仓库「前置条件不满足就中止」用的都是它
+    （见 `store.ProfileUnreadable` 的说明），`ValueError` 在本模块留给**入参 / 校验**类错误
+    （"没有这个 ID"、"ID 已被占用"）—— 把"文件读不出来"混进校验类错误，用户会以为是自己
+    填错了东西，跑去改 ID 而不是修文件。
+    """
+    with _JD_LOCK:
+        p = _jds_path(key)
+        # 判据问的就是**这个** key 的路径（不是默认 profile 的那一份），见 store.jds_safe_to_write。
+        ok, err = store.jds_safe_to_write(p)
+        if not ok:
+            raise RuntimeError(
+                "%s。**拒绝写入**：`save_jds` 是**整份覆盖**，而现在内存里那份是从读不出来的文件"
+                "兜出来的空库（`load_jds()` 永不抛异常）—— 写下去就是整个 JD 库一次性没掉，"
+                "盘上没有任何副本。请先把 `jds.json` 修好（或从别处恢复、把它移开）再保存。" % err)
+        if not isinstance(data, dict):
+            data = {}
+        raw = data.get("jds")
+        out = {"version": _as_int(data.get("version"), 1) or 1,
+               "seq": max(0, _as_int(data.get("seq"), 0)),
+               "jds": [r for r in (raw if isinstance(raw, list) else [])
+                       if isinstance(r, dict) and _text(r.get("id"))]}
+        store.snapshot_before_overwrite(p)      # 覆盖前留档（自带 `.bak-` 轮转，只留最新 3 份）
+        store.write_json(p, out)
+        return out
 
 
 def find_jd(jd_id, key=None):
@@ -531,12 +555,24 @@ def upsert_jd(record, key=None):
     """插入或按 id 更新一条 JD 记录。**不动 seq**（编号只由 `next_seq` 推进）。
 
     记录里没有 `created_at` 时补一个；返回落盘后的记录（便于调用方接着填字段）。
+
+    **读不出来时拒绝**（判据与 `save_jds` 同一份 `store.jds_safe_to_write`）：
+    `load_jds()` 读失败时给的是空库，拿它去 upsert 就是把整个 JD 库换成这一条
+    （**实测**：2 条记录 → 只剩新那一条，`.bak-` 0 份）。
     """
     if not isinstance(record, dict) or not _text(record.get("id")):
         raise ValueError("JD 记录必须有非空的 id")
     from datetime import datetime
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     with _JD_LOCK:
+        p = _jds_path(key)
+        # ⚠️ 先判"能不能写"再读：读不出来时 `load_jds()` 给的是空库。
+        ok, err = store.jds_safe_to_write(p)
+        if not ok:
+            raise RuntimeError(
+                "%s。**拒绝写入**：这次 `upsert_jd` 会把整个 JD 库覆盖成「这一条 + 读出来的"
+                "空库」，旧记录会在盘上消失且没有副本。请先把 `jds.json` 修好"
+                "（或从别处恢复、把它移开）再抓这个岗位。" % err)
         data = load_jds(key)
         new = dict(record)
         new.setdefault("id_history", [])
@@ -559,8 +595,21 @@ def upsert_jd(record, key=None):
 
 
 def next_seq(key=None):
-    """`seq += 1` 并落盘，返回新的编号（全局递增，ID 的编号段用它）。"""
+    """`seq += 1` 并落盘，返回新的编号（全局递增，ID 的编号段用它）。
+
+    **读不出来时拒绝**（与 `upsert_jd` 同一份判据）：`load_jds()` 读失败时给的是空库，
+    `seq` 会从 0 重新开始 —— 于是编号复用、ID 撞车；**实测**更严重：整个 JD 库被清成
+    `{"version":1,"seq":1,"jds":[]}`（299 → 47 字节），且没有副本。
+    """
     with _JD_LOCK:
+        p = _jds_path(key)
+        ok, err = store.jds_safe_to_write(p)
+        if not ok:
+            raise RuntimeError(
+                "%s。**拒绝写入**：`next_seq` 要把 `seq` 写回盘上，而现在内存里那份是从读不出来"
+                "的文件兜出来的空库 —— 写下去就是整个 JD 库被清空（编号还会从 1 重新开始，"
+                "跟已有的 ID 撞车）。请先把 `jds.json` 修好（或从别处恢复、把它移开）再继续。"
+                % err)
         data = load_jds(key)
         data["seq"] = max(0, _as_int(data.get("seq"), 0)) + 1
         save_jds(data, key)
@@ -620,14 +669,29 @@ def _repoint_kb(data, old_id, new_id):
 
 
 def _interview_status_paths(old_id):
-    """所有 `interviews/<面试id>/status.json` 里 `job_id == old_id` 的文件路径（有序）。"""
+    """扫 `interviews/<面试id>/status.json`，返回 `(job_id == old_id 的文件路径, 原因)`。
+
+    **原因非空 = 有一份 status.json 读不出来**，调用方（`rename_jd`）必须据此**拒绝整次改名**。
+
+    为什么不能再用 `store.read_json(path, None)` 把"读不出来"当成"它没引用我"：
+    面试记录不像知识库那样只有一个集中入口 —— 它是**每个面试目录一个文件**，
+    所以漏掉一份没有任何集中信号。被跳过的那一份，改完 ID 之后 `job_id` 会**静默**留着旧
+    ID（同一个岗位两种身份），用户看不到任何提示。**"读不出来"就是"不知道它指向谁"**，
+    而"不知道"不许当成"安全"（本项目丢数据的习惯）。
+    0 字节 / 文件不存在**不算**读不出来：里面一个字节都没有，也就没有 `job_id` 可指。
+    """
     import glob
     out = []
+    err = ""
     for path in sorted(glob.glob(store.interview_file("*", "status.json"))):
         st = store.read_json(path, None)
-        if isinstance(st, dict) and st.get("job_id") == old_id:
-            out.append(path)
-    return out
+        if isinstance(st, dict):
+            if st.get("job_id") == old_id:
+                out.append(path)
+            continue
+        if store.file_has_bytes_to_lose(path):
+            err = err or ("面试记录 `%s` 读不出来（拿不到它的 `job_id`）" % path)
+    return out, err
 
 
 def _bad(msg, **kw):
@@ -655,6 +719,15 @@ def rename_jd(old_id, new_id, key=None):
     （回归测试 `tests/test_jdid.py::RenameJdTest::test_an_unreadable_knowledge_base_refuses_the_rename_and_changes_nothing`）。
     0 字节 / 根本不存在的知识库**不算**读不出来（那是合法的"第一次"，没有可丢的字节）。
 
+    **JD 库读不出来时同样拒绝**（`RuntimeError`，判据 `store.jds_safe_to_write()`）：老实现会让
+    `load_jds()` 把坏文件静默归成空库，然后报「JD 库里没有这个 ID：X」—— 而那条记录其实就在
+    盘上（只是读不出来），误导用户去新建一个同岗位的第二种身份。
+
+    **任何一份面试 `status.json` 读不出来也拒绝整次改名**（`RuntimeError`）：面试记录是每个
+    面试目录一个文件，漏一份没有集中信号；老实现把"读不出来"当成"这份没引用我"跳过，
+    改完 ID 后那份的 `job_id` 静默留着旧 ID（回归测试
+    `RenameJdUnreadableInterviewStatusTest`）。
+
     **原像按原始字节保存**：**读不出来**（被锁 / 权限 / 任何异常）绝不能被当成"本来不存在"、
     更不许被兜成空内容 —— 回滚会反过来把用户的文件写成 `{}`（回归测试见
     `tests/test_jdid.py::RenameJdTest::test_a_read_failure_at_snapshot_time_leaves_the_bytes_untouched`）；
@@ -669,6 +742,21 @@ def rename_jd(old_id, new_id, key=None):
         return old
 
     with _JD_LOCK:
+        jds_path = _jds_path(key)
+        # ---- 需求二①：`jds.json` 读不出来 → **如实说"读不出来"**，不许说成"库里没有这个 ID" ----
+        # 老行为：`load_jds()` 把坏文件静默归成空库 → 走到下面那句 `_bad("JD 库里没有这个 ID")`
+        # —— 而那条记录其实**就在盘上**（只是读不出来）。用户照着"没有这个 ID"去查只会更糊涂，
+        # 还很容易顺手"那就新建一个吧"，于是同一个岗位又多出一种身份。
+        # 判据用 `store.jds_safe_to_write`（= 严格读 + "盘上有没有字节"），与三个写入口同一份；
+        # 0 字节 / 不存在**不算**读不出来（那是合法的"第一次"，照旧报"库里没有这个 ID"）。
+        jds_ok, jds_err = store.jds_safe_to_write(jds_path)
+        if not jds_ok:
+            msg = ("%s。**已拒绝这次改 ID**：读不出来就无法确认 %s 在不在库里，"
+                   "也无从把引用改过去（把「读不出来」说成「没有这个 ID」正是要修的误导）。"
+                   "这次改名一个字节都没动 —— 请先把 JD 库修好（或从别处恢复）再改。"
+                   % (jds_err, old))
+            log.log_event("jdid.rename_rejected", level="warn", reason=msg, old=old, new=new)
+            raise RuntimeError(msg)
         data = load_jds(key)
         target = None
         for r in data["jds"]:
@@ -705,7 +793,18 @@ def rename_jd(old_id, new_id, key=None):
                 raise RuntimeError(msg)
             kb_data = store.load_knowledge(key)
             jobs = store.load_jobs(key)
-            paths = _interview_status_paths(old)
+
+            # ---- 需求二②：有面试 status.json 读不出来 → 拒绝整次改名（"读不出来"就是"不知道"）----
+            # 面试记录是**每个面试目录一个文件**，漏掉一份不会有任何集中信号：老实现把它当成
+            # "这份没引用我"跳过，改完 ID 后那份的 `job_id` 静默留着旧 ID（同一个岗位两种身份）。
+            paths, iv_err = _interview_status_paths(old)
+            if iv_err:
+                msg = ("%s。**已拒绝这次改 ID**：读不出来就无法确认哪些面试记录挂在 %s 下面，"
+                       "改完会有一条面试记录的 `job_id` 静默留着旧 ID（同一个岗位两种身份）。"
+                       "这次改名一个字节都没动 —— 请先把它修好（或从别处恢复、把它移开）再改。"
+                       % (iv_err, old))
+                log.log_event("jdid.rename_rejected", level="warn", reason=msg, old=old, new=new)
+                raise RuntimeError(msg)
 
             # ---- 6) 先在内存里把全部改动算完（此时一个字节都还没落盘）----
             new_target = dict(target)
@@ -732,9 +831,9 @@ def rename_jd(old_id, new_id, key=None):
 
             # ---- 7) 落盘（逐文件；失败用内存原像回滚已写的文件）----
             # 原像一律按**原始字节**读（`read_bytes`，读不出来返回 None 表示"本来不存在"）。
-            # 这里真正的风险不是"非 UTF-8 的 jds.json"（那条静态路径**不可达**：GBK 的
-            # jds.json 会让 `load_jds` 返回空库、`rename_jd` 在"库里没有这个 ID"就退出，
-            # 一个字节都没写），而是**取原像这一步本身读失败**（文件被锁 / 权限）。
+            # 这里真正的风险不是"非 UTF-8 的 jds.json"（那条静态路径到不了这里：读不出来时
+            # 上面那道 `store.jds_safe_to_write` 闸门已经**拒绝整次改名**，一个字节都没写），
+            # 而是**取原像这一步本身读失败**（文件被锁 / 权限）。
             # 用 `read_text(..., None)` 会把"读失败"静默兜成 `None`，而 `None` 在下面的
             # 回滚里表示"这个文件本来不存在" → 回滚把 285 字节的台账写成 `{}`（2 字节），
             # 用户的 JD 库被清空、连备份里也没有原文。回归测试：

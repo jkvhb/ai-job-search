@@ -867,6 +867,210 @@ class WholeProfileBackupKeepsLedgerBackupsOutTest(IsolatedCase):
         self.assertTrue(os.path.exists(baks[0]), "备份是拷贝，原地的 .bak- 不许被动")
 
 
+class ReadJdsStrictTest(IsolatedCase):
+    """`read_jds_strict()`：**区分"读不出来"与"没有"**（`jds.json` 这一侧原先唯一的缺口）。
+
+    为什么必须有它：`jdid.load_jds()` 在任何读/解析失败时都回一份**空库**
+    （`{"version":1,"seq":0,"jds":[]}`，它的契约是"绝不抛异常"），而 `jdid.save_jds` 是
+    **整份覆盖** —— 于是"一次读失败"就等于整个 JD 库被内存里那份空库顶掉。
+    config / jobs / knowledge 三份早就有这对判据，jds 是漏掉的那一份。
+
+    **实测（隔离探针，299 字节 / 2 条记录的 GBK `jds.json`）**：
+      - `upsert_jd(一条新记录)` → 盘上 272 字节、**只剩新那一条**（旧 2 条被清、`.bak-` 0 份）
+      - `next_seq()`           → 盘上 47 字节、`{"version":1,"seq":1,"jds":[]}`（**全清**、0 份）
+    """
+
+    def _path(self):
+        return store.p_path("jds.json")
+
+    def _write(self, blob, path=None):
+        p = path or self._path()
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "wb") as f:
+            f.write(blob)
+        return p
+
+    def test_a_missing_file_is_empty_with_no_reason(self):
+        data, err = store.read_jds_strict()
+        self.assertEqual(data, {"version": 1, "seq": 0, "jds": []})
+        self.assertEqual(err, "", "文件不存在不是错误")
+
+    def test_a_valid_file_returns_its_records(self):
+        store.write_json(self._path(),
+                         {"version": 1, "seq": 3, "jds": [{"id": "a"}, {"id": "b"}]})
+        data, err = store.read_jds_strict()
+        self.assertEqual([r["id"] for r in data["jds"]], ["a", "b"])
+        self.assertEqual(data["seq"], 3)
+        self.assertEqual(err, "")
+
+    def test_a_non_utf8_file_reports_a_reason_instead_of_a_silent_empty(self):
+        raw = json.dumps({"version": 1, "seq": 7, "jds": [
+            {"id": "本科_字节跳动_数据标注_文本_北京_6-8K_0001", "company": "字节跳动"}]},
+            ensure_ascii=False).encode("gbk")
+        try:
+            raw.decode("utf-8")
+            raise AssertionError("夹具没坏：这串字节居然能按 UTF-8 解出来")
+        except UnicodeDecodeError:
+            pass
+        self.assertIn("字节跳动", raw.decode("gbk"))          # 自证：内容真的在里面
+        self._write(raw)
+        data, err = store.read_jds_strict()
+        self.assertEqual(data, {"version": 1, "seq": 0, "jds": []}, "读不出来时给的是空库占位")
+        self.assertTrue(err, "坏文件必须给出原因，绝不能静默当成空库")
+        self.assertIn("jds.json", err)
+        self.assertIn("读不出来", err)
+
+    def test_a_truncated_file_reports_a_reason(self):
+        self._write(b'{"jds": [ <<<CORRUPT>>>')
+        _, err = store.read_jds_strict()
+        self.assertTrue(err)
+        self.assertIn("jds.json", err)
+
+    def test_a_wrong_shape_reports_a_reason(self):
+        self._write(b'{"jds": "not-a-list"}')
+        _, err = store.read_jds_strict()
+        self.assertTrue(err, "结构不对也算读不出来")
+        self._write(b"[]")                                     # 合法 JSON、但不是含 jds 的对象
+        _, err2 = store.read_jds_strict()
+        self.assertTrue(err2)
+
+    def test_the_reason_names_the_file_that_was_actually_read(self):
+        """判据是通用函数（调用方可以传别的 path）：原因里必须出现**那个**文件名。
+        写死 `jds.json` 会让用户照着这句话去修错文件（与 `read_knowledge_strict` 同一条）。"""
+        other = os.path.join(self.tmp, "别处的库.json")
+        self._write(b'{"jds": [ <<<CORRUPT>>>', path=other)
+        _, err = store.read_jds_strict(other)
+        self.assertIn("别处的库.json", err)
+        self.assertNotIn("jds.json", err)
+        self._write(b'{"jds": "not-a-list"}', path=other)
+        _, err2 = store.read_jds_strict(other)
+        self.assertIn("别处的库.json", err2)
+        self.assertNotIn("jds.json", err2)
+
+    def test_it_does_not_write_anything(self):
+        bad = b'{"jds": [ <<<CORRUPT>>>'
+        path = self._write(bad)
+        folder = os.path.dirname(path)
+        before = sorted(os.listdir(folder))
+        store.read_jds_strict()
+        with open(path, "rb") as f:
+            self.assertEqual(f.read(), bad, "只读：坏文件原样留原路径")
+        self.assertEqual(sorted(os.listdir(folder)), before, "只读：不许多写/改名任何文件")
+
+
+class JdsSafeToWriteTest(IsolatedCase):
+    """`jds_safe_to_write()` —— `jds.json` 的写盘判据（与另外三份同形）。
+
+    可写 = **读得出来 或 真的是 0 字节**；有字节却读不出来 → 不可写（调用方必须拒绝写盘）。
+    """
+
+    def _path(self):
+        return store.p_path("jds.json")
+
+    def _write(self, blob, path=None):
+        p = path or self._path()
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "wb") as f:
+            f.write(blob)
+        return p
+
+    def test_a_missing_library_is_safe(self):
+        self.assertEqual(store.jds_safe_to_write(), (True, ""))
+
+    def test_a_valid_library_is_safe(self):
+        store.write_json(self._path(),
+                         {"version": 1, "seq": 0, "jds": [{"id": "本科_字节_标注_文本_北京_6-8K_0001"}]})
+        self.assertEqual(store.jds_safe_to_write(), (True, ""))
+
+    def test_a_zero_byte_library_is_safe(self):
+        """0 字节 = 合法的"第一次"，没有可丢的内容。"""
+        self._write(b"")
+        self.assertEqual(store.jds_safe_to_write(), (True, ""))
+
+    def test_a_non_utf8_library_is_not_safe(self):
+        raw = json.dumps({"version": 1, "seq": 7, "jds": [
+            {"id": "本科_腾讯_语音评测_语音_深圳_13-26K_0002", "company": "腾讯"}]},
+            ensure_ascii=False).encode("gbk")
+        try:
+            raw.decode("utf-8")
+            raise AssertionError("夹具没坏：这串字节居然能按 UTF-8 解出来")
+        except UnicodeDecodeError:
+            pass
+        self._write(raw)
+        ok, err = store.jds_safe_to_write()
+        self.assertFalse(ok, "有字节却读不出来 → 绝不能写盘")
+        self.assertIn("jds.json", err)
+
+    def test_a_truncated_library_is_not_safe(self):
+        self._write(b'{"jds": [ <<<CORRUPT>>>')
+        self.assertFalse(store.jds_safe_to_write()[0])
+
+    def test_a_wrong_shape_library_is_not_safe(self):
+        self._write('{"jds": "不是列表"}'.encode("utf-8"))
+        self.assertFalse(store.jds_safe_to_write()[0])
+
+    def test_a_whitespace_only_library_is_not_safe(self):
+        self._write(b"\r\n   \r\n")
+        ok, err = store.jds_safe_to_write()
+        self.assertFalse(ok, "有字节（不是 0 字节）→ 不可写")
+        self.assertIn("jds.json", err)
+
+    def test_the_judgement_asks_the_path_it_was_given(self):
+        """判据必须问**传进来的那个路径**（按 key 指定的档别拿默认 path 去判）。"""
+        other = os.path.join(self.tmp, "别的档", "jds.json")
+        self._write(b'{"jds": [ <<<CORRUPT>>>', path=other)
+        ok, err = store.jds_safe_to_write(other)
+        self.assertFalse(ok)
+        self.assertIn("jds.json", err)
+        self.assertEqual(store.jds_safe_to_write(), (True, ""), "默认那份不存在，不该被别的档连累")
+
+    def test_it_does_not_write_anything(self):
+        bad = b'{"jds": [ <<<CORRUPT>>>'
+        path = self._write(bad)
+        folder = os.path.dirname(path)
+        before = sorted(os.listdir(folder))
+        store.jds_safe_to_write()
+        with open(path, "rb") as f:
+            self.assertEqual(f.read(), bad, "只读：坏库原样留原路径")
+        self.assertEqual(sorted(os.listdir(folder)), before, "只读：不许多写/改名任何文件")
+
+
+class PruneBackupsPublicEntryTest(IsolatedCase):
+    """轮转的**公开入口**：`store.prune_backups`（`jobdup` 要给知识库 / 面试记录轮转）。
+
+    为什么要有它：`jobdup` 原先直接调带下划线的 `store._prune_backups` —— 跨模块调私有名，
+    哪天 store 把它改名/挪走，就是**静默**失效（备份无上限增长，没人报错）。
+    """
+
+    def test_it_is_public_and_is_the_same_single_implementation(self):
+        self.assertTrue(callable(store.prune_backups), "缺少公开的 prune_backups")
+        self.assertIs(store.prune_backups, store._prune_backups,
+                      "公开入口必须是同一份实现（两份轮转判据会各自漂移）")
+
+    def test_it_rotates_to_the_keep_limit_and_reports_what_it_removed(self):
+        path = os.path.join(self.tmp, "目标.json")
+        names = ["%s.bak-2026010100000%d" % (path, i) for i in range(1, 6)]
+        for i, n in enumerate(names):
+            store.write_bytes(n, b"v%d" % i)
+        removed = store.prune_backups(path)                       # 默认 keep=store.BACKUP_KEEP
+        left = sorted(os.path.basename(n) for n in glob.glob(path + ".bak-*"))
+        self.assertEqual(len(left), store.BACKUP_KEEP, "轮转后只该留最新 keep 份：%s" % left)
+        self.assertEqual(left, sorted(os.path.basename(n) for n in names[-store.BACKUP_KEEP:]))
+        self.assertEqual(sorted(os.path.basename(n) for n in removed),
+                         sorted(os.path.basename(n) for n in names[:-store.BACKUP_KEEP]),
+                         "被删的是最旧那几份，且返回值要如实给出它们")
+
+    def test_the_script_no_longer_claims_backups_are_never_deleted(self):
+        """`岗位去重.py` 的文案必须与实现一致：`.bak-` 只留最新 `store.BACKUP_KEEP`（= 3）份。
+
+        旧文案写的是"保留不删"/"（确认无误后可自行删除）"—— 说过头了：轮转会把更旧的删掉。
+        只钉文案（逻辑一个字不动），否则下一个人照着这句话会以为备份永远都在。
+        """
+        src = store.read_text(os.path.join(store.ROOT, "岗位去重.py"))
+        self.assertNotIn("保留不删", src, "文案还写着「保留不删」，与轮转实现不符")
+        self.assertIn("BACKUP_KEEP", src, "文案该说清「只留最新 BACKUP_KEEP 份」")
+
+
 class UpsertJobConcurrencyTest(IsolatedCase):
     """P0-5（体检报告 §2 / §10 的 1.9）：`jobs.json` 的**读-改-写必须整体互斥**。
 

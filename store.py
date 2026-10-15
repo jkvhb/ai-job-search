@@ -439,6 +439,69 @@ def find_job(job_id, key=None):
     return None
 
 
+# ---------- jds（JD 库，`jdid` 的写目标）----------
+# `jds.json` 的**路径**归 `jdid._jds_path(key)` 管（含 profile key 的解析）；store 这一侧只提供
+# "读得出来吗 / 能不能写"这对判据 —— 形状与 config / jobs / knowledge 三份完全相同
+# （「读不出来 ≠ 没有」这条口径**只准有一份实现**，而这三份早就有了，jds 是漏掉的那一份）。
+# ⚠️ 按 key 指定的那一份，调用方必须把 path **显式传进来**：这里的默认值是"当前 profile"，
+# 拿它去判另一个档的文件就是问错了对象（判据与写盘目标必须**同一个路径**）。
+def _empty_jd_library():
+    """空 JD 库的占位形状（与 `jdid.load_jds()` 的空库逐字段一致，方便调用方写类型安全的分支）。
+
+    ⚠️ 它只是**读不出来时的占位**，绝不能被写回盘上 —— 那正是这对判据要拦的事。
+    """
+    return {"version": 1, "seq": 0, "jds": []}
+
+
+def read_jds_strict(path=None):
+    """读 JD 库，**区分"读不出来"与"没有"**：返回 `(数据, 原因)`，原因非空 = 不可信。
+
+    形状照 `read_knowledge_strict` / `read_jobs_strict` 抄。为什么必须有它：
+    `jdid.load_jds()` 的契约是"**绝不抛异常**"（任何读/解析失败 → 空库），而 `jdid.save_jds`
+    是**整份覆盖** —— 于是"一次读失败"就等于整个 JD 库被内存里那份空库顶掉。
+    这是四个写目标里**唯一**还没有护栏的一个（config / jobs / knowledge 早就有各自的那一对）。
+
+    **只读**：不隔离、不改名、不写盘（坏文件原样留着，等用户自己处理）。
+    """
+    p = path or p_path("jds.json")
+    if not os.path.exists(p):
+        return _empty_jd_library(), ""
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        # 文件名必须插值：调用方可以传别的 path，写死 jds.json 会让用户照着这句话去修错文件。
+        return _empty_jd_library(), "JD 库 `%s` 读不出来：%s" % (os.path.basename(p), e)
+    if not isinstance(data, dict) or not isinstance(data.get("jds"), list):
+        return _empty_jd_library(), "JD 库 `%s` 的结构不对（应当是含 `jds` 列表的对象）" % (
+            os.path.basename(p),)
+    return data, ""
+
+
+def jds_safe_to_write(path=None):
+    """`jds.json` 当前是否可以**安全写盘**？返回 `(可写, 原因)`。
+
+    可写 = **读得出来**，**或者**文件里根本没有一个字节（不存在 / 真的是 0 字节）。
+    其余（有字节、却读不出来）→ 不可写：调用方必须**拒绝**这次写盘。
+
+    为什么必须有它（**实测，隔离探针，299 字节 / 2 条记录的 GBK `jds.json`**）：
+      - `jdid.upsert_jd(一条新记录)` → 盘上 272 字节、**只剩新那一条**（旧 2 条被清）
+      - `jdid.next_seq()`            → 盘上 47 字节、`{"version":1,"seq":1,"jds":[]}`（**全清**）
+      两次都**没有留下任何 `.bak-`**（老 `save_jds` 压根没有留档这一步）—— 不可恢复。
+    触发条件是现实的：用户手改 JSON、记事本按 ANSI/GBK 存过中文、杀毒软件短暂锁文件、IO 错误。
+
+    ⚠️ 判据必须问**严格读**，**不能**看 `jdid.load_jds()` 的返回值 ——
+    那正是把"读不出来"和"空库"混成同一个信号的根源。
+    """
+    p = path or p_path("jds.json")
+    _data, err = read_jds_strict(p)
+    if not err:
+        return True, ""
+    if not file_has_bytes_to_lose(p):
+        return True, ""          # 不存在 / 真的是 0 字节：合法的"第一次"
+    return False, err
+
+
 # ---------- knowledge（知识库，阶段 1 先留骨架）----------
 def knowledge_path(key=None):
     return p_path("knowledge.json", key=key)
@@ -560,6 +623,13 @@ def _prune_backups(path, keep=BACKUP_KEEP):
             continue
         removed.append(full)
     return removed
+
+
+# **公开入口，为 `jobdup` 提供**：它给 `knowledge.json` 与每个面试 `status.json` 留 `.bak-`，
+# 也需要"只留最新 N 份"这条轮转（`snapshot_before_overwrite` 只管它自己的目标文件）。
+# 跨模块调带下划线的私有名是隐患：store 哪天把它改名/挪走，调用方就是**静默**失效
+# （备份无上限增长，没人报错）。这里是同一份实现（不是副本），旧的私有名保留给内部调用。
+prune_backups = _prune_backups
 
 
 def snapshot_before_overwrite(path):

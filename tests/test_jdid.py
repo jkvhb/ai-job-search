@@ -11,6 +11,7 @@
 **断言粒度刻意收紧**（本项目已累计 11+ 次假绿）：ID 字符串一律**逐字比全文**；
 「重复被拒」与「改名被拒」**同时**断言「返回了错误说明」且「库里的东西一个字节没动」。
 """
+import glob
 import json
 import os
 import unittest
@@ -912,6 +913,314 @@ class RenameRollbackByteExactTest(IsolatedCase):
 
         with open(path, "rb") as f:
             self.assertEqual(f.read(), raw, "回滚必须逐字节还原（LF 不许被换成 CRLF）")
+
+
+_JDS_OLD_1 = "本科_字节跳动_数据标注_文本_北京_6-8K_0001"
+_JDS_OLD_2 = "本科_腾讯_语音评测_语音_深圳_13-26K_0002"
+_JDS_NEW = "本科_新单位_数据质检_文本_上海_6-8K_0003"
+
+
+def _gbk_jds_bytes():
+    """坏 `jds.json` 的夹具字节：GBK + 中文、里面**真有** 2 条记录。
+
+    ⚠️ 夹具**必须含中文**：纯 ASCII 的 GBK 与 UTF-8 逐字节相同 —— 那就不是坏文件，
+    `jds_safe_to_write()` 会判"读得出来" ⇒ 用这条夹具的用例会**假绿**
+    （本项目 11+ 次假绿的常见形态）。所以这里先自证：解不出 UTF-8、但解得出 GBK。
+    """
+    raw = json.dumps({"version": 1, "seq": 7, "jds": [
+        {"id": _JDS_OLD_1, "company": "字节跳动", "job_title": "数据标注"},
+        {"id": _JDS_OLD_2, "company": "腾讯", "job_title": "语音评测"}]},
+        ensure_ascii=False).encode("gbk")
+    try:
+        raw.decode("utf-8")
+        raise AssertionError("夹具没坏：这串字节居然能按 UTF-8 解出来")
+    except UnicodeDecodeError:
+        pass
+    if "字节跳动" not in raw.decode("gbk"):
+        raise AssertionError("夹具里没有中文内容：GBK 与 UTF-8 就没区别了")
+    if len(json.loads(raw.decode("gbk"))["jds"]) != 2:
+        raise AssertionError("夹具里应当有 2 条记录")
+    return raw
+
+
+def _write_gbk_jds():
+    raw = _gbk_jds_bytes()
+    path = store.p_path("jds.json")
+    with open(path, "wb") as f:
+        f.write(raw)
+    return path, raw
+
+
+class JdsWriteRefusesUnreadableLibraryTest(IsolatedCase):
+    """本轮实测的**两条丢数据路**：`jds.json` 有字节却读不出来时，三个写入口都必须拒绝。
+
+    config / jobs / knowledge 三份早就有「读不出来就别写」的判据与严格读，**jds 这一侧是
+    唯一的缺口**：`load_jds()` 的契约是"绝不抛异常"（读失败 → 空库），而 `save_jds` 是
+    **整份覆盖** ⇒ 一次读失败就等于整个 JD 库被内存里那份空库顶掉。
+    隔离探针实测（299 字节 / 2 条记录的 GBK 库）：
+      - `upsert_jd(一条新记录)` → 盘上 272 字节、**只剩新那一条**（旧 2 条被清、`.bak-` 0 份）
+      - `next_seq()`           → 盘上 47 字节、`{"version":1,"seq":1,"jds":[]}`（**全清**、0 份）
+
+    所以断言是三条一起：**逐字节未变**、**记录条数仍是 2**、**连 `.bak-` 都没多出来**。
+    """
+
+    def _assert_refused(self, call, layer):
+        path, raw = _write_gbk_jds()
+        folder = os.path.dirname(path)
+        before = sorted(os.listdir(folder))
+        with self.assertRaises(RuntimeError) as cm:
+            call()
+        msg = str(cm.exception)
+        self.assertIn("jds.json", msg, "错误说明里要点名是哪个文件")
+        self.assertIn(layer, msg, "要说清是哪一层的哪件事（%s）" % layer)
+        with open(path, "rb") as f:
+            self.assertEqual(f.read(), raw, "拒绝写盘时 JD 库必须逐字节未变")
+        with open(path, "rb") as f:
+            self.assertEqual(len(json.loads(f.read().decode("gbk"))["jds"]), 2,
+                             "不许被覆盖成「这一条 + 读出来的空库」（「没有多出半条」）")
+        self.assertEqual(sorted(os.listdir(folder)), before,
+                         "守卫先于留档：连 .bak- / .tmp- 都不该多出来")
+
+    def test_upsert_jd_refuses_and_keeps_every_byte(self):
+        self._assert_refused(lambda: jdid.upsert_jd({"id": _JDS_NEW, "company": "新单位"}),
+                             "upsert_jd")
+
+    def test_next_seq_refuses_and_keeps_every_byte(self):
+        self._assert_refused(jdid.next_seq, "next_seq")
+
+    def test_save_jds_refuses_and_keeps_every_byte(self):
+        self._assert_refused(
+            lambda: jdid.save_jds({"version": 1, "seq": 9, "jds": [{"id": _JDS_NEW}]}),
+            "save_jds")
+
+    # ---------- 守卫必须**在这一层**，不能只靠下游兜底 ----------
+    def test_upsert_jd_refuses_before_the_write_step(self):
+        """把写盘那一步换成哨兵：走到它就算这次 upsert 没拦住（老实现正是"读空库 → 写回"）。
+
+        `save_jds` 自己也有守卫（与 `store.save_jobs` 同一做法：每个入口各自拦），
+        但这一层的判据不能省：读进来的那份空库在语义上已经把"读不出来"当成了"库里没有"。
+        """
+        _write_gbk_jds()
+        with mock.patch.object(jdid, "save_jds", side_effect=AssertionError("不该走到写盘")):
+            with self.assertRaises(RuntimeError) as cm:
+                jdid.upsert_jd({"id": _JDS_NEW})
+        self.assertIn("upsert_jd", str(cm.exception))
+
+    def test_next_seq_refuses_before_the_write_step(self):
+        _write_gbk_jds()
+        with mock.patch.object(jdid, "save_jds", side_effect=AssertionError("不该走到写盘")):
+            with self.assertRaises(RuntimeError) as cm:
+                jdid.next_seq()
+        self.assertIn("next_seq", str(cm.exception))
+
+    def test_save_jds_refuses_before_the_write_step(self):
+        _write_gbk_jds()
+        with mock.patch.object(store, "write_json", side_effect=AssertionError("不该走到写盘")):
+            with self.assertRaises(RuntimeError) as cm:
+                jdid.save_jds({"version": 1, "seq": 9, "jds": [{"id": _JDS_NEW}]})
+        self.assertIn("save_jds", str(cm.exception))
+
+    # ---------- 对照组：不存在 / 真的是 0 字节 = 合法的"第一次" ----------
+    def test_a_missing_library_is_created(self):
+        path = store.p_path("jds.json")
+        self.assertFalse(os.path.exists(path))
+        jdid.upsert_jd({"id": _JDS_OLD_1, "company": "字节跳动"})
+        self.assertEqual([r["id"] for r in jdid.load_jds()["jds"]], [_JDS_OLD_1])
+        self.assertEqual(glob.glob(path + ".bak-*"), [], "第一次写没有旧内容可留")
+
+    def test_a_zero_byte_library_is_created_and_gets_no_backup(self):
+        path = store.p_path("jds.json")
+        with open(path, "wb") as f:
+            f.write(b"")
+        self.assertEqual(jdid.next_seq(), 1)
+        self.assertEqual(glob.glob(path + ".bak-*"), [], "0 字节没有可留的旧内容")
+        jdid.upsert_jd({"id": _JDS_OLD_1})
+        self.assertEqual([r["id"] for r in jdid.load_jds()["jds"]], [_JDS_OLD_1])
+
+    def test_save_jds_writes_a_missing_or_zero_byte_library(self):
+        path = store.p_path("jds.json")
+        jdid.save_jds({"version": 1, "seq": 0, "jds": []})              # 不存在
+        self.assertEqual(store.read_json(path)["jds"], [])
+        with open(path, "wb") as f:
+            f.write(b"")
+        jdid.save_jds({"version": 1, "seq": 5, "jds": [{"id": _JDS_OLD_1}]})   # 0 字节
+        self.assertEqual(jdid.load_jds()["seq"], 5)
+        self.assertEqual([r["id"] for r in jdid.load_jds()["jds"]], [_JDS_OLD_1])
+
+    # ---------- 判据必须问"按 key 指定的那个路径" ----------
+    def test_the_guard_asks_the_keyed_path_not_the_default_one(self):
+        """两个方向都钉死：别拿默认档的库去判一个按 key 指定的文件，也别反过来误伤。"""
+        raw = _gbk_jds_bytes()
+        alice = store.p_path("jds.json", key="alice")
+        dflt = store.p_path("jds.json")
+
+        # 方向一：默认档坏着，alice 的库是新写的 ⇒ 写 alice 必须照旧成功
+        with open(dflt, "wb") as f:
+            f.write(raw)
+        jdid.save_jds({"version": 1, "seq": 1, "jds": [{"id": _JDS_OLD_1}]}, key="alice")
+        jdid.upsert_jd({"id": _JDS_OLD_2}, key="alice")
+        self.assertEqual(len(jdid.load_jds("alice")["jds"]), 2,
+                         "判据问错了路径（拿默认档的坏库挡住了 alice 的写）")
+
+        # 方向二：默认档修好，alice 的库坏着 ⇒ 写 alice 必须拒，默认档一个字节不动
+        store.write_json(dflt, {"version": 1, "seq": 0, "jds": [{"id": _JDS_OLD_1}]})
+        with open(alice, "wb") as f:
+            f.write(raw)
+        with self.assertRaises(RuntimeError) as cm:
+            jdid.upsert_jd({"id": _JDS_NEW}, key="alice")
+        self.assertIn("jds.json", str(cm.exception))
+        with open(alice, "rb") as f:
+            self.assertEqual(f.read(), raw, "alice 的库逐字节未变")
+        self.assertEqual(len(jdid.load_jds("default")["jds"]), 1, "默认档一个字节都不该动")
+
+
+class SaveJdsBackupTest(IsolatedCase):
+    """覆盖前留档：`.bak-<时间戳>`（内容 = **覆盖前**那一份，逐字节）+ 只留最新 3 份。
+
+    为什么 jds.json 也要：`save_jds` 是**整份覆盖**，`upsert_jd` / `next_seq` 每次抓岗位都走它
+    —— 覆盖前那一份是事后唯一能救回来的东西。轮转复用 `store.snapshot_before_overwrite`
+    （因此自动拿到 `store.BACKUP_KEEP` = 3 的上限，profile 目录不会无上限长大）。
+    """
+
+    def _path(self):
+        return store.p_path("jds.json")
+
+    def test_overwriting_a_library_with_content_keeps_a_timestamped_backup(self):
+        jdid.save_jds({"version": 1, "seq": 1, "jds": [{"id": _JDS_OLD_1, "company": "旧"}]})
+        old = store.read_bytes(self._path())
+        jdid.save_jds({"version": 1, "seq": 2, "jds": [{"id": _JDS_OLD_1, "company": "新"}]})
+
+        backups = glob.glob(self._path() + ".bak-*")
+        self.assertEqual(len(backups), 1, "覆盖有内容的 JD 库必须留下一份 .bak-<时间戳>")
+        self.assertEqual(store.read_bytes(backups[0]), old, "备份必须逐字节等于覆盖前那一份")
+        self.assertEqual(jdid.load_jds()["jds"][0]["company"], "新")
+
+    def test_the_first_write_leaves_no_backup(self):
+        self.assertEqual(glob.glob(self._path() + ".bak-*"), [])
+        jdid.save_jds({"version": 1, "seq": 1, "jds": [{"id": _JDS_OLD_1}]})
+        self.assertEqual(glob.glob(self._path() + ".bak-*"), [],
+                         "第一次写没有旧内容可留，别造垃圾备份")
+
+    def test_writing_five_times_keeps_exactly_the_three_newest(self):
+        path = self._path()
+        raws = []
+        for i in range(1, 6):
+            jdid.save_jds({"version": 1, "seq": i,
+                           "jds": [{"id": _JDS_OLD_1, "company": "第%d版" % i}]})
+            raws.append(store.read_bytes(path))
+
+        baks = glob.glob(path + ".bak-*")
+        self.assertEqual(len(baks), 3,
+                         "连写 5 次只该留 3 份 .bak-，实际：%s"
+                         % sorted(os.path.basename(b) for b in baks))
+        self.assertEqual(sorted(store.read_bytes(b) for b in baks), sorted(raws[1:4]),
+                         "留下的必须是**最近 3 次**覆盖前的样子（按内容断言，不是只看数量）")
+        self.assertNotIn(raws[0], [store.read_bytes(b) for b in baks],
+                         "最旧的那一份（第 1 次写进去的样子）必须被删掉")
+        self.assertEqual(store.read_bytes(path), raws[4], "当前库仍是最后一次写进去的那份")
+
+    def test_upsert_jd_also_leaves_a_backup(self):
+        """真实路径：第一次抓岗位留不下东西；第二次（覆盖同一 ID）要留下一份覆盖前的样子。"""
+        jdid.upsert_jd({"id": _JDS_OLD_1, "company": "字节"})
+        self.assertEqual(glob.glob(self._path() + ".bak-*"), [])
+        jdid.upsert_jd({"id": _JDS_OLD_1, "company": "字节跳动"})
+        baks = glob.glob(self._path() + ".bak-*")
+        self.assertEqual(len(baks), 1)
+        self.assertEqual(json.loads(store.read_bytes(baks[0]).decode("utf-8"))["jds"][0]["company"],
+                         "字节")
+
+
+class RenameJdUnreadableLibraryTest(IsolatedCase):
+    """需求二①：坏 `jds.json` 时改名**拒绝**（老行为已经拒了），但原因必须是"读不出来"。
+
+    老行为：`load_jds()` 把坏文件静默归成空库 → 走到 `_bad("JD 库里没有这个 ID：X")` ——
+    而那条记录其实**就在盘上**（只是读不出来）。用户照着"没有这个 ID"去看只会更糊涂，
+    还很容易顺手"那就新建一个吧"，于是同一个岗位又多出一种身份。
+    """
+
+    def test_an_unreadable_library_refuses_and_says_unreadable(self):
+        path, raw = _write_gbk_jds()
+        with self.assertRaises(RuntimeError) as cm:
+            jdid.rename_jd(_JDS_OLD_1, _JDS_NEW)
+        msg = str(cm.exception)
+        self.assertIn("jds.json", msg)
+        self.assertIn("读不出来", msg, "「读不出来」不许说成「没有这个 ID」")
+        self.assertNotIn("库里没有这个 ID", msg, "不许照旧报老那句「库里没有这个 ID」")
+        self.assertIn("拒绝", msg)                                  # 说清这次改名没做
+        with open(path, "rb") as f:
+            self.assertEqual(f.read(), raw, "拒绝时 JD 库逐字节未变")
+        self.assertEqual(glob.glob(path + ".bak-*"), [], "拒绝时连留档都不该有")
+        self.assertFalse(os.path.exists(store.knowledge_path()), "更不该写知识库")
+
+    def test_a_zero_byte_library_still_says_the_id_is_missing(self):
+        """对照组：0 字节 = 没有可丢的字节（合法的"第一次"）⇒ 照旧 `ValueError` + "没有这个 ID"。
+
+        闸门不许把"空库"也当成"读不出来"（那会把一次正常的校验错误说成文件坏了）。
+        """
+        path = store.p_path("jds.json")
+        with open(path, "wb") as f:
+            f.write(b"")
+        with self.assertRaises(ValueError) as cm:
+            jdid.rename_jd(_JDS_OLD_1, _JDS_NEW)
+        self.assertIn("没有这个 ID", str(cm.exception))
+
+
+class RenameJdUnreadableInterviewStatusTest(IsolatedCase):
+    """需求二②：面试 `status.json` 读不出来 ≠ 它不引用这个 JD。
+
+    老行为：`_interview_status_paths` 用 `store.read_json(path, None)`，读不出来当"没有" ⇒
+    这个文件被跳过 ⇒ 改完 ID 之后它的 `job_id` **静默**留着旧 ID（与知识库那条是同一类病）。
+    面试记录不像知识库那样只有一个集中入口 —— 它是**每个面试目录一个 status.json**，
+    所以要扫一遍并如实上报；"读不出来"就是"不知道它指向谁"，而"不知道"不许当成"安全"。
+    """
+
+    def _readable_library(self):
+        store.write_json(store.p_path("jds.json"),
+                         {"version": 1, "seq": 1, "jds": [{"id": _JDS_OLD_1, "company": "字节跳动"}]})
+
+    def _broken_status(self, interview_id, job_id):
+        raw = json.dumps({"state": "done", "job_id": job_id, "title": "语音一面"},
+                         ensure_ascii=False).encode("gbk")
+        try:
+            raw.decode("utf-8")
+            raise AssertionError("夹具没坏：这串字节居然能按 UTF-8 解出来")
+        except UnicodeDecodeError:
+            pass
+        path = store.interview_file(interview_id, "status.json")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(raw)
+        return path, raw
+
+    def test_an_unreadable_status_refuses_the_rename_and_changes_nothing(self):
+        self._readable_library()
+        store.save_interview_json("iv_ok", "status.json",
+                                  {"state": "done", "job_id": _JDS_OLD_1, "title": "好的一份"})
+        iv_path, raw_iv = self._broken_status("iv_bad", _JDS_OLD_1)
+        jds_before = store.read_bytes(store.p_path("jds.json"))
+
+        with self.assertRaises(RuntimeError) as cm:
+            jdid.rename_jd(_JDS_OLD_1, _JDS_NEW)
+        msg = str(cm.exception)
+        self.assertIn("面试", msg)
+        self.assertIn("读不出来", msg)
+        self.assertIn("拒绝", msg)
+        self.assertEqual(store.read_bytes(store.p_path("jds.json")), jds_before,
+                         "整次改名没做：JD 库逐字节未变")
+        with open(iv_path, "rb") as f:
+            self.assertEqual(f.read(), raw_iv, "坏的那份原样留着")
+        self.assertEqual(store.load_interview_json("iv_ok", "status.json")["job_id"], _JDS_OLD_1,
+                         "好那份也不许先改成新 ID（半改状态）")
+
+    def test_an_unreadable_status_refuses_even_when_it_may_not_reference_the_id(self):
+        """判据是"读不出来"，不是"内容里恰好有旧 ID"—— 这里那份坏文件里写的是**别的** job_id。"""
+        self._readable_library()
+        iv_path, raw_iv = self._broken_status("iv_other", "别的岗位_标注_文本_上海_6-8K_0009")
+        with self.assertRaises(RuntimeError) as cm:
+            jdid.rename_jd(_JDS_OLD_1, _JDS_NEW)
+        self.assertIn("读不出来", str(cm.exception))
+        with open(iv_path, "rb") as f:
+            self.assertEqual(f.read(), raw_iv)
 
 
 if __name__ == "__main__":
