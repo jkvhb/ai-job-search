@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
-"""阶段 E：知识库优先复用 —— 纯函数测试（匹配 / 够格 / 判定校验 / 填充）。"""
+"""阶段 E：知识库优先复用 —— 测试（匹配 / 够格 / 判定校验 / 填充 / 写回安全的强不变量）。"""
+import copy
 import json
 import unittest
 from unittest import mock
@@ -1441,3 +1442,379 @@ class ReuseTest(IsolatedCase):
             self.assertEqual(seen.get("temperature"), want,
                              "temperature=%r 时该送出 %r" % (extra, want))
             self.assertIsInstance(seen.get("temperature"), float, "不许把 None / int 原样送出去")
+
+
+class _WriteBackCase(IsolatedCase):
+    """写回安全两个测试类的**公共夹具**（不是测试类：这里没有 `test_*` 方法）。
+
+    夹具一律走生产 API 造数据：`kb.absorb` 种卡（形状因此与线上完全一致，含
+    `clean_sources` 补出来的 5 个键、`confidence`、`first_seen/last_seen`）、
+    `kb.merge_nodes` 造别名、`kb.record_review` / `kb.record_interview` 造用户进度
+    —— **手写 dict 造不出这些形状**，而"逐字节不变"这种断言最怕夹具自己形状不对。
+    """
+
+    JD_OLD = {"id": "老岗位", "job_title": "语音数据质检", "company": "老公司", "date": "2026-10-03"}
+    JD_NEW = {"id": "新岗位", "job_title": "语音算法工程师", "company": "新公司", "date": "2026-10-15"}
+
+    def _seed_node(self, term, **kw):
+        """喂给**真** `kb.absorb` 的一份"知识节点"（形状照 `knowledge.build_for_jd` 的产出）。"""
+        n = {"term": term, "definition": "库里的定义", "plain_explanation": "库里的通俗",
+             "category": "核心概念", "layer": 0,
+             "sources": [{"title": "维基", "url": "https://w"}],
+             "timeline": [{"year": "2010", "text": "库里的时间线"}],
+             "related": [], "interview_questions": ["会怎么问"]}
+        n.update(kw)
+        return n
+
+    def _seed(self, term="语音识别", **kw):
+        """用真 `kb.absorb` 种一张卡，返回**从盘上重新读出来**的那张（与内存里那份不是同一对象）。"""
+        kb.absorb([self._seed_node(term, **kw)], self.JD_OLD)
+        cid = kb.normalize_id(term)
+        cards = [c for c in store.load_knowledge()["nodes"] if c.get("id") == cid]
+        self.assertEqual(len(cards), 1, "夹具前提：库里正好一张 %s" % cid)
+        return cards[0]
+
+    def _hand_card(self, term, **kw):
+        """**手改形态**的 knowledge.json 卡片：`term` 可以带尾随空格。
+
+        整个文件里**只有这一处**不走真 `kb.absorb` —— 真路径会把 term `.strip()`
+        （`kb._new_card` 第 239 行），造不出"卡片 term 带尾随空格"这种用户手改出来的形态；
+        而 `kb.absorb` 第 373 行读的恰恰是 `node["term"].strip()`。卡片其余字段照生产形态写。
+        """
+        c = {"id": kb.normalize_id(term), "term": term, "aliases": [],
+             "definition": "库里的定义", "plain_explanation": "库里的通俗",
+             "category": "核心概念", "layer": 0,
+             "sources": [{"title": "维基", "url": "https://w", "date": "", "accessed": "", "snippet": ""}],
+             "timeline": [{"year": "2010", "text": "库里的时间线"}],
+             "related": [], "interview_questions": [],
+             "from_jds": [dict(self.JD_OLD)],
+             "state": "已掌握", "last_outcome": "答上了", "asked_count": 1,
+             "review_count": 3, "last_reviewed_at": "2026-10-01", "last_result": "答上了",
+             "first_seen": "2026-10-03", "last_seen": "2026-10-03", "confidence": "verified"}
+        c.update(kw)
+        return c
+
+    def _seed_full_card(self):
+        """一张**生产形态**的满卡：内容 + 别名（真 `merge_nodes`）+ 用户进度（真 `record_review`）。
+
+        用户的进度字段不是编出来的：`record_review` 写 state / review_count / last_reviewed_at /
+        last_result，`record_interview` 写 asked_count / last_outcome / last_interview_jd。
+        """
+        self._seed("语音识别")
+        self._seed("语音辨识")
+        ok, msg = kb.merge_nodes("语音识别", "语音辨识")     # 真路径：旧写法记进 aliases
+        self.assertTrue(ok, msg)
+        kb.record_review("语音识别", kb.RESULT_UP)
+        kb.record_interview(self.JD_OLD["id"], asked=["语音识别"], good=["语音识别"])
+        cards = store.load_knowledge()["nodes"]
+        self.assertEqual(len(cards), 1, "夹具前提：drop 卡已被并走，只剩一张")
+        return cards[0]
+
+    def _node(self, term="语音识别", **kw):
+        """本次分析产出的一个知识点节点（形状照 knowledge 的产出）。
+
+        `related` 为空表是**刻意**的：`_COPY_FIELDS` 不含 `related`（kbreuse.py:276-289），
+        复用节点保留本次自己的 related —— 而 `kb._merge_into` 第 294 行会把它并进库里那张卡。
+        但这条**与"复用"无关**：② 头脑风暴跑在 `reuse.plan` **之前**（knowledge.py:390-393），
+        所以"不复用的同一次分析"会把**同一批** related 并进**同一张**卡（`kb.clean_related`
+        第 192-203 行按 id 去重）。夹具取空表，是为了把这条逐字节不变量只指向**复用引入的差异**：
+        related 的并集复用与不复用都一样会发生，掺进来只会盖住真正的信号。
+        """
+        n = {"id": store.slug(term), "term": term, "definition": "本次写的定义",
+             "plain_explanation": "本次写的通俗解释", "category": "核心概念", "layer": 0,
+             "sources": [], "timeline": [], "related": [], "interview_questions": [],
+             "confidence": "ai-generated", "state": "待学习"}
+        n.update(kw)
+        return n
+
+    @staticmethod
+    def _frozen(card, skip=("from_jds", "last_seen")):
+        """整张卡的**逐字节**快照（保留字段顺序 → 多一个键、挪一次顺序都会露出来）。"""
+        return json.dumps({k: v for k, v in card.items() if k not in skip}, ensure_ascii=False)
+
+
+class WriteBackSafetyTest(_WriteBackCase):
+    """写回安全 —— spec §7 的**强不变量**：复用并写回之后，库里那张卡**只该多一条 `from_jds`、
+    只该动 `last_seen`**，其余每个字段逐字节不变。
+
+    为什么非要用**真的 `kb.absorb`**：这条不变量横跨两个模块的缝 —— `kbreuse` 负责"认出是哪张卡、
+    把库里的内容抄进节点"，`kb` 负责"合并进库"。任何一侧的替身都会把缝糊掉，而"复用一次就把
+    库里那张卡改脏"正是这条缝上的事故。
+
+    生产路径（`app.do_analyze`，app.py:1365-1427）：`jdfacts.resolve(builder=_builder_with_reuse(reuse))`
+    里 `reuse.plan(nodes)`（= `plan_nodes`）就地填节点、写 `kb_reuse` 标记 → ③④ 只对**没复用**的
+    节点补内容 → 最后 `kb.absorb(know_nodes, {JD id, ...})`。本类的用例就是这条路径的后半段
+    （plan → absorb），不驱动 HTTP。
+
+    **逐条对照的真实实现**（行号 = 本仓库当前 `kb.py` / `kbreuse.py`，按字段列出）：
+      * `sources`：并集，`kb.clean_sources` 按 url 去重（kb.py:276）—— 复用节点带的是卡里那份
+        （`_fill_from_card` 用 `kb.clean_sources` 抄过去，kbreuse.py:288-299、335），并集 = 原样；
+      * `timeline`：**只取更长的**（kb.py:278-280）→ 等长保留原值；
+      * `definition` / `plain_explanation`：**严格更长才换**（kb.py:283-286）→ 等长不换；
+      * `category`：仅当卡里为空才补（kb.py:288-289）→ 非空时一个字不动；
+      * `layer`：`min`（kb.py:292）。复用侧 `_fill_from_card` 第 343-344 行先把节点的 layer
+        夹成 `min(节点的, 卡的)` —— ⚠️ **若 JD 这次把这个概念归到更基础的层**（节点的 layer
+        比卡小），`min` 会把卡的 layer **拉低**：这是 `kb._merge_into` 自己的规则，与"复用"无关
+        （同一概念不复用地重算一次，同样会拉低）。临时探针实测：卡的 layer 2 + 复用节点 layer 0
+        → 写回后卡的 layer = 0，且除 `from_jds`/`last_seen` 外**只有** `layer` 这一个字段变了。
+        夹具因此取等值 layer，前提就写在这里；
+      * `related` / `interview_questions`：并集（kb.py:294-296）—— 见 `_node` 的注释；
+      * 用户进度 `state` / `last_outcome` / `asked_count`：**只补空、绝不覆盖真值**（kb.py:302-304），
+        这是 kb.py 文件头铁律 1；
+      * `aliases` / `term` / `id` / `first_seen`：`_merge_into`（kb.py:271-306）压根不碰
+        （`first_seen` 只有第 305 行的 `setdefault` 补缺，真卡早就有）；
+      * `confidence`：kb.py:383 的 `_recompute_confidence` 会重算（有来源 → verified），
+        对本来就有来源的卡是同一个值；
+      * `from_jds`：按 id 去重追加一条（kb.py:215-235）；`last_seen` 更新（kb.py:306）。
+    """
+
+    def test_reuse_writeback_changes_only_the_refs_and_last_seen(self):
+        """不变量 1：够格复用（`got == "all"`）写回后，库里那张卡**只有** `from_jds` 多一条、
+        `last_seen` 更新 —— 其余每个字段**逐字节不变**（spec §7 / §11 第 5 条）。"""
+        self._seed_full_card()
+        # 把 last_seen 改成旧日期：不变量说它**允许**变 —— 夹具必须让它真的变过，那句话才不是空话
+        data = store.load_knowledge()
+        data["nodes"][0]["last_seen"] = "2020-01-01"
+        store.save_knowledge(data)
+        before = copy.deepcopy(store.load_knowledge()["nodes"][0])
+
+        node = self._node()
+        # 节点自带一份"本次搜到/本次算的"（步 ③④ 的产出）：够格复用后必须被库里那份整条替换
+        node["sources"] = [{"title": "本次搜到的", "url": "https://this-run"}]
+        node["timeline"] = [{"year": "2026", "text": "本次算的"}]
+
+        stats = kbreuse.plan_nodes([node], kbreuse.Index(store.load_knowledge()["nodes"]))
+        self.assertEqual(stats["matched"], 1, "夹具前提：命中")
+        self.assertEqual(stats["reusable"], 1, "夹具前提：够格复用")
+        self.assertEqual(node["kb_reuse"]["got"], "all", "夹具前提：卡里有时间线 → got=all")
+
+        added, merged = kb.absorb([node], self.JD_NEW)          # ← 真的 kb.absorb，不是替身
+        self.assertEqual((added, merged), (0, 1), "够格复用的写回是「并进那张卡」，不是新建")
+
+        cards = store.load_knowledge()["nodes"]
+        self.assertEqual(len(cards), 1, "卡片数不变（不变量 2）")
+        after = cards[0]
+
+        # ① 逐字段：除 from_jds / last_seen 之外，一个都不许不同（哪个字段归哪条规则见类 docstring）
+        changed = sorted(k for k in set(before) | set(after)
+                         if k not in ("from_jds", "last_seen") and before.get(k) != after.get(k))
+        self.assertEqual(changed, [], "这些字段被写回改了：%s" % changed)
+        # ② 逐字节：连**字段顺序**与"多出来的键"也不许变（比逐字段更硬，挡"悄悄加一个字段"）
+        self.assertEqual(self._frozen(after), self._frozen(before), "整张卡（除那两处）必须逐字节不变")
+        # ③ 用户进度字段单独再钉：不只要"没变"，还要"就是原来那些值"（spec §10.4 第二条）
+        self.assertEqual(
+            (after["state"], after["last_outcome"], after["asked_count"],
+             after["review_count"], after["last_reviewed_at"], after["last_result"],
+             after.get("last_interview_jd")),
+            ("已掌握", "答上了", 1, 1, kb._today(), kb.RESULT_UP, self.JD_OLD["id"]),
+            "用户进度字段必须原样留着（kb.py:302-304 + 文件头铁律 1）")
+        # ④ 允许变的两处：from_jds 追加一条（kb._add_jd）、last_seen 更新（kb.py:306）
+        self.assertEqual([j["id"] for j in after["from_jds"]],
+                         [self.JD_OLD["id"], self.JD_NEW["id"]], "只多这一条，且追加在尾部")
+        self.assertEqual(after["from_jds"][:-1], before["from_jds"], "旧的来源岗位条目原样保留")
+        self.assertEqual(after["from_jds"][-1], dict(self.JD_NEW),
+                         "记的是这次那个岗位（id / job_title / company / date 四项）")
+        self.assertEqual(before["last_seen"], "2020-01-01")
+        self.assertEqual(after["last_seen"], kb._today(), "last_seen 允许变，而且必须被更新")
+
+    def test_the_node_progress_never_overwrites_the_card_progress(self):
+        """`kb._merge_into` 第 302-304 行**只补空、绝不覆盖已有真值**（kb.py 文件头铁律 1）。
+
+        ⚠️ **为什么夹具要让两边相反**：在"够格复用"那条路上，`_fill_from_card` 已经把卡里的
+        `state` 抄到节点上（kbreuse.py:288-289 的 `_COPY_FIELDS` 含 `state`），两边必然相同 ——
+        覆盖了也看不出来。只有节点自带一份与库里**相反**的进度时，"永不触碰"这句话才有牙；
+        生产上这份相反进度来自"命中但不够格"那条路（那条路上 `_fill_from_card` 不跑）。
+        """
+        self._seed("语音识别", sources=[], timeline=[])
+        node = self._node(state="已掌握", last_outcome="答上了", asked_count=9,
+                          definition="本次定义", plain_explanation="本次通俗")
+        added, merged = kb.absorb([node], self.JD_NEW)
+        self.assertEqual((added, merged), (0, 1), "库里已有这张卡 → 并进去")
+        after = store.load_knowledge()["nodes"][0]
+        self.assertEqual(after["state"], "待学习", "节点自称「已掌握」也不许覆盖库里的状态")
+        self.assertEqual(after["last_outcome"], "未面试", "同理（kb.py:303 的 or 只补空）")
+        self.assertEqual(after["asked_count"], 0, "同理（kb.py:304 只做 _as_int 归一，不取值）")
+        self.assertEqual(after["definition"], "库里的定义", "更短的定义不许顶掉库里的（kb.py:283-286）")
+
+    def test_an_incomplete_hit_is_completed_in_place_and_never_duplicated(self):
+        """不变量 3：命中但**不够格**（缺来源）时写回是"就地补全"，逐条对照 `kb._merge_into`。
+
+        生产上这条对应"③④ 照样联网，搜到的东西并进原来那张卡"（spec §1 决策 3 / §3）。
+        """
+        self._seed("语音识别", definition="库里的定义（很长的那一版）", plain_explanation="库里的通俗",
+                   sources=[], timeline=[])
+        before = copy.deepcopy(store.load_knowledge()["nodes"][0])
+        reusable, missing = kbreuse._card_completeness(before)
+        self.assertFalse(reusable, "夹具前提：缺来源 → 不够格")
+        self.assertIn("sources", missing)
+        self.assertIn("timeline", missing)
+
+        node = self._node(definition="短定义",                                    # 比库里的**短**
+                          plain_explanation="本次搜到的通俗解释，比库里的那句长得多",  # **严格更长**
+                          state="已掌握", last_outcome="答上了", asked_count=9)      # 与库里相反
+        stats = kbreuse.plan_nodes([node], kbreuse.Index(store.load_knowledge()["nodes"]))
+        self.assertEqual((stats["matched"], stats["reusable"], stats["enriched"]), (1, 0, 1))
+        self.assertEqual(node["kb_reuse"]["got"], "", "不够格 → 没有 got=all（报告不许说「整条复用」）")
+        self.assertEqual(node["definition"], "短定义",
+                         "不够格时 `_fill_from_card` 不跑 → 节点内容一个字没动")
+
+        # 模拟 ③④ 联网之后拿到的东西（形状与生产一致）
+        node["sources"] = [{"title": "新来源", "url": "https://new"}]
+        node["timeline"] = [{"year": "2024", "text": "本次补算"}]
+
+        added, merged = kb.absorb([node], self.JD_NEW)
+        self.assertEqual((added, merged), (0, 1), "不够格的写回必须**并进那张已有卡**，不是新建")
+        cards = store.load_knowledge()["nodes"]
+        self.assertEqual(len(cards), 1, "卡片数不变（没有重复卡）")
+        after = cards[0]
+        self.assertEqual((after["id"], after["term"]), (before["id"], before["term"]), "还是原来那张卡")
+
+        # sources：并集（kb.py:276）—— 原来一条没有 → 等于这次搜到的（走 kb 自己的清洗尺子）
+        self.assertEqual(after["sources"], kb.clean_sources(node["sources"]))
+        self.assertEqual([s["url"] for s in after["sources"]], ["https://new"], "搜到的来源填上了")
+        self.assertEqual(after["confidence"], "verified", "有来源了 → kb.py:383 重算 confidence")
+        # timeline：**只取更长的**（kb.py:278-280）→ 新的更长，写进去
+        self.assertEqual(after["timeline"], [{"year": "2024", "text": "本次补算"}])
+        # definition：**严格更长才换**（kb.py:283-286）→ 本次的更短，留库里的
+        self.assertEqual(after["definition"], before["definition"], "更短的定义不许顶掉库里的")
+        # plain_explanation：同一条规则的另一半 —— 本次的严格更长 → 换
+        self.assertEqual(after["plain_explanation"], node["plain_explanation"])
+        self.assertNotEqual(after["plain_explanation"], before["plain_explanation"])
+        # category：库里非空 → 一个字不动（kb.py:288-289）
+        self.assertEqual(after["category"], before["category"])
+        # 进度字段：**永不触碰**（kb.py:302-304）—— 节点那份相反进度不许覆盖
+        self.assertEqual((after["state"], after["last_outcome"], after["asked_count"]),
+                         ("待学习", "未面试", 0), "库里的进度是库里的（kb.py 铁律 1）")
+        # from_jds：+1（kb.py:215-235）
+        self.assertEqual([j["id"] for j in after["from_jds"]],
+                         [self.JD_OLD["id"], self.JD_NEW["id"]])
+
+    def test_a_miss_creates_exactly_one_new_card_with_one_reference(self):
+        """不变量 4：**没命中**的写回新建一张卡，`from_jds` 恰好一条；库里别的卡一个字都不动。"""
+        self._seed("语音识别")                    # 库里有一张**不相干**的卡（空索引会早退，验不到"没命中"）
+        untouched_before = copy.deepcopy(store.load_knowledge()["nodes"][0])
+
+        node = self._node("梯度裁剪")
+        node["sources"] = [{"title": "新来源", "url": "https://new"}]
+        node["timeline"] = [{"year": "2019", "text": "本次算的"}]
+        stats = kbreuse.plan_nodes([node], kbreuse.Index(store.load_knowledge()["nodes"]))
+        self.assertEqual((stats["matched"], stats["reusable"], stats["searched"]), (0, 0, 1))
+        self.assertNotIn("kb_reuse", node, "没命中就没有复用标记（报告不许说查过库还命中了）")
+
+        added, merged = kb.absorb([node], self.JD_NEW)
+        self.assertEqual((added, merged), (1, 0), "没命中 → 新建一张卡")
+        cards = store.load_knowledge()["nodes"]
+        self.assertEqual(len(cards), 2)
+        new = [c for c in cards if c["id"] == kb.normalize_id("梯度裁剪")]
+        self.assertEqual(len(new), 1, "新卡身份键 = 术语归一化（kb._new_card 第 241 行）")
+        new = new[0]
+        self.assertEqual(len(new["from_jds"]), 1, "from_jds **恰好一条**")
+        self.assertEqual(new["from_jds"][0], dict(self.JD_NEW))
+        self.assertEqual(new["term"], "梯度裁剪")
+        self.assertEqual(new["sources"], kb.clean_sources(node["sources"]))
+        self.assertEqual(new["timeline"], kb.clean_timeline(node["timeline"]))
+        self.assertEqual((new["state"], new["last_outcome"]), ("待学习", "未面试"),
+                         "新卡的进度是默认值（kb._new_card 第 253-255 行）")
+        self.assertEqual((new["asked_count"], new["review_count"]), (0, 0))
+        self.assertEqual((new["first_seen"], new["last_seen"]), (kb._today(), kb._today()))
+        self.assertEqual(new["confidence"], "verified", "有来源 → verified（kb.py:267-268）")
+        # 原来那张卡**整张**（连 last_seen 都不排除）没被碰 —— 没命中的写回与它无关
+        old = [c for c in cards if c["id"] == kb.normalize_id("语音识别")][0]
+        self.assertEqual(self._frozen(old, skip=()), self._frozen(untouched_before, skip=()),
+                         "没命中的写回不许碰别的卡（连 last_seen 都不许）")
+
+    def test_the_reused_node_carries_the_library_sources_not_this_search(self):
+        """不变量 5：复用节点上的来源**就是库里那份**（值相等），本次搜索的东西一条都不许留下。
+
+        为什么要单独钉：报告读的是**节点**上的 `sources`，而"库里的来源"与"本次搜到的来源"
+        长得一模一样 —— 混进去看不出来（spec §10.4 / §11 第 3 条）。
+        """
+        self._seed("语音识别")
+        before = copy.deepcopy(store.load_knowledge()["nodes"][0])
+        node = self._node()
+        node["sources"] = [{"title": "本次搜到的", "url": "https://this-run"}]
+        node["timeline"] = [{"year": "2026", "text": "本次算的"}]
+
+        stats = kbreuse.plan_nodes([node], kbreuse.Index(store.load_knowledge()["nodes"]))
+        self.assertEqual(stats["reusable"], 1, "夹具前提：够格复用")
+        self.assertEqual(node["sources"], before["sources"], "来源 = 库里那份（值相等即可）")
+        self.assertEqual([s["url"] for s in node["sources"]], ["https://w"])
+        self.assertNotIn("https://this-run", [s.get("url") for s in node["sources"]],
+                         "本次搜索的东西不许留在复用节点里")
+        self.assertEqual(node["timeline"], before["timeline"], "时间线同理：本次那份被整条替掉")
+
+        kb.absorb([node], self.JD_NEW)
+        self.assertEqual(node["sources"], store.load_knowledge()["nodes"][0]["sources"],
+                         "写回之后节点与库里的来源仍然一致（不变量 5 的原话）")
+
+
+class WriteBackIdentityTest(_WriteBackCase):
+    """不变量 2：写回**必须认出库里原来那张卡**（卡片数不变），而"认出"的尺子是
+    `kb.normalize_id`（kb.py:70-80），**不是**字面相等。
+
+    ⚠️ **为什么"必须用 normalize_id"这句话要单独钉**：写回的落点判据在 `kb.absorb` 第 373 行
+    —— `normalize_id(node["term"].strip())` 与索引里的 `card["id"]` 比。下面四种**真实存在**的
+    形态里，节点名与卡片 id **字面不等**，归一化后却相等，而 `kb.absorb` 在这四种形态下都是
+    `added=0, merged=1`（并进那张卡）。拿字面比去写断言会**误报**（把"并进了原来那张卡"
+    报成"多出一张重复卡"）：
+      * **大小写**：`kb.normalize_id` 第 80 行的 `.lower()`；
+      * **全角**：同行的 `unicodedata.normalize("NFKC", …)`；
+      * **尾随空格**：`kb.absorb` 第 373 行先 `.strip()` 再归一；
+      * **头名键命中**：`kbreuse._fill_from_card` 第 350 行把节点改名成**卡里的规范名**，
+        而那张卡的 `id` 是"全名去掉括号"的归一化结果（`kb._new_card` 第 241 行）——
+        所以节点名（`词错率（WER）`）与卡片 id（`词错率wer`）字面永远不等。
+    """
+
+    def _write_back_and_check(self, case, term, jd_term, seeded=True):
+        """种一张卡 → 够格复用 → **真** `kb.absorb` 写回 → 断言只有原来那张卡动了。"""
+        if seeded:
+            self._seed(term)                 # 真路径种卡（生产形态）
+        else:
+            store.save_knowledge({"nodes": [self._hand_card(term)]})
+        before = copy.deepcopy(store.load_knowledge()["nodes"])
+        self.assertEqual(len(before), 1, "%s：夹具前提是库里只有一张卡" % case)
+
+        node = self._node(jd_term)
+        stats = kbreuse.plan_nodes([node], kbreuse.Index(store.load_knowledge()["nodes"]))
+        self.assertEqual(stats["matched"], 1, "%s：夹具前提是命中" % case)
+        self.assertEqual(node["kb_reuse"]["got"], "all", "%s：夹具前提是够格复用" % case)
+
+        added, merged = kb.absorb([node], self.JD_NEW)
+        self.assertEqual((added, merged), (0, 1),
+                         "%s：写回要并进那张卡（按字面找卡会新建一张重复卡）" % case)
+
+        after = store.load_knowledge()["nodes"]
+        self.assertEqual(len(after), len(before), "%s：卡片数前后相同" % case)
+        self.assertEqual(len(after), 1, "%s：库里还是那一张卡，没有重复卡" % case)
+        # **身份必须用归一化口径比**（四种形态见类 docstring）
+        same = [c for c in after
+                if kb.normalize_id(c.get("term")) == kb.normalize_id(node["term"])]
+        self.assertEqual(len(same), 1,
+                         "%s：写回必须落在原来那张卡上（按 kb.normalize_id 找；字面比会误报）" % case)
+        self.assertEqual(after[0]["id"], before[0]["id"], "%s：卡片的 id 一个字没动" % case)
+        self.assertEqual(after[0]["term"], before[0]["term"], "%s：卡片的 term 一个字没动" % case)
+        self.assertEqual([j["id"] for j in after[0]["from_jds"]],
+                         [self.JD_OLD["id"], self.JD_NEW["id"]],
+                         "%s：那张卡只多了一条 from_jds" % case)
+        # 这条用例的前提，也是"字面比会误报"的直接证据：节点名与卡片 id **字面不等**、
+        # 归一化后相等 —— 而 `kb.absorb` 第 373 行正是用后者找卡的。
+        self.assertNotEqual(node["term"], before[0]["id"],
+                            "%s：夹具前提是字面不等（否则这条用例测不到归一化）" % case)
+        self.assertEqual(kb.normalize_id(node["term"]), before[0]["id"],
+                         "%s：归一化后必须相等（kb.absorb 第 373 行的落点判据）" % case)
+
+    def test_identity_holds_when_only_the_letter_case_differs(self):
+        """大小写：库里 `ASR`（id `asr`）、JD 里写 `asr`。"""
+        self._write_back_and_check("大小写", "ASR", "asr")
+
+    def test_identity_holds_when_only_the_width_differs(self):
+        """全角：库里 `ＡＳＲ`（id `asr`）、JD 里写 `ASR`。"""
+        self._write_back_and_check("全角", "ＡＳＲ", "ASR")
+
+    def test_identity_holds_when_only_a_trailing_space_differs(self):
+        """尾随空格：库里那张卡的 `term` 带尾随空格（手改过的 knowledge.json）、`id` 已是归一化形态。"""
+        self._write_back_and_check("尾随空格", "ASR ", "ASR", seeded=False)
+
+    def test_identity_holds_when_the_hit_comes_from_the_head_name_key(self):
+        """头名键命中：库里 `词错率（WER）`（id `词错率wer`）、JD 写头名 `词错率`。"""
+        self._write_back_and_check("头名键", "词错率（WER）", "词错率")
