@@ -9,6 +9,9 @@
   1. 自动剔除 API Key（config.json 重新生成，key 留空）
   2. 自动剔除个人数据（简历 / 报告 / 岗位台账 / 日志 / 上传的 JD 图与原文）
   3. 打包完成后会反向扫描 zip，确认没有明文 key、没有个人信息，有问题直接报错
+  4. 反向扫描里还有一条**依赖自检**：从真实仓库推导「app.py 等源码 import 了哪些本地模块、
+     引用了哪些 web/ 静态文件」，缺一个就报错并删包（P0-10：以前包里少 9 个 .py，
+     朋友解压后双击 启动.bat 直接 ImportError，而 verify() 照样打印「✔ 通过」）。
 """
 import json
 import os
@@ -28,12 +31,18 @@ STAMP = datetime.now().strftime("%Y%m%d")
 PKG = "AI求职助手-分享版-%s" % STAMP
 
 # ---- 要打包的源码与文档 ----
+# ⚠️ 这里必须涵盖 **app.py 模块级 import 的每一个本地模块**（P0-10：曾漏 9 个，
+#    分享包解压后双击 启动.bat 直接 ImportError）。漏了会在 verify() 的依赖自检里被点名。
 FILES = [
     "app.py", "store.py", "log.py", "llm.py", "search.py", "knowledge.py", "migrate_to_profiles.py",
-    "启动.bat", "创建桌面快捷方式.bat", "分享说明.md", "README.md", "EXAMPLES.md",
+    "interview.py", "jdfacts.py", "jddelete.py", "jdid.py", "jobdup.py",
+    "kb.py", "kbreuse.py", "outcome.py", "resumelib.py",
+    "启动.bat", "README.md", "EXAMPLES.md",
     "00-求职SOP总纲.md", "01-资产库构建.md", "02-预筛与打分.md",
     "03-JD拆解.md", "04-简历大纲.md", "05-面试准备.md", "06-投递追踪.md",
 ]
+# 注：`创建桌面快捷方式.bat` 与 `分享说明.md` **盘上没有这个文件**，它们由 SHORTCUT_BAT /
+# SHARE_NOTE 字符串直接写进包（见 main()）；挂在 FILES 里只会每次打一行"跳过（不存在）"。
 DIRS = ["web", "assets", "templates"]
 
 # ---- 绝不打包（个人数据 / 密钥）----
@@ -41,6 +50,13 @@ DIRS = ["web", "assets", "templates"]
 # 旧路径一并拦住；.leak-keywords.txt 里是真实姓名/手机号，绝不允许进包。
 BLOCK_FILES = {"config.json", "jobs.json", "events.jsonl", ".leak-keywords.txt"}
 BLOCK_DIRS = {"data", "reports", "resumes", "dist", "__pycache__", "docs", ".git"}
+
+
+def _blocked(rel):
+    """这个相对路径按打包策略**绝不允许**进包（个人数据 / 密钥）？"""
+    rel = rel.replace("\\", "/")
+    return os.path.basename(rel) in BLOCK_FILES or rel.split("/")[0] in BLOCK_DIRS
+
 
 NEW_CONFIG = {
     "text_model": {"label": "DeepSeek（文本分析 / 跑 SOP）",
@@ -213,21 +229,28 @@ Key 申请地址：
 """
 
 
-def collect():
-    """收集要打包的文件（相对路径 -> 绝对路径）"""
+def collect(root=None, files=None, dirs=None):
+    """收集要打包的文件（相对路径 -> 绝对路径）
+
+    root / files / dirs 可注入，只为让测试能在**假仓库**上跑真实的代码路径；
+    默认就是本文件所在仓库 + 模块顶上的 FILES / DIRS。
+    """
+    root = root or ROOT
+    files = FILES if files is None else files
+    dirs = DIRS if dirs is None else dirs
     items = []
-    for f in FILES:
+    for f in files:
         # 二次保险：万一以后有人往 FILES 里加了个人数据文件，也进不了包
-        if os.path.basename(f) in BLOCK_FILES or f.replace("\\", "/").split("/")[0] in BLOCK_DIRS:
+        if _blocked(f):
             print("  跳过（禁止打包）:", f)
             continue
-        p = os.path.join(ROOT, f)
+        p = os.path.join(root, f)
         if os.path.exists(p):
             items.append((f, p))
         else:
             print("  跳过（不存在）:", f)
-    for d in DIRS:
-        base = os.path.join(ROOT, d)
+    for d in dirs:
+        base = os.path.join(root, d)
         if not os.path.isdir(base):
             continue
         for dirpath, dirnames, filenames in os.walk(base):
@@ -236,18 +259,18 @@ def collect():
                 if fn in BLOCK_FILES or fn.startswith("_"):
                     continue
                 full = os.path.join(dirpath, fn)
-                rel = os.path.relpath(full, ROOT).replace("\\", "/")
+                rel = os.path.relpath(full, root).replace("\\", "/")
                 items.append((rel, full))
     return items
 
 
-def leak_keywords():
+def leak_keywords(root=None):
     """从 .leak-keywords.txt 读取要拦截的个人信息关键词。
 
     该文件**不入库**（见 .gitignore）——避免为了"检测个人信息"而把个人信息写进源码。
     每行一个关键词，# 开头为注释。文件不存在时只检查 API Key。
     """
-    p = os.path.join(ROOT, ".leak-keywords.txt")
+    p = os.path.join(root or ROOT, ".leak-keywords.txt")
     kws = []
     try:
         with open(p, "r", encoding="utf-8") as f:
@@ -260,10 +283,92 @@ def leak_keywords():
     return kws
 
 
-def verify(zpath):
-    """反向扫描 zip，确认没有泄漏"""
+# ---- 依赖自检（P0-10）----
+# 这里推的是「**盘上真实存在**、且会被源码 import / 引用的文件」，不是「包里已经有什么」。
+# 拿 zip 自己的 namelist 当基准 = 自证循环，永远通过 —— 那正是本项要根治的假绿灯。
+_IMPORT_RE = re.compile(r"(?m)^\s*(?:import|from)\s+([A-Za-z_]\w*)")
+_ASSET_RE = re.compile(
+    r"[\"'](/?[A-Za-z0-9_][A-Za-z0-9_\-./]*"
+    r"\.(?:html|css|js|json|ico|png|jpg|jpeg|svg|woff2?))[\"']")
+
+
+def _scan_py_sources(root, files=None):
+    """依赖自检要读的源码：包内会带上的根目录 .py + app.py（永远扫）。
+
+    app.py 永远在扫描名单里：它是"分享包能不能起来"的入口，
+    即使哪天有人手滑把它从 FILES 里删掉，自检也不会因此失明。
+    """
+    names = set()
+    for f in list(files if files is not None else FILES) + ["app.py"]:
+        f = f.replace("\\", "/")
+        if "/" in f or not f.endswith(".py"):
+            continue
+        if os.path.isfile(os.path.join(root, f)):
+            names.add(f)
+    return sorted(names)
+
+
+def _read_text(path):
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            return f.read()
+    except Exception:
+        return ""
+
+
+def resolve_dependencies(root=None, files=None):
+    """从**真实仓库**推导「分享包里必须有的文件」清单（相对路径，已排序）。
+
+    两条都是真实引用，不写死清单：
+      1. 包内根目录 .py（含 app.py）的本地 import —— 仓库里存在同名 .py 才算依赖；
+      2. 这些 .py 里引用的 web/ 静态文件（报告模板 / 示例数据 / 首页）—— 盘上真实存在才算。
+    新增一个本地模块或一个模板而忘了打包，这里就会多出一条，verify() 随后点名。
+    """
+    root = root or ROOT
+    deps = set()
+    for name in _scan_py_sources(root, files):
+        txt = _read_text(os.path.join(root, name))
+        for mod in _IMPORT_RE.findall(txt):
+            if mod == os.path.splitext(name)[0]:
+                continue      # 自己 import 自己不算
+            if os.path.isfile(os.path.join(root, mod + ".py")):
+                deps.add(mod + ".py")
+        for ref in _ASSET_RE.findall(txt):
+            ref = ref.lstrip("/")
+            # 裸文件名先在 web/ 下找，再当仓库根下的路径找；带 / 的按仓库根算。
+            # ⚠️ 被 BLOCK_* 拦下的文件（config.json / data/… ）永远不算依赖：
+            #    否则自检会反过来要求把 API Key 打进分享包。
+            cands = (ref,) if "/" in ref else ("web/" + ref, ref)
+            for cand in cands:
+                cand = cand.replace("\\", "/")
+                if _blocked(cand):
+                    continue
+                if os.path.isfile(os.path.join(root, cand)):
+                    deps.add(cand)
+                    break
+    return sorted(deps)
+
+
+def _strip_pkg_prefix(names):
+    """把 zip 里的「顶层目录/相对路径」归一成相对路径集合（包名叫什么都不影响自检）。"""
+    out = set()
+    for n in names:
+        n = n.replace("\\", "/")
+        out.add(n.split("/", 1)[1] if "/" in n else n)
+    return out
+
+
+def dependency_issues(root=None, packaged=None):
+    """依赖自检：返回「被真实引用、却不在包里」的文件（空列表 = 包能跑）。"""
+    have = _strip_pkg_prefix(packaged or [])
+    return [rel for rel in resolve_dependencies(root) if rel not in have]
+
+
+def verify(zpath, root=None):
+    """反向扫描 zip，确认没有泄漏、而且**真的跑得起来**"""
+    root = root or ROOT
     issues = []
-    kws = leak_keywords()
+    kws = leak_keywords(root)
     with zipfile.ZipFile(zpath) as z:
         for n in z.namelist():
             info = z.getinfo(n)
@@ -279,6 +384,11 @@ def verify(zpath):
                 for kw in kws:
                     if kw in txt:
                         issues.append("个人信息 '%s' 出现在：%s" % (kw, n))
+        # ---- 依赖自检：以前只查"有没有泄密"，不查"能不能跑"，于是印出假绿灯 ----
+        # 基准来自**真实仓库**（app.py 等源码在盘上写了什么 import、引用了哪些 web 资源），
+        # 绝不来自 zip 自己的 namelist —— 拿包内已列文件当基准是自证循环，永远通过。
+        for rel in dependency_issues(root, z.namelist()):
+            issues.append("缺少依赖文件：%s（解压后双击 启动.bat 会 ImportError / 报告缺模板）" % rel)
     return issues
 
 
@@ -314,11 +424,16 @@ def main():
             print("     -", i)
         os.remove(zpath)
         return 1
-    print("  ✔ 通过：无明文 Key、无个人信息")
 
-    size = os.path.getsize(zpath)
     with zipfile.ZipFile(zpath) as z:
         names = z.namelist()
+    deps = resolve_dependencies()
+    n_py = len([n for n in names if n.endswith(".py")])
+    print("  ✔ 通过：无明文 Key、无个人信息")
+    print("     依赖自检通过：包内含 %d 个 .py 模块；%d 个被 import / 引用的文件全部在包内"
+          % (n_py, len(deps)))
+
+    size = os.path.getsize(zpath)
     print("\n  产物：%s" % zpath)
     print("  大小：%.1f KB   文件数：%d" % (size / 1024, len(names)))
     print("\n  包内结构：")
