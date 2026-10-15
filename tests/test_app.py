@@ -21,8 +21,10 @@ from urllib.parse import quote
 import app
 import interview
 import jddelete
+import jdfacts
 import jdid
 import kb
+import kbreuse
 import llm
 import outcome
 import resumelib
@@ -1949,8 +1951,34 @@ class AnalyzeKbReuseTest(_AnalyzeRouteCase):
         self._patch(app.knowledge, "build_for_jd", old_builder)
         report = self._run()
         self.assertEqual(calls, [self.LONG], "两参数的老 builder 没被正常调到（签名适配没生效）")
-        self.assertEqual(self._kb_reuse_of(report), {"cached": True},
-                         "库优先根本没跑 → 不许编 reusable: 0 这种假统计")
+        self.assertEqual(self._kb_reuse_of(report),
+                         {"not_run": True, "source": jdfacts.SOURCE_COMPUTED},
+                         "库优先根本没跑 → 说「没跑」+ 真实来源，不许编 reusable: 0 这种假统计")
+
+    def test_the_real_builder_receives_reuse_as_a_keyword(self):
+        """反向（追加 A）：**收 `reuse` 的** builder 必须真的收到它 —— 参数得是关键字。
+
+        `jdfacts._compute_once` 用 `builder(jd_text, cfg)` 两个位置参数调；`reuse` 只能靠
+        `_builder_with_reuse` 的闭包**按关键字**传进去。这条直接盯住那个关键字本身
+        （只看报告里"复用了 N 条"是间接证据：`reuse.used` 还可能因为别的路径被置上）。
+        """
+        seen = []
+
+        def builder_that_accepts_reuse(jd_text, cfg, reuse=None):
+            seen.append({"reuse": reuse, "jd_text": jd_text})
+            return [{"id": "x", "term": "RLHF", "definition": "d", "layer": 0,
+                     "sources": [], "timeline": [], "related": [], "interview_questions": [],
+                     "confidence": "ai-generated"}]
+
+        self._patch(app.knowledge, "build_for_jd", builder_that_accepts_reuse)
+        report = self._run()
+        self.assertEqual(len(seen), 1, "builder 没被调到")
+        self.assertIsInstance(seen[0]["reuse"], kbreuse.Reuse,
+                              "`reuse` 没按关键字传进 builder（功能会静默失效）")
+        self.assertEqual(seen[0]["jd_text"], self.LONG, "JD 原文要原样喂进去")
+        # builder 自己没跑库优先 → 这次就是「没跑」，来源是 computed（真的算了一份）
+        self.assertEqual(self._kb_reuse_of(report),
+                         {"not_run": True, "source": jdfacts.SOURCE_COMPUTED})
 
     # ---------------- ② 库坏了：分析照做，但坦白说清楚
     def test_a_broken_knowledge_base_is_reported_not_papered_over(self):
@@ -1973,9 +2001,35 @@ class AnalyzeKbReuseTest(_AnalyzeRouteCase):
         reuse = self._kb_reuse_of(second)
         self.assertEqual(self._data_of(second)["knowledge_meta"]["source"], "cache",
                          "夹具前提：第二次真的走了缓存")
-        self.assertEqual(reuse, {"cached": True},
+        self.assertEqual(reuse, {"not_run": True, "source": "cache"},
                          "缓存命中时这次**根本没跑**库优先 —— 不许写 reusable: 0 这种假话")
         self.assertEqual(len(self.searches), searches_before, "复用缓存时一次搜索都不该有")
+
+    # ---------------- ③b 播种：同样是"没跑"，但来源**不是**缓存
+    def test_a_seeded_map_says_seeded_not_cached(self):
+        """追加 C：`used` 为假也覆盖**播种**路径 —— 键名叫 `cached` 而来源是 `seeded:…`
+        就是**说错话**（读报告的人会以为"库里那份缓存被复用了"，而实际是从旧报告免费播种的）。
+
+        夹具：先真算一次（留下 JD + 报告 + 缓存）→ 把该 JD 的缓存 `jd_facts` 摘掉 →
+        再分析一次（同一份 JD 文本 / 同一份 JD 身份）→ 只能走播种。
+        """
+        store.save_knowledge({"nodes": [self._card()]})
+        first = self._run()
+        self.assertGreaterEqual(self._kb_reuse_of(first)["reusable"], 1, "夹具前提：第一次真的复用了")
+
+        data = jdid.load_jds()
+        for rec in data["jds"]:
+            rec.pop("jd_facts", None)          # 摘掉缓存 → 三级回退只剩"播种"
+        jdid.save_jds(data)
+
+        second = self._run(resume="第二版.md", allow_duplicate=True)
+        meta = self._data_of(second)["knowledge_meta"]
+        self.assertTrue(meta["source"].startswith(jdfacts.SEEDED_PREFIX),
+                        "夹具前提：第二次必须走播种，实际来源是 %r" % (meta["source"],))
+        self.assertEqual(meta["kb_reuse"], {"not_run": True, "source": meta["source"]},
+                         "播种路径不许被说成 cached —— 键名与来源必须一致")
+        self.assertNotIn("cached", meta["kb_reuse"],
+                         "「没跑」不等于「缓存命中」：说准来源（追加 C）")
 
 
 # ⚠️ 本块的另一组高风险假绿：

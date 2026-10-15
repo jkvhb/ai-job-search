@@ -15,6 +15,7 @@
 """
 import json
 import re
+import traceback
 
 import kb
 import llm
@@ -383,17 +384,34 @@ def plan_nodes(nodes, index, call=None, error=""):
         # 空库直接早退：省掉那次模型判定（本来也没什么可判的）。
         return stats
     found = {}      # id(node) -> (card, matched_by)
+    occupied = set()   # 确定性匹配已经占用的 card_id（判定层的**禁选集合**，I-1）
     for n in nodes:
         card, how = idx.lookup(n.get("term"))
         if card is not None:
             found[id(n)] = (card, how)
+            cid = kb.normalize_id(card.get("term"))
+            if cid:
+                occupied.add(cid)
     rest = [n for n in nodes if id(n) not in found]
     if call is not None and rest:
-        pairs = judge(rest, idx, call)
+        pairs = judge(rest, idx, call, forbidden=occupied)
+        # 填充前的**第二道收口**（I-1）：判定命中不许拿已被确定性占用的卡，判定命中之间
+        # 也互不共享一张卡（先出现的赢）。它与 `judge` 里的 `forbidden` **不是**重复的摆设：
+        # 两处各有独立的测试盯着（`test_the_plan_gate_drops_a_judged_card_that_the_exact_hit_already_took`
+        # 与 `test_the_judge_itself_drops_a_forbidden_card_and_keeps_the_legal_one`），
+        # 别因为"看起来像兜底"就删掉任何一处。
+        # ⚠️ **确定性同名共享一张卡是允许的**（spec §5：同名是"确凿同一"，
+        # `test_two_nodes_resolving_to_one_card_both_get_reused`）—— 所以被禁的只是
+        # "判定命中去拿别人已经占上的卡"，不是"一张卡只能填一个节点"。
         for n in rest:
-            card = idx.cards.get(pairs.get(str(n.get("term") or "")))
-            if card is not None:
-                found[id(n)] = (card, "assisted")
+            cid = pairs.get(str(n.get("term") or ""))
+            if not cid or cid in occupied:
+                continue
+            card = idx.cards.get(cid)
+            if card is None:
+                continue            # 判定层已经校验过，这里是"别处的 bug 也别炸"的一层
+            found[id(n)] = (card, "assisted")
+            occupied.add(cid)
     for n in nodes:
         hit = found.get(id(n))
         if hit is None:
@@ -432,28 +450,58 @@ def plan_nodes(nodes, index, call=None, error=""):
 
 
 def _chunks(seq, size):
+    """按 `size` 切块。**`size <= 0` 一律兜底成 1**（M-6）。
+
+    为什么非要兜这一下：`size=0` 时 `range(0, n, 0)` 抛 `ValueError`，而这个函数**不在**
+    `judge` 那个 `try` 里（try 罩的是模型调用）—— 它会一路掀掉整步知识地图：
+    Task 5 接上之后，整次分析的知识地图退化成 `knowledge_error`，几十个节点的复用机会
+    一起丢。负数更坏：一个 chunk 都不产出，看起来"判过了"其实**一条都没问**。
+    当前唯一的 `size` 来源是模块常量 `MAX_JUDGE_TERMS`（硬编码、没有配置入口），
+    所以这是**预防性**的兜底 —— 但代价极低，而漏掉的代价是整步崩。
+    """
+    size = max(1, int(size))
     for i in range(0, len(seq), size):
         yield seq[i:i + size]
 
 
-def judge(nodes, index, call):
+def judge(nodes, index, call, forbidden=None):
     """让模型判一次"这些知识点是不是库里已有的某个概念"。
 
     返回 `{节点 term 原文: card_id}`。**逐条校验**，任何可疑的一律丢弃：
-      * `card_id` 必须真实存在于**这一批**库里（**不许发明概念**）；
-      * `node` 必须是这次问过的节点；
-      * **一张卡只认一条**（模型说两个不同名字都等于同一张卡时，多半认错了一个）；
-      * 返回畸形 / 调用抛异常 → **一条都不用**（等同"没命中"），记日志。
+      * `card_id` 必须真实存在于**这一批（这一块）**清单里（**不许发明概念**）；
+      * `node` 必须是这次问过的节点，且它的 `kb.normalize_id(term)` **非空** ——
+        空名节点不参与判定（I-1：否则 `node:""` 能**一次认领多个**空名节点，
+        两个空名节点会被填上同一张卡）；
+      * **一张卡只认一条**、**一条节点只认一张卡**：先出现的赢（顺序稳定，绝不随机）。
+        模型说"两个不同名字都等于同一张卡"时，多半认错了一个（spec §6）；
+      * `forbidden` 里的 `card_id`（**确定性匹配已经占用**的那些）一律丢弃 ——
+        "一卡一条"必须跨过「确定性 / 判定」这条边界（I-1）：否则同一张卡会同时落到
+        「同名命中」与「模型判定命中」两个节点上，两个节点被改成同一个 `term`、
+        装着一模一样的内容，而其中一个概念其实没被认出来；
+      * 调用抛异常 / `llm.parse_json_reply` 失败 / **顶层**形状不对 → **这一块**
+        一条都不用（等同"没命中"），记日志（含**块序号与总块数**，且异常原文**截断**后
+        再落盘 —— HTTP 报错常带整段 prompt/回复）。**某一块坏了只作废那一块**，
+        其余块照常生效（`continue`），绝不"整步退回确定性匹配"。
+
+    ⚠️ 已知无上限（M-7，如实记一句）：B 清单（要问的节点）**每一块都重发整份**，
+    块数越多重复越多。当前不做优化 —— 生产上节点 ≤ 60、块数通常为 1，收益为零。
     """
     nodes = list(nodes or [])
     terms = index.terms_for_judge() if index is not None else []
     if not terms or not nodes:
         return {}
+    banned = {str(x) for x in (forbidden or [])}
     wanted = {}
     for n in nodes:
-        wanted.setdefault(str(n.get("term") or ""), n)
+        t = str(n.get("term") or "")
+        if not kb.normalize_id(t):
+            continue            # 空名节点不参与判定（I-1）
+        wanted.setdefault(t, n)
+    if not wanted:
+        return {}               # 一条能问的都没有 → 别白花那次模型调用
     out = {}
-    for chunk in _chunks(terms, MAX_JUDGE_TERMS):
+    chunks = list(_chunks(terms, MAX_JUDGE_TERMS))
+    for i, chunk in enumerate(chunks):
         payload = {"A": chunk,
                    "B": [{"node": t, "term": t,
                           "definition": str((n.get("definition") or ""))[:40]}
@@ -461,15 +509,25 @@ def judge(nodes, index, call):
         try:
             reply = call([{"role": "system", "content": JUDGE_SYSTEM},
                           {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}])
-            data = json.loads(reply) if isinstance(reply, str) else None
+            # 与 `knowledge._call` 那条路**同一个** helper（容 ```json 围栏）——
+            # 用裸 `json.loads` 时，一句带围栏的回复会让**整块白丢**（M-8）。
+            # 校验闸门一条都不放松：下面逐条校验的还是同一批（parse 只负责把文本读成 dict）。
+            data = llm.parse_json_reply(reply)
         except Exception as e:
-            log.log_exc("kbreuse.judge_error", e)
+            # 手动落一条 `log_exc` 形状的记录（error + traceback），但**截断**异常原文：
+            # `log.log_exc` 会把 `str(异常)` 原样写进去，而 HTTP 报错常带整段 prompt/回复。
+            log.log_event("kbreuse.judge_error", level="error",
+                          error=str(e)[:300], traceback=traceback.format_exc()[-2000:],
+                          chunk=i + 1, chunks=len(chunks))
             continue
-        pairs = data.get("pairs") if isinstance(data, dict) else None
+        pairs = data.get("pairs")
         if not isinstance(pairs, list):
-            log.log_event("kbreuse.judge_bad_shape", level="warn", got=type(pairs).__name__)
+            log.log_event("kbreuse.judge_bad_shape", level="warn",
+                          got=type(pairs).__name__, chunk=i + 1, chunks=len(chunks))
             continue
-        allowed = {c["card_id"] for c in chunk}
+        # `allowed` 是**当前这一块**的清单（减掉确定性已占用的）——不是全部 terms：
+        # 小库里两者恰好相同，所以这条要有牙就必须真的分块（见 `test_a_card_id_from_another_chunk_is_dropped`）。
+        allowed = {c["card_id"] for c in chunk} - banned
         for p in pairs:
             if not isinstance(p, dict):
                 continue
@@ -477,8 +535,8 @@ def judge(nodes, index, call):
             cid = str(p.get("card_id") or "")
             if node_term not in wanted or cid not in allowed:
                 continue
-            if cid in out.values():
-                continue          # 一张卡只认一条
+            if node_term in out or cid in out.values():
+                continue          # 一卡一条 / 一条一张卡：**先出现的赢**（M-5）
             out[node_term] = cid
     return out
 
@@ -496,6 +554,9 @@ def _judge_caller(cfg):
 
     `temperature` 走 `float(tm.get("temperature") or 0.3)`（与 `knowledge._call` 的口径一致）：
     往接口送 `None` 是"不带这个参数"的另一套语义，而这个字段在配置里是可选装饰。
+
+    `json_mode=True` 也照 `knowledge._call`：判定是**只要 JSON** 的调用，而 `llm` 在不支持
+    `response_format` 时会自动降级重试，所以这里不需要自己兜。
     """
     tm = (cfg or {}).get("text_model") or {}
     if not (tm.get("base_url") and tm.get("api_key") and tm.get("model")):
@@ -503,6 +564,7 @@ def _judge_caller(cfg):
 
     def call(messages):
         return llm.call_openai_compatible(tm["base_url"], tm["api_key"], tm["model"], messages,
+                                          json_mode=True,
                                           temperature=float(tm.get("temperature") or 0.3))
     return call
 

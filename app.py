@@ -1031,7 +1031,22 @@ def _as_bool(value):
 
 
 def _accepts_reuse(fn):
-    """这个 builder 收不收 `reuse` 关键字参数？（判据只有签名，见 `_builder_with_reuse`）"""
+    """这个 builder 收不收 `reuse` 关键字参数？（判据只有签名，见 `_builder_with_reuse`）
+
+    ⚠️ **这道签名判断是必需的，不是画蛇添足 —— 别"顺手简化"掉它。**
+    原因（后人一定要看这里，否则会踩）：
+      * `jdfacts._compute_once`（`jdfacts.py:303`）用 `builder(jd_text, cfg)` —— **两个位置参数** ——
+        调那条 builder 缝；而本仓**既有**的替身（`tests/test_analyze_knowledge_cache.py` 里那批
+        `fake_knowledge`、`tests/test_app.py:1350` 的 `_patch_analyze_deps` 等）签的就是
+        `def fake_knowledge(jd_text, cfg)`；
+      * 所以在闭包里**硬塞** `fn(jd_text, cfg, reuse=reuse)` 会让这些替身**在进入函数体之前**
+        就 `TypeError`（`calls` 全空、断言全红）—— 而它们**不在**本次改动的文件范围内，
+        修不了也不该修（那是"替身没跟上新签名"，不是被测代码该出的错）；
+      * 反过来，不注入就等于阶段 E **静默失效**（见 `_builder_with_reuse`）。
+    所以判据只能是签名：**对方真的收，才传**。两个方向都由测试钉住
+    （`test_the_real_builder_receives_reuse_as_a_keyword` 与
+    `test_a_builder_that_only_accepts_the_old_two_arguments_still_works`）。
+    """
     try:
         params = inspect.signature(fn).parameters.values()
     except (TypeError, ValueError):
@@ -1053,11 +1068,13 @@ def _builder_with_reuse(reuse):
     知识地图照旧出得来、报告也照旧写，只是**每条都去联网**：阶段 E 会**静默失效**，
     而且看不出来（这正是本项目最忌讳的失败形态）。
 
-    ⚠️ **为什么还要看签名**：那条缝原本的契约就是 `builder(jd_text, cfg)`，注入的替身/别的实现
-    只收这两个参数。硬塞 `reuse=` 会让它们 `TypeError` —— 那是"替身没跟上新签名"，
-    不是被测代码该出的错（实测：不加这道判断，`tests/test_analyze_knowledge_cache.py` 里
-    一批两参数的假 builder 会在**进入函数体之前**就炸，`calls` 全空）。
-    所以只把对方**真的收**的参数传过去。
+    ⚠️ **为什么还要看签名**（`_accepts_reuse`）：那条缝原本的契约就是 `builder(jd_text, cfg)`，
+    注入的替身/别的实现只收这两个参数（`tests/test_analyze_knowledge_cache.py` 里那批
+    `fake_knowledge`、`tests/test_app.py:1350` 的 `_patch_analyze_deps` 等，都在**本次改动的
+    文件之外**）。硬塞 `reuse=` 会让它们 `TypeError` —— 那是"替身没跟上新签名"，
+    不是被测代码该出的错（实测：不加这道判断，那一批两参数的假 builder 会在**进入函数体之前**
+    就炸，`calls` 全空）。所以只把对方**真的收**的参数传过去 —— 判据与理由详见 `_accepts_reuse`
+    的 docstring（那里写着"为什么不能简化掉它"）。
 
     ⚠️ 这里**没有** try/except：`Reuse` 自己不许抛（读不出来只落在 `stats` 里），
     真抛出来的话那是别处的 bug，应当响亮地失败。
@@ -1370,10 +1387,14 @@ def do_analyze(jd_text, image_data_url, resume_name, link="", overwrite_id="", a
             # ⚠️ 两支**不是同一件事**，报告里不许混：
             #   * `used` 为真 = 这次**真的跑过**"库优先" → 如实带上统计（`stats` 为空 dict
             #     也是"跑了"，那表示"库是空的、复用了 0 条"）；
-            #   * `used` 为假 = 知识地图是从**缓存/旧报告**里拿的（三级回退的①②），
-            #     这次**根本没跑** → 只标 `cached`。这时写「复用了 0 条」是**假话**
-            #     （读报告的人会以为查过库、只是没查到，实际上压根没查）。
-            meta["kb_reuse"] = dict(reuse.stats) if reuse.used else {"cached": True}
+            #   * `used` 为假 = 这次**根本没跑**库优先 → 只标 `not_run` + **真实来源**。
+            #     这时写「复用了 0 条」是**假话**（读报告的人会以为查过库、只是没查到）。
+            # ⚠️ **键名不许叫 `cached`**（追加 C）：`used` 为假覆盖三种来源，键名叫 cached
+            #     就是说错话 —— `source` 是 `cache`（缓存命中）、`seeded:<报告id>`（从该 JD 的
+            #     旧报告**免费播种**）、`computed`（注入的 builder 压根不收 `reuse`）。
+            #     前两者的共同真话只有一句：**这次没跑库优先**；到底怎么来的，读 `source`。
+            meta["kb_reuse"] = (dict(reuse.stats) if reuse.used
+                                else {"not_run": True, "source": know_source})
             d["knowledge_meta"] = meta
         except Exception as e:
             # 明确区分「管线失败」与「真的没有知识点」，避免静默变成空模块。
