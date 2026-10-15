@@ -20,6 +20,7 @@ import base64
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -34,6 +35,7 @@ import kb
 import log
 import store
 
+from tests import web_probe
 from tests.base import IsolatedCase
 
 JD_A = "本科_甲公司_标注_文本_北京_13-26K_0001"
@@ -1280,6 +1282,201 @@ class TemplateHygieneTest(IsolatedCase):
             self.assertIn(needle, body)
         # 反证：`at` 绝不是直接拼进去的
         self.assertNotIn("+at+", body)
+
+
+# ================================================================ P2-2 链接协议白名单
+#
+# 断言的是**渲染出来的** `href`，不是源码里有没有 `esc(`：
+# `esc()` 只转 `&<>"'`、**不转义冒号**，所以 `esc("javascript:alert(1)")` 原样落进 href 就是一条
+# 可点的"脚本链接"。而这些串是**外部字符串**：`sources[].url` 来自模型/搜索，
+# `source_link` 来自台账 JSON（用户手改也算）。
+#
+# 三个入口（报告来源 / 报告原岗位链接 / 台账原岗位链接）**都要**降级成纯文本：
+# 内容仍然看得见（不静默消失），只是点不动。
+FAKE_LINKS = (
+    ("经典 javascript:", "javascript:alert(1)"),
+    ("带协议头的 data:", "data://x"),
+    ("data: 内联页面", "data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg=="),
+    ("vbscript:", "vbscript:msgbox(1)"),
+    ("大小写混写", "JaVaScRiPt:alert(1)"),
+    ("前导空白", "  javascript:alert(1)"),
+    ("file:", "file:///C:/Windows/System32/calc.exe"),
+    # 协议相对 URL **本批裁定不放行**：它继承"打开这份文档的协议" —— 报告既可能从
+    # `http://127.0.0.1:8000` 打开，也可能被用户另存后从 `file://` 打开，那时 `//host/x`
+    # 就变成一条本项目从未评估过的 `file://` 链接。仓库里没有任何生产者会产出协议相对 URL
+    # （岗位链接都是模型/搜索给的绝对 http(s) 地址），放行它的收益是 0，所以按"不认识就不点"处理。
+    ("协议相对", "//evil.example.com/x"),
+)
+
+#: href 里**绝不许**出现的开头（小写比较）。`//` 见上面的裁定。
+BAD_HREF_PREFIXES = ("javascript:", "data:", "vbscript:", "file:", "//")
+
+GOOD_URL = "https://example.com/a"
+
+
+def _anchor_tags(html):
+    """渲染结果里真渲染出来的锚点（`<a …>` 整段，含属性）。"""
+    return re.findall(r"<a\b[^>]*>", html)
+
+
+def _hrefs(html):
+    """渲染结果里全部锚点的 href 值（不跨标签匹配：`[^>]*?` 出不了这个标签）。"""
+    return [m.group(1) for m in re.finditer(r'<a\b[^>]*?\bhref="([^"]*)"', html)]
+
+
+def _safe_url_body(path):
+    """取出某个文件里 `safeUrl()` 的函数体（找不到 → **响亮失败**，别静默返回空串）。"""
+    src = store.read_text(path)
+    anchor = "function safeUrl(u){"
+    i = src.find(anchor)
+    if i < 0:
+        raise AssertionError("%s 里没有 safeUrl()（吃外部字符串的 href 靠它兜底）" % path)
+    self_end = src.find("\n}", i)
+    if self_end < 0:
+        raise AssertionError("%s 里的 safeUrl() 没有结束（切不出去）" % path)
+    body = src[i:self_end]
+    if len(body) < 40:
+        raise AssertionError("%s 里的 safeUrl() 太短（切错了？）：%r" % (path, body))
+    return body
+
+
+def _report_data_with(sources=None, source_link=None, jd_image=None):
+    """一份最小可渲染的报告数据 + 要测的那个外部链接字段。"""
+    data = {"job_title": "语音数据质检", "score": 91.5, "verdict": "建议投递",
+            "scores": [{"name": "匹配度", "score": 91.5, "weight": 10}],
+            "knowledge": [{"id": "n1", "term": "语音识别", "definition": "d", "layer": 0,
+                           "sources": list(sources or []), "timeline": [], "related": [],
+                           "interview_questions": [], "confidence": "guess"}]}
+    if source_link is not None:
+        data["source_link"] = source_link
+    if jd_image is not None:
+        data["jd_image"] = jd_image
+    return data
+
+
+def _ledger_html(row):
+    """**真跑**台账页的 `renderJobs()`，回 `#jobList` 的渲染结果。空结果 → 直接报错。"""
+    need_node()
+    out = web_probe.run_index(
+        "JOBS = [__fixture.row];\n"
+        "renderJobs();\n"
+        "out.html = String(document.querySelector('#jobList').innerHTML);\n",
+        {"row": row})
+    html = out.get("html") or ""
+    if not html:
+        raise AssertionError("台账卡片什么都没渲染（渲染没发生 → 断言会变成恒真的假绿）：%r" % (out,))
+    return html
+
+
+class LinkSchemeWhitelistTest(IsolatedCase):
+    """P2-2：吃外部字符串的 `href` 只放行绝对 http(s)，其余一律降级成纯文本。"""
+
+    def setUp(self):
+        super().setUp()
+        need_node()
+
+    def _assert_no_bad_href(self, html, raw):
+        """href 里绝不许有伪协议。
+
+        `strip()` 是**必须**的：浏览器解析 href 时会丢掉首尾空白与制表/换行，
+        所以 `href="  javascript:alert(1)"` 点下去照样执行 —— 不 strip 就会看漏这一条。
+        """
+        for href in _hrefs(html):
+            self.assertFalse(
+                href.strip().lower().startswith(BAD_HREF_PREFIXES),
+                "伪协议被渲染成了可点的链接：href=%r（原始输入 %r）" % (href, raw))
+
+    # ---------------------------------------------------------- ① 报告来源链接
+    def test_a_fake_scheme_source_url_is_plain_text_instead_of_a_link(self):
+        """`sources[].url`（**模型/搜索返回的 URL**）非 http(s) → 不生成 `<a>`，内容仍可见。"""
+        for name, url in FAKE_LINKS:
+            with self.subTest(scheme=name):
+                # 不带 title：来源那一行显示的就是 URL 本身 ⇒ 能直接断言"那串文本仍然看得见"
+                html = _render_page(_report_data_with(sources=[{"url": url}]))
+                self._assert_no_bad_href(html, url)
+                # 这一份数据里 #main 唯一可能的链接就是这条来源 ⇒ 它一个锚点都不该生成
+                self.assertEqual(_anchor_tags(html), [],
+                                 "非 http(s) 的来源居然生成了锚点：%r" % (_anchor_tags(html),))
+                self.assertIn(url.strip(), html, "降级成纯文本时那串内容消失了（用户该看得见）")
+        # 有 title 时显示 title（标题照样不许把 href 变成链接）
+        html = _render_page(_report_data_with(sources=[{"url": "javascript:alert(1)",
+                                                        "title": "某来源"}]))
+        self._assert_no_bad_href(html, "javascript:alert(1)")
+        self.assertIn("某来源", html, "连来源标题一起消失了")
+
+    # ---------------------------------------------------------- ② 报告原岗位链接
+    def test_a_fake_scheme_source_link_is_plain_text_instead_of_a_link(self):
+        """`source_link` 非 http(s) → 整条不生成 `<a>`，但那一行文案与地址本身仍然看得见。"""
+        for name, url in FAKE_LINKS:
+            with self.subTest(scheme=name):
+                html = _render_page(_report_data_with(source_link=url))
+                self._assert_no_bad_href(html, url)
+                self.assertIn("原岗位链接", html, "整条链接被删掉了（该降级成纯文本，不是消失）")
+                self.assertIn(url.strip(), html, "降级成纯文本时那串内容消失了（用户该看得见）")
+                self.assertIn('title="链接不可用', html,
+                              "降级之后没有告诉用户为什么点不动：%r" % (html,))
+
+    # ---------------------------------------------------------- ③ 台账原岗位链接
+    def test_the_ledger_original_job_link_degrades_for_a_fake_scheme(self):
+        """台账（`web/index.html`）里那条原岗位链接 —— 同一个判据。"""
+        for name, url in FAKE_LINKS:
+            with self.subTest(scheme=name):
+                html = _ledger_html({"id": "j-1", "job_title": "语音数据质检", "source_link": url})
+                self._assert_no_bad_href(html, url)
+                self.assertIn("原岗位链接", html, "整条链接被删掉了（该降级成纯文本，不是消失）")
+                self.assertIn(url.strip(), html, "降级成纯文本时那串内容消失了（用户该看得见）")
+
+    # ---------------------------------------------------------- ④ 对照组：正常链接照旧可点
+    def test_a_normal_https_link_is_still_a_real_link(self):
+        """**别把正常链接也杀了**：`https://…` 三个入口都仍然渲染成真 `<a href>`。"""
+        html = _render_page(_report_data_with(sources=[{"url": GOOD_URL, "title": "官网"}]))
+        self.assertIn('<a href="' + GOOD_URL + '"', html, "正常的 https 来源被降级了")
+
+        html = _render_page(_report_data_with(source_link=GOOD_URL))
+        self.assertIn('<a class="lnk" href="' + GOOD_URL + '"', html, "正常的 https 原岗位链接被降级了")
+
+        html = _ledger_html({"id": "j-1", "job_title": "语音数据质检", "source_link": GOOD_URL})
+        self.assertIn('href="' + GOOD_URL + '"', html, "台账里正常的 https 原岗位链接被降级了")
+
+    # ---------------------------------------------------------- ⑤ 两个文件里的 safeUrl 必须同源
+    def test_safe_url_is_the_same_function_in_both_files(self):
+        """`safeUrl()` 在两个文件各有一份（自包含是必须的），但**逻辑必须逐字一致**。
+
+        报告模板与台账页是两份独立文件（报告要能单独打开），所以函数不能合并 ——
+        代价就是"改一处忘了另一处"。这条把代价钉住：两份的函数体必须一字不差。
+        """
+        index_body = _safe_url_body(web_probe.WEB_INDEX)
+        tpl_body = _safe_url_body(app.TEMPLATE_PATH)
+        self.assertEqual(index_body, tpl_body,
+                         "两份 safeUrl() 的逻辑不一致了（改一处必须改另一处）")
+        self.assertIn("/^https?:\\/\\//i", index_body, "判据不是 http(s) 白名单了？")
+        # 提成 safeUrl 之后不该再有 kbSafeUrl 这个旧名字（有两个名字就会两处漂移）
+        self.assertNotIn("kbSafeUrl", store.read_text(web_probe.WEB_INDEX))
+
+    # ---------------------------------------------------------- ⑥ target=_blank 必须配 noopener
+    def test_every_target_blank_anchor_carries_noopener(self):
+        """反制 `window.opener` 劫持：**报告模板那两处**（来源 / 原岗位链接；截图那处也一并补上）。
+
+        两个文件里**每一条** `target="_blank"` 都要有 `rel="noopener` —— 数一下锚点数量，
+        免得这条断言因为"某个链接没渲染"而空跑。
+        """
+        html = _render_page(_report_data_with(sources=[{"url": GOOD_URL, "title": "官网"}],
+                                             source_link=GOOD_URL, jd_image="jd1.png"))
+        blank = [a for a in _anchor_tags(html) if 'target="_blank"' in a]
+        self.assertEqual(len(blank), 3,
+                         "报告里带 target=_blank 的锚点数不是 3 条（这条断言会空跑）：%r" % (blank,))
+        self.assertEqual([a for a in blank if 'rel="noopener' not in a], [],
+                         "报告里 target=_blank 没配 rel=noopener：%r"
+                         % ([a for a in blank if 'rel="noopener' not in a],))
+
+        ledger = _ledger_html({"id": "j-1", "source_link": GOOD_URL, "report": "r.html",
+                               "jd_image": "jd1.png"})
+        lblank = [a for a in _anchor_tags(ledger) if 'target="_blank"' in a]
+        self.assertEqual(len(lblank), 3,
+                         "台账里带 target=_blank 的锚点数不是 3 条（这条断言会空跑）：%r" % (lblank,))
+        self.assertEqual([a for a in lblank if 'rel="noopener' not in a], [],
+                         "台账里 target=_blank 没配 rel=noopener：%r"
+                         % ([a for a in lblank if 'rel="noopener' not in a],))
 
 
 if __name__ == "__main__":

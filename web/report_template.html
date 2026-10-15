@@ -303,6 +303,24 @@ async function applyCheck(cb){
 }
 
 function esc(s){ return String(s==null?'':s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+// 链接协议白名单：**吃外部字符串的 href 都必须先过它**。
+// 为什么必须有：报告里的 `source_link` / `sources[].url` 来自**模型 / 搜索返回的 URL**（也是
+// 用户手改报告 JSON 能塞的东西），而 `esc()` 只转 &<>"'、**不转义冒号** ⇒
+// `esc("javascript:alert(1)")` 原样进 href 就是一条可点的"脚本链接"（点一下就能执行）。
+// 判据：**只放行绝对 http:// / https://**；其余（javascript: / data: / vbscript: / file: /
+//       自定义 scheme / 相对路径 / `//host` 这种协议相对 URL）一律返回空串，
+//       由调用方渲染成**纯文本**（内容仍然可见，只是点不动）。
+//       为什么不放行 `//host/x`：它继承**打开文档的协议** —— 报告既可能从 http://127.0.0.1
+//       打开，也可能被用户另存后从 file:// 打开，那时它变成一条本项目从未评估过的 file:// 链接；
+//       而本项目没有任何生产者会产出协议相对 URL，放行收益为 0。
+//       首尾空白先 trim：`" javascript:..."` 的前导空白在浏览器里也会被吞掉，不 trim 就会放行一条真链接。
+// ⚠️ 本函数在 **web/report_template.html 与 web/index.html 各有一份**（报告页要能单独打开，
+//    所以不能合并成同一个文件）。两份的**函数体必须逐字一致**：**改一处必须改另一处**
+//    （tests/test_analyze_knowledge_cache.py::LinkSchemeWhitelistTest 会比对两份的函数体）。
+function safeUrl(u){
+  const s = String(u == null ? '' : u).trim();
+  return /^https?:\/\//i.test(s) ? s : '';
+}
 function save(){ try { localStorage.setItem(SKEY, JSON.stringify(state)); } catch(e){} }
 function flash(msg, bad){ const h=document.getElementById('hint'); if(!h)return; h.textContent = msg||'已保存 ✓'; h.style.color = bad ? 'var(--red)' : 'var(--green)'; clearTimeout(window.__ft); window.__ft=setTimeout(()=>{h.textContent=HINT_TEXT;h.style.color='';},1600); }
 function toggleAll(open){ document.querySelectorAll('#main details').forEach(d => d.open = open); }
@@ -361,8 +379,14 @@ function renderContact(){
     ['🎯 岗位名称', d.job_title]
   ].filter(x=>x[1]);
   const links = [];
-  if(d.source_link) links.push('<a class="lnk" href="'+esc(d.source_link)+'" target="_blank">🔗 打开原岗位链接</a>');
-  if(d.jd_image) links.push('<a class="lnk" href="/jd/'+encodeURIComponent(d.jd_image)+'" target="_blank">🖼 查看原始 JD 截图</a>');
+  // 原岗位链接 / 截图链接都来自外部字符串：**非 http(s) 不生成 <a>**（见 safeUrl 的注释），
+  // 降级成纯文本（仍然说明这里原本有个链接、为什么点不动，绝不静默消失）。
+  const srcLink = safeUrl(d.source_link);
+  if(d.source_link) links.push(srcLink
+    ? '<a class="lnk" href="'+esc(srcLink)+'" target="_blank" rel="noopener noreferrer">🔗 打开原岗位链接</a>'
+    : '<span class="lnk" title="链接不可用：只支持 http/https 的地址">🔗 原岗位链接（链接不可用：'+esc(d.source_link)+'）</span>');
+  // 截图走的是本机路由（`/jd/<文件名>`，前缀固定 + encodeURIComponent 把冒号也编掉）⇒ 结构上不可能变成伪协议
+  if(d.jd_image) links.push('<a class="lnk" href="/jd/'+encodeURIComponent(d.jd_image)+'" target="_blank" rel="noopener noreferrer">🖼 查看原始 JD 截图</a>');
   if(d.phone) links.push('<button class="lnk" data-copy="'+esc(d.phone)+'">📞 复制电话</button>');
   if(!items.length && !links.length) return '';
   let h = '';
@@ -658,9 +682,13 @@ function kCard(n, expanded){
     ? '<h4>💬 面试会怎么问</h4><div class="ktx">'+n.interview_questions.map(esc).join('<br>')+'</div>' : '';
 
   const src = (n.sources && n.sources.length)
-    ? '<div class="ksrc">📎 来源：' + n.sources.map(s=>
-        '<a href="'+esc(s.url)+'" target="_blank" rel="noopener">'+esc(s.title || s.url)+'</a>'
-      ).join(' ｜ ') + '</div>'
+    ? '<div class="ksrc">📎 来源：' + n.sources.map(s=>{
+        const label = esc(s.title || s.url);
+        const url = safeUrl(s.url);
+        // 非 http(s) 不渲染成链接（见 safeUrl 的注释）：内容仍然可见，只是点不动
+        return url ? '<a href="'+esc(url)+'" target="_blank" rel="noopener noreferrer">'+label+'</a>'
+                   : '<span title="链接不可用：只支持 http/https 的地址">'+label+'</span>';
+      }).join(' ｜ ') + '</div>'
     : '<div class="ksrc">📎 未找到可靠来源，以上内容为 AI 整理，请自行查证。</div>';
 
   const checked = knowChecked(n) ? 'checked' : '';
