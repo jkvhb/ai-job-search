@@ -1558,7 +1558,12 @@ class WriteBackSafetyTest(_WriteBackCase):
         （同一概念不复用地重算一次，同样会拉低）。临时探针实测：卡的 layer 2 + 复用节点 layer 0
         → 写回后卡的 layer = 0，且除 `from_jds`/`last_seen` 外**只有** `layer` 这一个字段变了。
         夹具因此取等值 layer，前提就写在这里；
+        ⚠️ **注释不算钉住**（M-1）：这两条规则各自有一条显式测试 ——
+        `test_the_layer_is_the_kb_minimum_rule_not_a_reuse_side_effect`（且两头都验：
+        复用 / 不复用同一条规则）；
       * `related` / `interview_questions`：并集（kb.py:294-296）—— 见 `_node` 的注释；
+        ⚠️ `related` 的并集同样有显式测试（M-1）：
+        `test_related_is_unioned_by_the_kb_rule_and_the_reuse_side_copies_none`；
       * 用户进度 `state` / `last_outcome` / `asked_count`：**只补空、绝不覆盖真值**（kb.py:302-304），
         这是 kb.py 文件头铁律 1；
       * `aliases` / `term` / `id` / `first_seen`：`_merge_into`（kb.py:271-306）压根不碰
@@ -1723,6 +1728,76 @@ class WriteBackSafetyTest(_WriteBackCase):
         self.assertEqual(self._frozen(old, skip=()), self._frozen(untouched_before, skip=()),
                          "没命中的写回不许碰别的卡（连 last_seen 都不许）")
 
+    def test_the_layer_is_the_kb_minimum_rule_not_a_reuse_side_effect(self):
+        """M-1 第一条：`layer` 取 **min** 是 `kb._merge_into`（kb.py:292）**自己的**规则，
+        **不是**"复用把库里的卡改脏"。
+
+        上一轮那条逐字节不变量（`test_reuse_writeback_changes_only_the_refs_and_last_seen`）
+        的夹具取了**等值** layer，于是这条规则被夹具绕开了 —— 只有注释，没有牙。
+        这里把它显式钉住，并且**两头都验**（复用 / 不复用同一条规则），
+        证明它是 kb 的合并行为，而不是复用引入的差异。
+        """
+        # ① 复用路径：卡的 layer 更大（2）、本次节点更小（0）→ 写回后取 min = 0
+        self._seed("语音识别", layer=2)
+        data = store.load_knowledge()
+        data["nodes"][0]["last_seen"] = "2020-01-01"
+        store.save_knowledge(data)
+        before = copy.deepcopy(store.load_knowledge()["nodes"][0])
+        self.assertEqual(before["layer"], 2, "夹具前提：库里的层更大")
+        node = self._node(layer=0)
+        stats = kbreuse.plan_nodes([node], kbreuse.Index(store.load_knowledge()["nodes"]))
+        self.assertEqual((stats["matched"], stats["reusable"]), (1, 1), "夹具前提：够格复用")
+
+        added, merged = kb.absorb([node], self.JD_NEW)
+        self.assertEqual((added, merged), (0, 1))
+        after = store.load_knowledge()["nodes"][0]
+        self.assertEqual(after["layer"], 0, "layer 取 min（kb.py:292）：卡的 2 与节点的 0 取小的")
+        changed = sorted(k for k in set(before) | set(after)
+                         if k not in ("from_jds", "last_seen") and before.get(k) != after.get(k))
+        self.assertEqual(changed, ["layer"],
+                         "复用路径上**唯一**被改的内容字段就是 layer（其余见不变量 1 那条）")
+
+        # ② 这条规则与复用**无关**：同一个概念不复用地重算一次（直接喂真 `kb.absorb` 一个节点，
+        #    整步 `plan_nodes` 都不跑），kb 的 min 照样把它拉低。
+        self._seed("梯度裁剪", layer=3)
+        raw = self._seed_node("梯度裁剪", layer=1)      # 形状与 knowledge 的产出一致
+        added, merged = kb.absorb([raw], self.JD_NEW)
+        self.assertEqual((added, merged), (0, 1))
+        cards = {c["id"]: c for c in store.load_knowledge()["nodes"]}
+        self.assertEqual(cards[kb.normalize_id("梯度裁剪")]["layer"], 1,
+                         "不复用也一样取 min → 这条 min 属于 kb，不属于复用")
+
+    def test_related_is_unioned_by_the_kb_rule_and_the_reuse_side_copies_none(self):
+        """M-1 第二条：`related` 会**并集**（kb.py:294），且并进去的是**节点自己**那份 ——
+        `_COPY_FIELDS`（kbreuse.py:288）刻意不含 `related`。前提同样是"这是 kb 的规则"。
+
+        上一轮的夹具取了空 related 并只写注释（见 `_node` 的 docstring），这条把规则钉住：
+        并集的是节点那份、卡的旧值也留着（这里卡里是空的，所以并集 == 节点那份）。
+        """
+        rel = [{"id": "另一个概念的节点", "relation": "先修"}]
+        # ① 复用路径：节点自己的 related 在写回时并进库里那张卡
+        self._seed("语音识别")
+        before = copy.deepcopy(store.load_knowledge()["nodes"][0])
+        self.assertEqual(before["related"], [], "夹具前提：库里那张卡的 related 是空的")
+        node = self._node(related=copy.deepcopy(rel))
+        stats = kbreuse.plan_nodes([node], kbreuse.Index(store.load_knowledge()["nodes"]))
+        self.assertEqual(stats["reusable"], 1, "夹具前提：够格复用")
+        self.assertEqual(node["related"], rel,
+                         "复用**不复制**卡里的 related —— 节点留着本次自己那份")
+
+        added, merged = kb.absorb([node], self.JD_NEW)
+        self.assertEqual((added, merged), (0, 1))
+        after = store.load_knowledge()["nodes"][0]
+        self.assertEqual(after["related"], kb.clean_related(rel), "related 并集（kb.py:294）")
+
+        # ② 与复用无关：不复用地重算同一概念，节点那份 related 一样会被并进去
+        self._seed("梯度裁剪")
+        raw = self._seed_node("梯度裁剪", related=copy.deepcopy(rel))
+        kb.absorb([raw], self.JD_NEW)
+        cards = {c["id"]: c for c in store.load_knowledge()["nodes"]}
+        self.assertEqual(cards[kb.normalize_id("梯度裁剪")]["related"], kb.clean_related(rel),
+                         "不复用也一样并集 → 这条并集属于 kb，不属于复用")
+
     def test_the_reused_node_carries_the_library_sources_not_this_search(self):
         """不变量 5：复用节点上的来源**就是库里那份**（值相等），本次搜索的东西一条都不许留下。
 
@@ -1818,3 +1893,137 @@ class WriteBackIdentityTest(_WriteBackCase):
     def test_identity_holds_when_the_hit_comes_from_the_head_name_key(self):
         """头名键命中：库里 `词错率（WER）`（id `词错率wer`）、JD 写头名 `词错率`。"""
         self._write_back_and_check("头名键", "词错率（WER）", "词错率")
+
+
+class IncompleteHitIdentityTest(_WriteBackCase):
+    """I-1（**真缺陷**）：身份对齐（把节点 term 换成库里的规范名）要覆盖**所有命中**，
+    不只是够格那一支。
+
+    缺口（本轮之前）：改名只写在 `_fill_from_card` 里，而它**只在够格时**跑 → 命中但不够格
+    （缺来源 / 缺通俗解释）时节点名原样留着。于是 `kb.absorb` 按
+    `normalize_id(node["term"].strip())` 找卡（kb.py:373）找不到 → **新建一张重复卡**。
+    实测复现：库里 1 张「语音识别」（缺来源）+ 节点「ASR」被模型判定命中
+    → `matched=1 / reusable=0 / enriched=1`、`node["term"]` 仍是 `"ASR"` → 卡片数 1 → 2
+    （「语音识别」+「asr」）。这正是 spec §7 要防的"知识库越长越乱"。
+
+    边界（**这一条不许被这次改动突破**）：
+      * 内容（`definition` / `plain_explanation` / `sources` / `timeline` / `category` /
+        `state` / `confidence` …）**一个字节都不许改** —— 它们仍归 ③④ 去跑；
+      * `node["id"]` 不许动（报告里的关联概念图按它连线）。
+    """
+
+    def _judge_call(self, pairs):
+        """一次"模型判定命中"的调用（`call(messages) -> reply 文本`）。"""
+        return lambda messages: json.dumps({"pairs": pairs}, ensure_ascii=False)
+
+    def _hit(self, term="ASR", card_id="语音识别"):
+        """跑一次 `plan_nodes`（节点 `term` 由模型判定命中 `card_id`），返回 `(stats, 节点)`。"""
+        node = self._node(term)
+        stats = kbreuse.plan_nodes([node], kbreuse.Index(store.load_knowledge()["nodes"]),
+                                   call=self._judge_call([{"node": term, "card_id": card_id}]))
+        return stats, node
+
+    def test_a_judged_incomplete_hit_is_renamed_and_does_not_duplicate_the_card(self):
+        """核心那条：库里「语音识别」**缺来源** + 节点「ASR」被判定命中 → 改名为规范名；
+        然后**真** `kb.absorb(node)` → `added=0, merged=1`、**卡片数不变**。
+
+        （这就是上一轮那个"写就是红"的探针，现在要它绿。）
+        """
+        self._seed("语音识别", sources=[], timeline=[])
+        before = copy.deepcopy(store.load_knowledge()["nodes"][0])
+        reusable, missing = kbreuse._card_completeness(before)
+        self.assertFalse(reusable, "夹具前提：库里那张卡缺来源 → 不够格")
+        self.assertIn("sources", missing)
+
+        stats, node = self._hit("ASR", "语音识别")
+        self.assertEqual((stats["matched"], stats["reusable"], stats["enriched"]), (1, 0, 1),
+                         "夹具前提：命中但不够格（要联网并把结果写回那张卡）")
+        self.assertEqual(node["kb_reuse"]["matched_by"], "assisted", "夹具前提：模型判定命中")
+        self.assertFalse(node["kb_reuse"]["reusable"], "夹具前提：不够格")
+        self.assertEqual(node["term"], "语音识别", "命中就要做身份对齐（不够格也一样）")
+        self.assertEqual(node["kb_reuse"]["term_original"], "ASR",
+                         "改名确实发生过 → 记下 JD 原本的写法")
+        self.assertEqual(node["kb_reuse"]["card_term"], "语音识别")
+
+        added, merged = kb.absorb([node], self.JD_NEW)      # ← 真的 kb.absorb
+        self.assertEqual((added, merged), (0, 1), "改名之后写回必须并进原来那张卡，不是新建")
+        cards = store.load_knowledge()["nodes"]
+        self.assertEqual(len(cards), 1, "卡片数不变（1 → 2 就是新建了一张重复卡）")
+        self.assertEqual(cards[0]["id"], before["id"], "还是原来那张卡")
+        self.assertEqual([j["id"] for j in cards[0]["from_jds"]],
+                         [self.JD_OLD["id"], self.JD_NEW["id"]], "只多了一条 from_jds")
+
+    def test_a_width_only_difference_is_renamed_and_the_original_literal_is_recorded(self):
+        """归一化后同名、**字面不同**（库 `ＡＳＲ` 全角 / JD 写 `ASR`）→ 也要改名，
+        `term_original` 记**原字面**，写回仍然落在原来那张卡上（卡片数不变）。"""
+        self._seed("ＡＳＲ", sources=[], timeline=[])
+        before = copy.deepcopy(store.load_knowledge()["nodes"][0])
+        self.assertEqual(before["id"], "asr", "夹具前提：卡片身份键 = 归一化后的 asr")
+
+        node = self._node("ASR")
+        stats = kbreuse.plan_nodes([node], kbreuse.Index(store.load_knowledge()["nodes"]))
+        self.assertEqual((stats["matched"], stats["reusable"]), (1, 0), "夹具前提：命中但不够格")
+        self.assertEqual(node["kb_reuse"]["matched_by"], "exact", "归一化后同名 → exact")
+        self.assertEqual(node["term"], "ＡＳＲ", "字面不同也要换成库里的规范名")
+        self.assertEqual(node["kb_reuse"]["term_original"], "ASR", "记的是**原字面**")
+
+        added, merged = kb.absorb([node], self.JD_NEW)
+        self.assertEqual((added, merged), (0, 1))
+        cards = store.load_knowledge()["nodes"]
+        self.assertEqual(len(cards), 1, "卡片数不变")
+        self.assertEqual((cards[0]["id"], cards[0]["term"]), (before["id"], before["term"]),
+                         "库里那张卡一个字没动")
+
+    def test_an_incomplete_hit_changes_only_the_term(self):
+        """回归（原约束**不变**）：不够格时内容**一个字节都不许改** —— 只有 `term` 被对齐。
+
+        `definition` / `plain_explanation` / `sources` / `timeline` 仍归 ③④ 去跑。
+        """
+        self._seed("语音识别", sources=[], timeline=[])
+        node = self._node("ASR")                  # sources / timeline 都是空的（③④ 还没跑）
+        before = copy.deepcopy(node)
+
+        kbreuse.plan_nodes([node], kbreuse.Index(store.load_knowledge()["nodes"]),
+                           call=self._judge_call([{"node": "ASR", "card_id": "语音识别"}]))
+        self.assertEqual(node["term"], "语音识别", "夹具前提：这条确实改了名（否则下面是假绿）")
+        changed = sorted(k for k in set(before) | set(node)
+                         if k not in ("term", "kb_reuse") and before.get(k) != node.get(k))
+        self.assertEqual(changed, [], "不够格时除 term 外一个字段都不许动：%s" % changed)
+        # 逐字节（比逐字段更硬：多一个键、挪一次顺序都露出来）
+        self.assertEqual(self._frozen(node, skip=("kb_reuse",)),
+                         self._frozen(dict(before, term="语音识别"), skip=("kb_reuse",)),
+                         "整条节点（除 term / kb_reuse）必须逐字节不变")
+        self.assertEqual(node["definition"], "本次写的定义", "内容归 ③④，不许被库里那份顶掉")
+        self.assertEqual(node["sources"], [], "本次的来源是本次的（不够格 = 没有来源可复用）")
+        self.assertEqual(node["confidence"], "ai-generated",
+                         "不够格没有整条复用 → 不许标 verified（那是够格那支的事）")
+
+    def test_the_reusable_branch_still_renames_and_copies_wholesale(self):
+        """回归：**够格**那一支的 `term_original` / 内容覆盖口径**一字不变**（别改坏了）。
+
+        同一条路径上用真 `kb.absorb` 走一遍：改名记录照旧、内容整条用库里那份、写回不新建卡。
+        """
+        self._seed("语音识别")                     # 满卡：有来源 + 时间线
+        card = copy.deepcopy(store.load_knowledge()["nodes"][0])
+        node = self._node("ASR")
+        node["sources"] = [{"title": "本次搜到的", "url": "https://this-run"}]
+        node["timeline"] = [{"year": "2026", "text": "本次算的"}]
+
+        stats = kbreuse.plan_nodes([node], kbreuse.Index(store.load_knowledge()["nodes"]),
+                                   call=self._judge_call([{"node": "ASR", "card_id": "语音识别"}]))
+        self.assertEqual((stats["matched"], stats["reusable"]), (1, 1), "夹具前提：够格复用")
+        self.assertEqual(node["kb_reuse"]["matched_by"], "assisted")
+        self.assertEqual(node["kb_reuse"]["term_original"], "ASR", "改名记录口径不变")
+        self.assertEqual(node["kb_reuse"]["got"], "all")
+        self.assertEqual(node["term"], card["term"], "改成库里的规范名")
+        self.assertEqual(node["definition"], card["definition"], "整条用库里那份")
+        self.assertEqual(node["plain_explanation"], card["plain_explanation"])
+        self.assertEqual(node["sources"], kb.clean_sources(card["sources"]),
+                         "本次搜到的被整条替掉（不变量 5）")
+        self.assertEqual(node["timeline"], kb.clean_timeline(card["timeline"]))
+        self.assertEqual(node["confidence"], "verified")
+        self.assertEqual(node["state"], card["state"])
+
+        added, merged = kb.absorb([node], self.JD_NEW)
+        self.assertEqual((added, merged), (0, 1), "写回仍然并进原来那张卡")
+        self.assertEqual(len(store.load_knowledge()["nodes"]), 1)

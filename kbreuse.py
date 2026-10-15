@@ -317,6 +317,26 @@ def _origin_of(card):
     return {"job_title": str(first.get("job_title") or ""), "date": str(first.get("date") or "")}
 
 
+def _align_term(node, card):
+    """**身份对齐**：把节点的 `term` 换成库里的规范名，返回节点**原来的**写法。
+
+    这件事**不是内容覆盖，是身份对齐** —— 所以它**只要命中就跑**（够格 / 不够格都一样）：
+    `kb.absorb` 是按 `kb.normalize_id(node["term"].strip())` 找卡的（kb.py:373），节点名不改，
+    写回时就找不到库里那张卡 → **新建一张重复卡**（spec §7 要防的"知识库越长越乱"）。
+
+    真缺陷复现（本轮修掉的那条）：库里「语音识别」（缺来源）+ 节点「ASR」被模型判定命中 →
+    旧行为下 `node["term"]` 仍是 `"ASR"` → `kb.absorb` 给出 `added=1, merged=0`，
+    卡片数 1 → 2（「语音识别」+「asr」）。
+
+    刻意**不动** `node["id"]`：报告里的关联概念图按它连线，改它会打断 `related`（spec §7）。
+    `card["term"]` 为空（手改坏）时保留节点自己的写法，绝不把 `term` 变成空串 ——
+    空名节点写回时连"可吸收"都不算（`kb.absorb` 第 359-361 行）。
+    """
+    original = str(node.get("term") or "")
+    node["term"] = str(card.get("term") or original)
+    return original
+
+
 def _fill_from_card(node, card):
     """把库里那份**整条**覆盖到节点上，返回节点**原来的**写法（`term_original`）。
 
@@ -325,7 +345,6 @@ def _fill_from_card(node, card):
       * `node["related"]` —— 见 `_COPY_FIELDS` 上面的注释；
       * `node["kb_reuse"]` —— 由调用方 `plan_nodes` 写（这里只管内容）。
     """
-    original = str(node.get("term") or "")
     for k in _COPY_FIELDS:
         if k not in card:
             continue                        # 卡里没有的字段保持节点自己的值
@@ -347,8 +366,10 @@ def _fill_from_card(node, card):
     # 刻意不写 `"verified" if card.get("sources") else ...`：那是死分支，而且它用的是
     # truthy，不是 completeness 那把"有 url 的 dict"的尺子，两把尺子迟早会漂移。
     node["confidence"] = "verified"
-    node["term"] = str(card.get("term") or original)
-    return original
+    # 身份对齐与"不够格"那一支**同一处实现**（I-1）：两条支路各写一遍迟早就漂移，
+    # 而这里漂移的代价正是本轮修掉的那条真缺陷（写回新建重复卡）。
+    # 返回值就是节点**原来的**写法（`_align_term` 唯一一处算它的地方）。
+    return _align_term(node, card)
 
 
 def plan_nodes(nodes, index, call=None, error=""):
@@ -368,6 +389,13 @@ def plan_nodes(nodes, index, call=None, error=""):
     `matched` / `reusable` / `timeline_reused` 各 +2，而且第二遍会把第一遍写好的
     `term_original` **抹成 `""`**（改名记录丢失）。注意去重按**对象身份**，
     不是按名字 —— 两个内容相同的真节点是两条，都要处理。
+
+    **两条支路的差别只有"要不要拿库里的内容"（I-1）**：
+      * 够格 → `_fill_from_card`：改名 + **整条内容覆盖**；
+      * 不够格 → 只 `_align_term` 改名，内容一个字不动（definition / sources / timeline
+        全归 ③④ 去跑）。
+    改名这件事两条支路**都要做**，因为它决定 `kb.absorb` 写回时认不认得出原来那张卡
+    （见 `_align_term`）。
     """
     nodes = list(nodes or [])
     uniq, seen = [], set()
@@ -427,16 +455,20 @@ def plan_nodes(nodes, index, call=None, error=""):
                 stats["timeline_reused"] += 1
         else:
             stats["enriched"] += 1
+            # **不够格也要做身份对齐**（I-1，真缺陷）：改名不是内容覆盖，只要命中就该做。
+            # 不做的话写回会新建一张重复卡（`kb.absorb` 按 `normalize_id(term)` 找卡）。
+            # 内容（definition / sources / timeline / …）一个字都不动 —— 那是 ③④ 的事。
+            original = _align_term(n, card)
         n["kb_reuse"] = {
             "card_id": kb.normalize_id(card.get("term")),
             "card_term": str(card.get("term") or ""),
             # ⚠️ **只在真的改名时才记**（M-8）：
-            #   * 名字与规范名相同时留空串 —— 否则报告里会冒出一句多余的
+            #   * 名字与规范名**字面**相同时留空串 —— 否则报告里会冒出一句多余的
             #     「JD 里写作 语音识别」；
-            #   * `reusable` 也为假时留空串 —— **不够格就不改名**（内容一个字都不动，
-            #     名字也不是"被改成了规范名"，记下来是编的）。所以这里的 `reusable and`
-            #     不是多余条件，而是"改名确实发生过"的一部分。
-            "term_original": (original if (reusable and original
+            #   * 两条支路（够格 / 不够格）都记，判据只有"改名有没有真的发生"这一条：
+            #     不够格时也改名了（I-1），所以这里**不再**掺 `reusable` —— 那会把
+            #     一个真发生过的改名记成没发生（报告与事实相反）。
+            "term_original": (original if (original
                                            and original != str(card.get("term") or "")) else ""),
             "matched_by": how,
             "reusable": bool(reusable),
