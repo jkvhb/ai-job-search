@@ -2242,3 +2242,121 @@ class KbAbsorbFindsCardsByIdAndNormalizedTermTest(IsolatedCase):
         self.assertEqual((added, merged), (0, 1))
         cards = store.load_knowledge()["nodes"]
         self.assertEqual(len(cards), 2, "合并只该并进一张，另一张原样留着")
+
+
+class KbSetStateAndReviewUseOneRulerTest(IsolatedCase):
+    """P0-8：`set_state` / `record_review` 的**守卫**与**主体**必须是同一把尺子。
+
+    实测（批 1 独立复查）：库里有 `{"id": "yuyinshibie", "term": "ASR"}`（手改 / 别的写入者
+    造成 id ≠ 归一化 term）时
+      * 守卫 `refuse_when` 用 `_card_index`（id + 归一化 term 双键）→ 判定"卡在"
+      * 主体 `_set_state_in` / `_record_review_in` 只用 `n.get("id")` → 判定"卡不在"
+    ⇒ `kb.set_state("ASR", "已掌握")` 回 `(False, "找不到该知识点")`：**卡就在库里、文案却是假的**，
+    而且用户点的掌握度**静默没生效**（同形态下 `kb.absorb` 早已能命中，P0-7）。
+
+    这些用例只钉"守卫与主体同尺"这一件事：命中之后改的仍必须是**原来那张卡**，
+    **不建新卡**（卡片数不变），真的不存在时仍如实说找不到。
+    """
+
+    def _mismatched(self, **kw):
+        return _raw_card("ASR", cid="yuyinshibie", **kw)
+
+    def _seed(self, cards):
+        store.ensure_profile()
+        store.save_knowledge({"version": 1, "nodes": cards})
+        return cards
+
+    def test_set_state_finds_a_card_whose_id_differs_from_its_term(self):
+        self._seed([self._mismatched()])
+        ok, msg = kb.set_state("ASR", "已掌握")
+        # 不修的话这里是 (False, "找不到该知识点")，而那张卡就在库里
+        self.assertTrue(ok, "卡就在库里，不该报失败：%r" % (msg,))
+        self.assertNotIn("找不到该知识点", msg, "这是假话（卡就在库里）：%r" % (msg,))
+        cards = store.load_knowledge()["nodes"]
+        self.assertEqual(len(cards), 1, "这条入口不建卡：卡片数必须不变")
+        self.assertEqual(cards[0]["id"], "yuyinshibie", "改的必须还是原来那张卡")
+        self.assertEqual(cards[0]["term"], "ASR", "不许顺手改术语")
+        self.assertEqual(_state_of("yuyinshibie"), "已掌握", "用户的掌握度必须真的落盘")
+
+    def test_record_review_finds_a_card_whose_id_differs_from_its_term(self):
+        self._seed([self._mismatched()])
+        ok, node = kb.record_review("ASR", kb.RESULT_UP)
+        # 不修的话这里是 (False, None)：这次自测被静默吞掉
+        self.assertTrue(ok, "卡就在库里，不该报失败")
+        self.assertIsNotNone(node, "命中了就该回传那张卡")
+        self.assertEqual(node["id"], "yuyinshibie", "回传的必须是库里那张卡")
+        cards = store.load_knowledge()["nodes"]
+        self.assertEqual(len(cards), 1, "这条入口不建卡：卡片数必须不变")
+        after = cards[0]
+        self.assertEqual(after["state"], "已掌握")
+        self.assertEqual(after["review_count"], 1, "这次自测必须真的记下来（不许静默吞掉）")
+        self.assertEqual(after["last_reviewed_at"], kb._today())
+        self.assertEqual(after["last_result"], kb.RESULT_UP)
+
+    def test_the_mismatched_card_is_still_found_by_its_own_id(self):
+        """反向：按 id 找卡这条路**不许**被"改成只按归一化 term"的修法弄丢。"""
+        self._seed([self._mismatched()])
+        self.assertTrue(kb.set_state("yuyinshibie", "已掌握")[0])
+        self.assertEqual(_state_of("yuyinshibie"), "已掌握")
+        self.assertTrue(kb.record_review("yuyinshibie", kb.RESULT_UP)[0])
+        self.assertEqual(_state_of("yuyinshibie"), "已掌握")
+        self.assertEqual(len(store.load_knowledge()["nodes"]), 1)
+
+    def test_a_plain_card_behaves_exactly_as_before(self):
+        """对照组：id 恰好等于归一化 term 的普通卡，行为一字不变。"""
+        self._seed([_raw_card("语音识别")])
+        self.assertTrue(kb.set_state("语音识别", "学习中")[0])
+        self.assertEqual(_state_of("语音识别"), "学习中")
+        self.assertTrue(kb.record_review("语音识别", kb.RESULT_UP)[0])
+        self.assertEqual(_state_of("语音识别"), "已掌握")
+        self.assertEqual(len(store.load_knowledge()["nodes"]), 1)
+
+    def test_a_really_missing_term_is_still_reported_as_missing(self):
+        """对照组：真的不存在 → 仍如实说"找不到该知识点"，且不许建卡。"""
+        self._seed([self._mismatched()])
+        ok, msg = kb.set_state("压根没有的概念", "已掌握")
+        self.assertFalse(ok, "不存在的概念不该报成功")
+        self.assertIn("找不到该知识点", msg, "真的不存在时才说这句：%r" % (msg,))
+        self.assertFalse(kb.record_review("压根没有的概念", kb.RESULT_UP)[0])
+        self.assertEqual(len(store.load_knowledge()["nodes"]), 1, "找不到时不许建卡")
+
+
+class KbSetStateCorruptLibraryHonestyTest(IsolatedCase):
+    """需求 4：库读不出来时，`set_state` 必须说"库读不出来"，**不许**说成"找不到该知识点"。
+
+    后者是假话：盘上那份 GBK 字节里那张卡明明在（只是整个库读不出来）——
+    用户照着"找不到该知识点"会以为卡丢了 / 术语打错了，而真正该做的是先去修库。
+    （同款口径的既有断言见 `KbWriteEntryPointsCorruptLibraryTest._assert_no_backup_claim` 家族。）
+    """
+
+    def _on_disk(self):
+        """盘上那份字节；文件已经不在了就返回 None（用 with 读，不留下未关闭的句柄）。"""
+        path = store.knowledge_path()
+        if not os.path.exists(path):
+            return None
+        with open(path, "rb") as f:
+            return f.read()
+
+    def _write_gbk_kb(self):
+        store.ensure_profile()
+        raw = json.dumps({"version": 1, "nodes": [_raw_card("语音识别", cid="yuyinshibie")]},
+                         ensure_ascii=False).encode("gbk")
+        _assert_really_non_utf8(self, raw, "KbSetStateCorruptLibraryHonestyTest 夹具")
+        self.assertIn(self.tmp, store.knowledge_path(), "探针必须落在临时根里")
+        with open(store.knowledge_path(), "wb") as f:
+            f.write(raw)
+        return raw
+
+    def test_set_state_says_the_library_is_unreadable_not_the_card_missing(self):
+        raw = self._write_gbk_kb()
+        self.assertEqual(self._on_disk(), raw, "夹具前提：盘上就是这份 GBK 字节")
+        ok, msg = kb.set_state("语音识别", "已掌握")
+        # 诊断串自己不许抛异常（否则真正的判据被一句 FileNotFoundError 顶掉、红在不该红的行上）
+        after = self._on_disk()
+        kv = "before=%d after=%s msg=%r" % (len(raw), "文件不在了" if after is None else len(after), msg)
+        self.assertFalse(ok, "读不出库却报告成功 " + kv)
+        self.assertNotIn("找不到该知识点", msg,
+                         "库读不出来时说这句是假话（卡就在盘上那份字节里）" + kv)
+        self.assertIn("读", msg, "没如实说清原因是'库读不出来' " + kv)
+        self.assertIsNotNone(after, "坏库被弄没了（连隔离备份都不是）" + kv)
+        self.assertEqual(after, raw, "坏库被动过 " + kv)

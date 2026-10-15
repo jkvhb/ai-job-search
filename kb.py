@@ -507,9 +507,13 @@ def set_state(node_id, state):
     """只改学习状态，不碰任何其它字段。返回 (ok, msg)。
 
     参数可以是**身份键**也可以是**原始术语**（内部先 normalize_id，对已归一化的 id 是 no-op）。
+    **找卡与守卫是同一把尺子**（`_card_index`：id + 归一化 term 双键、id 优先，P0-8）——
+    一张 id ≠ 归一化 term 的卡（手改 / 别的写入者造成，如实测的
+    `{"id": "yuyinshibie", "term": "ASR"}`）两把钥匙都开得开。
 
     **不建卡**：找不到就返回 (False, "找不到该知识点")。库读不出来时同样返回 False，
     但理由不同（见 `_with_kb_write` 的 `_KB_WRITE_REFUSED`）—— 调用方据 msg 就能如实回报。
+    这两句话分别对应"卡**真的**不在"与"库读不出来"，不许混用（假话 + 静默吞掉用户的掌握度）。
 
     哨兵与 load→save 这段整体由 `_with_kb_write` 承担（P0-1）。**守卫要在哨兵之前**：
     "状态不合法"是纯粹的入参问题，不该因为一次失败调用就把好库隔离走。
@@ -528,14 +532,22 @@ def set_state(node_id, state):
 
 
 def _set_state_in(kb, node_id, state):
-    """`set_state` 的主体（调用方已持锁、已过入参守卫、已隔离坏库）。"""
-    for n in kb["nodes"]:
-        if n.get("id") == node_id:
-            n["state"] = state
-            store.save_knowledge(kb)
-            log.log_event("kb.state_set", id=node_id, state=state)
-            return True, ""
-    return False, "找不到该知识点"
+    """`set_state` 的主体（调用方已持锁、已过入参守卫、已隔离坏库）。
+
+    P0-8：找卡必须与守卫（`refuse_when`）**同一把尺子** —— `_card_index`（id + 归一化 term
+    双键、id 优先）。此前这里只比 `n.get("id")`，于是库里 `{"id": "yuyinshibie", "term": "ASR"}`
+    这种卡（手改 / 别的写入者造成 id ≠ 归一化 term）上：守卫说"卡在"、主体说"卡不在" ⇒
+    `set_state("ASR", ...)` 回一句**假话**（"找不到该知识点"）外加**静默吞掉**用户的掌握度。
+    命中之后改的仍必须是**库里那张原卡**：本入口不建卡（卡片数是守卫与主体共同守住的）。
+    """
+    card = _card_index(kb).get(node_id)
+    if card is None:
+        return False, "找不到该知识点"
+    card["state"] = state
+    store.save_knowledge(kb)
+    # 日志记卡片的**真 id**（命中可能是走归一化 term 那把钥匙，此时 node_id 只是术语）
+    log.log_event("kb.state_set", id=card.get("id") or node_id, state=state)
+    return True, ""
 
 
 _REVIEW_WEIGHT = {"待学习": 3, "学习中": 2, "已掌握": 1}
@@ -608,6 +620,10 @@ def record_review(node_id, result):
     答上了 → 直接「已掌握」；没答上 → 退一档（已掌握→学习中→待学习，待学习留在原地）。
     退档而不是清零：答错一次不该把「学习中」打回原点，但也不该留在原位骗自己。
 
+    参数可以是身份键也可以是原始术语（内部先 normalize_id）；**找卡与守卫是同一把尺子**
+    （`_card_index`：id + 归一化 term 双键、id 优先，P0-8），免得守卫放行了主体却说找不到、
+    把用户这次自测静默吞掉。
+
     **不建卡**：找不到就返回 (False, None)。库读不出来时同样返回 (False, None) ——
     盘上的坏文件一个字节都不动（调用方要更细的原因，看 `kb._KB_WRITE_REFUSED`）。
 
@@ -628,21 +644,26 @@ def record_review(node_id, result):
 
 
 def _record_review_in(data, nid, result):
-    """`record_review` 的主体（调用方已持锁、已过入参守卫、已隔离坏库）。"""
-    for n in data["nodes"]:
-        if n.get("id") == nid:
-            if result == RESULT_UP:
-                n["state"] = "已掌握"
-            else:
-                rank = _STATE_RANK.get(str(n.get("state")), 0)
-                n["state"] = STATE_VALUES[max(0, rank - 1)]
-            n["review_count"] = _as_int(n.get("review_count")) + 1
-            n["last_reviewed_at"] = _today()
-            n["last_result"] = result
-            store.save_knowledge(data)
-            log.log_event("kb.review_recorded", id=nid, result=result, state=n["state"])
-            return True, n
-    return False, None
+    """`record_review` 的主体（调用方已持锁、已过入参守卫、已隔离坏库）。
+
+    P0-8：找卡与守卫共用 `_card_index`（id + 归一化 term 双键、id 优先）—— 理由同
+    `_set_state_in`：两把尺子会让守卫放行、主体却"找不到"，用户的这次自测被静默吞掉。
+    命中后回传的就是**库里那张卡**本身（调用方拿它更新界面），卡片数不变（本入口不建卡）。
+    """
+    card = _card_index(data).get(nid)
+    if card is None:
+        return False, None
+    if result == RESULT_UP:
+        card["state"] = "已掌握"
+    else:
+        rank = _STATE_RANK.get(str(card.get("state")), 0)
+        card["state"] = STATE_VALUES[max(0, rank - 1)]
+    card["review_count"] = _as_int(card.get("review_count")) + 1
+    card["last_reviewed_at"] = _today()
+    card["last_result"] = result
+    store.save_knowledge(data)
+    log.log_event("kb.review_recorded", id=card.get("id") or nid, result=result, state=card["state"])
+    return True, card
 
 
 # ---------- 面试（阶段 3.4）：确定性命中 + 结果回写 ----------
