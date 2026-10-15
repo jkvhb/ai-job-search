@@ -80,13 +80,19 @@
 3. **正文写入也必须是原子的**（Task 1.11 修 P0-13）：``_write_content`` 旧写法是
    ``open(path, "w")`` —— **先把旧正文截断成 0 字节**再一段段写，中途失败（磁盘满 /
    进程被 kill / 文件名超长）就留下**半截简历**；而**族谱第一家**时没有快照兜底，
-   那份半截东西就是用户唯一的一份。现在正文与快照共用同一条 ``_atomic_write_bytes``
-   （同目录临时文件 + ``os.replace``）：失败 = 目标**一个字节都没动** + 一句人话
-   （``SnapshotArchiveError``，路由接成 **409**，不是裸 ``OSError`` 的 500）。
+   那份半截东西就是用户唯一的一份。现在**内容文件**（正文 / 母版快照 / 旧快照的留档旁挂）
+   共用同一条 ``_atomic_write_bytes``（同目录临时文件 + ``os.replace``）：失败 = 目标
+   **一个字节都没动** + 一句人话（``SnapshotArchiveError``，路由接成 **409**，不是裸
+   ``OSError`` 的 500）。⚠️ 台账 ``resumes.json`` 不走这一条（它是 ``store.write_json``，
+   ``store`` 里另一条原子实现）—— 说清范围，别让"只有这一条落盘实现"变成一句空话。
    失败时**还要撤掉这次新建的快照**（``_withdraw_fresh_snapshot``）：一次保存要么整体成立
    （新正文 + 新记录），要么整体不成立；盘上留一份"记录里没有、而 ``read_version``
    按版本 id 照样找得到"的快照就是第三种状态。撤不掉时**照实说**
    （日志 + 那句给用户看的话里明写"没有登记"），绝不假装撤掉了。
+   **台账那一跳（``save_resumes``）失败同样不许留半成功**（批 1 复查抓到：正文留在盘上、
+   记录里没有、异常还是裸 ``OSError`` → 500）：把正文**回滚**到写之前（族谱第一家就撤掉
+   刚写下的那份）、那份新建的快照按"字节至少有一处可达"的顺序处理、失败翻成同一种专用异常；
+   理由与顺序见 ``create_version`` 的 docstring。
 
 诚实边界（规格 §8）：
 
@@ -178,6 +184,11 @@ _SIDE_ARCHIVE_TRIES = 9
 # 后者盖前者 —— 同一个哨兵两份定义，改一处漏一处就是"读不出来的名字被当成名字空着"）。
 _UNREADABLE = object()
 
+# "写正文之前盘上那份**读不出来**"的哨兵（台账写失败要回滚时用）。
+# 它与 `None`（此前**没有**这个文件）必须分得开：把"读不出来"当成"不存在"，回滚那一步就会
+# 把**别人的**正文当成"这次新建的"删掉 —— 又一个"不知道"被当成"安全"。
+_PREV_CONTENT_UNKNOWN = object()
+
 
 def _archive_old_snapshot(snap_path, old):
     """把即将被覆盖的旧快照字节**留档**到旁挂文件；返回真正写进去的路径（失败抛 ``SnapshotArchiveError``）。
@@ -211,37 +222,51 @@ def _archive_old_snapshot(snap_path, old):
 
 
 def _write_side(side, old):
-    """真正落盘那一行（变异取证要打在**这一行**上：留档失败必须冒泡成 ``SnapshotArchiveError``）。"""
-    try:
-        store.write_bytes(side, old)
-    except OSError as e:
-        # ⚠️ 这里**必须**放弃本次修正：继续往下走就会把旧快照**盖掉**
-        # （复查实测：留档失败还被 `pass` 掉时，旧快照内容在整棵树里再也搜不到）。
-        log.log_event("resume.snapshot_archive_failed", level="warn",
-                      side=os.path.basename(side), dir=os.path.dirname(side),
-                      error=str(e), note="宁可这次不修，也绝不把旧快照静默盖掉（那是不可逆的）")
-        raise SnapshotArchiveError(
-            "没能给旧快照留档（%s），已中止本次修正：宁可这次不修，"
-            "也绝不把旧快照静默盖掉（那是不可逆的）。请先确认 %s 没有被别的程序占用。"
-            % (e, os.path.dirname(side)), cause=e)
+    """真正落盘那一行（变异取证要打在**这一行**上：留档失败必须冒泡成 ``SnapshotArchiveError``）。
+
+    ⚠️ 这里**必须**放弃本次修正：留档失败还被 ``pass`` 掉的话，调用方会接着把旧快照**盖掉**
+    （复查实测：那时旧快照内容在整棵树里再也搜不到）。
+
+    **走的是本模块"内容文件"那条原子写**（正文 / 快照 / 旁挂共用，见 ``_atomic_write_bytes``）——
+    "留档旁挂只是旁挂，直写就行"这个想法经不起看：
+      - 直写（``store.write_bytes``）半途失败（磁盘满 / 进程被 kill）会留下一个**半截的**
+        ``.stale-<8位>`` 文件；而那个名字是**内容寻址**的（声称自己就是那份 sha 的字节），
+        内容却只有一半 —— 名与实不符。原子写的半截只可能落在**临时文件**里，由 ``finally``
+        删掉，旁挂名上只会出现完整字节。
+      - 失败语义**正合适**：``_atomic_write_bytes`` 抛的本来就是 ``SnapshotArchiveError``
+        （正是调用方要的那种：放弃本次修正，路由接成 409），临时文件也在 ``finally`` 里清掉，
+        不会在快照目录里积垃圾。
+      - 目标与临时文件**同目录**（快照目录），``os.replace`` 在这里同样是原子的。
+    """
+    _atomic_write_bytes(
+        side, old, what="旧快照留档", event="resume.snapshot_archive_failed",
+        tail="宁可这次不修，也绝不把旧快照静默盖掉（那是不可逆的）。",
+        log_fields={"side": os.path.basename(side)})
     return side
 
 
 def _atomic_write_bytes(path, raw, what, event, tail, log_fields=None):
     """把 ``raw`` 字节**原子地**写到 ``path``（同目录临时文件 + ``os.replace``）。
 
-    **全模块只有这一条落盘实现**（Task 1.11 修 P0-13：快照与正文共用；别在这里之外再写第二套）。
+    **本模块的"内容文件"只有这一条落盘实现**（Task 1.11 修 P0-13：正文 + 母版快照 +
+    留档旁挂共用；别在这里之外再写第二套）。⚠️ 说清**范围**，免得又变成"说的和做的不一样"
+    （批 1 复查抓到过：旁挂那条当时还是直写）：
+      - 走这条的：``<名字>.md``（正文）、``快照/<版本id>.md``（母版快照）、
+        ``快照/<版本id>.md.stale-*``（旧快照留档旁挂）；
+      - **不走这条的**：台账 ``resumes.json`` —— 那是 ``store.write_json``（``store`` 里另一条
+        原子实现，与这里无关），本函数只落**内容字节**。
 
     为什么必须原子：裸写（``open(path, "wb")``）**先把目标截断成 0 字节**，然后一段一段往里写；
     中途失败（磁盘满 / 进程被 kill / 断电 / 文件名超长）就留下一个**半截文件** ——
-    对快照是"版本记录一直指着一个残缺的档"，对正文是"用户唯一的一份成了半截"。
+    对快照是"版本记录一直指着一个残缺的档"，对正文是"用户唯一的一份成了半截"，
+    对留档旁挂则是"名字谎称自己就是那份 sha 的字节、内容却只有一半"。
     临时文件必须与目标**同目录**：``os.replace`` 只在同一文件系统内保证原子（跨盘会退化成复制）。
 
-    参数（**两处**调用各给一句自己的话，函数本身不认识"快照"还是"正文"）：
-      - ``what``：失败句里"没能写入的东西"（``母版快照`` / ``简历正文``）；
-      - ``event``：日志事件名（两种各自一个，事后好分辨是哪一处失败）；
+    参数（**三处**调用各给一句自己的话，函数本身不认识"快照" / "正文" / "旁挂"）：
+      - ``what``：失败句里"没能写入的东西"（``母版快照`` / ``简历正文`` / ``旧快照留档``）；
+      - ``event``：日志事件名（各种各自一个，事后好分辨是哪一处失败）；
       - ``tail``：那句话里"为什么宁可这次不保存"的那半句（也当日志的 ``note``）；
-      - ``log_fields``：该事件特有的字段（比如 ``{"snapshot": ...}``）。
+      - ``log_fields``：该事件特有的字段（比如 ``{"snapshot": ...}`` / ``{"side": ...}``）。
 
     失败一律翻成 ``SnapshotArchiveError``（一句中文人话，``app.py`` 的 ``POST /api/resumes``
     接成 409）：裸 ``OSError`` 穿到路由就是 **500**，用户只看到「服务器内部错误」，
@@ -322,6 +347,72 @@ def _withdraw_fresh_snapshot(snap):
                            "（里面是覆盖前盘上那份字节，记录里不会有 mother_file），可手工删。")
         return ("（另外：这次已经写下的母版快照 %s 没能撤掉，它还留在盘上、**没有登记**进版本记录 ——"
                 " 里面是覆盖前盘上那份字节，可以手工删。）" % snap_rel)
+
+
+def _restore_content_before_write(path, prev):
+    """把正文恢复成 ``_write_content`` 之前那份 → ``(是否已收回, 一句要照实说的话)``。
+
+    只在"台账（``resumes.json``）没写成"时调用：那一刻盘面是**半成功**的
+    （正文已写、记录里没有它），三个分支各说各的实话：
+
+      - ``prev is None``：这次调用之前**没有**这个文件（族谱第一家）→ 撤掉刚写下的那一份
+        = 回到调用前的盘面（**绝不**把它当成"留一份给用户看看"：那正是"正文在盘上却没有登记"
+        这种没人看得见的状态，`/api/resumes` 的 ``unregistered`` 也只在**新开**时才照得到它）；
+      - 有字节：用**同一条**原子写把旧字节写回去（写失败 = 那份没登记的新正文留在盘上，照实说）；
+      - ``_PREV_CONTENT_UNKNOWN``：写之前那份**读不出来** → 无从"恢复"，照实说，**绝不动手删**
+        （"读不出来"不等于"不存在"，删了就是拿别人的东西冒账）。
+    """
+    base = os.path.basename(path)
+    if prev is _PREV_CONTENT_UNKNOWN:
+        log.log_event("resume.ledger_rollback_failed", level="warn", file=base,
+                      error="写入之前那份正文读不出来，无从恢复",
+                      note="台账没写成要把正文收回来，但写之前那份读不出来 → 只能如实说"
+                           "（盘上现在是这次要保存的新内容，且没有登记）")
+        return False, ("（盘上的 %s 现在是这次要保存的新内容 —— 写入之前那份读不出来，"
+                       "没法恢复到原样。）" % base)
+    if prev is None:
+        try:
+            os.remove(path)
+            return True, ""
+        except FileNotFoundError:
+            return True, ""            # 已经不在了（别的程序删的）→ 结果一样：这次写下的正文不在盘上
+        except OSError as e:
+            log.log_event("resume.ledger_rollback_failed", level="warn", file=base, error=str(e),
+                          note="这次新建的正文没能撤掉 → 盘上留了一份**没有登记**的新正文（必须如实说）")
+            return False, ("（这次新建的 %s 没能撤掉，它还留在盘上、**没有登记**进版本记录。）" % base)
+    try:
+        _atomic_write_bytes(path, prev, what="简历正文（回滚）",
+                            event="resume.ledger_rollback_failed",
+                            tail="台账（resumes.json）没写成 → 这次保存整体不成立：正文必须回到写之前"
+                                 "的样子，绝不留「正文在盘上、版本记录里没有」这种半成功状态。")
+        return True, ""
+    except SnapshotArchiveError as e:
+        return False, ("（这次写下的正文没能收回（%s），盘上现在是这次要保存的新内容、"
+                       "**没有登记**进版本记录。）" % e)
+
+
+def _undo_failed_ledger_write(file_path, prev, fresh_snapshot):
+    """台账没写成 → 把盘面收回这次调用之前 → ``(正文是否已收回, 一句要照实说的话)``。
+
+    顺序**不能反**（这是"字节至少要有一处可达"那条底线）：
+    先收回正文；**只有**正文真的收回了，那份**这次新建的**母版快照才可以撤 ——
+    否则它里面那份"覆盖前盘上那份字节"就是当前唯一的一份，撤掉才是真丢数据。
+    """
+    restored, note = _restore_content_before_write(file_path, prev)
+    if not restored:
+        if fresh_snapshot:
+            log.log_event("resume.snapshot_orphan_left", level="warn",
+                          snapshot=os.path.basename(fresh_snapshot[0]),
+                          dir=os.path.dirname(fresh_snapshot[0]),
+                          note="台账没写成、正文也没能收回 → 这份**这次新建**的快照**故意不撤**："
+                               "里面是覆盖前盘上那份旧字节，是那些字节当前可达的最后一手"
+                               "（版本记录里没有登记它）")
+            note += ("（这次新建的母版快照 %s **故意没撤**：里面是覆盖前盘上那份旧字节，"
+                     "那些字节现在只剩它这一份，但版本记录里没有登记它。）" % fresh_snapshot[1])
+        return restored, note
+    if fresh_snapshot:
+        return restored, _withdraw_fresh_snapshot(fresh_snapshot)
+    return restored, note
 
 
 # ---------- 路径 / 取值小工具 ----------
@@ -649,15 +740,30 @@ def create_version(name, content, parent_id=None, note=""):
      会抛 ``ValueError`` 的情形：名字为空／重名（未移出的）／父版本不存在／
      父版本已移出（移出的族谱不能延续）／延续时改了名字。
      母版原文**读不出来**（被锁 / 权限）**或旧快照没能留档** **或正文写不进去**
-     （磁盘满 / 文件名超长 / 被别的程序占用）→ 抛
+     （磁盘满 / 文件名超长 / 被别的程序占用）**或台账写不进去** → 抛
      ``SnapshotArchiveError``（``RuntimeError`` 的子类）并**中止本次保存**
-     （绝不覆盖那份读不出来的东西，绝不把旧快照盖掉，也绝不留半截正文；消息是人话，
+     （绝不覆盖那份读不出来的东西，绝不把旧快照盖掉，绝不留半截正文，也绝不留
+     "正文在盘上、版本记录里没有"的半成功状态；消息是人话，
      `app.py` 的路由**只接这一种**并接成 **409** 显示给用户）。
 
      正文写入是**原子**的（Task 1.11 修 P0-13，与快照共用 ``_atomic_write_bytes``）：
      失败 = ``<名字>.md`` 一个字节都没动 + 这次**不登记**新版本。并且，若这次调用
      **新建**了一份母版快照，失败时它会被**撤掉**（``_withdraw_fresh_snapshot``：
      一次保存要么整体成立、要么整体不成立；撤不掉会在那句话里如实说明）。
+
+     **最后一步写台账失败**（批 1 复查抓到的半成功形态）走同一套口径，**选"回滚正文"而不是
+     "留着正文并说明"**，理由三条（都在这个模块里能对上）：
+     ① 这里本来就是"整体成立或不成立"的契约（上面那句 + `_withdraw_fresh_snapshot` 的理由都写着
+        "第三种状态"不许存在）；"正文在盘上、记录里没有"正是第三种状态 —— 而且是**用户看不见**
+        的那种：延续时文件名是**已登记**的，`/api/resumes` 的 `unregistered` 面板根本照不到它，
+        可界面上的"最新版"取回来还是旧的（旧正文在快照里），用户完全没法知道自己盘上多了什么；
+     ② 留着正文**解决不了**"登记"这件事 —— 台账这一跳刚刚才写失败，我们没有第二个地方可以
+        如实登记它，"未登记的版本"在延续这条路上压根没有能识别它的形态；
+     ③ 回滚的代价是**可收回的**：这份正文就是这次请求带上来的内容（`content`），调用方手里还有；
+        而**不回滚**留下的是"用户以为没保存、盘上却有"的持久状态，只能靠人工发现。
+     回滚本身也可能失败（磁盘满时"把旧正文写回去"也会失败）→ 那时**照实说**
+     （日志 ``resume.ledger_rollback_failed`` + 那句话里明写"没有登记"），
+     并且**那份这次新建的母版快照绝不撤**（覆盖前的旧字节只剩它这一份）。
     """
     text = content if isinstance(content, str) else str(content or "")
     clean = store.safe_name(name)
@@ -782,6 +888,14 @@ def create_version(name, content, parent_id=None, note=""):
                             fresh_snapshot = (snap_path, _snapshot_rel(mid))
                         if m_kind in ("latest", "mother"):
                             mother["mother_file"] = _snapshot_rel(mid)
+        # 台账（`resumes.json`）写失败时要把**盘面收回这一步之前** → 先按**原始字节**记下
+        # 这份简历此刻盘上是什么（`store.read_bytes`：文件不存在 → None；**读不出来** →
+        # `_PREV_CONTENT_UNKNOWN`，绝不冒充"没有"，见 `_restore_content_before_write`）。
+        # 位置必须在 `_write_content` **之前**：写完再读，读到的就是刚写下的新正文了。
+        try:
+            prev_content = store.read_bytes(file_path)
+        except OSError:
+            prev_content = _PREV_CONTENT_UNKNOWN
         try:
             _write_content(file_path, text)
         except SnapshotArchiveError as e:
@@ -813,7 +927,26 @@ def create_version(name, content, parent_id=None, note=""):
             REMOVED: False,
         }
         recs.append(rec)
-        save_resumes(doc)
+        try:
+            save_resumes(doc)
+        except Exception as e:                    # noqa: BLE001 —— 收口的是**盘面**，与异常种类无关
+            # 「正文已写、台账没写」= **半成功**：用户以为没保存，盘上却已经有一份记录里没有的
+            # 正文；**延续**时连 `/api/resumes` 的 `unregistered` 面板都看不见它（文件名就是已登记
+            # 的那个，只是内容换成了新版）。所以这里**先把盘面收回调用之前**，再把失败翻成人话。
+            restored, note = _undo_failed_ledger_write(file_path, prev_content, fresh_snapshot)
+            log.log_event("resume.ledger_write_failed", level="warn", name=clean, error=str(e),
+                          restored=restored,
+                          note=note or "盘面已收回本次保存之前的样子（正文收回了、记录里没有新版本）")
+            if not isinstance(e, OSError):
+                raise                             # 不是写盘失败（程序缺陷）：盘面已收回，异常照原样抛
+            raise SnapshotArchiveError(
+                "没能把新版本登记进版本记录（%s），已中止本次保存：%s%s请稍后重试。"
+                % (e,
+                   "刚写下的新正文已收回，盘面回到这次保存之前的样子。"
+                   if restored else
+                   "这次保存**整体没有成立**（版本记录里没有新版本），但盘上那份新正文"
+                   "没能收回、也**没有登记**进版本记录。",
+                   note), cause=e) from None
         return dict(rec)
 
 

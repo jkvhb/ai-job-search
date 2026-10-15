@@ -1205,6 +1205,114 @@ class AtomicContentWriteTest(IsolatedCase):
                          "就算快照撤不掉，正文也绝不许被写坏")
 
 
+class LedgerWriteFailureTest(IsolatedCase):
+    """台账（``resumes.json``）写失败 = **半成功**：新正文已落在盘上、版本记录里却没有它。
+
+    收口前实测的形态：``create_version`` 走到最后一步 ``save_resumes`` 抛**裸 ``OSError``**
+    → 路由（``app.py`` 的 ``POST /api/resumes``）接不住它 → **500**，而盘上多了一份
+    "记录里没有"的正文。比 500 更坏的是它给"第二句假话"留了余地：用户以为这次保存没发生，
+    盘上却已经有新内容；**延续**时连 ``/api/resumes`` 的 ``unregistered`` 面板都看不见它
+    （文件名就是已登记的那个），而界面上"最新版"取回来的还是旧的（旧正文在快照里）。
+
+    收口口径（**选 A：回滚正文**，理由写在 ``create_version`` 的 docstring 里）：
+    ① 这次保存**整体不成立** —— 正文收回到写之前（族谱第一家就把刚写下的那份撤掉）；
+    ② 失败翻成**既有**专用异常（一句人话，``app.py:2258`` 接成 409，不是 500）；
+    ③ 万一收不回来就**照实说**（日志 + 那句话里明写"没有登记"），并且**这次新建的**快照
+    一定要留下（那些旧字节只剩这一份了）。
+    """
+
+    def _snap_path(self, version_id):
+        return store.p_path("resumes", resumelib.SNAPSHOT_DIR, version_id + ".md")
+
+    @staticmethod
+    def _inject_ledger_failure():
+        """只让**台账**那一跳失败（``store.write_json`` 是 ``save_resumes`` 的落盘点）。"""
+        return mock.patch.object(store, "write_json", side_effect=OSError(28, "磁盘空间不足"))
+
+    def test_a_failed_ledger_write_rolls_the_content_back_and_says_so(self):
+        """延续时台账写失败 → 正文逐字节回到写之前 + 没有新记录 + 撤掉这次新建的快照 + 人话。"""
+        v1 = resumelib.create_version("母版", "第一版内容")
+        resumelib.choose(v1["id"])
+        path = store.p_path("resumes", "母版.md")
+        before = store.read_bytes(path)
+        snap = self._snap_path(v1["id"])
+        self.assertFalse(os.path.exists(snap), "前置条件：这次延续才会新建母版快照")
+
+        with self._inject_ledger_failure():
+            with self.assertRaises(resumelib.SnapshotArchiveError) as ctx:
+                resumelib.create_version("母版", "第二版内容", parent_id=v1["id"])
+
+        sentence = str(ctx.exception)
+        self.assertNotIsInstance(ctx.exception, OSError, "裸 OSError 穿到路由就是 500")
+        self.assertIn("版本记录", sentence)            # 说清是哪一步失败
+        self.assertIn("保存", sentence)
+        self.assertIn("收回", sentence)                # 并且说清盘面现在是什么样
+        self.assertEqual(store.read_bytes(path), before,
+                         "正文必须回到写之前：绝不留「正文在盘上、版本记录里没有」的半成功状态")
+        self.assertEqual([r["id"] for r in resumelib.list_versions()], [v1["id"]],
+                         "这次保存整体不成立：不许留下一条没有正文的版本记录")
+        self.assertFalse(os.path.exists(snap),
+                         "这次新建的快照也要撤掉：记录里没有它，盘上就是一份没人引用的孤儿档")
+        self.assertIn("resume.ledger_write_failed", _events_text(),
+                      "必须留下一句日志说清台账没写成（不许静默）")
+
+    def test_the_first_version_of_a_lineage_is_removed_again_when_the_ledger_write_fails(self):
+        """族谱第一家：此前**没有**这个文件 → 收口就是撤掉刚写下的那一份（不留孤儿正文）。"""
+        with self._inject_ledger_failure():
+            with self.assertRaises(resumelib.SnapshotArchiveError) as ctx:
+                resumelib.create_version("独苗", "正文内容")
+
+        sentence = str(ctx.exception)
+        self.assertNotIsInstance(ctx.exception, OSError, "裸 OSError 穿到路由就是 500")
+        self.assertIn("版本记录", sentence)
+        self.assertIn("收回", sentence)
+        self.assertFalse(os.path.exists(store.p_path("resumes", "独苗.md")),
+                         "刚写下的正文要撤掉（连「未登记」列表里都不该出现它）")
+        self.assertEqual(resumelib.list_versions(), [], "没有新记录")
+        room = store.p_path("resumes")
+        self.assertEqual([f for f in os.listdir(room) if f.endswith(".md")], [],
+                         "盘上不许留下这次写下的任何 .md（%r）" % (os.listdir(room),))
+        self.assertIn("resume.ledger_write_failed", _events_text())
+
+    def test_an_unrestorable_content_is_reported_honestly_and_the_snapshot_is_kept(self):
+        """收不回来（连"把旧正文写回去"也炸）→ **照实说**，且那份新建的快照**绝不能撤**。
+
+        为什么不能撤：它里面是**覆盖前盘上那份旧字节** —— 正文收不回来的这一刻，那些字节
+        只剩这一份了。撤掉才是真丢数据（这是"字节至少要有一处可达"那条底线）。
+        """
+        v1 = resumelib.create_version("母版", "第一版内容")
+        resumelib.choose(v1["id"])
+        path = store.p_path("resumes", "母版.md")
+        before = store.read_bytes(path)
+        snap = self._snap_path(v1["id"])
+        real_replace = os.replace
+        state = {"ledger_failed": False}
+
+        def flaky_write_json(_path, _obj):
+            state["ledger_failed"] = True
+            raise OSError(28, "磁盘空间不足")
+
+        def fake_replace(src, dst):
+            if state["ledger_failed"] and os.path.abspath(str(dst)) == os.path.abspath(path):
+                raise OSError(28, "磁盘空间不足")     # 台账炸了之后，把旧正文写回去这一步也炸
+            return real_replace(src, dst)
+
+        with mock.patch.object(store, "write_json", side_effect=flaky_write_json), \
+                mock.patch.object(resumelib.os, "replace", side_effect=fake_replace):
+            with self.assertRaises(resumelib.SnapshotArchiveError) as ctx:
+                resumelib.create_version("母版", "第二版内容", parent_id=v1["id"])
+
+        sentence = str(ctx.exception)
+        self.assertIn("版本记录", sentence)
+        self.assertIn("没有登记", sentence, "收不回来就必须如实说：盘上多了一份没登记的新正文")
+        self.assertEqual(store.read_bytes(path), "第二版内容".encode("utf-8"), "收不回来就是收不回来")
+        self.assertTrue(os.path.exists(snap),
+                        "正文没收回时那份新建的快照绝不能撤 —— 覆盖前的旧字节只剩它这一份")
+        self.assertEqual(store.read_bytes(snap), before, "那份旧字节逐字节还在")
+        self.assertIn("resume.ledger_rollback_failed", _events_text(),
+                      "收不回来这件事必须留下日志（不许静默）")
+
+
 class SnapshotArchiveFailureTest(IsolatedCase):
     """Task 1.10b 修 I-1：**留档失败 → 放弃本次修正**（绝不静默把旧快照盖掉，那是不可逆的）。
 
@@ -1241,19 +1349,26 @@ class SnapshotArchiveFailureTest(IsolatedCase):
         return resumelib.by_id(v1["id"]), self._snap_path(v1["id"])
 
     def test_a_failed_archive_aborts_the_repair_and_leaves_the_old_snapshot_byte_identical(self):
-        """① 留档失败（写旁挂直接抛 `OSError`）→ **放弃本次修正**：旧快照一个字节都没变。"""
+        """① 留档失败（写旁挂那一步抛 `OSError`）→ **放弃本次修正**：旧快照一个字节都没变。
+
+        ⚠️ 注入点跟着**实现**走（需求二把旁挂改成原子写之后：留档那一跳是
+        "同目录临时文件 + `os.replace`"）。**只换注入点，断言一个字都没动**；
+        而且它反过来就是需求二的钉子：有人把旁挂改回**直写**（`store.write_bytes(side, old)`）时，
+        这里根本没有对旁挂的 `os.replace` 可打 → 修正一路做完 → 下面的 `assertRaises` 立刻红。
+        """
         v1, snap = self._broken_fingerprint()
         before = store.read_bytes(snap)
         self.assertTrue(before, "前置条件：旧快照里有字节（不然没什么可丢的）")
         before_state = resumelib.read_version(v1["id"])     # (text, path, kind)，用来核对"与修正前一致"
-        real_write_bytes = store.write_bytes
+        side = _stale_side_name(snap, before)
+        real_replace = os.replace
 
-        def fake_write_bytes(p, raw):
-            if ".stale-" in str(p):
+        def fake_replace(src, dst):
+            if os.path.abspath(str(dst)) == os.path.abspath(side):
                 raise OSError(28, "磁盘空间不足")
-            return real_write_bytes(p, raw)
+            return real_replace(src, dst)
 
-        with mock.patch.object(store, "write_bytes", side_effect=fake_write_bytes):
+        with mock.patch.object(resumelib.os, "replace", side_effect=fake_replace):
             with self.assertRaises(resumelib.SnapshotArchiveError) as ctx:
                 resumelib.create_version("母版", "第三版内容", parent_id=v1["id"])
 
@@ -1361,6 +1476,82 @@ class SnapshotArchiveFailureTest(IsolatedCase):
 
         self.assertIn("留档", str(ctx.exception))
         self.assertEqual(store.read_bytes(snap), before, "读不出来就不修：旧快照一个字节都没变")
+
+    def test_the_side_archive_goes_through_the_single_atomic_write_path(self):
+        """需求二：留档旁挂也走**同一条原子写**（`_atomic_write_bytes`：同目录临时文件 + `os.replace`）。
+
+        为什么不让它"直写"（``store.write_bytes(side, old)``）：
+        ① 那样一来 ``_atomic_write_bytes`` 的 docstring 里那句"只有这一条落盘实现"就是**说的和
+           做的不一样**（验收报告也照着写了一遍）；
+        ② 直写半途失败会留下一个**半截的** ``.stale-<8位>`` 文件 —— 那个名字是**内容寻址**的
+           （声称自己就是那份 sha 的字节），内容却只有一半，名与实不符。
+
+        失败语义这里**正合适**（这是选 (A) 前要判断的那一条）：原子写抛的本来就是
+        ``SnapshotArchiveError``（调用方据此放弃本次修正、路由接成 409），临时文件也在 ``finally``
+        里清掉 —— 不会在快照目录里积垃圾、更不会在旁挂名上留下半截。
+
+        两条断言在旧实现上**都红**：① 旁挂名**是**由 `os.replace` 换上去的（原子那一步真的发生了）；
+        ② **没有**任何一次"直接往旁挂名上写"。
+        """
+        v1, snap = self._broken_fingerprint()
+        before = store.read_bytes(snap)
+        side = _stale_side_name(snap, before)
+        replaced, direct = [], []
+        real_replace, real_write_bytes = os.replace, store.write_bytes
+
+        def spy_replace(src, dst):
+            if os.path.abspath(str(dst)) == os.path.abspath(side):
+                replaced.append(str(src))
+            return real_replace(src, dst)
+
+        def spy_write_bytes(p, raw):
+            if os.path.abspath(str(p)) == os.path.abspath(side):
+                direct.append(str(p))
+            return real_write_bytes(p, raw)
+
+        with mock.patch.object(resumelib.os, "replace", side_effect=spy_replace), \
+                mock.patch.object(store, "write_bytes", side_effect=spy_write_bytes):
+            resumelib.create_version("母版", "第三版内容", parent_id=v1["id"])
+
+        self.assertEqual(direct, [],
+                         "别往旁挂名上直写（半截失败就留下一个名字谎称内容 sha 的文件）：%r" % (direct,))
+        self.assertEqual(len(replaced), 1,
+                         "留档旁挂必须走原子写（同目录临时文件 + os.replace）换上去：%r" % (replaced,))
+        self.assertEqual(store.read_bytes(side), before, "留档内容照旧是覆盖前那份旧字节")
+
+    def test_a_torn_side_write_leaves_no_half_written_archive_behind(self):
+        """原子写的直接好处：留档**写坏**时不会在快照目录里留下半截的 ``.stale-*``。
+
+        注入的是"该落的那份字节写了一半就报 `OSError`"（磁盘满 / 被 kill 的形态）：
+        - 原子写：那半截只可能落在**临时文件**里，`finally` 把它删掉 → 目录里没有旁挂、没有 `.tmp-`；
+        - 直写（旧实现）：半截**就是**那个 ``.stale-<8位>`` 文件（名字还谎称它就是那份 sha 的字节）
+          → 本用例的 `leftovers` 断言红。
+        """
+        v1, snap = self._broken_fingerprint()
+        before = store.read_bytes(snap)
+        room = os.path.dirname(snap)
+        real_write_bytes = store.write_bytes
+
+        def torn_write_bytes(p, raw):
+            # 只打坏"这份旧快照字节的落盘"：新实现写的是同目录临时文件，旧实现写的就是旁挂名本身。
+            if raw == before and os.path.abspath(os.path.dirname(str(p))) == os.path.abspath(room):
+                with open(p, "wb") as f:
+                    f.write(raw[: max(1, len(raw) // 2)])       # 半截
+                raise OSError(28, "磁盘空间不足")
+            return real_write_bytes(p, raw)
+
+        with mock.patch.object(store, "write_bytes", side_effect=torn_write_bytes):
+            with self.assertRaises(resumelib.SnapshotArchiveError) as ctx:
+                resumelib.create_version("母版", "第三版内容", parent_id=v1["id"])
+
+        self.assertIn("留档", str(ctx.exception))       # 说人话（路由接成 409 给用户）
+        self.assertEqual(store.read_bytes(snap), before, "留档失败 → 放弃本次修正：旧快照一个字节都没变")
+        leftovers = sorted(f for f in os.listdir(room) if ".stale-" in f or f.startswith(".tmp-"))
+        self.assertEqual(leftovers, [],
+                         "写坏的那半截不许留在盘上（它的名字会谎称自己就是那份 sha 的字节）：%r"
+                         % (leftovers,))
+        self.assertEqual(resumelib.read_version(v1["id"])[2], "latest",
+                         "修正已放弃 → 取回结果与修正前一致")
 
 
 class ReadPathFingerprintGateTest(IsolatedCase):
