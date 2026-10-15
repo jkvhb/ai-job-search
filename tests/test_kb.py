@@ -2278,6 +2278,8 @@ class KbSetStateAndReviewUseOneRulerTest(IsolatedCase):
 
     def _seed(self, cards):
         store.ensure_profile()
+        # 探针必须落在 IsolatedCase 给的临时根里（绝不碰真实 data/，跑前跑后基线一致）
+        self.assertIn(self.tmp, store.knowledge_path(), "探针必须落在临时根里")
         store.save_knowledge({"version": 1, "nodes": cards})
         return cards
 
