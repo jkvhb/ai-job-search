@@ -473,5 +473,227 @@ class MergeSnapshotReadFailureTest(IsolatedCase):
                          ["keep", "drop"], "引用一条都没被改跑")
 
 
+def _assert_isolated(case, *paths):
+    """写盘用例的第一步：钉住「这次要写的东西**都在隔离根里**」。
+
+    为什么把它写进用例而不是只靠 `IsolatedCase`：本项目真实出过一次事故（探针没隔离根目录，
+    把用户 145 张卡清成 0 张）。隔离根是 `IsolatedCase.setUp` 给的 `case.tmp`（临时目录），
+    这里把"目标确实落在它下面"变成一条**每次都会跑的断言**，而不是靠人记得先设 `DATA_ROOT`。
+    """
+    root = os.path.abspath(case.tmp)
+    for p in paths:
+        case.assertTrue(os.path.abspath(p).startswith(root + os.sep),
+                        "路径不在隔离根里，拒绝跑：%s（隔离根 %s）" % (p, root))
+
+
+class MergeRollbackPrunedBackupTest(IsolatedCase):
+    """回滚的**前提**（备份）不见了 → 绝不把目标写成 0 字节，且如实报「回滚未完成」。
+
+    ⚠️ 这正是**上一批加的轮转让它从"不可达"变成"可达"**的那条老雷（第一条铁律：绝不静默丢数据）：
+    合并窗口里只要别的写者连写几次 `jobs.json`，`store._prune_backups` 就会把这次合并留下的
+    `jobs.json.bak-<ts>` 挤出"最新 3 份"；那一刻 `_restore` 读不到备份（`store.read_bytes`
+    返回 `None`）就写 `b""` —— 回滚"成功"了，盘上却是一份 0 字节的台账，用户的岗位记录**永久消失**。
+    """
+
+    def _fixture(self):
+        store.upsert_job({"id": "keep", "job_title": "k", "created_at": "2026-10-03 00:30"})
+        store.upsert_job({"id": "drop", "job_title": "d", "created_at": "2026-10-08 16:40"})
+        store.write_text(store.p_path("jd", "keep.txt"), FindDuplicatesTest.LONG)
+        store.write_text(store.p_path("jd", "drop.txt"), FindDuplicatesTest.SHORT)
+        for jid in ("keep", "drop"):
+            kb.absorb([{"term": "语音识别", "layer": 0, "sources": [], "timeline": [],
+                        "related": [], "interview_questions": []}], {"id": jid})
+        store.save_interview_json("iv1", "status.json", {"state": "done", "job_id": "drop"})
+        iv_path = store.interview_file("iv1", "status.json")
+        _assert_isolated(self, store.jobs_path(), store.knowledge_path(), iv_path)
+        return store.jobs_path(), store.knowledge_path(), iv_path
+
+    @staticmethod
+    def _break_the_jobs_snapshot(jobs_path, jobs_before, zero_it=False):
+        """弄掉**本次合并**留下的那份 `jobs.json` 原像（内容逐字节等于合并前的台账）。
+
+        两种都真实可达：`zero_it=False` = 被 `store._prune_backups` 挤掉（并发写台账），
+        `zero_it=True` = 备份文件被别的东西截成 0 字节。
+        """
+        for p in glob.glob(jobs_path + ".bak-*"):
+            if store.read_bytes(p) != jobs_before:
+                continue                       # 别的写者（upsert_job）留的档，内容不是合并前的台账
+            if zero_it:
+                with open(p, "wb"):
+                    pass
+            else:
+                os.remove(p)
+            return
+        raise AssertionError("夹具前提不成立：没找到本次合并留下的 jobs.json 原像")
+
+    def test_a_pruned_jobs_snapshot_is_never_restored_as_an_empty_file(self):
+        jobs_path, kb_path, iv_path = self._fixture()
+        jobs_before = store.read_bytes(jobs_path)
+        kb_before = store.read_bytes(kb_path)
+        iv_before = store.read_bytes(iv_path)
+        self.assertTrue(jobs_before, "夹具前提：台账里本来有内容 —— 只有这时候『写成空』才是丢数据")
+
+        def failing_save_jobs(jobs, key=None):
+            # 模拟"合并窗口里另一个写者写台账 → 轮转把我们的原像挤出最新 3 份"，然后这次写盘失败
+            self._break_the_jobs_snapshot(jobs_path, jobs_before)
+            raise OSError("disk full")
+
+        with mock.patch.object(store, "save_jobs", side_effect=failing_save_jobs):
+            res = jobdup.merge_jobs("keep", "drop")
+
+        self.assertFalse(res["ok"])
+        self.assertEqual(store.read_bytes(jobs_path), jobs_before,
+                         "原像被删掉时，台账必须**一个字节都不动**：写成 b\"\" 就是用户的岗位记录"
+                         "永久消失（老实现把 `read_bytes` 的 None 兜成 b\"\"，正是这么干的）")
+        self.assertNotEqual(store.read_bytes(jobs_path), b"", "回滚把有内容的台账写成了 0 字节")
+        self.assertFalse(res["rolled_back"], "回滚没成，却报了「已回滚」")
+        self.assertIn("回滚未完成", res["reason"])
+        # 其它文件的原像还在 → 它们仍要如实还原（一个失败不该让整段回滚放弃）
+        self.assertEqual(store.read_bytes(kb_path), kb_before)
+        self.assertEqual(store.read_bytes(iv_path), iv_before)
+
+    def test_a_zeroed_backup_never_empties_a_target_that_still_has_content(self):
+        """备份被截成 0 字节：0 字节的原像只说明「那一刻这里没有内容」，
+        **不许**拿它覆盖一份**现在有字节**的台账 —— 那些字节没有任何备份覆盖。"""
+        jobs_path, _kb_path, _iv_path = self._fixture()
+        jobs_before = store.read_bytes(jobs_path)
+        self.assertTrue(jobs_before)
+
+        def failing_save_jobs(jobs, key=None):
+            self._break_the_jobs_snapshot(jobs_path, jobs_before, zero_it=True)
+            raise OSError("disk full")
+
+        with mock.patch.object(store, "save_jobs", side_effect=failing_save_jobs):
+            res = jobdup.merge_jobs("keep", "drop")
+
+        self.assertFalse(res["ok"])
+        self.assertEqual(store.read_bytes(jobs_path), jobs_before,
+                         "0 字节的备份不许覆盖一份有内容的台账：写回去就是拿一次回滚换掉用户的数据")
+        self.assertFalse(res["rolled_back"], "回滚没成，却报了「已回滚」")
+
+    def test_restore_raises_and_never_touches_the_target_when_the_backup_is_missing(self):
+        """判据的另一半：`_restore` 的入参里**记账过**的备份不见了 → 抛，不是"当成空的"。"""
+        target = store.jobs_path()
+        _assert_isolated(self, target)
+        store.write_text(target, "{\"keep\": 1}")
+        before = store.read_bytes(target)
+        missing = target + jobdup.BACKUP_SUFFIX + "20260101_000000_000001"
+        with self.assertRaises(RuntimeError) as cm:
+            jobdup._restore(target, missing)
+        self.assertIn(missing, str(cm.exception), "错误信息要给出路径，否则用户没法自救")
+        self.assertEqual(store.read_bytes(target), before,
+                         "备份不存在 = 回滚的前提没了：目标一个字节都不许动（尤其不许变成 0 字节）")
+
+    def test_restore_raises_when_the_backup_is_missing_even_if_the_target_is_empty(self):
+        """**判据 #1 的单独可观测形态**（目标现在没有字节 → 0 字节守卫不会替它兜住）：
+        记账过的备份不见了 = 回滚的前提没了 —— 我们**不知道**原文当时是什么，写 `b""` 是在猜
+        （本项目的规矩：把"不知道"当成"安全"正是丢数据的习惯）；而且那还会把"没有这个文件"
+        变成盘上一个 0 字节文件。判据 #2 只能挡住"目标有内容"的那一半，所以这条必须独立存在。
+        """
+        target = store.jobs_path()
+        _assert_isolated(self, target)
+        missing = target + jobdup.BACKUP_SUFFIX + "20260101_000000_000001"
+        self.assertFalse(os.path.exists(target), "夹具前提：目标现在一个字节都没有")
+        with self.assertRaises(RuntimeError):
+            jobdup._restore(target, missing)
+        self.assertFalse(os.path.exists(target),
+                         "备份不见了还去写 b\"\"：把「没有这个文件」变成一个 0 字节文件，"
+                         "而且是在不知道原文是什么的前提下猜的")
+
+    def test_restore_refuses_a_zero_byte_backup_over_a_target_with_bytes(self):
+        """知识库那一路（持 `kb._KB_LOCK` 的分支）同样判据。"""
+        target = store.knowledge_path()
+        _assert_isolated(self, target)
+        store.write_text(target, "{\"nodes\": [{\"id\": \"x\"}]}")
+        before = store.read_bytes(target)
+        backup = target + jobdup.BACKUP_SUFFIX + "20260101_000000_000001"
+        with open(backup, "wb"):
+            pass                                   # 备份存在、但读出来是空的
+        self.assertEqual(store.read_bytes(backup), b"")
+        with self.assertRaises(RuntimeError):
+            jobdup._restore(target, backup)
+        self.assertEqual(store.read_bytes(target), before,
+                         "有内容的知识库不许被 0 字节的备份清空（本项目真实丢过 145 张卡）")
+
+    def test_no_snapshot_for_a_target_is_legal_and_touches_nothing(self):
+        """**别把合法的"本次没留档"变成硬错误**：它的形态是"这一对根本不在 `backups` 里"，
+        不是"记账了、文件却不见了" —— 所以既不抛、也不动任何文件。"""
+        target = store.jobs_path()
+        _assert_isolated(self, target)
+        store.write_text(target, "{\"keep\": 1}")
+        before = store.read_bytes(target)
+        self.assertEqual(jobdup._rollback([]), (True, []))
+        self.assertEqual(store.read_bytes(target), before)
+
+    def test_a_merge_that_fails_before_any_snapshot_says_nothing_was_touched(self):
+        """失败点在任何 `_snapshot` 之前 → 一个文件都没改：说「已回滚」是多说的（备份都没留成）。"""
+        jobs_path, _kb_path, _iv_path = self._fixture()
+        jobs_before = store.read_bytes(jobs_path)
+        with mock.patch.object(jobdup, "_snapshot", side_effect=OSError("备份写不出")):
+            res = jobdup.merge_jobs("keep", "drop")
+        self.assertFalse(res["ok"])
+        self.assertTrue(res["rolled_back"], "没有任何改动时，数据本来就在原样")
+        self.assertIn("一个字节都没动", res["reason"])
+        self.assertEqual(store.read_bytes(jobs_path), jobs_before)
+
+
+class SnapshotRotationTest(IsolatedCase):
+    """`.bak-` 轮转：**jobdup 自己留的档**也要有上限（原来只有 store 的那几个目标有）。
+
+    为什么必须有：`store._prune_backups` 只在 `store.snapshot_before_overwrite` 里被调用 ——
+    即只轮转 `config.json` / `jobs.json`；而 `jobdup._snapshot` 还会给 `knowledge.json`
+    与每个 `interviews/<面试id>/status.json` 留一份，**每次合并各留一份、谁都不删**，
+    这两处因此无上限增长（`简历迁移` 的整目录备份还会把它们一起拷走）。
+    """
+
+    TS = ["20260101_000000_000001", "20260101_000000_000002", "20260101_000000_000003",
+          "20260101_000000_000004", "20260101_000000_000005"]
+
+    def _snap_five_times(self, target, content):
+        _assert_isolated(self, target)
+        store.write_text(target, content)
+        before = store.read_bytes(target)
+        for ts in self.TS:
+            jobdup._snapshot(target, ts, [])
+        return before
+
+    def _kept(self, target):
+        return sorted(os.path.basename(p) for p in glob.glob(target + ".bak-*"))
+
+    def test_knowledge_backups_keep_only_the_newest_three(self):
+        target = store.knowledge_path()
+        before = self._snap_five_times(target, "{\"nodes\": []}")
+        keep = ["knowledge.json.bak-" + ts for ts in self.TS[-store.BACKUP_KEEP:]]
+        self.assertEqual(self._kept(target), keep,
+                         "留下的必须是**最新**的 %d 份（不是最旧的那几份）" % store.BACKUP_KEEP)
+        self.assertFalse(os.path.exists(target + jobdup.BACKUP_SUFFIX + self.TS[0]),
+                         "最旧的那份没被轮转掉 → knowledge.json 的 `.bak-` 还是会无上限增长")
+        self.assertEqual(store.read_bytes(target), before, "留档/轮转都不许改目标文件本身")
+
+    def test_interview_status_backups_are_rotated_too(self):
+        store.save_interview_json("iv1", "status.json", {"state": "done", "job_id": "d"})
+        target = store.interview_file("iv1", "status.json")
+        before = self._snap_five_times(target, "{\"state\": \"done\", \"job_id\": \"d\"}")
+        keep = ["status.json.bak-" + ts for ts in self.TS[-store.BACKUP_KEEP:]]
+        self.assertEqual(self._kept(target), keep,
+                         "面试 status.json 的 `.bak-` 也要只留最新 %d 份" % store.BACKUP_KEEP)
+        self.assertFalse(os.path.exists(target + jobdup.BACKUP_SUFFIX + self.TS[0]))
+        self.assertEqual(store.read_bytes(target), before)
+
+    def test_repeated_merges_do_not_grow_knowledge_backups_without_bound(self):
+        """真实路径：`merge_jobs` 每次都给 `knowledge.json` 留一份档 —— 连做 4 次也只留最新 N 份。"""
+        _assert_isolated(self, store.knowledge_path(), store.jobs_path())
+        store.upsert_job({"id": "keep", "job_title": "k", "created_at": "2026-10-03 00:30"})
+        for i in range(4):
+            drop = "drop%d" % i
+            store.upsert_job({"id": drop, "job_title": "d", "created_at": "2026-10-08 16:40"})
+            res = jobdup.merge_jobs("keep", drop)
+            self.assertTrue(res["ok"], res["reason"])
+        baks = self._kept(store.knowledge_path())
+        self.assertEqual(len(baks), store.BACKUP_KEEP,
+                         "4 次合并留下的知识库档必须轮转到 %d 份，实际 %s"
+                         % (store.BACKUP_KEEP, baks))
+
+
 if __name__ == "__main__":
     unittest.main()

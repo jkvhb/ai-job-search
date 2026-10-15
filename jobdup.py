@@ -17,7 +17,9 @@
   2. 写 `knowledge.json` 必须持 `kb._KB_LOCK`（本模块的 KB 写路径显式持同一把锁）——
      否则会和 `absorb` / `record_interview` 并发写坏文件（本项目真实发生过丢更新）。
   3. 合并只标 `merged_into`，**绝不删岗位记录、绝不删报告、绝不删 JD 原文**（报告是用户的资产）。
-  4. 合并前必备份（带时间戳、保留不删），任一步失败用备份回滚。
+  4. 合并前必备份（带时间戳；**每个目标只保留最新 `store.BACKUP_KEEP` 份**，更旧的轮转删掉），
+     任一步失败用备份回滚；**备份读不出来时拒绝回滚**并如实报「回滚未完成」，绝不把文件写成空的
+     （轮转正是会删掉原像的那只手 —— 这条老雷就是这么变可达的）。
   5. `find_duplicate_jobs` **只读**（不写文件、不记日志），这样体检 CLI 无参数时能保证零写入。
 """
 import glob
@@ -194,15 +196,37 @@ def _result(ok, reason="", **kw):
     return r
 
 
+def _prune_backups(path):
+    """轮转本模块留在 `path` 旁边的 `.bak-<时间戳>`：**复用 `store` 的唯一一份实现**。
+
+    为什么必须轮转：`_snapshot` 给 `knowledge.json` 与每个 `interviews/<面试id>/status.json`
+    都留一份，**每次合并各留一份、谁都不删** ⇒ 这两处无上限增长（`简历迁移` / `身份迁移` 的
+    整目录备份还会把它们一起拷走）。而 `store.snapshot_before_overwrite` 的轮转**只管它自己的
+    目标**（`config.json` / `jobs.json`），这两处不在里面。
+
+    为什么直接调带下划线的 `store._prune_backups`：它本来就是"按路径轮转 `<path>.bak-*`"的通用
+    实现（`snapshot_before_overwrite` 只是它的调用方之一），而"新旧怎么判"是个**已经踩过坑**的
+    判据（仓库里两种真实命名、按文件名里的时间戳去掉分隔符比数字；见它的注释）。另写一套 =
+    两份轮转实现各自漂移，正是本项目在修的那类病。上限也直接用 `store.BACKUP_KEEP`（同一个数）。
+    """
+    return store._prune_backups(path, keep=store.BACKUP_KEEP)
+
+
 def _snapshot(path, ts, backups):
     """把 path 的**当前内容**存成 `<path>.bak-<ts>`，返回备份路径。
 
     文件不存在时写一个空快照 —— 备份的语义是「回到合并前的状态」，缺失也是一种状态，
     回滚时写回空内容即可（load_knowledge / load_jobs 对空文件都容错成空结构）。
-    空快照**不删除**，与其它备份一样保留。
+    留档是**写成功之后**才记账（`backups.append` 在 `write_bytes` 后面）：所以 `backups` 里
+    的每一对，在快照那一刻盘上**确实**有一份备份文件 —— 这正是 `_restore`「记账过的备份不见了
+    就抛」的依据。
+
+    **轮转**：留档之后只保留最新 `store.BACKUP_KEEP`（= 3）份（见 `_prune_backups`）；
+    否则 `knowledge.json` / `interviews/*/status.json` 的 `.bak-` 会无上限增长。
     """
     backup = path + BACKUP_SUFFIX + ts
     store.write_bytes(backup, store.read_bytes(path) or b"")
+    _prune_backups(path)
     backups.append((path, backup))
     return backup
 
@@ -214,9 +238,37 @@ def _restore(path, backup):
     快照按字节（`store.read_bytes` / `write_bytes`），避免解码兜底与换行转换：
     用 `read_text` 时非 UTF-8 文件会被兜成空串、写回去就把用户的数据清空；`write_text`
     在 Windows 上还会把 LF 换成 CRLF —— 那两种情况下回滚都不是"逐字节还原"。
+
+    **拿不到可信的原像时一律抛，绝不写空**（本批修的正是这条老雷：轮转让它可达）：
+      - `store.read_bytes` **只在文件不存在时**返回 `None`（权限/被占用会原样抛 `OSError`
+        —— 所以"备份存在但读不出来"那一路本来就抛得出去）。而 `_snapshot` 永远是**先写成功、
+        再记账**，所以记账过的备份"不见了"只可能是被删了（`_prune_backups` 轮转 / 用户手删）
+        —— 那是**回滚的前提没了**，绝不是"原文本来就是空的"。判据里"合法的没留档"是
+        **这一对根本不在 `backups` 里**（例如失败点在任何 `_snapshot` 之前），那种情况
+        `_rollback` 根本不会走到这里、一个文件都不动；不把它做成硬错误。
+      - 备份**存在但是 0 字节**：0 字节本身是合法原像（快照那一刻原文不存在 / 真的是 0 字节），
+        但它**不许**盖到一份**现在有字节**的目标上 —— 那些字节是快照之后才出现的
+        （`_repoint_kb` / `write_json` / `save_jobs` 写的，或并发写者写的），**没有任何备份
+        覆盖它们**，写回去就是"拿一次回滚换掉用户的数据"。当前真实路径上撞不到这一条
+        （台账里得有 keep/drop 才有这次合并；面试 `status.json` 是被 `read_json` 认出 `job_id`
+        的；知识库要**本来就有卡**才会被 `_repoint_kb` 改写）—— 它是给"备份被外部截成 0 字节"
+        和"我们快照之后有并发写者新建了目标"留的 fail-safe。
+
+    用 `RuntimeError`：与 `_repoint_kb` 的"拒绝写"同一个既有类型（全仓"前置条件不满足就中止"
+    的惯例），`_rollback` 只 catch `Exception`，两种成因用同一个类型表达"拒绝回滚"，
+    调用方与测试不必猜是哪种 OS 错误。
     """
     raw = store.read_bytes(backup)
-    blob = raw if raw is not None else b""
+    if raw is None:
+        raise RuntimeError(
+            "回滚的前提没了：备份 `%s` 不存在（备份总是写成功之后才记账，不见了 = 被轮转/被删）。"
+            "绝不把「备份读不出来」当成「原文是空的」—— 那会把 `%s` 写成 0 字节，"
+            "用户的台账/知识库就永久消失了。备份路径见本次合并的 `backups`。" % (backup, path))
+    if not raw and store.file_has_bytes_to_lose(path):
+        raise RuntimeError(
+            "备份 `%s` 是 0 字节，而 `%s` **现在有内容**：这些字节是快照之后才写的、没有任何备份"
+            "覆盖它们，写回去就是拿一次回滚换掉用户的数据。拒绝回滚。" % (backup, path))
+    blob = raw
     if path == store.knowledge_path():
         with kb._KB_LOCK:
             store.write_bytes(path, blob)
@@ -225,16 +277,22 @@ def _restore(path, backup):
 
 
 def _rollback(backups):
-    """用备份把已改的文件恢复回去（倒序）。返回是否全部恢复成功。绝不删任何文件。"""
+    """用备份把已改的文件恢复回去（倒序）。返回 `(是否全部恢复成功, 没能还原的文件名列表)`。
+
+    绝不删任何文件。一个目标还原失败**不影响其它目标继续还原**（能救一个是一个），但返回值必须
+    如实反映"有东西没还原回去" —— 调用方**不许**在这种情况下说"已回滚"。
+    """
     ok = True
+    failed = []
     for path, backup in reversed(backups):
         try:
             _restore(path, backup)
         except Exception as e:            # 回滚本身不能再抛出去把原始异常吞掉
             ok = False
+            failed.append(os.path.basename(path))
             log.log_event("jobdup.rollback_failed", level="error",
-                          file=os.path.basename(path), error=str(e))
-    return ok
+                          file=os.path.basename(path), backup=backup, error=str(e))
+    return ok, failed
 
 
 def _repoint_kb(keep_id, drop_id):
@@ -353,10 +411,20 @@ def _merge_jobs_locked(keep_id, drop_id):
         drop["merged_into"] = keep_id
         store.save_jobs(raw)              # 原样写回整份台账，只多了一个 merged_into
     except BaseException as e:
-        restored = _rollback(backups)
+        restored, failed = _rollback(backups)
         log.log_exc("jobdup.merge_failed", e, keep=keep_id, drop=drop_id,
-                    rolled_back=restored, backups=len(backups))
-        return _result(False, "合并失败：%s（%s）" % (e, "已用备份回滚" if restored else "回滚未完成！"),
+                    rolled_back=restored, backups=len(backups), not_restored=failed)
+        if not backups:
+            # 备份一份都没留成（失败点在任何 `_snapshot` 之前）⇒ 目标文件**一个字节都没动**。
+            # 这时候说"已回滚"是多说的（同 jddelete 那条规矩：备份都没成功 ≠ 已回滚）。
+            how = "尚未改动任何文件：备份没留成，目标一个字节都没动"
+        elif restored:
+            how = "已用备份回滚"
+        else:
+            # 回滚**没成**：必须如实说，还要点名哪个文件没还原（用户据此手工自救）
+            how = "回滚未完成！没能还原：%s（细节见日志 jobdup.rollback_failed，备份路径见下）" \
+                  % "、".join(failed)
+        return _result(False, "合并失败：%s（%s）" % (e, how),
                        rolled_back=restored, backups=[b for _p, b in backups])
 
     after = kb.stats(store.load_knowledge())["multi_jd"]
