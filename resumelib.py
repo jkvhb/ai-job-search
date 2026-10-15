@@ -77,6 +77,17 @@
    → 如实报 ``mother`` + 空文本。判"有没有字节"只能按**原始字节**（``strip()`` 后为空
    才算空档）；写成 ``if not text: mismatch`` 就把这批合法空档也诬成"读不出来"了。
 
+3. **正文写入也必须是原子的**（Task 1.11 修 P0-13）：``_write_content`` 旧写法是
+   ``open(path, "w")`` —— **先把旧正文截断成 0 字节**再一段段写，中途失败（磁盘满 /
+   进程被 kill / 文件名超长）就留下**半截简历**；而**族谱第一家**时没有快照兜底，
+   那份半截东西就是用户唯一的一份。现在正文与快照共用同一条 ``_atomic_write_bytes``
+   （同目录临时文件 + ``os.replace``）：失败 = 目标**一个字节都没动** + 一句人话
+   （``SnapshotArchiveError``，路由接成 **409**，不是裸 ``OSError`` 的 500）。
+   失败时**还要撤掉这次新建的快照**（``_withdraw_fresh_snapshot``）：一次保存要么整体成立
+   （新正文 + 新记录），要么整体不成立；盘上留一份"记录里没有、而 ``read_version``
+   按版本 id 照样找得到"的快照就是第三种状态。撤不掉时**照实说**
+   （日志 + 那句给用户看的话里明写"没有登记"），绝不假装撤掉了。
+
 诚实边界（规格 §8）：
 
 - **旧版原文不保留**（用户已定的取舍：每个族谱只留母版 + 最新版）→ 历史版只有
@@ -145,6 +156,12 @@ class SnapshotArchiveError(RuntimeError):
     了。对用户说"没保存"而实际保存了，是本项目最不能犯的那种假话。
 
     继承 ``RuntimeError`` 只为向后兼容（既有调用方 / 既有测试接的就是 ``RuntimeError``）。
+
+    它现在覆盖**三种**"盘上现在的状态让这次保存做不了"（Task 1.11 加了第 3 种）：
+    ① 旧快照没能留档；② 母版原文读不出来（那份东西现在读不了，绝不覆盖它）；
+    ③ **正文写不进去**（``_atomic_write_bytes`` 失败：磁盘满 / 文件名超长 / 被占用）——
+    三种的共同点是"**这次保存整体没成立**"，所以都该给用户一句人话而不是 500。
+    名称里的 Snapshot 是历史包袱：**不要**据此把它当成"只有快照相关才会抛"。
     """
 
     def __init__(self, message="", cause=None):
@@ -210,44 +227,101 @@ def _write_side(side, old):
     return side
 
 
-def _write_snapshot_atomically(snap_path, raw):
-    """把母版原文**原子地**写成快照（临时文件 + ``os.replace``）；失败抛 ``SnapshotArchiveError``。
+def _atomic_write_bytes(path, raw, what, event, tail, log_fields=None):
+    """把 ``raw`` 字节**原子地**写到 ``path``（同目录临时文件 + ``os.replace``）。
 
-    为什么必须原子（Task 1.10c 修 E-1）：旧写法是裸的 ``store.write_bytes(snap_path, raw)``，
-    它等于 ``open(path, "wb")`` —— **先把旧快照截断成 0 字节**，然后一段一段往里写。
-    中途失败（磁盘满 / 进程被 kill / 断电）就留下一个**半截快照**，而版本记录仍指着它：
-    用户以为"母版原文留过档"，取回来却是残缺的 —— 又一例"以为留了档其实没留"。
+    **全模块只有这一条落盘实现**（Task 1.11 修 P0-13：快照与正文共用；别在这里之外再写第二套）。
+
+    为什么必须原子：裸写（``open(path, "wb")``）**先把目标截断成 0 字节**，然后一段一段往里写；
+    中途失败（磁盘满 / 进程被 kill / 断电 / 文件名超长）就留下一个**半截文件** ——
+    对快照是"版本记录一直指着一个残缺的档"，对正文是"用户唯一的一份成了半截"。
     临时文件必须与目标**同目录**：``os.replace`` 只在同一文件系统内保证原子（跨盘会退化成复制）。
 
-    失败一律翻成**专用异常**（一句中文人话，``app.py`` 的 ``POST /api/resumes`` 接成 409）：
-    裸 ``OSError`` 穿到路由就是 **500**，用户只看到「服务器内部错误」，对"快照没写成、
-    这次保存已中止"什么都没说清（Task 1.10c 第 E-1 条）。
+    参数（**两处**调用各给一句自己的话，函数本身不认识"快照"还是"正文"）：
+      - ``what``：失败句里"没能写入的东西"（``母版快照`` / ``简历正文``）；
+      - ``event``：日志事件名（两种各自一个，事后好分辨是哪一处失败）；
+      - ``tail``：那句话里"为什么宁可这次不保存"的那半句（也当日志的 ``note``）；
+      - ``log_fields``：该事件特有的字段（比如 ``{"snapshot": ...}``）。
+
+    失败一律翻成 ``SnapshotArchiveError``（一句中文人话，``app.py`` 的 ``POST /api/resumes``
+    接成 409）：裸 ``OSError`` 穿到路由就是 **500**，用户只看到「服务器内部错误」，
+    对"没写成、这次保存已中止"什么都没说清。
     """
-    room = os.path.dirname(snap_path)
+    room = os.path.dirname(path)
     tmp = ""
     try:
         os.makedirs(room, exist_ok=True)
         fd, tmp = tempfile.mkstemp(prefix=".tmp-", suffix=".md", dir=room)
         os.close(fd)
         store.write_bytes(tmp, raw)
-        os.replace(tmp, snap_path)
+        os.replace(tmp, path)
         return
     except OSError as e:
-        log.log_event("resume.snapshot_write_failed", level="warn",
-                      snapshot=os.path.basename(snap_path), dir=room, error=str(e),
-                      note="宁可这次不保存，也绝不留下半截快照（记录会一直指着它）")
+        fields = {"dir": room, "error": str(e)}
+        fields.update(log_fields or {})
+        log.log_event(event, level="warn", note=tail, **fields)
         raise SnapshotArchiveError(
-            "没能写入母版快照（%s），已中止本次保存：宁可这次不保存，也绝不留下一个不完整的"
-            "快照 —— 版本记录会一直指着它，以后取回这一版拿到的却是残缺的内容。"
-            "请先确认 %s 可写、磁盘空间足够。" % (e, room), cause=e)
+            "没能写入%s（%s），已中止本次保存：%s请先确认 %s 可写、磁盘空间足够。"
+            % (what, e, tail, room), cause=e)
     finally:
-        # 失败时别在快照目录里留垃圾（成功时 `os.replace` 已经把临时文件挪走了）
+        # 失败时别在目标目录里留垃圾（成功时 `os.replace` 已经把临时文件挪走了）
         if tmp:
             try:
                 if os.path.exists(tmp):
                     os.remove(tmp)
             except OSError:
                 pass
+
+
+def _write_snapshot_atomically(snap_path, raw):
+    """把母版原文**原子地**写成快照；失败抛 ``SnapshotArchiveError``（实现见 ``_atomic_write_bytes``）。
+
+    为什么必须原子（Task 1.10c 修 E-1）：旧写法是裸的 ``store.write_bytes(snap_path, raw)``，
+    它等于 ``open(path, "wb")`` —— **先把旧快照截断成 0 字节**，然后一段一段往里写。
+    中途失败（磁盘满 / 进程被 kill / 断电）就留下一个**半截快照**，而版本记录仍指着它：
+    用户以为"母版原文留过档"，取回来却是残缺的 —— 又一例"以为留了档其实没留"。
+
+    失败一律翻成**专用异常**（一句中文人话，``app.py`` 的 ``POST /api/resumes`` 接成 409）：
+    裸 ``OSError`` 穿到路由就是 **500**，用户只看到「服务器内部错误」，对"快照没写成、
+    这次保存已中止"什么都没说清（Task 1.10c 第 E-1 条）。
+    """
+    return _atomic_write_bytes(
+        snap_path, raw, what="母版快照", event="resume.snapshot_write_failed",
+        tail="宁可这次不保存，也绝不留下一个不完整的快照 —— 版本记录会一直指着它，"
+             "以后取回这一版拿到的却是残缺的内容。",
+        log_fields={"snapshot": os.path.basename(snap_path)})
+
+
+def _withdraw_fresh_snapshot(snap):
+    """撤掉「**这次调用刚写下、此前不存在**」的快照；返回一句要**照实说**的话（没问题就是空串）。
+
+    ⚠️ ``snap`` 是 ``(路径, 相对路径)``：调用方必须自己保证"此前不存在"（只撤这次新建的），
+    这里面**不做**任何判断 —— 传错了就会删掉别人的档。
+
+    为什么选"撤掉"而不是"留着并说明"（P0-13 要求二选一，这里写清理由）：
+    一次保存要么**整体成立**（新正文 + 新记录），要么**整体不成立**。盘上留下一份
+    "记录里没有、而 ``read_version`` 按版本 id 照样找得到"的快照，就是**第三种状态**：
+    用户以为这次保存被中止了，可盘上多了一份谁也说不清来历的档（记录的 ``mother_file``
+    是空的，而下次延续又会因为"快照已存在"而不再触发归档 —— 它从此永远说不清是哪来的）。
+    撤掉 = 回到**调用前**的盘面。两条例外：
+      - **调用前就存在的东西一律不碰**（这里只可能拿到"这次新建"的那一个）；
+      - 留档的 ``.stale-*`` 旁挂**不动** —— 它们是 append-only 的留档（见 ``_archive_old_snapshot``），
+        是那份旧字节当前可达的最后一手，删了就是真丢字节。
+    撤不掉（被别的程序占着）时**绝不假装撤掉了**：返回一句人话，由调用方并进给用户看的那句话里，
+    并另记一条日志 —— "盘上留了一份没登记的档"这件事必须说出来。
+    """
+    snap_path, snap_rel = snap
+    try:
+        os.remove(snap_path)
+        return ""
+    except OSError as e:
+        log.log_event("resume.snapshot_orphan_left", level="warn",
+                      snapshot=os.path.basename(snap_path), dir=os.path.dirname(snap_path),
+                      error=str(e),
+                      note="这次保存已中止，但刚写下的母版快照没能撤掉：盘上留了一份**没有登记**的档"
+                           "（里面是覆盖前盘上那份字节，记录里不会有 mother_file），可手工删。")
+        return ("（另外：这次已经写下的母版快照 %s 没能撤掉，它还留在盘上、**没有登记**进版本记录 ——"
+                " 里面是覆盖前盘上那份字节，可以手工删。）" % snap_rel)
 
 
 # ---------- 路径 / 取值小工具 ----------
@@ -291,17 +365,26 @@ def _doc_path():
 
 
 def _write_content(path, text):
-    """写简历 / 快照内容文件。
+    """写简历正文 —— 与快照共用**原子写**（``_atomic_write_bytes``：临时文件 + ``os.replace``）。
 
     ``newline=""`` 很关键：默认的换行转换会把 ``\\n`` 写成 ``\\r\\n``（Windows），
     于是"磁盘字节数"与"内容的 UTF-8 字节数"对不上，``size`` / ``sha256`` 也不再是
     同一份内容的指纹。**写侧**因此是保真的 —— 但快照要真的"与原文逐字节相等"，
     还得**读侧**也按字节（快照走 ``store.read_bytes`` / ``write_bytes``：
     文本读会把 CRLF 归一成 LF、把非 UTF-8 兜成空串，见 ``create_version``）。
+    ⚠️ 原子写走的还是"文本 → ``encode("utf-8")`` → 写字节"，所以保真口径**没有变**：
+    同一份文本在两种写法下落的字节完全相同（已有一条正面断言钉住含 CRLF / 非 ASCII 的情形）。
+
+    P0-13：旧写法是 ``open(path, "w")``（**先把旧正文截断成 0 字节**再一段段写）——
+    中途失败（磁盘满 / 被 kill / 文件名超长 ``WinError 123``）就留下**半截简历**，
+    而族谱**第一家**时没有快照兜底，那份半截东西就是用户唯一的一份；而且裸 ``OSError``
+    穿到路由是 **500**。现在失败 = 目标一个字节都没动 + 一句人话（409）。
     """
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8", newline="") as f:
-        f.write(text)
+    raw = (text if isinstance(text, str) else str(text or "")).encode("utf-8")
+    return _atomic_write_bytes(
+        path, raw, what="简历正文", event="resume.content_write_failed",
+        tail="宁可这次不保存，也绝不留下半截简历 —— 盘上那份仍然是上一次保存的内容，"
+             "一个字节都没改。")
 
 
 def sha256_of(text):
@@ -565,10 +648,16 @@ def create_version(name, content, parent_id=None, note=""):
 
      会抛 ``ValueError`` 的情形：名字为空／重名（未移出的）／父版本不存在／
      父版本已移出（移出的族谱不能延续）／延续时改了名字。
-     母版原文**读不出来**（被锁 / 权限）**或旧快照没能留档** → 抛
+     母版原文**读不出来**（被锁 / 权限）**或旧快照没能留档** **或正文写不进去**
+     （磁盘满 / 文件名超长 / 被别的程序占用）→ 抛
      ``SnapshotArchiveError``（``RuntimeError`` 的子类）并**中止本次保存**
-     （绝不覆盖那份读不出来的东西，也绝不把旧快照盖掉；消息是人话，
+     （绝不覆盖那份读不出来的东西，绝不把旧快照盖掉，也绝不留半截正文；消息是人话，
      `app.py` 的路由**只接这一种**并接成 **409** 显示给用户）。
+
+     正文写入是**原子**的（Task 1.11 修 P0-13，与快照共用 ``_atomic_write_bytes``）：
+     失败 = ``<名字>.md`` 一个字节都没动 + 这次**不登记**新版本。并且，若这次调用
+     **新建**了一份母版快照，失败时它会被**撤掉**（``_withdraw_fresh_snapshot``：
+     一次保存要么整体成立、要么整体不成立；撤不掉会在那句话里如实说明）。
     """
     text = content if isinstance(content, str) else str(content or "")
     clean = store.safe_name(name)
@@ -609,6 +698,9 @@ def create_version(name, content, parent_id=None, note=""):
             raise ValueError("已有一份未移出的简历叫「%s」，不能覆盖它（先移出或换个名字）" % clean)
         file_path = _resume_path(clean)
         mother = _mother_in(recs, root_id) if parent is not None else None
+        # 这次调用**新建**的（此前盘上没有的）快照 `(路径, 相对路径)`：正文写失败时要撤掉它。
+        # 只撤"这次新建的" —— 调用前就存在的快照一律不碰（见 `_withdraw_fresh_snapshot`）。
+        fresh_snapshot = None
         if mother is not None:
             mid = _clean_id(mother.get("id"))
             snap_path = _snapshot_path(mid)
@@ -625,10 +717,11 @@ def create_version(name, content, parent_id=None, note=""):
                 # 本身就可能是错的 —— 所以下面覆盖前**必须先把旧快照改名留档**（Task 1.10 第 2 条）。
                 # ⚠️ 记录**没有** sha256 时**不修** —— 没有依据，宁可不动（那个 `bool(expected)` 就是这道闸）。
                 expected = _text(mother.get("sha256"))
-                stale = (bool(expected) and os.path.exists(snap_path)
+                snap_existed_before = os.path.exists(snap_path)
+                stale = (bool(expected) and snap_existed_before
                          and m_kind in ("latest", "mother")
                          and sha256_of(store.read_text(snap_path, "")) != expected)
-                if (not os.path.exists(snap_path) or stale) and m_kind != "missing":
+                if (not snap_existed_before or stale) and m_kind != "missing":
                     # 快照必须**按字节**留原文：`_read_in` 走的是文本读（`store.read_text`）。
                     # 非 UTF-8 文件解码失败会被兜成空串（→ `_write_content(snap, "")` 写出
                     # 0 字节"假存档"，而库里还记着 `mother_file` 指向它 = 静默"以为留了档"）；
@@ -663,7 +756,7 @@ def create_version(name, content, parent_id=None, note=""):
                     # 0 字节没什么可留的：写一个空快照只会让"有快照就走快照"那条顺序
                     # 把这一版说成"存过档"，档里却什么都没有 —— 又一个"以为留了档"。
                     if raw:
-                        if stale and os.path.exists(snap_path):
+                        if stale and snap_existed_before:
                             # 旧快照的字节也**不许静默丢掉** —— 那是盘上出现过的东西，而"过时"
                             # 这个判断的证明力**全在记录里**（记录被改坏时它就是错的，实测过）。
                             # 留档到一个旁挂名字（不删除、也不冒充母版）。
@@ -682,9 +775,23 @@ def create_version(name, content, parent_id=None, note=""):
                         # 旧写法 `store.write_bytes(snap_path, raw)` 会先把旧快照截断成 0 字节，
                         # 中途失败就留下半截快照，而记录仍指着它；而且裸 `OSError` 会变成 500。
                         _write_snapshot_atomically(snap_path, raw)
+                        if not snap_existed_before:
+                            # P0-13：这份快照是**这次调用新建**的 —— 正文写失败（下面那个 try）时
+                            # 要撤掉它。否则盘上会留下一个"记录里没有、而 `read_version` 按版本 id
+                            # 照样找得到"的孤儿档（这就是本项要修的第二种伤害）。
+                            fresh_snapshot = (snap_path, _snapshot_rel(mid))
                         if m_kind in ("latest", "mother"):
                             mother["mother_file"] = _snapshot_rel(mid)
-        _write_content(file_path, text)
+        try:
+            _write_content(file_path, text)
+        except SnapshotArchiveError as e:
+            # 正文没写成 → 这次保存**整体**不成立（记录也不会登记）→ 把刚写的快照撤掉，
+            # 回到调用前的盘面。撤不掉时**照实说**（并进那句给用户看的话里），绝不假装撤掉了。
+            extra = _withdraw_fresh_snapshot(fresh_snapshot) if fresh_snapshot else ""
+            if extra:
+                raise SnapshotArchiveError(str(e) + extra,
+                                           cause=getattr(e, "cause", None)) from None
+            raise
         rec = {
             "id": new_id,
             "name": clean,

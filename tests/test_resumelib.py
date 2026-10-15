@@ -7,6 +7,7 @@
 import hashlib
 import json
 import os
+import shutil
 import threading
 from datetime import datetime
 from unittest import mock
@@ -1023,6 +1024,185 @@ class SnapshotByteFidelityTest(IsolatedCase):
                          "这次保存整体中止：母版原文一个字节都不许被写坏")
         self.assertEqual([r["id"] for r in resumelib.list_versions()], [v1["id"]],
                          "这次保存整体中止：不许留下一条没有正文的版本记录")
+
+
+class AtomicContentWriteTest(IsolatedCase):
+    """P0-13：**正文写入必须原子**，失败要翻成人话，且不许留下孤儿快照。
+
+    旧写法 `_write_content` = `open(path, "w")`（**截断后写**）：中途失败（磁盘满 / 进程被 kill /
+    文件名超长 `WinError 123`）就留下**半截简历**；而**族谱第一家**时没有快照兜底 ——
+    那份半截东西就是用户唯一的一份。而且裸 `OSError` 穿到路由 = **500**（用户只看到
+    「服务器内部错误」），对"没写成、这次保存已中止"什么都没说清。
+
+    这里按重要性钉四件事：①正文一个字节都不许被写坏；②不许登记新版本（"记录了新版而正文是旧的"
+    比半截更坏：那是另一句用户可见的假话）；③失败时**撤掉这次新建的快照**（一次保存要么整体
+    成立、要么整体不成立）；④撤不掉时要**照实说**（日志 + 那句人话里明写"没有登记"）。
+    """
+
+    def _snap_path(self, version_id):
+        return store.p_path("resumes", resumelib.SNAPSHOT_DIR, version_id + ".md")
+
+    def _inject_content_write_failure(self, path):
+        """只让**正文**那一跳失败（磁盘满），快照那一跳照常成功 —— 这正是"孤儿快照"的成因。
+
+        原子写的最后一步是 `os.replace(tmp, 目标)`：把**目标路径**上的那一次打成 `OSError`。
+        """
+        real_replace = os.replace
+
+        def fake_replace(src, dst):
+            if os.path.abspath(str(dst)) == os.path.abspath(path):
+                raise OSError(28, "磁盘空间不足")
+            return real_replace(src, dst)
+
+        return mock.patch.object(resumelib.os, "replace", side_effect=fake_replace)
+
+    def test_a_content_write_failure_keeps_the_old_bytes_and_withdraws_the_fresh_snapshot(self):
+        """需求一：正文写失败 → 旧正文逐字节不变 + 没有新记录 + **撤掉刚写的快照**。"""
+        v1 = resumelib.create_version("母版", "第一版内容")
+        resumelib.choose(v1["id"])
+        path = store.p_path("resumes", "母版.md")
+        before = store.read_bytes(path)
+        snap = self._snap_path(v1["id"])
+
+        with self._inject_content_write_failure(path):
+            with self.assertRaises(resumelib.SnapshotArchiveError) as ctx:
+                resumelib.create_version("母版", "第二版内容", parent_id=v1["id"])
+
+        sentence = str(ctx.exception)
+        self.assertIn("简历", sentence)          # 说清是哪一步失败
+        self.assertIn("保存", sentence)          # 一句人话，不是裸 Errno 文本
+        self.assertEqual(store.read_bytes(path), before,
+                         "①`resumes/<名字>.md` 逐字节仍是旧内容（绝不留半截简历）")
+        self.assertEqual([r["id"] for r in resumelib.list_versions()], [v1["id"]],
+                         "②这次保存整体中止：不许登记新版本（记录了新版而正文是旧的 = 更坏的一句假话）")
+        self.assertFalse(os.path.exists(snap),
+                         "③失败时把这次新建的快照撤掉：盘上不许留一个没人引用的孤儿快照")
+        room = os.path.dirname(snap)
+        leftovers = [f for f in (os.listdir(room) if os.path.isdir(room) else [])
+                     if f.startswith(".tmp-")]
+        self.assertEqual(leftovers, [], "失败后不许留临时文件垃圾：%r" % (leftovers,))
+
+    def test_an_overlong_name_is_a_human_sentence_and_writes_nothing(self):
+        """需求二：300 字符的名字（写盘抛 `OSError`）必须变成**一句人话**，不是裸 500。
+
+        诚实边界：文件名的组件上限是 255（Windows 上原子写的最后一步 `os.replace` 报
+        `WinError 123`，旧写法 `open(path, "w")` 报 `[Errno 22]`，Linux 上报 `ENAMETOOLONG`）
+        ⇒ **超长名字的目标文件根本建不出来**，所以这一条里
+        **没有**（也不可能有）"旧正文"可被截断；"真有旧正文时一个字节都不动"由
+        `test_a_content_write_failure_keeps_the_old_bytes_and_withdraws_the_fresh_snapshot`
+        与既有的两条钉子（`test_an_unreadable_mother_file_...` / `test_a_snapshot_write_failure_...`）覆盖。
+        这里钉的是：**不许把裸 `OSError` 抛给路由**（那是 500），并且不许留下
+        半截文件 / 临时文件垃圾 / 版本记录，也**不许波及别的简历**。
+        """
+        other = resumelib.create_version("别人", "别人那份内容\r\n第二行")
+        other_path = store.p_path("resumes", "别人.md")
+        other_bytes = store.read_bytes(other_path)
+        long_name = "长" * 300
+
+        with self.assertRaises(resumelib.SnapshotArchiveError) as ctx:
+            resumelib.create_version(long_name, "超长名字的正文")
+
+        sentence = str(ctx.exception)
+        self.assertIn("简历", sentence)
+        self.assertIn("保存", sentence)
+        self.assertNotIsInstance(ctx.exception, OSError, "裸 OSError 穿到路由就是 500")
+        self.assertFalse(os.path.exists(store.p_path("resumes", long_name + ".md")),
+                         "写不成的正文连文件都不该建出来（更不许留半截）")
+        room = store.p_path("resumes")
+        leftovers = [f for f in os.listdir(room) if f.startswith(".tmp-")]
+        self.assertEqual(leftovers, [], "失败后不许在简历目录里留临时文件垃圾：%r" % (leftovers,))
+        self.assertEqual([r["id"] for r in resumelib.list_versions()], [other["id"]],
+                         "这次保存整体中止：不许留下一条没有正文的版本记录")
+        self.assertEqual(store.read_bytes(other_path), other_bytes,
+                         "这次失败不许波及别的简历：别人那份正文逐字节未变")
+
+    def test_a_successful_write_lands_the_exact_bytes(self):
+        """正面钉：写成功时目标内容与传入的 `raw` **逐字节相同**（含 CRLF / 非 ASCII）。"""
+        content = "第一行\r\n第二行\n第三行\t结尾带表情🙂"
+        rec = resumelib.create_version("保真", content)
+
+        self.assertEqual(store.read_bytes(store.p_path("resumes", "保真.md")),
+                         content.encode("utf-8"),
+                         "原子写不许改变字节（CRLF 不许被归一成 LF、非 ASCII 不许被换编码）")
+        self.assertEqual(rec["size"], len(content.encode("utf-8")), "size 就是磁盘字节数")
+
+    def test_the_old_bytes_are_still_there_at_the_moment_of_the_swap(self):
+        """原子性的**直接**钉子：换名那一刻，目标文件里**仍是**旧正文；目标**绝不许被就地写**。
+
+        非原子的"截断后写"（`open(path, "w")`）在那一刻目标**已经被截断**了；"往目标就地拷贝"
+        的写法（`shutil.copy` / `copyfile`）则在那一刻目标正被**一段段覆盖** ——
+        两种都是"中途失败 = 半截简历"的窗口。所以这里钉**两条**：
+        ① 全程**没有任何"往目标文件本身拷贝"**（`shutil.copyfile` 的目的地是目标 → 红）；
+        ② 目标路径上的换名发生时，目标里仍是旧正文（截断后写的实现根本不会有这个时刻）。
+
+        变异取证（都实测过）：
+          - 改回 `open(path, "w")` → **②红**（换名那一刻根本不存在）；
+          - 改成 `shutil.move(tmp, 目标)` → **②红**，而 **①不红** —— 因为临时文件与目标
+            **同目录**（这是原子写的前提），同盘 move 内部走的就是 `os.rename`（仍然是一次改名），
+            "跨盘退化成 copy"那条分支在这里永远走不到。**这条要如实说**：`shutil.move` 这个变异
+            对"非原子"本身**没有**直接反证力，红的只是"原子换名这一步还在不在"；
+          - 改成 `shutil.copyfile(tmp, 目标)`（**另做的一次变异**，只为验①有没有牙）→ **①红**
+            （报出"往目标就地拷贝"的目的地路径）。也就是说：① 只在"直接往目标拷贝"的写法上才有牙。
+        """
+        v1 = resumelib.create_version("母版", "第一版内容")
+        resumelib.choose(v1["id"])
+        path = store.p_path("resumes", "母版.md")
+        before = store.read_bytes(path)
+        real_replace = os.replace
+        real_copyfile = shutil.copyfile
+        seen, in_place_copies = [], []
+
+        def spy_replace(src, dst):
+            if os.path.abspath(str(dst)) == os.path.abspath(path):
+                seen.append(store.read_bytes(path))     # 换名前一刻，目标里是什么？
+            return real_replace(src, dst)
+
+        def spy_copyfile(src, dst, *a, **k):
+            # 目的地就是**目标文件本身** = 就地覆盖（copy 写一半失败 → 半截正文）
+            in_place_copies.append(str(dst))
+            return real_copyfile(src, dst, *a, **k)
+
+        with mock.patch.object(resumelib.os, "replace", side_effect=spy_replace), \
+                mock.patch.object(shutil, "copyfile", side_effect=spy_copyfile):
+            resumelib.create_version("母版", "第二版内容", parent_id=v1["id"])
+
+        self.assertEqual([c for c in in_place_copies
+                          if os.path.abspath(str(c)) == os.path.abspath(path)], [],
+                         "①目标只能靠**同目录换名**上场，绝不许被就地拷贝/截断写：%r" % (in_place_copies,))
+        self.assertEqual(seen, [before],
+                         "②换名前一刻目标里必须**仍是旧正文**（不是 0 字节、也不是半截）")
+        self.assertEqual(store.read_bytes(path), "第二版内容".encode("utf-8"))
+
+    def test_an_unremovable_fresh_snapshot_is_reported_honestly(self):
+        """③ 的诚实兜底：撤不掉刚写的快照时**照实说**，绝不假装撤掉了。
+
+        撤掉失败不是"静默留着"：① 一句日志（`resume.snapshot_orphan_left`）
+        ② 那句给用户看的话里明写"没有登记"（盘上那份是什么、为什么还在）。
+        """
+        v1 = resumelib.create_version("母版", "第一版内容")
+        resumelib.choose(v1["id"])
+        path = store.p_path("resumes", "母版.md")
+        snap = self._snap_path(v1["id"])
+        real_remove = os.remove
+
+        def fake_remove(p):
+            if os.path.abspath(str(p)) == os.path.abspath(snap):
+                raise PermissionError(13, "拒绝访问")
+            return real_remove(p)
+
+        with self._inject_content_write_failure(path), \
+                mock.patch.object(resumelib.os, "remove", side_effect=fake_remove):
+            with self.assertRaises(resumelib.SnapshotArchiveError) as ctx:
+                resumelib.create_version("母版", "第二版内容", parent_id=v1["id"])
+
+        sentence = str(ctx.exception)
+        self.assertIn("快照", sentence)
+        self.assertIn("没有登记", sentence, "撤不掉就必须如实说盘上留了一份没登记的快照")
+        self.assertTrue(os.path.exists(snap), "撤不掉就是撤不掉（这里如实承认它还在盘上）")
+        self.assertIn("resume.snapshot_orphan_left", _events_text(),
+                      "撤不掉这件事必须留下日志（不许静默）")
+        self.assertEqual(store.read_bytes(path), "第一版内容".encode("utf-8"),
+                         "就算快照撤不掉，正文也绝不许被写坏")
 
 
 class SnapshotArchiveFailureTest(IsolatedCase):
