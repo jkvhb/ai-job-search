@@ -1786,6 +1786,23 @@ class InterviewFeedbackTest(IsolatedCase):
         self.assertLess("乙概念", "甲概念")
 
 
+def _assert_really_non_utf8(case, raw, label=""):
+    """夹具自证：这份字节**必须真的不是 UTF-8**。
+
+    ⚠️ 这条自证是必需品，不是洁癖：ASCII 内容的 GBK 与 UTF-8 逐字节相同 ——
+    夹具里不带中文时，`encode("gbk")` 写出来的其实是一份**合法 UTF-8** 文件，
+    于是"坏库"根本不存在，整条坏库用例会在**什么都没测到**的情况下假绿
+    （2026-10-15 主线程正是栽在这上面，报了一次假警报）。
+    所以凡是要造"读不出来"的文件，先过这一关。
+    """
+    try:
+        raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return
+    case.fail("夹具没坏（这些字节能按 UTF-8 解码）：%s；GBK 夹具里必须含中文。字节=%r"
+              % (label, raw[:200]))
+
+
 class KbAbsorbNonUtf8Test(IsolatedCase):
     """GBK 写坏的库 + 一次 absorb → **用户的卡必须还在**（在被备份走的那份里）。
 
@@ -1803,6 +1820,7 @@ class KbAbsorbNonUtf8Test(IsolatedCase):
     def test_absorb_quarantines_a_non_utf8_library_instead_of_wiping_it(self):
         path = store.knowledge_path()
         raw = json.dumps({"nodes": self._cards()}, ensure_ascii=False).encode("gbk")
+        _assert_really_non_utf8(self, raw, "KbAbsorbNonUtf8Test")
         with open(path, "wb") as f:
             f.write(raw)
         node = {"id": "新概念", "term": "新概念", "definition": "d", "plain_explanation": "p",
@@ -1849,8 +1867,55 @@ def _state_of(card_id):
     return None
 
 
+def _first_diff(a, b):
+    """两段字节**第一个**不同的下标（全同返回 None）。只为把诊断串写具体。"""
+    for i, (x, y) in enumerate(zip(a, b)):
+        if x != y:
+            return i
+    return None if len(a) == len(b) else min(len(a), len(b))
+
+
+class KbQuarantineBackupByteForByteTest(IsolatedCase):
+    """P0-1 需求三：`absorb` 走 (b)「留档后写」时，`.corrupt-*` 必须是**跑之前那份文件的逐字节副本**。
+
+    为什么单独立一条（而不是靠"备份存在 + 活库能读 + 卡数对"就够）：留档是用户那 145 张卡
+    **唯一**的存身之处 —— 这次写入已经把活库换成了一份新库。留档只要不是逐字节副本，
+    哪怕只是"按文本读进来再写出去"这种看起来最无害的往返（解码失败被兜成空串 / 换行被规范化 /
+    凭空多个 BOM），用户的卡就**永久**没了，而上面那些断言**全都还是绿的**。
+    所以这条钉子必须直接比字节。
+    """
+
+    def _cards(self):
+        return [_raw_card("语音识别"), _raw_card("语音辨识", cid="yuyinshibian"),
+                _raw_card("Transformer 架构", category="模型结构")]
+
+    def test_absorb_backup_is_a_byte_for_byte_copy_of_the_file_before_the_call(self):
+        path = store.knowledge_path()
+        raw = json.dumps({"version": 1, "nodes": self._cards()},
+                         ensure_ascii=False).encode("gbk")
+        _assert_really_non_utf8(self, raw, "KbQuarantineBackupByteForByteTest")
+        with open(path, "wb") as f:
+            f.write(raw)
+        before = open(path, "rb").read()      # 「跑之前那份文件内容」——当场重读，不是复用上面那个变量
+        self.assertEqual(before, raw, "夹具前提：盘上就是这份 GBK 字节")
+
+        kb.absorb([_raw_card("新概念")], {"id": "j1", "job_title": "新岗位"})
+
+        folder = os.path.dirname(path)
+        backups = [f for f in os.listdir(folder) if ".corrupt-" in f]
+        self.assertEqual(len(backups), 1, "这次 absorb 必须正好留档一份：%r" % (backups,))
+        after = open(os.path.join(folder, backups[0]), "rb").read()
+        self.assertEqual(after, before,
+                         "留档不是逐字节副本 —— 用户的卡就永久没了：before=%d after=%d 首个不同位置=%s"
+                         % (len(before), len(after), _first_diff(before, after)))
+        # 反向：这条用例必须真的走在 (b)「留档后写」上（不然"备份恰好等于原文"是白捡的）
+        self.assertTrue(store.knowledge_safe_to_write()[0], "新库必须读得出来")
+        self.assertIn("新概念", [c.get("term") for c in store.load_knowledge()["nodes"]],
+                      "本次沉淀必须照旧生效（(b) 是'留档后写'，不是'拒绝'）")
+
+
 class KbWriteEntryPointsCorruptLibraryTest(IsolatedCase):
-    """P0-1 的**五个写入口**统一契约：库读不出来时要么**逐字节不动**，要么**留档**。
+    """P0-1 的**五个写入口**统一契约：库读不出来时要么**逐字节不动**（拒绝），要么**留档后写**。
 
     背景（报告 §2 P0-1，主线程实测）：`record_interview` 会把整库换成空库**且不留备份**
     （隔离根里把 knowledge.json 写成 GBK → 300 字节变 36 字节、卡片 0、`.corrupt-*` 0 个）。
@@ -1859,24 +1924,33 @@ class KbWriteEntryPointsCorruptLibraryTest(IsolatedCase):
 
     两个形态（每个入口必须落在其中一个上，且必须**写死在表里**）：
 
-      (a) **不写**：库读不出来就放弃这次写入，盘上的坏文件**逐字节不动**（留给用户自己修）。
-          选它的理由：这个入口在「目标卡不存在」时本来就不写盘（`set_state` / `record_review`
-          是"更新型"入口 —— 找不到卡就返回失败，绝不自作主张建卡）。库读不出来 = 找不到卡，
-          于是"不写"既是最小惊讶，也保住了坏文件（用户还能用记事本把它另存为 UTF-8）。
-      (b) **留档后写**：这个入口在"目标卡不存在"时会**建卡**（`absorb` / `upsert_check`），
-          或**无条件 save**（`record_interview` / `merge_nodes`）—— 对它来说"放弃写入"
-          等于让用户刚做完的操作静默丢失。所以它必须先 `_quarantine_corrupt_kb()` 把坏文件
-          改名留档，再往新库写。备份里逐字节保留了用户原来的卡（同 `KbAbsorbNonUtf8Test`）。
+      (a) **拒绝、连留档都不做**：库读不出来就放弃这次写入，盘上的坏文件**逐字节不动**
+          （留给用户自己修）。选它的理由见 `REFUSING_ENTRIES` 的注释（写的**就是库里那张
+          已有的卡**，而"这张卡在不在"在坏库下整个失效）。
+      (b) **留档后写**：`absorb`（沉淀用户这次分析出的知识点）与 `upsert_check`（用户刚点的勾）
+          —— 对这俩来说"放弃写入"等于让用户刚做完的操作静默丢失。所以先
+          `_quarantine_corrupt_kb()` 把坏文件逐字节改名留档，再往新库写
+          （副本逐字节性由 `KbQuarantineBackupByteForByteTest` 与下面 (b) 分支各自钉住）。
+
+    ⚠️ `record_interview` 原来是 (b)，本轮改成 **(a)**（P0-1 的后续）：它虽然"无条件 save"，
+    但写的**就是库里那些已有的卡**（asked_count / last_outcome / 降级）—— 坏库下
+    `_record_interview_in` 一张卡都命中不到、却照样 save 一份空库。结果是**这次反哺一个字都没记下**，
+    而用户 145 张卡从活库消失（只剩 `.corrupt-*`）。留档不丢字节，但用户打开界面看到"知识库 0 张卡"，
+    还得自己去找那个备份文件；拒绝则让用户修好库之后**重试这次反哺**
+    （`interview._apply_feedback` 只在真写进库之后才落 feedback 标记，专门为这一支留的）。
     """
 
     #: (说明, 调用)
-    #: ⚠️ **五个入口的形态全是 (a)「不写」** —— 这是实测出来的统一策略，不是分类懒得做：
-    #: 库读不出来时"目标卡在不在"**无从判断**（`load_knowledge()` 给的是空库），任何"按目标
-    #: 决定写不写"的设计都会在这一步退化成"找不到卡 ⇒ 不写"。所以五个入口一律不写，并且
-    #: 如实报"库读不出来"（`kb._KB_WRITE_REFUSED`）—— 盘上那个坏文件**一个字节都不动**，
-    #: 用户还能自己用记事本把它另存为 UTF-8 救回来。
-    #: 真正"留档后写"的那条路（坏库 + 目标在库里的卡仍能正常工作）由
-    #: `test_a_corrupt_library_is_quarantined_then_all_five_write` 单独覆盖。
+    #: ⚠️ 这五个入口的形态**不是**"统一策略"，而是按各自语义分两类，且**逐条写死在
+    #: `REFUSING_ENTRIES` 里**（改了哪一条、这条用例就在哪一条上红）：
+    #:   * (a) 拒绝：写的**就是库里那张已有的卡**（`set_state` / `record_review` / `merge_nodes`）
+    #:     或**读不出库就只有空库可写**（`record_interview`）。"目标卡在不在"这个判据在坏库下
+    #:     整个失效（`load_knowledge()` 给的是空库），所以一律不写、且**连隔离都不做** ——
+    #:     盘上那个坏文件**一个字节都不动**，用户还能自己用记事本把它另存为 UTF-8 救回来。
+    #:   * (b) 留档后写：`absorb` / `upsert_check` 写的是**用户这次的操作**，放弃等于静默丢失；
+    #:     所以先把坏文件逐字节留档，再往新库写。
+    #: 两类的反面（读得出来时照旧干活）由
+    #: `test_a_corrupt_library_is_quarantined_and_a_readable_one_still_writes` 覆盖。
     ENTRIES = (
         ("set_state", lambda: kb.set_state("语音识别", "已掌握")),
         ("record_review", lambda: kb.record_review("语音识别", kb.RESULT_UP)),
@@ -1898,6 +1972,7 @@ class KbWriteEntryPointsCorruptLibraryTest(IsolatedCase):
 
     def _write_gbk_kb(self, cards):
         raw = json.dumps({"version": 1, "nodes": cards}, ensure_ascii=False).encode("gbk")
+        _assert_really_non_utf8(self, raw, "KbWriteEntryPointsCorruptLibraryTest 夹具")
         with open(store.knowledge_path(), "wb") as f:
             f.write(raw)
         return raw
@@ -1926,27 +2001,39 @@ class KbWriteEntryPointsCorruptLibraryTest(IsolatedCase):
     def _kv(self, text):
         return dict(part.split("=", 1) for part in text.split() if "=" in part)
 
-    #: 写的**就是库里那张已有的卡**的三个入口（`write_when_unreadable=False`）：
-    #: 库读不出来时"有没有这张卡"无从判断 → 一律不写。另外两个（`absorb` / `upsert_check`）
-    #: 写的是**用户这次的操作**，坏文件留档后照常写（见 `kb._with_kb_write`）。
-    TARGET_ENTRIES = ("set_state", "record_review", "merge_nodes")
+    def _assert_no_backup_claim(self, msg, kv):
+        """(a) 的口子**不许声称"已留档"**：这条路上 `_quarantine_corrupt_kb()` 压根没被调用，
+        盘上没有任何 `.corrupt-*` —— 用户照着"坏文件已按 .corrupt-* 留档"去找备份只会扑空，
+        而那正是本次要修的"说的和做的不一样"。（如实说"本次没有留档"是可以的、也是有用的。）
+        """
+        self.assertNotIn(".corrupt-", str(msg), "(a) 拒绝时不该声称已按 .corrupt-* 留档 " + kv)
+
+    #: (a) **拒绝写入、连留档都不做**的四个入口（`_with_kb_write(..., write_when_unreadable=False)`）。
+    #: 前三个写的**就是库里那张已有的卡**（"这张卡在不在"在坏库下整个失效 → 判不了就不写）；
+    #: `record_interview` 虽然"无条件 save"，但坏库下它一张卡都命中不到、save 下去的只有一份空库
+    #: （用户 145 张卡从活库消失、这次反哺一个字都没记下）⇒ 同样归入"拒绝、文件逐字节不动"。
+    #: 另外两个（`absorb` / `upsert_check`）写的是**用户这次的操作**，坏文件留档后照常写
+    #: （见 `kb._with_kb_write`），所以不在这张表里。
+    REFUSING_ENTRIES = ("set_state", "record_review", "record_interview", "merge_nodes")
 
     def test_every_writer_refuses_to_wipe_a_corrupt_library(self):
-        """P0-1 的核心回归：库读不出来时，**五个写入口都不许把用户那 411 字节换成空库**。
+        """P0-1 的核心回归：库读不出来时，**五个写入口都不许把用户的 GBK 字节换成空库**。
 
         实测（报告 §2 P0-1）：`record_interview` 把 GBK 写坏的库换成 36 字节空库、`.corrupt-*`
         一个都没有。另外四个当时"数据不丢"靠的是**副作用**（读到空库 → 找不到目标卡 → 恰好
         没走到 save），不是契约 —— 这里把它钉成契约。
 
-        每个入口选 (a) 还是 (b) 及其理由（**同一入口的行为在表里钉死**）：
-          * (b) **留档后写**：`record_interview`（无条件 save）、`upsert_check`（会建卡）。
+        每个入口选 (a) 还是 (b) 及其理由（**同一入口的行为写死在表里**）：
+          * (a) **拒绝、连留档都不做**（`REFUSING_ENTRIES`）：`set_state` / `record_review` /
+            `merge_nodes` 写的**就是库里那张已有的卡**，而库读不出来时"有没有这张卡"整个
+            无从判断 —— 一次点空了的操作不该让用户的文件消失（哪怕留下了备份）；
+            `record_interview` 虽然"无条件 save"，但坏库下它一张卡都命中不到、save 下去的
+            只是一份空库（145 张卡从活库消失，而这次反哺一个字都没记下）⇒ 同样归入拒绝。
+            所以一个字节都不动（连隔离都不做），并如实报"库读不出来"（`kb._KB_WRITE_REFUSED`）。
+          * (b) **留档后写**：`absorb`（沉淀这次分析出的知识点）、`upsert_check`（用户刚点的勾）。
             这两个入口的目标不是"库里已有的某张卡"，而是"用户刚做的这次操作"；放弃写入
-            等于让用户的操作静默丢失。所以先 `_quarantine_corrupt_kb()` 把坏文件逐字节留档，
-            再往新库写（用户的 411 字节一个不少地躺在 `.corrupt-*` 里）。
-          * (a) **不写、连隔离都不做**：`set_state` / `record_review` / `merge_nodes`。
-            它们写的**就是库里那张已有的卡**，而库读不出来时"有没有这张卡"无从判断；
-            一次点空了的操作不该让用户的文件消失（哪怕留下了备份）。所以一个字节都不动，
-            并如实报"库读不出来"（`kb._KB_WRITE_REFUSED`）。
+            等于让用户的操作静默丢失。所以先 `_quarantine_corrupt_kb()` 把坏文件**逐字节**留档，
+            再往新库写（用户原来的字节一个不少地躺在 `.corrupt-*` 里）。
 
         ⚠️ fixture 那张卡的 `id` 故意 ≠ 归一化 `term`（`yuyinshibie` / 语音识别，P0-7 那种手改库），
         顺手证明两把钥匙（按 id、按归一化 term）在坏库路径上也没丢。
@@ -1967,18 +2054,25 @@ class KbWriteEntryPointsCorruptLibraryTest(IsolatedCase):
                 after = open(store.knowledge_path(), "rb").read()
                 kv = "entry=%s before=%d after=%d backups=%d result=%r" % (
                     name, len(before), len(after), len(self._backups()), result)
-                if name in self.TARGET_ENTRIES:
-                    # (a) 不写：坏文件逐字节不动，连备份都不做
+                if name in self.REFUSING_ENTRIES:
+                    # (a) 拒绝：坏文件逐字节不动，连备份都不做
                     self.assertEqual(after, before, "坏库被动过 " + kv)
-                    self.assertEqual(self._backups(), [], "没目标卡的调用不该隔离用户文件 " + kv)
+                    self.assertEqual(self._backups(), [], "拒绝写入的调用不该隔离用户文件 " + kv)
                     if name == "set_state":
                         self.assertFalse(result[0], "读不出库却报告成功 " + kv)
                         self.assertIn("读", result[1], "没如实说清原因 " + kv)
+                        self._assert_no_backup_claim(result[1], kv)
                     elif name == "record_review":
                         self.assertEqual(result, (False, None), "外形不对 " + kv)
+                    elif name == "record_interview":
+                        # `(0, 0, 0)` 是**合法结果**（这次面试一个知识点都没提到），调用方
+                        # 没法拿它区分"写成了"与"压根没写" ⇒ 没写时必须是 None（interview.py 靠它
+                        # 决定不落 feedback 标记、好让用户修好库之后能重试这次反哺）
+                        self.assertIsNone(result, "必须返回那个'没写'信号 None " + kv)
                     else:                               # merge_nodes
                         self.assertFalse(result[0], "读不出库却报告成功 " + kv)
                         self.assertIn("读", result[1], "没如实说清原因 " + kv)
+                        self._assert_no_backup_claim(result[1], kv)
                 else:
                     # (b) 留档后写：坏文件被整体改名，备份逐字节等于原文
                     backups = self._backups()
@@ -1988,25 +2082,25 @@ class KbWriteEntryPointsCorruptLibraryTest(IsolatedCase):
                                      "备份不是逐字节原文 " + kv)
                     # 新库必须读得出来（不然"留档"就只是把用户的库改名走）
                     self.assertTrue(store.knowledge_safe_to_write()[0], "新库读不出来 " + kv)
-                    if name == "record_interview":
-                        # 库里已没有那张卡（读不出来 → 空库），所以这次命中 0 个：
-                        # **绝不自动建卡**是本函数的既有契约
-                        self.assertEqual(result, (0, 0, 0), kv)
-                        self.assertEqual(store.load_knowledge()["nodes"], [], kv)
-                    else:                               # upsert_check
-                        self.assertEqual(result[0], True, kv)
-                        self.assertEqual(result[1], True, "应当新建那张卡 " + kv)
-                        self.assertEqual([c.get("id") for c in store.load_knowledge()["nodes"]],
-                                         ["语音识别"], kv)
+                    # 只剩 `upsert_check` 还留在这条 (b) 支上
+                    self.assertEqual(result[0], True, kv)
+                    self.assertEqual(result[1], True, "应当新建那张卡 " + kv)
+                    self.assertEqual([c.get("id") for c in store.load_knowledge()["nodes"]],
+                                     ["语音识别"], kv)
                 # 收尾：把临时根还回去，免得下一个入口/下一条用例接着往这里写
                 mock.patch.stopall()
 
     def test_a_failed_quarantine_refuses_all_five_writes_and_keeps_the_file(self):
         """**哨兵自己失败**时（改名失败：磁盘满 / 文件被占用）：五个入口一个字节都不许写。
 
-        这是 `_with_kb_write` 里 `if not _quarantine_corrupt_kb(): return False, _KB_WRITE_REFUSED`
+        这是 `_with_kb_write` 里 `if not _quarantine_corrupt_kb(): return False, _KB_BACKUP_FAILED`
         那条路。没有这条用例的话，"哨兵返回 False 时照样继续写"这个变异可以让其它用例全绿 ——
         那正是 P0-1 事故本身（坏文件留不住档时，内存里的空库照样写下去）。
+
+        ⚠️ 四个 (a) 入口（`REFUSING_ENTRIES`）在**哨兵之前**就返回了，所以对它们来说这个
+        mock 其实是空转 —— 但它们仍然必须给出可分辨的"没写"信号，这一半断言照旧有效
+        （顺带证明：哨兵挂了也不会让 (a) 入口改口说"写成了"）。真正走到这里的只有
+        (b) 的 `upsert_check`。
         """
         for name, call in self.ENTRIES:
             with self.subTest(entry=name):
@@ -2023,10 +2117,11 @@ class KbWriteEntryPointsCorruptLibraryTest(IsolatedCase):
                 # ① 坏文件必须原样留着（既不改名、也不被空库顶掉）
                 self.assertEqual(open(path, "rb").read(), before, "哨兵失败却动了盘 " + kv)
                 self.assertEqual(self._backups(), [], "哨兵失败了还留下了备份 " + kv)
-                # ② 五个入口都必须让调用方看得出"没写"
+                # ② 五个入口都必须让调用方看得出"没写"，并且不许声称"已留档"（这次确实没有）
                 if name == "set_state":
                     self.assertFalse(result[0], "哨兵失败却报告成功 " + kv)
                     self.assertIn("读", result[1], "没如实说清原因是'库读不出来' " + kv)
+                    self._assert_no_backup_claim(result[1], kv)
                 elif name == "record_review":
                     self.assertEqual(result, (False, None), "外形不对 " + kv)
                 elif name == "record_interview":
@@ -2036,6 +2131,7 @@ class KbWriteEntryPointsCorruptLibraryTest(IsolatedCase):
                 else:                                   # merge_nodes
                     self.assertFalse(result[0], "哨兵失败却报告成功 " + kv)
                     self.assertIn("读", result[1], "没如实说清原因是'库读不出来' " + kv)
+                    self._assert_no_backup_claim(result[1], kv)
                 mock.patch.stopall()
 
     def test_a_corrupt_library_is_quarantined_and_a_readable_one_still_writes(self):

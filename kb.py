@@ -335,7 +335,15 @@ def _quarantine_corrupt_kb():
     return True
 
 
-_KB_WRITE_REFUSED = "知识库读不出来，本次没有写入（坏文件已按 .corrupt-* 留档，先修好库再操作）"
+_KB_WRITE_REFUSED = ("知识库读不出来，本次没有写入（文件原样未动、本次也没有留档；"
+                     "先修好库再操作）")
+
+#: **留档自己失败**（改名失败：磁盘满 / 文件被占用）时用这句。
+#: 不能与上面那句混用：那句说的是"我们**决定**不碰你的文件、所以没有 `.corrupt-*`"，
+#: 这句说的是"我们**试着**留档但没成功" —— 两件事、用户要做的动作也不同（一个去修库，
+#: 一个还要腾磁盘）。混用会让用户照着"已按 .corrupt-* 留档"去找一份并不存在的备份。
+_KB_BACKUP_FAILED = ("知识库读不出来，坏文件留档也失败，本次没有写入（文件原样未动；"
+                     "先修好库、腾出磁盘再操作）")
 
 
 def _with_kb_write(fn, refuse_when=None, write_when_unreadable=True):
@@ -344,11 +352,13 @@ def _with_kb_write(fn, refuse_when=None, write_when_unreadable=True):
     `fn(data)` 返回调用方要的返回值。
     `refuse_when(data) -> str | None` 是可选的**入参守卫**，返回非空字符串 = "这次没什么可写的"
     （如"找不到该知识点"）。`write_when_unreadable=False` 表示这个入口在**库读不出来时一律不写**
-    （`set_state` / `record_review` / `merge_nodes`：它们写的**就是库里那张已有的卡**）。
+    （`set_state` / `record_review` / `merge_nodes`：它们写的**就是库里那张已有的卡**；
+    `record_interview` 同理 —— 它虽然无条件 save，但坏库下 save 下去的只是一份空库，
+    见该函数 docstring）。
 
     返回 `(是否真的调用过 fn, fn 的返回值或守卫给的原因)`：
 
-      * `(False, 守卫给的原因 / _KB_WRITE_REFUSED)` —— 没写。
+      * `(False, 守卫给的原因 / _KB_WRITE_REFUSED / _KB_BACKUP_FAILED)` —— 没写。
       * `(True, result)` —— fn 跑过了；库读不出来时坏文件已先被改名留档（这次写入不丢用户的卡）。
 
     **为什么必须抽出来（P0-1）**：`absorb` 早就接了哨兵，而另外五个写入口各写各的样板。
@@ -363,9 +373,14 @@ def _with_kb_write(fn, refuse_when=None, write_when_unreadable=True):
       * 写的**就是库里那张已有的卡**（`write_when_unreadable=False`）：目标无从判断，就不写。
         一次点空了的调用不该让用户的文件消失（哪怕留下备份）。如实报 `_KB_WRITE_REFUSED`，
         调用方/界面就能说"库读不出来，先去修库" —— 比"静默干了半件事"有用得多。
-      * 写的是**用户这次的操作**（`absorb` 的沉淀、`upsert_check` 的勾、`record_interview`
-        的反哺）：坏文件先逐字节留档，然后照常写新库。放弃写入等于让用户刚做完的操作静默丢失，
-        而留档之后"用户的卡会被空库顶掉"这件事已经不成立了（P0-1 的修法正是这个）。
+        `record_interview` 也归这一类：它无条件 save，但坏库下**一张卡都命中不到**、
+        save 下去的只是一份空库 ⇒ 这次反哺一个字没记下、用户的卡还从活库消失了
+        （2026-10-15 的修正，见该函数 docstring）。
+      * 写的是**用户这次的操作**（`absorb` 的沉淀、`upsert_check` 的勾）：坏文件先逐字节留档，
+        然后照常写新库。放弃写入等于让用户刚做完的操作静默丢失，而留档之后"用户的卡会被空库
+        顶掉"这件事已经不成立了（P0-1 的修法正是这个）。
+        （这两个调用方目前都把留档失败的那句话**吞掉**，各报自己的外形：`absorb` → `(0, 0)`、
+        `upsert_check` → `(False, False, None)`；`_KB_BACKUP_FAILED` 因此只出现在日志里。）
 
     **守卫的位置**：
       * 库**读得出来** → 先问守卫（这是 `absorb` 那条"零可吸收节点先返回"的一般化）：
@@ -388,9 +403,14 @@ def _with_kb_write(fn, refuse_when=None, write_when_unreadable=True):
             log.log_event("kb.write_refused", level="warn", reason="corrupt_kb_unreadable")
             return False, _KB_WRITE_REFUSED
         if not _quarantine_corrupt_kb():
-            # 坏文件留档失败：宁可这次不沉淀，也绝不能让用户的卡被内存里的空库顶掉
+            # 坏文件留档失败：宁可这次不沉淀，也绝不能让用户的卡被内存里的空库顶掉。
+            # 用 `_KB_BACKUP_FAILED`（"试着留档但没成功"）而不是 `_KB_WRITE_REFUSED`
+            # （"决定不碰你的文件、所以没有 .corrupt-*"）—— 两句说的事不一样。
+            # 注意：`write_when_unreadable=False` 的四个入口走不到这里（库读不出来时上面
+            # 那行已经返回了；库读得出来时 `_quarantine_corrupt_kb()` 只会返回 True），
+            # 所以这句话目前只出现在日志里（两个 (b) 调用方各自吞掉它、报自己的外形）。
             log.log_event("kb.write_refused", level="warn", reason="corrupt_backup_failed")
-            return False, _KB_WRITE_REFUSED
+            return False, _KB_BACKUP_FAILED
         return True, fn(ensure_kb(store.load_knowledge()))
 
 
@@ -660,17 +680,29 @@ def record_interview(jd_id, asked=None, weak=None, good=None):
     —— 保证降级不会被后续写回覆盖掉。
     **找不到的术语直接忽略，绝不自动建卡**（新词由用户在复盘报告里手动加入）。
 
-    ⚠️ **本函数无条件 save** —— 它是 P0-1 唯一真正丢数据的那条路（实测：GBK 写坏的库
-    300 字节 → 36 字节、用户卡全没、`.corrupt-*` 一个都没有）。现在整段走
-    `_with_kb_write`：坏库先留档再写。
+    ⚠️ **库读不出来时拒绝写入、连留档都不做**（`write_when_unreadable=False`）：
+    盘上那个坏文件**逐字节不动**，本函数返回 `None`。
 
-    **库读不出来且留档失败时返回 `None`**（不是 `(0, 0, 0)`）：`(0, 0, 0)` 是**合法结果**
+    **为什么是 (a) 拒绝，而不是像 `absorb` / `upsert_check` 那样 (b) 留档后写**：本函数写的
+    **就是库里那些已有的卡**（asked_count / last_outcome / 降级），而库读不出来时"哪张卡被问过"
+    整个无从判断 —— `load_knowledge()` 给的是空库，`_record_interview_in` 于是一张卡都命中不到，
+    却照样走到 `store.save_knowledge(data)`（本函数无条件 save）：**这次反哺一个字都没记下**，
+    而用户的 145 张卡从**活库**消失（只在 `.corrupt-*` 里）。留档没丢字节，但用户打开界面看到的是
+    "知识库 0 张卡"，还得自己去找那份备份文件 —— 纯亏。拒绝则让用户修好库之后**重试这次反哺**。
+
+    （2026-10-15 修正：本函数原先是 (b)，`_with_kb_write` 的 docstring 里那套"写的是用户这次
+    的操作 ⇒ 留档后写"的分类对它并不成立 —— 它写的是库里已有的卡，只是恰好无条件 save。）
+
+    **库读不出来时返回 `None`**（不是 `(0, 0, 0)`）：`(0, 0, 0)` 是**合法结果**
     （这次面试一个知识点都没提到），调用方没法拿它区分"写成了"与"压根没写"。
     `interview._apply_feedback` 依赖这个区分：它只在**真写进库之后**才落 feedback 标记，
     否则那次反哺永远补不回来（标记已落盘、重试会被幂等挡掉）。
+
+    哨兵与 load→save 这段整体由 `_with_kb_write` 承担（P0-1：五个写入口共用同一条闸门）。
     """
     invoked, result = _with_kb_write(
-        lambda data: _record_interview_in(data, jd_id, asked, weak, good))
+        lambda data: _record_interview_in(data, jd_id, asked, weak, good),
+        write_when_unreadable=False)
     if not invoked:
         return None                      # 没写：调用方必须能分辨，绝不能报一个假 (0, 0, 0)
     return result
@@ -723,10 +755,20 @@ def upsert_check(term, state, meta=None):
     为什么要自动建卡：报告里的勾是**用户已经做出的判断**。概念在知识库里还没有卡时
     直接拒绝，勾就丢了（正是「关掉程序勾就没了」的复发）。宁可多一张卡，也不能丢用户的勾。
 
-    ⚠️ **建卡那一支会无条件 save** —— 与 `record_interview` 同一个坑：库读不出来时
-    内存里的空库会把用户的整库顶掉。整段走 `_with_kb_write`，坏库先留档。
+    ⚠️ **库读不出来时走的是 (b)「留档后写」，不是 (a)「拒绝」**（`_with_kb_write` 的默认
+    `write_when_unreadable=True`）：先 `_quarantine_corrupt_kb()` 把坏文件**逐字节**改名成
+    `.corrupt-*`，再把用户这个勾写进新库。
 
-    库读不出来且留档失败时返回 `(False, False, None)`：与"术语不合法 / state 不合法"
+    **为什么选 (b)**（而不是像 `set_state` / `merge_nodes` 那样一个字节都不动）：本函数写的
+    是**用户这次的操作**（刚点下的那个勾），不是"库里已有的某张卡"。选 (a) 也有一条站得住的
+    理由 —— 库读不出来时"目标卡在不在"这个判据整个失效，而且**报告里的勾可以在用户修好库
+    之后重新点一次**（勾还在报告页上，重不重试由用户决定）；但项目的既有取舍是
+    **绝不丢掉用户刚做完的操作**：留档之后"用户的卡被空库顶掉"这件事已经不成立了
+    （那些字节一个不少地躺在 `.corrupt-*` 里），所以宁可留档后写。
+    （`absorb` 同属这一类；`record_interview` 原本也在这里，2026-10-15 改成了 (a) ——
+    它写的其实是"库里那些已有的卡"，坏库下 save 下去的只是一份空库，见该函数 docstring。）
+
+    库读不出来**且留档也失败**时返回 `(False, False, None)`：与"术语不合法 / state 不合法"
     同一个外形，调用方（路由）本来就把 ok=False 当"这次没勾上"处理。
 
     load → 改 → save 整段进 _with_kb_write：与 absorb / set_state 同类，无锁并发会丢更新。
@@ -846,12 +888,16 @@ def merge_nodes(keep_id, drop_id):
     作答结果，选错方向（把已掌握的并进待学习的）不该静默丢掉复习进度。这与 _merge_into 的
     「只保 keep 进度」并不矛盾 —— 那条铁律守的是「AI 新节点不许覆盖你的进度」，这里两边都是你。
 
-    ⚠️ **本函数无条件 save** —— 与 `record_interview` 同一个坑（P0-1）：整段走 `_with_kb_write`。
+    ⚠️ **两张卡都在时本函数一定会 save**（没有别的出口）—— P0-1 盯的就是这种形状：
+    save 之前必须有闸门。整段走 `_with_kb_write`，而它属于 **(a) 拒绝**那一类
+    （`write_when_unreadable=False`）：库读不出来时连哨兵都到不了，盘上一个字节不动。
 
     两张卡缺一张时（含"库读不出来 ⇒ 读成空库"）**连隔离都不做**，原样返回
-    "找不到要合并的知识点"、盘上一个字节不动（`refuse_when`）。留档也失败时返回
-    `(False, _KB_WRITE_REFUSED)`：调用方（路由）本来就按 ok=False 如实回报，
+    "找不到要合并的知识点"、盘上一个字节不动（`refuse_when`）。库读不出来时由
+    `write_when_unreadable=False` 那条提前返回 `(False, _KB_WRITE_REFUSED)`
+    （"文件原样未动、本次也没有留档"）：调用方（路由）本来就按 ok=False 如实回报，
     这句 msg 还会说清是"库读不出来"，用户据此知道该去修库、而不是去核对卡片。
+    本入口到不了"留档失败"那一支 —— 库读不出来时它已经提前返回，库读得出来时哨兵只会返回 True。
     """
     keep_id, drop_id = normalize_id(keep_id), normalize_id(drop_id)
     if not keep_id or not drop_id:
