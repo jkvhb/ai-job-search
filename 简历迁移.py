@@ -134,13 +134,16 @@ def _doc_state():
 
     「**有内容但解析不出来**」→ 直接中止（同 `身份迁移._build_knowledge` 那条铁律）：
     拿一份空库顶掉用户手改坏的文件，就是**静默丢数据**。
-    ⚠️ "有没有内容"必须问 `store.content_bytes_present()`（**看原始字节**）——
+    ⚠️ "有没有内容"必须问 `store.file_has_bytes_to_lose()`（**看原始字节，且只认 0 字节**）——
     老写法用 `store.read_text(path, "").strip()`，而非 UTF-8 文件解码会失败并被兜成空串，
     于是"有内容但读不出来"被误判成"空文件"，迁移照跑、把用户记录顶掉。
+    中途换成 `content_bytes_present()` 也只修了一半：它按 `strip()` 判"有没有可见内容"，
+    于是一个只有 `b"\r\n   \r\n"` 的版本库仍被判成"空" ⇒ 迁移照跑、写一份空库上去（P0-6）。
+    现在只有"不存在"或"真的是 0 字节"才算没东西可丢。
     """
     path = store.p_path(resumelib.RESUMES_FILE)
     raw = store.read_json(path, None)
-    if raw is None and store.content_bytes_present(path):
+    if raw is None and store.file_has_bytes_to_lose(path):
         raise RuntimeError("resumes.json 有内容但解析失败：已放弃本次迁移，"
                            "绝不把它写成空库（先修好或移开这个文件再跑）")
     if not isinstance(raw, dict):

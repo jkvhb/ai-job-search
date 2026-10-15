@@ -25,6 +25,20 @@ DEFAULT_CONFIG = {
 CATEGORIES = ["数据标注/质检", "AI数据运营", "标注管理", "AI产品经理", "AI训练师", "其他"]
 STATUSES = ["未投递", "已投", "待回复", "面试中", "已拒", "Offer", "放弃"]
 
+# 覆盖前留档的命名后缀（与 `jobdup.BACKUP_SUFFIX` 同一风格；`_quarantine_report_state` 用的是
+# `.corrupt-<时间戳>`，那个语义是"读不出来的坏文件先挪走"，与"留一份覆盖前的样子"不同）。
+BACKUP_SUFFIX = ".bak-"
+
+
+class ProfileUnreadable(RuntimeError):
+    """`current_profile.txt` **存在却读不出来** —— 绝不能静默退回 default。
+
+    为什么是这个类型：全仓库「前置条件不满足就中止」用的是 `RuntimeError`
+    （`jddelete._readable_jobs_or_raise`、`简历迁移._doc_state`、app 的各个路由），
+    继承它能让既有兜底接住并**如实回话**（例如 `简历迁移.main()` 会印成一行错误而不是 traceback）；
+    独立的子类让调用方与测试能精确区分「档名读不出来」这一种，不必靠文案匹配。
+    """
+
 
 # ---------- profile ----------
 def profiles_root():
@@ -49,20 +63,58 @@ def ensure_profile(key=None):
 
 
 def current_profile():
+    """当前 profile 的档名。**文件不存在 → `"default"`**；**存在却读不出来 → 抛错**。
+
+    ⚠️ 为什么不能再是 `except Exception: return "default"`：那会把两件**相反**的事混成
+    同一个信号 —— "文件不存在"（合法的第一次）与"文件存在却有字节读不出来"
+    （记事本按 ANSI/GBK 存过中文档名、磁盘/IO 错误、权限问题）。后者意味着：
+    用户以为自己在"张三"下面工作，而**之后每一次写入都落进 default**
+    （`p_path()` 是靠本函数解析目录的），界面上完全看不出来，而且**不可逆**——
+    新写的分析/配置/知识都已经进了另一个档，事后无法分辨哪些是串过去的。
+
+    所以这里只认两种情形：读得出来（用它的值）、文件真的不存在（→ default）。
+    其余一律响亮失败（`ProfileUnreadable`），让用户先去修那个文件；宁可这次不启动，
+    也不静默把用户的东西写进另一个人的档里。
+    """
+    fp = current_profile_file()
     try:
-        with open(current_profile_file(), "r", encoding="utf-8") as f:
+        with open(fp, "r", encoding="utf-8") as f:
             return f.read().strip() or "default"
-    except Exception:
+    except FileNotFoundError:
         return "default"
+    except Exception as e:
+        raise ProfileUnreadable(
+            "档名文件 `%s` **存在但读不出来**：%s\n"
+            "**已拒绝**静默回退到 default —— 那会让之后的每一次写入串到另一个档，且不可逆。"
+            "请先把它修好（内容应当是一行 UTF-8 的档名），或者删掉它（删掉 = 回到 default）。"
+            % (fp, e))
 
 
 def set_current_profile(key=None):
+    """切换当前 profile 的档名，**原子写**。
+
+    ⚠️ 为什么必须是原子写：老写法 `open(fp, "w")` 会**立刻**把原文件截断成 0 字节，之后才写
+    新档名。这中间任何一次读（另一条线程、另一个进程、或进程恰好在这里崩掉/断电）拿到的都是
+    空文件 —— 而空文件按约定等于 `default`，用户就被**静默**换档了，正是本文件要防的那件事。
+    先写同目录临时文件再 `os.replace`（同目录 = 同文件系统 = 原子），失败时删掉临时文件、抛错。
+    """
     k = (key or "").strip() or "default"
     ensure_profile(k)
     fp = current_profile_file()
-    os.makedirs(os.path.dirname(fp), exist_ok=True)
-    with open(fp, "w", encoding="utf-8") as f:
-        f.write(k)
+    d = os.path.dirname(fp)
+    os.makedirs(d, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".tmp-profile-", suffix=".txt", dir=d)
+    os.close(fd)
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(k)
+        os.replace(tmp, fp)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
     return k
 
 
@@ -178,7 +230,61 @@ def load_config(key=None):
 
 
 def save_config(cfg, key=None):
-    write_json(config_path(key), cfg)
+    """写配置。**读不出来时拒绝**（理由见 `config_safe_to_write`），覆盖前留一份 `.bak-`。"""
+    p = config_path(key)
+    ok, err = config_safe_to_write(p)
+    if not ok:
+        raise RuntimeError(
+            "%s。**拒绝保存设置**：`load_config()` 读不出来时回的是默认配置"
+            "（`api_key` 为空、`search_providers` 为空），它**看起来就是「没配过」的样子** ——"
+            "写下去就是真的 API Key 与搜索来源永久消失，盘上没有任何副本。"
+            "请先把 `config.json` 修好（或从别处恢复、把它移开）再保存。" % err)
+    snapshot_before_overwrite(p)
+    write_json(p, cfg)
+
+
+def read_config_strict(path=None):
+    """读配置，**区分"读不出来"与"没有"**：返回 `(配置, 原因)`，原因非空 = 不可信。
+
+    形状照 `read_knowledge_strict` 抄 —— "读不出来 ≠ 没有"这条口径只准有一份实现，
+    只是这里的"有"是"含 api_key / search_providers 的对象"。
+    """
+    p = path or config_path()
+    if not os.path.exists(p):
+        return {}, ""
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        # 文件名必须插值：本函数是通用判据（调用方可以传别的 path），写死会让用户去修错文件。
+        return {}, "配置 `%s` 读不出来：%s" % (os.path.basename(p), e)
+    if not isinstance(data, dict):
+        return {}, "配置 `%s` 的结构不对（应当是含 text_model / search_providers 的对象）" % (
+            os.path.basename(p),)
+    return data, ""
+
+
+def config_safe_to_write(path=None):
+    """`config.json` 当前是否可以**安全写盘**？返回 `(可写, 原因)`。
+
+    可写 = **读得出来**，**或者**文件里根本没有一个字节（不存在 / 真的是 0 字节）。
+    其余（有字节、却读不出来）→ 不可写：调用方必须**拒绝**这次保存。
+
+    为什么必须有它：`load_config()` 在任何读/解析失败时都回 `DEFAULT_CONFIG`，
+    而那份默认值看起来**就是"没配过"的样子**（`api_key=''`、`search_providers=[]`）：
+    用户手改坏了 `config.json`（或记事本按 ANSI 存成了 GBK），界面上一切正常，
+    点一次"保存设置"就把真的 API Key 与搜索来源**永久**抹掉了 —— 不可恢复、没有任何副本。
+
+    与 `read_config_strict` 的分工同知识库：那个回答"读得出来吗"，这个回答"写上去会不会丢东西"
+    （0 字节的文件读不出来，但写上去不丢任何东西，是合法的"第一次"）。
+    """
+    p = path or config_path()
+    _data, err = read_config_strict(p)
+    if not err:
+        return True, ""
+    if not file_has_bytes_to_lose(p):
+        return True, ""
+    return False, err
 
 
 # ---------- jobs（岗位台账）----------
@@ -191,11 +297,79 @@ def load_jobs(key=None):
     return d if isinstance(d, list) else []
 
 
+def read_jobs_strict(path=None):
+    """读台账，**区分"读不出来"与"没有"**：返回 `(记录列表, 原因)`，原因非空 = 不可信。
+
+    形状照 `read_knowledge_strict` 抄（"读不出来 ≠ 没有"这条口径只准有一份实现）。
+    必须有它，是因为 `load_jobs()` 在任何读/解析失败时都回 `[]`，
+    而 `[]` 与"真的没有台账"无法区分 —— 调用方一旦把它写回去就是**整份台账被清空**。
+
+    `jddelete` 早就有自己的 `_jobs_or_error()`（只保护它那条删除路径）；
+    这条收归到 store 之后，四个写者（app / jddelete / jdid / jobdup）才共用同一把尺子。
+
+    **只读**：不隔离、不改名、不写盘。
+    """
+    p = path or jobs_path()
+    if not os.path.exists(p):
+        return [], ""
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        return [], "台账 `%s` 读不出来：%s" % (os.path.basename(p), e)
+    if not isinstance(data, list):
+        return [], "台账 `%s` 的结构不对（应当是一个列表）" % (os.path.basename(p),)
+    return data, ""
+
+
+def jobs_safe_to_write(path=None):
+    """`jobs.json` 当前是否可以**安全写盘**？返回 `(可写, 原因)`。
+
+    可写 = **读得出来**，**或者**文件里根本没有一个字节（不存在 / 真的是 0 字节）。
+    其余（有字节、却读不出来）→ 不可写。
+
+    为什么必须有它：`upsert_job` 是分析记录写盘的**唯一真出口**（`app.py` 的 `/api/analyze`
+    与结果面板、`outcome.py` 都走它），而它的第一步 `load_jobs()` 在读/解析失败时回 `[]`
+    —— 于是"一次读失败"就等于"整份台账被那一条新记录顶掉"：所有岗位的分析记录一次性消失，
+    报告文件还在盘上，但台账与界面上再也看不到这份刚花过模型额度跑出来的分析。
+    触发条件是现实的：用户手改 JSON、非 UTF-8 保存（本项目已栽过一次 GBK）、
+    杀毒软件短暂锁文件、磁盘/IO 错误。
+
+    ⚠️ 判据必须问**严格读**，**不能**看 `load_jobs()` 的返回值 ——
+    那正是把"读不出来"和"空台账"混成同一个信号的根源。
+    """
+    p = path or jobs_path()
+    _data, err = read_jobs_strict(p)
+    if not err:
+        return True, ""
+    if not file_has_bytes_to_lose(p):
+        return True, ""          # 不存在 / 真的是 0 字节：合法的"第一次"
+    return False, err
+
+
 def save_jobs(jobs, key=None):
-    write_json(jobs_path(key), jobs)
+    """写台账。**读不出来时拒绝**（理由见 `jobs_safe_to_write`），覆盖前留一份 `.bak-`。"""
+    p = jobs_path(key)
+    ok, err = jobs_safe_to_write(p)
+    if not ok:
+        raise RuntimeError(
+            "%s。**拒绝写入**：`save_jobs` / `upsert_job` 是**整份覆盖**，而现在内存里那份是从"
+            "读不出来的文件兜出来的空台账 —— 写下去就是所有岗位的分析记录一次性没掉。"
+            "请先把 `jobs.json` 修好（或从别处恢复、把它移开）再保存。" % err)
+    snapshot_before_overwrite(p)
+    write_json(p, jobs)
 
 
 def upsert_job(record, key=None):
+    p = jobs_path(key)
+    # ⚠️ 先判"能不能写"再读：读不出来时 `load_jobs()` 给的是 `[]`，
+    # 拿它去 upsert 就是把整份台账换成这一条（老行为，实测丢过）。
+    ok, err = jobs_safe_to_write(p)
+    if not ok:
+        raise RuntimeError(
+            "%s。**拒绝写入**：这次 upsert 会把整份台账覆盖成「这一条 + 读出来的空列表」，"
+            "旧记录会在盘上消失且没有副本。请先把 `jobs.json` 修好"
+            "（或从别处恢复、把它移开）再分析。" % err)
     jobs = load_jobs(key)
     for i, j in enumerate(jobs):
         if j.get("id") == record.get("id"):
@@ -260,8 +434,10 @@ def content_bytes_present(path):
     于是"有内容但读不出来"被误判成"空文件，没有可丢的数据"。
     实测过：GBK 的 `knowledge.json` 会被内存里的空库顶掉，用户的卡全没。
 
-    **它是公开的**：现在有两个调用方（知识库 `knowledge_safe_to_write`、简历版本库
-    `简历迁移._doc_state`），这条易错的规则必须只有一份实现。
+    **它是公开的**：其余调用方是勾选状态的隔离（`_quarantine_report_state`，那里判的是
+    "值不值得造一份备份"）、简历版本库（`resumelib`）与 app 的两道简历闸。
+    ⚠️ **写盘判据不要用它**（P0-6 之后改用 `file_has_bytes_to_lose`）：纯空白文件在它这里
+    算"没有可丢的内容"，于是"有字节却解析不出"会被判成可写、被内存里的空结构顶掉。
     """
     try:
         with open(path, "rb") as f:
@@ -274,22 +450,74 @@ def content_bytes_present(path):
         return True
 
 
+def file_has_bytes_to_lose(path):
+    """这个文件里**有没有一个字节**可以丢？（**写盘判据**专用，P0-6）
+
+    与 `content_bytes_present()` 的分工（两个判据都在，**别混用**）：
+      - `content_bytes_present()` 回答"有没有**可见内容**"（`strip()` 之后还有东西吗）。
+        它按自己的语义是对的、且有测试钉着 —— **不要改它**；
+        `_quarantine_report_state()` 那种"几个勾、不值得为它挡掉写入"的场景继续用它。
+      - 本函数回答"盘上有没有**一个字节**"，是写盘判据：一个只有 `b"\\r\\n   \\r\\n"` 的文件
+        **不是 0 字节** —— 它可能是用户手写的、别的工具写坏的、或将来还能救回来的东西。
+        "解析不出"不等于"没有可丢的内容"；把两者混起来，用户的知识库/版本库就会被空结构顶掉。
+
+    只有"**不存在**"或"**真的是 0 字节**"才算没东西可丢。
+    **存在但打不开**（权限/被锁）→ 当成"有"（fail-safe）：把"不知道"当成"安全"就是丢数据的习惯。
+    """
+    try:
+        return os.path.getsize(path) > 0
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+
+
+def snapshot_before_overwrite(path):
+    """覆盖前留档：文件**存在且真的有字节** → 复制成同目录 `<path>.bak-<时间戳>`，返回备份路径。
+
+    为什么要它：`save_jobs` / `save_config` 都是**整份覆盖**。读不出来时上面两道守卫已经拒绝
+    写入了，但**读得出来也可能把东西写没**（用户手改过的字段被一次保存抹平、代码 bug、
+    把"加载失败兜出来的默认值"当数据写回）—— 覆盖前的那一份是事后唯一能救回来的东西。
+
+    命名沿用仓库既有风格（`jobdup.BACKUP_SUFFIX = ".bak-"`）；时间戳带微秒
+    （`%f`）—— 秒级粒度下同一秒内的两次覆盖会互相盖掉备份（`_quarantine_report_state` 同理）。
+    按**原始字节**复制（`read_bytes` / `write_bytes`）：`read_text` 会把非 UTF-8 文件兜成空串、
+    `write_text` 在 Windows 上还会把 LF 换成 CRLF，那样留下的就不是"覆盖前那一份"了。
+
+    判据是"**真的有字节**"而不是"有可见内容"：纯空白的老台账也是花过钱的分析留下的痕迹。
+
+    文件不存在 / 0 字节 → 返回 `None`（合法的第一次，没有旧内容可留）。
+    备份**失败就抛**：调用方本来就在写盘路径上，悄悄少一份留档正是
+    "以为有兜底、其实没有"那类假安全感（同一目录写不出字节时，紧随其后的写盘多半也会失败，
+    早抛比晚抛更清楚）。
+    """
+    if not file_has_bytes_to_lose(path):
+        return None
+    backup = "%s%s%s" % (path, BACKUP_SUFFIX, datetime.now().strftime("%Y%m%d%H%M%S%f"))
+    write_bytes(backup, read_bytes(path) or b"")
+    return backup
+
+
 def knowledge_safe_to_write(path=None):
     """知识库当前是否可以**安全写盘**？返回 `(可写, 原因)`。
 
-    可写 = **读得出来**，**或者**文件里根本没有可丢的内容（不存在 / 0 字节 / 纯空白）。
-    其余（有字节、却读不出来）→ 不可写：调用方必须先备份或放弃本次写盘，
+    可写 = **读得出来**，**或者**文件里根本没有一个字节（不存在 / 真的是 0 字节）。
+    其余（有字节、却读不出来，**含纯空白**）→ 不可写：调用方必须先备份或放弃本次写盘，
     **绝不能**把内存里那份（`load_knowledge()` 给的 `{"nodes": []}`）写回去。
 
     这是「读不出来 ≠ 空」这条规则**唯一**的实现（`kb` / `jobdup` / `身份迁移` 都用它）。
     注意它与 `read_knowledge_strict` 的分工不同：那个回答"读得出来吗"，
     这个回答"写上去会不会丢东西" —— 0 字节的文件读不出来，但写上去不丢任何东西。
+
+    ⚠️ P0-6：判据从 `content_bytes_present()` 收紧成 `file_has_bytes_to_lose()`。
+    老判据对 `b"\\r\\n   \\r\\n"` 这种"有字节但 strip 之后为空"的文件判"没有可丢的内容" ⇒ 可写，
+    于是它会被内存里的空库顶掉（实测）。字节意义上它不是空的 —— 那就不能当成"没什么可丢"。
     """
     p = path or knowledge_path()
     _data, err = read_knowledge_strict(p)
     if not err:
         return True, ""
-    if not content_bytes_present(p):
+    if not file_has_bytes_to_lose(p):
         return True, ""
     return False, err
 

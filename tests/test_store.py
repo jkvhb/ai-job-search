@@ -187,7 +187,11 @@ class ReadKnowledgeStrictTest(IsolatedCase):
 
 
 class KnowledgeSafeToWriteTest(IsolatedCase):
-    """`(可写, 原因)` 的六种情形 —— 「读不出来 ≠ 空」这条规则**唯一**的写盘判据。"""
+    """`(可写, 原因)` 的各种情形 —— 「读不出来 ≠ 空」这条规则**唯一**的写盘判据。
+
+    P0-6 之后判据是「**不存在 或 真的是 0 字节**才算没东西可丢」：纯空白文件（有字节、
+    却解析不出）从 safe 翻成了 not safe（见下面那条用例的 docstring）。
+    """
 
     def _write(self, blob):
         with open(store.knowledge_path(), "wb") as f:
@@ -200,14 +204,29 @@ class KnowledgeSafeToWriteTest(IsolatedCase):
         store.save_knowledge({"nodes": [{"id": "a", "term": "A"}]})
         self.assertEqual(store.knowledge_safe_to_write(), (True, ""))
 
-    def test_an_empty_or_whitespace_only_file_is_safe(self):
-        """没有**字节**可丢 → 可以写（0 字节 / 纯空白**不是**损坏，别为它造垃圾备份）。"""
-        for blob in (b"", b"   \n  ", b"\r\n"):
+    def test_a_zero_byte_file_is_still_safe(self):
+        """0 字节 = 合法的"第一次"：没有可丢的内容，别为它造垃圾备份。"""
+        self._write(b"")
+        self.assertEqual(store.knowledge_safe_to_write(), (True, ""))
+
+    def test_a_whitespace_only_file_is_no_longer_safe(self):
+        """**这两条断言是从 safe 翻成 not safe 的（体检报告 P0-6），翻是对的。**
+
+        老判据借的是 `content_bytes_present()`（"`strip()` 之后还有东西吗"），于是
+        `b"\\r\\n   \\r\\n"` 被判成"没有可丢的内容" ⇒ 可写 ⇒ 被内存里的 `{"nodes": []}` 顶掉。
+        字节语义上它确实没有可见内容，但它**不是 0 字节**：可能是用户手写坏的、别的工具写坏的、
+        或将来还能救回来的东西。写盘判据因此收紧成"**不存在 或 真的是 0 字节**"才算没东西可丢。
+
+        （`content_bytes_present()` 本体的语义**没有变**、钉它的测试也没动 —— 它回答的是
+        "有没有可见内容"，那对 `_quarantine_report_state` 那种"几个勾不值得挡住写入"的场景
+        仍然是对的。两个判据分工不同，见 `FileHasBytesToLoseTest`。）
+        """
+        for blob in (b"   \n  ", b"\r\n", b"\r\n   \r\n"):
             with self.subTest(blob=blob):
                 self._write(blob)
                 ok, err = store.knowledge_safe_to_write()
-                self.assertTrue(ok, "空文件不该被当成损坏：%r" % (blob,))
-                self.assertEqual(err, "")
+                self.assertFalse(ok, "有字节却解析不出（含纯空白）→ 绝不可写盘：%r" % (blob,))
+                self.assertIn("knowledge.json", err)
 
     def test_a_truncated_json_file_is_not_safe(self):
         self._write(b'{"nodes": [ <<<CORRUPT>>>')
@@ -395,6 +414,335 @@ class ContentBytesPresentUnreadableTest(IsolatedCase):
         with mock.patch("builtins.open", fake_open):
             self.assertTrue(store.content_bytes_present(path),
                             "读不出来不等于没有内容 —— 不许把'不知道'当成'安全'")
+
+
+class FileHasBytesToLoseTest(IsolatedCase):
+    """`file_has_bytes_to_lose()` —— P0-6 收紧之后的**写盘**判据。
+
+    它和 `content_bytes_present()` 是**两个分工不同的判据**，混用就是丢数据那条路：
+      - `content_bytes_present()`：有没有**可见内容**（`strip()` 之后还有东西吗）；
+      - `file_has_bytes_to_lose()`：盘上有没有**一个字节**（本函数）。
+    写盘判据只能用后者：一个只有 `b"\\r\\n   \\r\\n"` 的文件不是 0 字节。
+    """
+
+    def _write(self, blob, name="probe.json"):
+        path = os.path.join(store.profile_dir(), name)
+        with open(path, "wb") as f:
+            f.write(blob)
+        return path
+
+    def test_a_missing_file_has_nothing_to_lose(self):
+        self.assertFalse(store.file_has_bytes_to_lose(
+            os.path.join(store.profile_dir(), "没有这个文件")))
+
+    def test_a_zero_byte_file_has_nothing_to_lose(self):
+        self.assertFalse(store.file_has_bytes_to_lose(self._write(b"")))
+
+    def test_a_whitespace_only_file_still_has_bytes_to_lose(self):
+        """**这条就是 P0-6 的全部理由**：纯空白不是 0 字节 → 写盘判据必须拦住。"""
+        for blob in (b"   \n  ", b"\r\n", b"\r\n   \r\n"):
+            with self.subTest(blob=blob):
+                self.assertTrue(store.file_has_bytes_to_lose(self._write(blob)))
+
+    def test_a_non_utf8_file_has_bytes_to_lose(self):
+        self.assertTrue(store.file_has_bytes_to_lose(self._write("中文".encode("gbk"))))
+
+
+class JobsSafeToWriteTest(IsolatedCase):
+    """`jobs_safe_to_write()` —— 台账的写盘判据（体检报告 P0-2）。
+
+    为什么必须有它：`load_jobs()` 在**任何**读/解析失败时都返回 `[]`，而 `upsert_job` 是
+    分析记录写盘的**唯一真出口** —— 于是"一次读失败"就等于"整份台账被那一条新记录顶掉"，
+    旧记录一条不剩、盘上也没有副本。判据必须问**严格读**，不能看 `load_jobs()` 的返回值
+    （那正是把"读不出来"和"空台账"混成同一个信号的根源）。
+    """
+
+    def _write(self, blob):
+        path = store.jobs_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(blob)
+        return path
+
+    def test_a_missing_ledger_is_safe(self):
+        self.assertEqual(store.jobs_safe_to_write(), (True, ""))
+
+    def test_a_valid_ledger_is_safe(self):
+        store.save_jobs([{"id": "a", "score": 80}])
+        self.assertEqual(store.jobs_safe_to_write(), (True, ""))
+
+    def test_a_zero_byte_ledger_is_safe(self):
+        """0 字节 = 合法的"第一次"，没有可丢的内容。"""
+        self._write(b"")
+        self.assertEqual(store.jobs_safe_to_write(), (True, ""))
+
+    def test_a_non_utf8_ledger_is_not_safe(self):
+        self._write(json.dumps([{"id": "语音标注", "score": 80}], ensure_ascii=False).encode("gbk"))
+        ok, err = store.jobs_safe_to_write()
+        self.assertFalse(ok, "有字节却读不出来 → 绝不能写盘")
+        self.assertIn("jobs.json", err)
+
+    def test_a_truncated_ledger_is_not_safe(self):
+        self._write(b'[{"id": "a"}, <<<CORRUPT>>>')
+        self.assertFalse(store.jobs_safe_to_write()[0])
+
+    def test_a_wrong_shape_ledger_is_not_safe(self):
+        self._write(b'{"id": "a"}')          # 合法 JSON，但不是列表 → 台账结构不对
+        self.assertFalse(store.jobs_safe_to_write()[0])
+
+    def test_a_whitespace_only_ledger_is_not_safe(self):
+        self._write(b"\r\n   \r\n")
+        self.assertFalse(store.jobs_safe_to_write()[0])
+
+    def test_it_does_not_write_anything(self):
+        bad = b'[{"id": "a"}, <<<CORRUPT>>>'
+        path = self._write(bad)
+        folder = os.path.dirname(path)
+        before = sorted(os.listdir(folder))
+        store.jobs_safe_to_write()
+        with open(path, "rb") as f:
+            self.assertEqual(f.read(), bad, "只读：坏台账原样留原路径")
+        self.assertEqual(sorted(os.listdir(folder)), before, "只读：不许多写/改名任何文件")
+
+
+class UpsertJobRefusesUnreadableLedgerTest(IsolatedCase):
+    """P0-2 的核心断言：**读不出来的台账，一个字节都不许动**。
+
+    老行为：`upsert_job` → `load_jobs()` 兜成 `[]` → `save_jobs([那条新记录])` ——
+    整份台账被 1 条记录覆盖，旧记录在盘上再无痕迹。
+    """
+
+    def _gbk_ledger(self):
+        path = store.jobs_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        raw = json.dumps(
+            [{"id": "20261008_语音文本评测_72分", "score": 72.0, "resume": "周汉钦-母版"},
+             {"id": "20261003_语音文本评测_75分", "score": 75.0, "resume": "周汉钦-母版"}],
+            ensure_ascii=False).encode("gbk")
+        with open(path, "wb") as f:
+            f.write(raw)
+        return path, raw
+
+    def test_a_gbk_ledger_refuses_the_write_and_keeps_every_byte(self):
+        path, raw = self._gbk_ledger()
+        folder = os.path.dirname(path)
+        before = sorted(os.listdir(folder))
+        with self.assertRaises(RuntimeError) as cm:
+            store.upsert_job({"id": "刚跑完的分析", "score": 88.0})
+        self.assertIn("jobs.json", str(cm.exception))
+        with open(path, "rb") as f:
+            self.assertEqual(f.read(), raw, "拒绝写盘时台账必须逐字节未变")
+        self.assertEqual(len(json.loads(raw.decode("gbk"))), 2, "夹具里真有 2 条记录，别做成空台账假绿")
+        with open(path, "rb") as f:
+            self.assertEqual(len(json.loads(f.read().decode("gbk"))), 2,
+                             "不许被那一条新记录顶掉（「没有多出半条」）")
+        self.assertEqual(sorted(os.listdir(folder)), before,
+                         "守卫先于留档：连 .bak- 都不该多出来")
+
+    def test_save_jobs_also_refuses(self):
+        """`save_jobs` 是四个阵营共用的出口（app / jddelete / jdid / jobdup），必须自己拦。"""
+        path, raw = self._gbk_ledger()
+        with self.assertRaises(RuntimeError):
+            store.save_jobs([{"id": "整个台账被顶掉"}])
+        with open(path, "rb") as f:
+            self.assertEqual(f.read(), raw)
+
+    def test_a_missing_ledger_is_created(self):
+        self.assertIsNone(store.find_job("新分析"))
+        store.upsert_job({"id": "新分析", "score": 88.0})
+        self.assertEqual([j["id"] for j in store.load_jobs()], ["新分析"])
+
+    def test_a_zero_byte_ledger_is_created(self):
+        path = store.jobs_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(b"")
+        store.upsert_job({"id": "新分析", "score": 88.0})
+        self.assertEqual([j["id"] for j in store.load_jobs()], ["新分析"])
+        self.assertEqual(glob.glob(path + ".bak-*"), [], "0 字节没有可留的旧内容")
+
+
+class SaveJobsBackupTest(IsolatedCase):
+    """覆盖前留档（P0-2 要求 3）：`.bak-<时间戳>`，内容 = **覆盖前那一份**（逐字节）。"""
+
+    def test_overwriting_a_ledger_with_content_keeps_a_timestamped_backup(self):
+        store.save_jobs([{"id": "旧记录", "score": 60.0}])
+        old = store.read_bytes(store.jobs_path())
+        store.save_jobs([{"id": "新记录", "score": 90.0}])
+
+        backups = glob.glob(store.jobs_path() + ".bak-*")
+        self.assertEqual(len(backups), 1, "覆盖有内容的台账必须留下一份 .bak-<时间戳>")
+        self.assertEqual(store.read_bytes(backups[0]), old, "备份必须逐字节等于覆盖前那一份")
+        self.assertEqual([j["id"] for j in store.load_jobs()], ["新记录"])
+
+    def test_the_first_write_leaves_no_backup(self):
+        self.assertEqual(glob.glob(store.jobs_path() + ".bak-*"), [])
+        store.save_jobs([{"id": "第一条"}])
+        self.assertEqual(glob.glob(store.jobs_path() + ".bak-*"), [],
+                         "第一次写没有旧内容可留，别造垃圾备份")
+
+
+class ConfigSafeToWriteTest(IsolatedCase):
+    """`config_safe_to_write()` —— 体检报告 P0-4。
+
+    `load_config()` 读不出来时回的是 `DEFAULT_CONFIG`（`api_key=''`、`search_providers=[]`），
+    而那**看起来就是"没配过"的样子**：用户点一次"保存设置"就把真的 API Key 与搜索源
+    永久抹掉了，盘上没有任何副本。
+    """
+
+    def _write(self, blob):
+        path = store.config_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(blob)
+        return path
+
+    def test_a_missing_config_is_safe(self):
+        self.assertEqual(store.config_safe_to_write(), (True, ""))
+
+    def test_a_valid_config_is_safe(self):
+        store.save_config({"text_model": {"api_key": "sk-x"}})
+        self.assertEqual(store.config_safe_to_write(), (True, ""))
+
+    def test_a_zero_byte_config_is_safe(self):
+        self._write(b"")
+        self.assertEqual(store.config_safe_to_write(), (True, ""))
+
+    def test_a_non_utf8_config_is_not_safe(self):
+        self._write(json.dumps({"text_model": {"api_key": "sk-真钥匙"}},
+                               ensure_ascii=False).encode("gbk"))
+        ok, err = store.config_safe_to_write()
+        self.assertFalse(ok, "有字节却读不出来 → 绝不能写盘")
+        self.assertIn("config.json", err)
+
+    def test_a_truncated_config_is_not_safe(self):
+        self._write(b'{"text_model": { <<<CORRUPT>>>')
+        self.assertFalse(store.config_safe_to_write()[0])
+
+    def test_a_wrong_shape_config_is_not_safe(self):
+        self._write('["不是对象"]'.encode("utf-8"))
+        self.assertFalse(store.config_safe_to_write()[0])
+
+    def test_a_whitespace_only_config_is_not_safe(self):
+        self._write(b"\r\n   \r\n")
+        self.assertFalse(store.config_safe_to_write()[0])
+
+
+class SaveConfigRefusesUnreadableConfigTest(IsolatedCase):
+    """P0-4 的核心断言：GBK 的 `config.json` → `save_config(load_config())` 必须拒绝。"""
+
+    def _gbk_config(self):
+        path = store.config_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        raw = json.dumps({"text_model": {"api_key": "sk-真钥匙", "model": "deepseek-flash"},
+                          "search_providers": [{"name": "某个搜索源", "key": "k-1"}]},
+                         ensure_ascii=False).encode("gbk")
+        with open(path, "wb") as f:
+            f.write(raw)
+        return path, raw
+
+    def test_a_gbk_config_refuses_the_save_and_keeps_every_byte(self):
+        path, raw = self._gbk_config()
+        with self.assertRaises(RuntimeError) as cm:
+            store.save_config(store.load_config())       # 正是"点一次保存设置"那条路
+        self.assertIn("config.json", str(cm.exception))
+        with open(path, "rb") as f:
+            self.assertEqual(f.read(), raw, "拒绝写盘时配置必须逐字节未变")
+        self.assertIn("sk-真钥匙", raw.decode("gbk"), "夹具里真有钥匙，别做成空配置假绿")
+        self.assertEqual(glob.glob(path + ".bak-*"), [], "守卫先于留档：连 .bak- 都不该多出来")
+
+    def test_a_missing_config_is_written(self):
+        self.assertFalse(os.path.exists(store.config_path()))
+        store.save_config({"text_model": {"api_key": "sk-新的"}})
+        self.assertEqual(store.load_config()["text_model"]["api_key"], "sk-新的")
+
+    def test_a_zero_byte_config_is_written(self):
+        path = store.config_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(b"")
+        store.save_config({"text_model": {"api_key": "sk-新的"}})
+        self.assertEqual(store.load_config()["text_model"]["api_key"], "sk-新的")
+        self.assertEqual(glob.glob(path + ".bak-*"), [], "0 字节没有可留的旧内容")
+
+
+class SaveConfigBackupTest(IsolatedCase):
+    def test_overwriting_a_config_with_content_keeps_a_timestamped_backup(self):
+        store.save_config({"text_model": {"api_key": "sk-旧钥匙"}})
+        old = store.read_bytes(store.config_path())
+        store.save_config({"text_model": {"api_key": "sk-新钥匙"}})
+
+        backups = glob.glob(store.config_path() + ".bak-*")
+        self.assertEqual(len(backups), 1, "覆盖有内容的配置必须留下一份 .bak-<时间戳>")
+        self.assertEqual(store.read_bytes(backups[0]), old)
+        self.assertIn("sk-旧钥匙", store.read_bytes(backups[0]).decode("utf-8"))
+
+
+class CurrentProfileUnreadableTest(IsolatedCase):
+    """P0-3：`current_profile.txt` **存在却读不出来**时，绝不静默退回 default。
+
+    老实现 `except Exception: return "default"` 把两件相反的事混成一个信号：
+      - 文件不存在 → default（合法，保持不变）；
+      - 文件存在却有字节读不出来（记事本按 ANSI/GBK 存了中文档名、磁盘错误）→ 也 default。
+    后者意味着：用户以为在"张三"下工作，**之后每一次写入都进 default**，
+    界面上完全看不出来，而且**不可逆**（新记录已经落进另一个档）。
+    """
+
+    def test_a_gbk_profile_file_does_not_silently_fall_back_to_default(self):
+        path = store.current_profile_file()
+        with open(path, "wb") as f:
+            f.write("张三".encode("gbk"))
+
+        with self.assertRaises(RuntimeError) as cm:
+            store.current_profile()
+        self.assertIn("current_profile.txt", str(cm.exception))
+        # 真正的杀伤面在 p_path()：它是所有写盘路径的入口，必须一起响亮失败，
+        # 而不是把这次写入静默挪到 default 档去。
+        with self.assertRaises(RuntimeError):
+            store.p_path("jobs.json")
+        with open(path, "rb") as f:
+            self.assertEqual(f.read(), "张三".encode("gbk"), "只读：坏档名文件一个字节都不许动")
+
+    def test_a_missing_file_is_still_default(self):
+        os.remove(store.current_profile_file())
+        self.assertEqual(store.current_profile(), "default")
+
+    def test_a_blank_file_is_still_default(self):
+        with open(store.current_profile_file(), "w", encoding="utf-8") as f:
+            f.write("   \n")
+        self.assertEqual(store.current_profile(), "default")
+
+
+class SetCurrentProfileAtomicTest(IsolatedCase):
+    """P0-3 要求 3：`set_current_profile` 必须**原子写**。
+
+    老实现是"先 `open(fp, "w")` 把文件截断成 0 字节、再写"：写一半崩掉（或另一条线程 /
+    另一个进程正好在这时读）看到的就是空文件，而空文件按约定等于 default ——
+    用户被**静默**换档，正是这条需求要防的那件事。
+    """
+
+    def test_a_failed_replace_keeps_the_old_content(self):
+        store.set_current_profile("dave")
+        path = store.current_profile_file()
+
+        with mock.patch.object(store.os, "replace", side_effect=OSError("拒绝访问")):
+            with self.assertRaises(OSError):
+                store.set_current_profile("erin")
+
+        with open(path, "rb") as f:
+            self.assertEqual(f.read(), b"dave",
+                             "写失败时旧档名必须原样还在（老实现这里会是 b'' → 静默变 default）")
+        self.assertEqual(store.current_profile(), "dave")
+        self.assertEqual(glob.glob(os.path.join(os.path.dirname(path), ".tmp*")), [],
+                         "写失败不留临时文件")
+
+    def test_a_successful_switch_writes_exactly_the_new_key(self):
+        store.set_current_profile("张三")
+        self.assertEqual(store.current_profile(), "张三")
+        with open(store.current_profile_file(), "rb") as f:
+            self.assertEqual(f.read(), "张三".encode("utf-8"), "原子写完，文件里没有半截旧值")
+        self.assertEqual(glob.glob(os.path.join(os.path.dirname(store.current_profile_file()),
+                                                ".tmp*")), [], "写完不留临时文件")
 
 
 if __name__ == "__main__":

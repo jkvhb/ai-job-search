@@ -565,6 +565,22 @@ class NonUtf8ResumesDocTest(MigrationCase):
         self.assertTrue(json.loads(store.read_text(path, "{}"))["resumes"],
                         "空文件 + 盘上有简历 → 应当正常登记出记录")
 
+    def test_a_whitespace_only_resumes_doc_is_treated_as_corrupt(self):
+        """P0-6：`b"\\r\\n   \\r\\n"` **不是** 0 字节 → 不许当成"没什么可丢"再写一份空库上去。
+
+        老判据走 `store.content_bytes_present()`（"`strip()` 之后还有东西吗"），纯空白文件
+        被判成"空文件" → 迁移照跑、把空的版本库写回去。写盘判据收紧成
+        "不存在 **或** 真的是 0 字节"才算没东西可丢（0 字节那条见上一个用例，仍然放行）。
+        """
+        path = store.p_path("resumes.json")
+        raw = b"\r\n   \r\n"
+        with open(path, "wb") as f:
+            f.write(raw)
+        code, _out, err = self.run_cli(["--执行"])
+        self.assertNotEqual(code, 0, "有字节却解析不出 → 必须非零退出，不能假装成功")
+        self.assertIn("有内容但解析失败", err)
+        self.assertEqual(self.disk_bytes(path), raw, "中止时一个字节都不许动")
+
 
 if __name__ == "__main__":
     unittest.main()
