@@ -11,6 +11,7 @@
 **断言粒度刻意收紧**（本项目已累计 11+ 次假绿）：ID 字符串一律**逐字比全文**；
 「重复被拒」与「改名被拒」**同时**断言「返回了错误说明」且「库里的东西一个字节没动」。
 """
+import json
 import os
 import unittest
 from unittest import mock
@@ -642,6 +643,98 @@ class RenameJdTest(IsolatedCase):
         self.assertEqual([x["id"] for x in frm], [self.NEW])
         self.assertEqual(frm[0]["job_title"], "新")   # 保留本来就在的那一条
 
+
+    # ---------- P0-8：知识库**读不出来**时拒绝整次改名（判据与 `jobdup._repoint_kb` 同一份） ----------
+    def _break_knowledge_base_non_utf8(self):
+        """把 `knowledge.json` 写成一个**真的非 UTF-8**（GBK，含中文）的坏文件，返回那串字节。
+
+        ⚠️ 夹具**必须含中文**：纯 ASCII 的 GBK 与 UTF-8 逐字节相同，那就不是坏文件，
+        `knowledge_safe_to_write()` 会判"读得出来" → 这条测试**假绿**（本项目 11+ 次假绿的常见形态）。
+        所以下面先自证：它解不出 UTF-8、但解得出 GBK（内容真的在里面）。
+        """
+        raw = json.dumps({"version": 1, "nodes": [
+            {"id": "yuyinshibie", "term": "语音识别",
+             "from_jds": [{"id": self.OLD, "job_title": "旧岗位"}]}]},
+            ensure_ascii=False).encode("gbk")
+        try:
+            raw.decode("utf-8")
+            raise AssertionError("夹具没坏：这串字节居然能按 UTF-8 解出来")
+        except UnicodeDecodeError:
+            pass
+        self.assertIn("语音识别", raw.decode("gbk"))          # 自证：内容确实在里面
+        with open(store.knowledge_path(), "wb") as f:
+            f.write(raw)
+        return raw
+
+    def test_an_unreadable_knowledge_base_refuses_the_rename_and_changes_nothing(self):
+        """P0-8：知识库**有内容但读不出来** → 拒绝整次改名，别处的引用一个字节都不许动。
+
+        老行为：`load_knowledge()` 把坏文件静默归成 `{"nodes": []}` → `_repoint_kb` 命中 0 →
+        `if kb_touched:` 为假 → **一字不写**，而 `rename_jd` 照样成功返回。
+        于是"没有卡引用它"与"库读不出来"**不可区分**：jds.json / 台账 / 面试记录都改指了新 ID，
+        知识库里那些卡的 `from_jds` 仍指向旧 ID —— 用户把库修好的那一刻，同一个岗位成了两种身份。
+        """
+        self._fixture()
+        raw_kb = self._break_knowledge_base_non_utf8()
+        jds_before = store.read_bytes(store.p_path("jds.json"))
+        jobs_before = store.read_bytes(store.jobs_path())
+        iv_before = store.read_bytes(store.interview_file("iv1", "status.json"))
+        with self.assertRaises(RuntimeError) as cm:
+            jdid.rename_jd(self.OLD, self.NEW)
+        msg = str(cm.exception)
+        self.assertIn("知识库", msg)                      # 说清坏在哪
+        self.assertIn("拒绝", msg)                        # 说清这次改名没做
+        # 逐字节比：不是"读回来看看"，而是四个文件全是原样
+        self.assertEqual(store.read_bytes(store.p_path("jds.json")), jds_before)
+        self.assertEqual(store.read_bytes(store.jobs_path()), jobs_before)
+        self.assertEqual(store.read_bytes(store.interview_file("iv1", "status.json")), iv_before)
+        self.assertEqual(store.read_bytes(store.knowledge_path()), raw_kb)
+        # 半成品状态也不许有：旧 ID 还在、新 ID 没有凭空出现
+        self.assertIsNotNone(jdid.find_jd(self.OLD))
+        self.assertIsNone(jdid.find_jd(self.NEW))
+        self.assertEqual(store.load_jobs()[0]["jd_id"], self.OLD)
+
+    def test_a_wrong_shaped_knowledge_base_also_refuses(self):
+        """有字节、JSON 也合法但**结构不对**（`[]`）→ 同样拒绝：里面可能正躺着那些引用。"""
+        self._fixture()
+        with open(store.knowledge_path(), "wb") as f:
+            f.write(b"[]")
+        with self.assertRaises(RuntimeError):
+            jdid.rename_jd(self.OLD, self.NEW)
+        self.assertEqual(jdid.load_jds()["jds"][0]["id"], self.OLD)     # 库没动
+
+    def test_a_readable_knowledge_base_keeps_the_existing_behaviour(self):
+        """对照组（P0-8）：库**读得出来** → 闸门不许改变既有行为，卡上的引用要改指新 ID。"""
+        self._fixture()
+        before = store.load_knowledge()["nodes"]
+        self.assertEqual([x["id"] for n in before for x in n["from_jds"]], [self.OLD])
+        self.assertEqual(jdid.rename_jd(self.OLD, self.NEW), self.NEW)
+        frm = store.load_knowledge()["nodes"][0]["from_jds"]
+        self.assertEqual([x["id"] for x in frm], [self.NEW])
+        self.assertEqual(store.load_jobs()[0]["jd_id"], self.NEW)
+        self.assertEqual(store.load_interview_json("iv1", "status.json")["job_id"], self.NEW)
+
+    def test_a_missing_knowledge_base_is_not_a_reason_to_refuse(self):
+        """闸门不许**误伤**：没有 knowledge.json → 照改（"读不出来 **或** 根本没有一个字节"才可写）。
+
+        这条与上面那条是一对：判据必须是「读得出来 或 0 字节」，不是"文件不存在才算空"
+        也不是"非空就拒绝" —— 少了它，把判据写成 `os.path.exists()` 之类的实现也会绿。
+        """
+        jdid.upsert_jd({"id": self.OLD, "seq": 1, "company": ""})
+        store.upsert_job({"id": "a1", "jd_id": self.OLD, "resume": "母版",
+                          "score": 75.0, "report": "a1.html"})
+        self.assertFalse(os.path.exists(store.knowledge_path()))
+        self.assertEqual(jdid.rename_jd(self.OLD, self.NEW), self.NEW)
+        self.assertEqual(store.load_jobs()[0]["jd_id"], self.NEW)
+        self.assertFalse(os.path.exists(store.knowledge_path()))    # 没卡提到它 → 一个字节都不写
+
+    def test_a_zero_byte_knowledge_base_is_not_a_reason_to_refuse(self):
+        """0 字节的 `knowledge.json` 是合法的"第一次"（没有可丢的字节）→ 照改。"""
+        self._fixture()
+        with open(store.knowledge_path(), "wb") as f:
+            f.write(b"")
+        self.assertEqual(jdid.rename_jd(self.OLD, self.NEW), self.NEW)
+        self.assertEqual(jdid.load_jds()["jds"][0]["id"], self.NEW)
 
     def test_a_read_failure_at_snapshot_time_leaves_the_bytes_untouched(self):
         """快照时刻**读不出来**（被锁/权限）→ 整体中止，`jds.json` 一个字节都不许动。

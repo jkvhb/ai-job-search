@@ -647,6 +647,14 @@ def rename_jd(old_id, new_id, key=None):
 
     先在内存里算完全部改动、校验通过后**逐文件落盘**；中途任一步抛错就用内存里的原像
     把已写的文件回滚（先 jds.json 后知识库），绝不留「jds 改了、引用没改」的半改状态。
+
+    **知识库读不出来时拒绝整次改名**（`RuntimeError`）：判据是 `store.knowledge_safe_to_write()`
+    —— 与 `jobdup._repoint_kb` 用的是**同一份**（"读不出来 ≠ 空"只有一个实现）。为什么必须拒绝：
+    `load_knowledge()` 会把坏文件静默归成 `{"nodes": []}`，于是"没有卡引用它"与"库读不出来"
+    **不可区分**，照改就会留下「jds.json 指向新 ID、知识库里的引用仍指向旧 ID」的两种身份
+    （回归测试 `tests/test_jdid.py::RenameJdTest::test_an_unreadable_knowledge_base_refuses_the_rename_and_changes_nothing`）。
+    0 字节 / 根本不存在的知识库**不算**读不出来（那是合法的"第一次"，没有可丢的字节）。
+
     **原像按原始字节保存**：**读不出来**（被锁 / 权限 / 任何异常）绝不能被当成"本来不存在"、
     更不许被兜成空内容 —— 回滚会反过来把用户的文件写成 `{}`（回归测试见
     `tests/test_jdid.py::RenameJdTest::test_a_read_failure_at_snapshot_time_leaves_the_bytes_untouched`）；
@@ -679,6 +687,22 @@ def rename_jd(old_id, new_id, key=None):
 
         # 锁顺序恒为 _JD_LOCK → _KB_LOCK（见文件头铁律 3）
         with kb._KB_LOCK:
+            # ---- P0-8：动手之前先确认知识库**读得出来**（闸门与 `jobdup._repoint_kb` 同一判据）----
+            # 不装这道闸门的后果（本块修的就是它）：`load_knowledge()` 把坏文件静默归成
+            # `{"nodes": []}` → `_repoint_kb` 命中 0 → `if kb_touched:` 为假 → **一字不写**，
+            # 而本函数照样成功返回 —— 于是 jds.json / 台账 / 面试记录都改指新 ID，
+            # 知识库里那些卡的 `from_jds` 仍指向旧 ID（同一个岗位两种身份，用户修好库的那一刻就看得见）。
+            # 这是"会串档"里最隐蔽的一条：**"没有卡引用它"与"库读不出来"不可区分**。
+            # 判据只准有一份（`store.knowledge_safe_to_write`）：读得出来 **或** 真的没有一个字节
+            # 才放行；0 字节 / 不存在是合法的"第一次"，不算读不出来。
+            kb_ok, kb_reason = store.knowledge_safe_to_write(store.knowledge_path(key))
+            if not kb_ok:
+                msg = ("%s。**已拒绝这次改 ID**：读不出来就无法确认哪些卡引用了 %s，"
+                       "改完会留下「jds.json 指向新 ID、知识库里的引用还指向旧 ID」的两种身份。"
+                       "这次改名一个字节都没动 —— 请先把知识库修好（或从别处恢复）再改。"
+                       % (kb_reason, old))
+                log.log_event("jdid.rename_rejected", level="warn", reason=msg, old=old, new=new)
+                raise RuntimeError(msg)
             kb_data = store.load_knowledge(key)
             jobs = store.load_jobs(key)
             paths = _interview_status_paths(old)
