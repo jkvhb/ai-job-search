@@ -272,16 +272,14 @@ class AnalyzeKnowledgeCacheTest(_AnalyzeCase):
         self.assertEqual(meta2["source"], "cache")
         self.assertNotIn("at", meta2,
                          "生产把非字符串的 knowledge_at 送进了报告（模板守卫形同虚设）：%r" % (meta2,))
-        if NODE:      # 没有 Node 的机器上跳过渲染那半句（口径断言上面已经钉过）
-            got = _know_meta_text(self._data_of(r2))
-            # 阶段 E 之后这一行还会追加一句「本次没有重跑「库优先」」（`kb_reuse.not_run`），
-            # 所以这里断言**那半句真话还在**，而不是整行等于它。
-            self.assertIn("📚 知识地图：复用该岗位已缓存的那份（本次没有重新搜索）", got,
-                          "`5` 被当成日期显示出来了（说了不真实的话）：%r" % (got,))
-            self.assertNotIn("生成的那份", got,
-                             "`at` 不可用时不能编一句「X 生成的那份」：%r" % (got,))
-        else:
-            print("  [skip] 本机没有 Node，跳过 `at` 的渲染断言")
+        need_node()   # 缺 Node → 红（1.10③）：这半句渲染断言原先被 `if NODE:` 静默跳过
+        got = _know_meta_text(self._data_of(r2))
+        # 阶段 E 之后这一行还会追加一句「本次没有重跑「库优先」」（`kb_reuse.not_run`），
+        # 所以这里断言**那半句真话还在**，而不是整行等于它。
+        self.assertIn("📚 知识地图：复用该岗位已缓存的那份（本次没有重新搜索）", got,
+                      "`5` 被当成日期显示出来了（说了不真实的话）：%r" % (got,))
+        self.assertNotIn("生成的那份", got,
+                         "`at` 不可用时不能编一句「X 生成的那份」：%r" % (got,))
 
     def test_seeding_from_the_jds_own_report_does_not_call_the_builder(self):
         """该 JD 已有报告里有知识地图 → 免费播种，builder **0 次**，source == seeded:<报告id>。
@@ -760,6 +758,29 @@ class AnalyzeConcurrentKnowledgeTest(_AnalyzeCase):
 # ---------------------------------------------------------------- 模板：Node 探针
 NODE = shutil.which("node")
 
+#: 缺 Node 时这**一批**前端断言的覆盖面（供失败信息说清代价，别让人以为只是少跑一条）。
+_NODE_LOSS = ("这两条用例的渲染断言（三种 source 的文案 + 缺失时不显示 + 模板里 `at` "
+              "不可用时的半句）会静默消失 —— 报告模板标注那一批就没有任何断言了")
+
+
+def need_node():
+    """缺 Node **响亮失败**，绝不静默跳过（1.10③）。
+
+    为什么改成红：原先这里（以及本模块 :275 那处内联 `if NODE:`、`test_app.py` 的
+    `_need_node`）在缺 Node 的机器上把整批「真跑页面 JS」的断言变成 `SkipTest` / 直接不执行 ——
+    全量测试照样打印 OK，而**报告模板标注那一批根本没有被断言过**。那种绿是假绿：
+    改动模板的 JS 不会红，测试不再保护它。缺环境就该是红的，并且要能一眼看出缺什么、
+    丢了哪些覆盖（Node 是开发机依赖：装一次即可，不是"这条测试不稳定"）。
+    """
+    if NODE is None:
+        raise AssertionError(
+            "本环境缺 Node：`node` 不在 PATH 上，这批「真跑 web/ 模板 JS」的前端断言不能静默跳过。\n"
+            "  · 丢掉的覆盖：%s\n"
+            "  · 修法：装 Node 并确保 `node` 在 PATH 上（`node --version` 能跑）后重跑本批。\n"
+            "  · 若确实要在无 Node 的环境跑：**不要**把它改回 skip —— 那等于把这条不变量删掉；"
+            "请显式说明这次没验前端，并让 CI 在有 Node 的机器上跑这一批。"
+            % _NODE_LOSS)
+
 # 探针：真跑模板里的 JS（最小 DOM 垫片），只回 `#main` 的 innerHTML，调用方再从里面取
 # **那一个元素**（#knowMeta）的文本。
 #
@@ -885,11 +906,14 @@ def _render_page(data):
     return html
 
 
-@unittest.skipUnless(NODE, "本机没有 Node，跳过模板那一行的渲染探针")
 class KnowledgeMetaTemplateTest(IsolatedCase):
     """模板那一行：三种 source 的文案 + 缺失/垃圾时不显示 + `esc()` 生效。"""
 
     TERM = "语音识别"
+
+    def setUp(self):
+        super().setUp()
+        need_node()          # 缺 Node → 红（理由见 `need_node`），**不**静默跳过
 
     def _html(self, meta):
         return _know_meta_text(self._data(meta))
@@ -974,7 +998,6 @@ class KnowledgeMetaTemplateTest(IsolatedCase):
                 self.assertNotIn("生成的那份", got)
 
 
-@unittest.skipUnless(NODE, "本机没有 Node，跳过模板渲染探针")
 class KbReuseTemplateTest(IsolatedCase):
     """阶段 E 的报告标注（spec §8）：顶部汇总（①跑过/②没跑/③库坏了）+ 卡片逐条出处（④）。
 
@@ -982,6 +1005,10 @@ class KbReuseTemplateTest(IsolatedCase):
     与「跑了、库是空的（复用 0 条）」是**两件不同的事**，报告里必须分得出来。
     口径同 `_know_meta_text` / `_kreuse_text`：只断言**那个元素自己的文本**。
     """
+
+    def setUp(self):
+        super().setUp()
+        need_node()          # 缺 Node → 红（理由见 `need_node`），**不**静默跳过
 
     def _data(self, meta=None, node_extra=None):
         node = {"id": "n1", "term": "语音识别", "definition": "d", "layer": 0,

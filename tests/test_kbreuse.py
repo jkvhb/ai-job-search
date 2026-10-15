@@ -293,34 +293,6 @@ class IndexTest(IsolatedCase):
         self.assertEqual([k for k in idx.by_key if len(k) < 2], [])
         self.assertIn("a", idx.by_name, "精确名（哪怕 1 个字符）仍在第一层")
 
-    def test_the_real_knowledge_base_also_has_no_short_derived_key(self):
-        """同一条不变量在**真库**上（只读）：`by_key` 无 len<2 的键。
-
-        单独成条而不是并进上面那条 —— 并在一起时真库那半截会被前一行断言挡住，
-        "真库也干净"就永远没被测到（本次就是踩到这个才拆开的）。
-        真库此刻确实干净（145 张卡、无 1 字符卡 id、`by_key` 无短键），
-        这条钉的是**将来**（用户手改 knowledge.json 或 merge_nodes 写入单字符别名）。
-
-        ⚠️ 读真库就要**临时退出隔离**：`IsolatedCase` 把 `store.DATA_ROOT` 指到临时目录，
-        而临时目录里没有知识库 → `build_index()` 会读到空库，这条断言就变成"0 张卡也绿"
-        （实测踩到）。所以这里显式还原真实 `DATA_ROOT` 并清掉 `_KB_BACKUP_DONE`
-        （脏文件备份只该发生一次，但这条不读脏文件，清掉是防御性的），**finally 里恢复隔离**。
-        """
-        wait = getattr(store, "_KB_BACKUP_DONE", None)
-        store.DATA_ROOT = self._real_data_root
-        if wait is not None:
-            store._KB_BACKUP_DONE = False
-        try:
-            real, err = kbreuse.build_index()
-        finally:
-            store.DATA_ROOT = self.tmp
-            if wait is not None:
-                store._KB_BACKUP_DONE = wait
-        self.assertEqual(err, "", "真库要读得出来（只读）")
-        self.assertTrue(len(real) > 0, "真库不该是空的（否则这条没牙）")
-        self.assertEqual([k for k in real.by_key if len(k) < 2], [],
-                         "真库的派生键也没有 len<2 的")
-
     def test_lookup_misses_cleanly(self):
         idx = kbreuse.Index([{"id": "语音识别", "term": "语音识别", "definition": "d"}])
         self.assertEqual(idx.lookup("完全不相干的概念"), (None, ""))
@@ -2210,3 +2182,50 @@ class MismatchedCardIdentityEndToEndTest(_WriteBackCase):
         self.assertEqual(after[0]["id"], "yuyinshibie", "还是原来那张卡")
         self.assertEqual([j["id"] for j in after[0]["from_jds"]], [self.JD_OLD["id"], self.JD_NEW["id"]],
                          "只多了一条 from_jds（不是新建的卡）")
+
+
+# ---------------------------------------------------------------------------------
+# 只读真库的**人工闸门**（1.10①）。故意不做成 `unittest` 用例。
+#
+# 原先是 `RealKbTest.test_the_real_knowledge_base_also_has_no_short_derived_key`：
+# 它临时把全局 `store.DATA_ROOT` 指回**用户真实库**、跑完再指回临时目录，有三个问题：
+#   1. **无锁改全局**：那一刻只要有别的线程活着（本项目真出过 app/interview 后台线程写盘
+#      的事故），它就会**写进用户真实 data/** —— 测试绝不该有这条通路；
+#   2. **断言绑在本机数据上**：把库挪走、或库里某个时刻有 1 字符卡 id，全量测试就红，
+#      而那与**代码**有没有问题无关（数据问题该用数据闸门看，不该让全量测试变红）；
+#   3. 它还操作 `store._KB_BACKUP_DONE` —— 该属性在 `store.py` 里**根本不存在**
+#      （`git show HEAD:store.py` 搜不到），是纯死代码（`getattr` 拿到 None 就整段跳过）。
+#
+# ⚠️ 不变量**没有被删**：`by_key` 无 len<2 键这件事仍由构造库那条强用例钉着
+# （`test_no_short_key_ever_lands_in_by_key`，构造了单字符 term / 单字符别名 / 两位数
+# 等最坏形状；`_keys_of_term` 的闸门另有 KeysTest 那批钉住）。这里保留的是**另外半件事**：
+# 「用户此刻盘上那份真库也干净」—— 它是**数据体检**，不是单元测试，所以走人工入口：
+#
+#     python -B -m tests.test_kbreuse
+#
+# 照样会红（非 0 退出码），但**不会**在每次 `unittest discover` 里碰用户真实数据。
+def check_real_kb_has_no_short_derived_key():
+    """只读用户真实知识库，返回 `(ok, 说明)`。**绝不写盘、绝不改任何全局路径。**"""
+    index, err = kbreuse.build_index()     # cards=None → store.read_knowledge_strict，只读
+    if err:
+        return False, "真库读不出来（只读）：%s" % err
+    if len(index) <= 0:
+        return False, ("真库是空的 —— 这条闸门没牙；先确认 DATA_ROOT 指向的是真库：%s"
+                       % store.DATA_ROOT)
+    bad = [k for k in index.by_key if len(k) < 2]
+    if bad:
+        return False, ("真库的派生键里有 len<2 的键：%r（用户手改 knowledge.json、或 "
+                       "merge_nodes 写入单字符别名时，两个不相干的概念就会互相认错）"
+                       % (bad[:20],))
+    return True, ("真库干净：%d 张卡，by_key 共 %d 把键，无 len<2 的键（只读检查，未写盘）"
+                  % (len(index), len(index.by_key)))
+
+
+if __name__ == "__main__":
+    # 人工入口：**不** `unittest.main()` —— 本模块的用例仍由 `unittest discover` 跑，
+    # 这里只跑上面那道「只读真库」的闸门。失败 → 非 0 退出（人工巡检/CI 都能当红用）。
+    print("[check] DATA_ROOT=%s" % store.DATA_ROOT)
+    _ok, _why = check_real_kb_has_no_short_derived_key()
+    print("[%s] %s" % ("OK" if _ok else "FAIL", _why))
+    raise SystemExit(0 if _ok else 1)
+

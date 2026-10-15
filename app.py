@@ -2478,11 +2478,16 @@ class Handler(BaseHTTPRequestHandler):
             checks = body.get("checks") if isinstance(body.get("checks"), dict) else {}
             know = body.get("know") if isinstance(body.get("know"), dict) else {}
             saved = created = 0
+            failed = []                 # 每一项都是「用户点了但没存上」的如实说明
             for k, v in checks.items():
                 st = store.load_report_state(rid)
                 st["checks"][str(k)] = bool(v)
                 if store.save_report_state(rid, st["checks"]):
                     saved += 1
+                else:
+                    # 以前这里**默默不计**：勾选落盘失败时界面照样显示「已保存 ✓」。
+                    failed.append("勾选 `%s` 没落盘（%s 写不进去：目录不可写 / 磁盘满？）"
+                                  % (k, store.report_state_dir()))
             for term, val in know.items():
                 if isinstance(val, dict):
                     state = str(val.get("state") or "")
@@ -2494,7 +2499,29 @@ class Handler(BaseHTTPRequestHandler):
                 if ok:
                     saved += 1
                     created += 1 if was_created else 0
-            log.log_event("report_state.write", report=rid, saved=saved, created=created)
+                else:
+                    if state not in kb.STATE_VALUES:
+                        why = "知识点状态 %r 不是合法值（合法值：%s）" % (state, "、".join(kb.STATE_VALUES))
+                    elif not kb.normalize_id(term):
+                        why = "术语 %r 归一化后是空的（它建不出卡，勾会丢）" % (term,)
+                    else:
+                        why = "知识库 `knowledge.json` 读不出来且留档（改名成 .corrupt-*）也失败"
+                    failed.append("知识点 `%s`（%s）没写进知识库：%s" % (term, state, why))
+            log.log_event("report_state.write", report=rid, saved=saved, created=created,
+                          failed=len(failed))
+            if failed:
+                # ⚠️ **有失败就绝不回 `ok: True`**：前端（web/report_template.html:292 的
+                # `if(!r || r.ok !== true) throw new Error(r.error || '写入失败')`，再由
+                # `applyCheck` 的 catch 回滚勾选框并告示）只认 `ok !== true`。
+                # 老写法在这里**无条件**回 ok:True，于是勾没存上也显示「已保存 ✓」——
+                # 假 ok 比报错更糟：用户以为存上了，关掉程序就没了。
+                detail = "；".join(failed[:3])
+                if len(failed) > 3:
+                    detail += "；…（另有 %d 项，见日志 report_state.write）" % (len(failed) - 3)
+                return self._send(200, {
+                    "ok": False, "saved": saved, "created": created,
+                    "failed": len(failed),
+                    "error": "有 %d 项没存上（本次存上 %d 项）：%s" % (len(failed), saved, detail)})
             return self._send(200, {"ok": True, "saved": saved, "created": created})
 
         if p == "/api/knowledge/merge":

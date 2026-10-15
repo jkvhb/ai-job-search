@@ -220,10 +220,14 @@ const epilogue = '\n;globalThis.__fixture = ' + JSON.stringify(fixture) + ';\n' 
 def run_index(scenario, fixture=None, timeout=60):
     """跑一段场景（真 JS），回传探针的 `out` 对象。
 
-    失败会抛 `AssertionError`（切错脚本 / 探针崩了 / 没 Node），**绝不静默返回空**。
+    失败会抛 `AssertionError`（切错脚本 / 探针崩了 / 缺 Node），**绝不静默返回空**。
+    缺 Node 时是**响亮失败**（不是跳过）：跳过会让这批断言在无 Node 的机器上静默消失。
     """
     if NODE is None:
-        raise RuntimeError("本机没有 Node，跑不了页面探针")
+        # 缺 Node 是**响亮失败**（1.10③）：静默跳过等于把「真跑页面 JS」这批断言删掉，
+        # 而全量测试照样绿。调用方（tests/test_app.py 的 `_need_node`）也会先报同一条。
+        raise AssertionError("本环境缺 Node（`node` 不在 PATH 上）：跑不了页面探针，"
+                             "这批前端渲染断言不能静默跳过 —— 装上 Node 再重跑")
     js = index_script()
     payload = json.dumps({"js": js, "scenario": scenario,
                           "fixture": fixture if fixture is not None else {}},

@@ -3184,9 +3184,93 @@ def _js_fn_body(name, arg=""):
     return js[start:js.index("\n}", start)]
 
 
+class ReportStateWriteOkTest(IsolatedCase):
+    """`/api/report_state/write`：**有失败就绝不回 `ok: True`**（假 ok 比报错更糟）。
+
+    为什么这条重要：前端只认 `ok !== true` —— `web/report_template.html:292` 是
+    `if(!r || r.ok !== true) throw new Error((r && r.error) || '写入失败')`，
+    再由 `applyCheck`（:293-297）的 catch **回滚勾选框**并告示「没存上，勾选已还原」。
+    老写法在这里**无条件** `return {"ok": True, ...}`：勾没落盘也显示「已保存 ✓」，
+    用户以为存上了、关掉程序就没了（正是不许假装存上的那一类）。
+    所以这两条用例挡的是「把 ok 写死成 True」这个具体退化。
+    """
+
+    def _post(self, path, body):
+        raw = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        headers = {"Content-Length": str(len(raw)), "Content-Type": "application/json; charset=utf-8"}
+        h = _sandbox_handler("POST", path, raw, headers)
+        return h._status, h._body
+
+    def test_a_failed_check_write_is_not_reported_as_saved(self):
+        old = store.save_report_state
+        store.save_report_state = mock.Mock(return_value=False)     # 勾选落盘失败
+        self.addCleanup(setattr, store, "save_report_state", old)
+        code, body = self._post("/api/report_state/write",
+                                {"report_id": "r1", "checks": {"gate:0": True}})
+        self.assertEqual(code, 200, body)          # 请求本身处理完了，只是这一项没写进去
+        self.assertIs(body["ok"], False, "勾没落盘却回了 ok:true（界面会显示「已保存 ✓」）：%r" % (body,))
+        self.assertEqual(body["saved"], 0)
+        self.assertGreaterEqual(body["failed"], 1)
+        self.assertIn("没存上", body["error"])
+        self.assertIn("gate:0", body["error"])
+        self.assertFalse(os.path.exists(store.report_state_path("r1")),
+                         "夹具前提：这一项确实一个字节都没落盘")
+
+    def test_corrupt_library_plus_failed_quarantine_is_reported_not_swallowed(self):
+        """本批给 `upsert_check` 新增的那条 `ok=False`（坏库 + 留档失败）必须**如实回给前端**。
+
+        这条路径以前是**不可达**的（`upsert_check` 只在 state/术语不合法时回 False，而那两种
+        情况本来就不会被前端发上来），所以老写法「ok 写死 True」一直没暴露；现在它可达了：
+        知识库读不出来、把坏文件留档改名也失败 → `(False, False, None)` → 用户的勾**真的丢了**。
+        这里从路由层走一遍，钉住「丢了的勾会被说出来」，而不是当成成功。
+        """
+        store.write_json(store.knowledge_path(), {"nodes": []})       # 先有一个正常库
+        with mock.patch.object(kb, "_quarantine_corrupt_kb", return_value=None):
+            store.write_bytes(store.knowledge_path(), b'{"nodes": [ <<<CORRUPT>>>')  # 手改坏
+            code, body = self._post("/api/report_state/write",
+                                    {"report_id": "r1", "know": {"新概念": {"state": "已掌握"}}})
+        self.assertEqual(code, 200, body)
+        self.assertIs(body["ok"], False, "勾真的丢了却回了 ok:true：%r" % (body,))
+        self.assertEqual(body["saved"], 0)
+        self.assertEqual(body["failed"], 1)
+        self.assertIn("新概念", body["error"])
+        self.assertIn("留档", body["error"])
+        # 坏文件必须原地保留（留档失败就不许动它）—— 测试也不许把它删掉
+        with open(store.knowledge_path(), "rb") as f:
+            self.assertIn(b"CORRUPT", f.read())
+
+    def test_a_valid_know_check_still_reports_ok(self):
+        """别把闸门做过头：正常勾选仍然必须是 `ok: true`（新加的 ok=False 只覆盖真失败）。"""
+        code, body = self._post("/api/report_state/write",
+                                {"report_id": "r1",
+                                 "know": {"新概念": {"state": "已掌握", "definition": "定义"}}})
+        self.assertEqual(code, 200, body)
+        self.assertIs(body["ok"], True, body)
+        self.assertEqual(body["saved"], 1)
+        self.assertEqual(body["created"], 1)
+        self.assertNotIn("error", body)
+        self.assertEqual(store.load_knowledge()["nodes"][0]["state"], "已掌握")
+
+
 def _need_node():
+    """缺 Node **响亮失败**，绝不静默跳过（1.10③）。
+
+    为什么改成红：原先这里 `raise unittest.SkipTest(...)`，而缺 Node 的机器上全量测试
+    只会在末尾多一行 `skipped=…`、照样打印 OK —— 这批「真跑页面 JS」的渲染断言
+    （本文件 30+ 处，含报告模板标注那批）就**静默消失**了。那种绿是假绿：
+    改坏模板/页面的 JS 不会让任何测试变红。缺环境就该是红的，并且一眼看出缺什么、
+    丢了哪些覆盖（Node 是开发机依赖：装一次即可，不是"这条测试不稳定"）。
+    """
     if web_probe.NODE is None:
-        raise unittest.SkipTest("本机没有 Node，跳过「真跑页面 JS」的渲染探针")
+        raise AssertionError(
+            "本环境缺 Node：`node` 不在 PATH 上，这批「真跑 web/ 页面 JS」的前端断言"
+            "不能静默跳过。\n"
+            "  · 丢掉的覆盖：tests/test_app.py 里全部 Node 渲染探针（简历下拉、JD 卡片、"
+            "面试面板、报告模板标注等 30+ 处），以及 tests/test_analyze_knowledge_cache.py "
+            "里模板文案那两条用例。\n"
+            "  · 修法：装 Node 并确保 `node` 在 PATH 上（`node --version` 能跑）后重跑本批。\n"
+            "  · **不要**把它改回 SkipTest —— 那等于把这批不变量删掉。"
+            "确实要在无 Node 环境跑，就显式说明这次没验前端，并让 CI 在有 Node 的机器上跑。")
 
 
 def _resumes_view(include_removed=True):

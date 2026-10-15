@@ -216,6 +216,32 @@ class AnalyzeTest(IsolatedCase):
 
 
 class PipelineTest(IsolatedCase):
+    def setUp(self):
+        """把流水线的 cfg 钉在**本用例临时目录里的假 vidkit** 上。
+
+        ⚠️ 这里**必须**显式给 `vidkit_dir`：`find_vidkit` 在没有配置时会去探测
+        **本项目的同级目录** `../video-link-extractor`（interview.py:217-220）。本机恰好装着它，
+        所以 `cfg={}` 也绿；但把仓库复制到别处（或在没装 vidkit 的机器上）跑，
+        `find_vidkit` 返回 None → `run_transcribe` 先抛「找不到 vidkit」，整批 PipelineTest
+        11 条全红（实测：复制到 %TEMP% 后 errors=7 / failures=4）。
+
+        注意 `run_transcribe` **即使注入了 runner 也先要求 vidkit 目录与它的 venv 存在**
+        （interview.py:347-353，runner 只替掉最后那一步子进程），所以光注入 runner 不够 ——
+        假 venv 里的 `python.exe` 让 `_vidkit_python` 的存在性检查通过，而 runner 仍然是假的，
+        真子进程一次都不会起。
+        """
+        super().setUp()
+        self.cfg = {"vidkit_dir": self._fake_vidkit()}
+
+    def _fake_vidkit(self, name="video-link-extractor"):
+        """造一个「venv 里真有 python.exe」的假 vidkit 目录（与 TranscribeCallTest 同形）。"""
+        root = os.path.join(self.tmp, "fake-vidkit", name)
+        os.makedirs(os.path.join(root, ".venv", "Scripts"))
+        py = os.path.join(root, ".venv", "Scripts", "python.exe")
+        with open(py, "wb") as f:
+            f.write(b"")
+        return root
+
     def _deps(self, text="转写内容", reply=None, boom=None):
         """假转写 + 假模型：整条链同步跑完，绝不真跑 vidkit / 真调模型。"""
         def runner(cmd, **kw):
@@ -233,7 +259,7 @@ class PipelineTest(IsolatedCase):
 
     def test_pipeline_writes_transcript_analysis_and_done_status(self):
         store.save_stream("iv1", "audio.wav", io.BytesIO(b"x" * 100), max_bytes=10_000)
-        interview.run_pipeline("j1", "iv1", {}, deps=self._deps())
+        interview.run_pipeline("j1", "iv1", self.cfg, deps=self._deps())
         self.assertTrue(os.path.exists(store.interview_file("iv1", "transcript.json")))
         self.assertTrue(os.path.exists(store.interview_file("iv1", "analysis.json")))
         self.assertEqual(store.load_interview_json("iv1", "status.json")["state"], "done")
@@ -252,13 +278,13 @@ class PipelineTest(IsolatedCase):
         old = store.save_interview_json
         store.save_interview_json = spy
         self.addCleanup(setattr, store, "save_interview_json", old)
-        interview.run_pipeline("j1", "iv1", {}, deps=self._deps())
+        interview.run_pipeline("j1", "iv1", self.cfg, deps=self._deps())
         self.assertEqual(seen, ["transcribing", "analyzing", "done"])
 
     def test_failure_sets_error_state_and_keeps_the_audio(self):
         store.save_stream("iv1", "audio.wav", io.BytesIO(b"x" * 100), max_bytes=10_000)
         with self.assertRaises(Exception):
-            interview.run_pipeline("j1", "iv1", {}, deps=self._deps(boom="transcribe"))
+            interview.run_pipeline("j1", "iv1", self.cfg, deps=self._deps(boom="transcribe"))
         st = store.load_interview_json("iv1", "status.json")
         self.assertEqual(st["state"], "error")
         self.assertIn("vidkit", st.get("error", ""))
@@ -268,7 +294,7 @@ class PipelineTest(IsolatedCase):
         """转写失败时绝不能写出半截 transcript.json —— 否则重试会「跳过转写」拿空文本去分析。"""
         store.save_stream("iv1", "audio.wav", io.BytesIO(b"x" * 100), max_bytes=10_000)
         with self.assertRaises(Exception):
-            interview.run_pipeline("j1", "iv1", {}, deps=self._deps(boom="transcribe"))
+            interview.run_pipeline("j1", "iv1", self.cfg, deps=self._deps(boom="transcribe"))
         self.assertFalse(os.path.exists(store.interview_file("iv1", "transcript.json")))
 
     def test_retry_skips_transcription_when_transcript_exists(self):
@@ -277,7 +303,7 @@ class PipelineTest(IsolatedCase):
         called = []
         deps = self._deps()
         deps["runner"] = lambda cmd, **kw: called.append(cmd) or ""
-        interview.run_pipeline("j1", "iv1", {}, deps=deps)
+        interview.run_pipeline("j1", "iv1", self.cfg, deps=deps)
         self.assertEqual(called, [])                              # 没有再跑转写
         self.assertEqual(store.load_interview_json("iv1", "transcript.json")["text"], "已有的转写")
 
@@ -287,7 +313,7 @@ class PipelineTest(IsolatedCase):
         called = []
         deps = self._deps()
         deps["runner"] = lambda cmd, **kw: called.append(cmd) or ""
-        interview.run_pipeline("j1", "iv1", {}, kind="text", deps=deps)
+        interview.run_pipeline("j1", "iv1", self.cfg, kind="text", deps=deps)
         self.assertEqual(called, [])
         self.assertEqual(store.load_interview_json("iv1", "status.json")["state"], "done")
         tr = store.load_interview_json("iv1", "transcript.json")
@@ -308,12 +334,12 @@ class PipelineTest(IsolatedCase):
         old = store.save_interview_json
         store.save_interview_json = spy
         self.addCleanup(setattr, store, "save_interview_json", old)
-        interview.run_pipeline("j1", "iv1", {}, kind="text", deps=self._deps())
+        interview.run_pipeline("j1", "iv1", self.cfg, kind="text", deps=self._deps())
         self.assertNotIn("transcribing", seen)
 
     def test_missing_audio_raises_and_keeps_error_state(self):
         with self.assertRaises(RuntimeError):
-            interview.run_pipeline("j1", "iv1", {}, deps=self._deps())
+            interview.run_pipeline("j1", "iv1", self.cfg, deps=self._deps())
         self.assertEqual(store.load_interview_json("iv1", "status.json")["state"], "error")
 
     def test_analysis_failure_keeps_audio_and_transcript(self):
@@ -322,7 +348,7 @@ class PipelineTest(IsolatedCase):
         deps = self._deps()
         deps["chat"] = fake_chat_factory(["完全不是 JSON"])
         with self.assertRaises(Exception):
-            interview.run_pipeline("j1", "iv1", {}, deps=deps)
+            interview.run_pipeline("j1", "iv1", self.cfg, deps=deps)
         self.assertEqual(store.load_interview_json("iv1", "status.json")["state"], "error")
         self.assertTrue(os.path.exists(store.interview_file("iv1", "audio.wav")))
         self.assertTrue(os.path.exists(store.interview_file("iv1", "transcript.json")))
@@ -343,7 +369,7 @@ class PipelineTest(IsolatedCase):
         deps = self._deps(text="我们聊了 RLHF 和语音识别")
         deps["chat"] = fake_chat_factory([reply])
         store.save_stream("iv1", "audio.wav", io.BytesIO(b"x" * 100), max_bytes=10_000)
-        interview.run_pipeline("j1", "iv1", {}, deps=deps)
+        interview.run_pipeline("j1", "iv1", self.cfg, deps=deps)
         cards = {n["term"]: n for n in store.load_knowledge()["nodes"]}
         self.assertEqual(cards["RLHF"]["asked_count"], 1)
         self.assertEqual(cards["RLHF"]["last_outcome"], "没答上")
@@ -357,7 +383,7 @@ class PipelineTest(IsolatedCase):
         rendered = []
         deps["render"] = lambda out, jd_id, iv_id: rendered.append((out, jd_id, iv_id)) or "f.html"
         store.save_stream("iv1", "audio.wav", io.BytesIO(b"x" * 100), max_bytes=10_000)
-        interview.run_pipeline("j1", "iv1", {}, deps=deps)
+        interview.run_pipeline("j1", "iv1", self.cfg, deps=deps)
         data, jd_id, iv_id = rendered[0]
         self.assertEqual(data["kind"], "interview")
         self.assertEqual(jd_id, "j1")
@@ -372,7 +398,7 @@ class PipelineTest(IsolatedCase):
         store.save_stream("iv1", "source.txt", io.BytesIO("面试官：你好".encode("utf-8")), max_bytes=10_000)
         deps = self._deps()
         del deps["render"]
-        interview.run_pipeline("j1", "iv1", {}, kind="text", deps=deps)
+        interview.run_pipeline("j1", "iv1", self.cfg, kind="text", deps=deps)
         path = os.path.join(store.p_path("reports"), "iv_iv1.html")
         self.assertTrue(os.path.exists(path))
         self.assertEqual(store.load_interview_json("iv1", "status.json")["state"], "done")
@@ -389,12 +415,12 @@ class PipelineTest(IsolatedCase):
         reply = json.dumps({"summary": "s"}, ensure_ascii=False)
         first = self._deps(text="我们聊了 RLHF")
         first["chat"] = fake_chat_factory([reply])
-        interview.run_pipeline("j1", "iv1", {}, deps=first)
+        interview.run_pipeline("j1", "iv1", self.cfg, deps=first)
         self.assertEqual({n["term"]: n for n in store.load_knowledge()["nodes"]}["RLHF"]["asked_count"], 1)
 
         again = self._deps(text="我们聊了 RLHF")
         again["chat"] = fake_chat_factory([reply])
-        interview.run_pipeline("j1", "iv1", {}, deps=again)      # 重试
+        interview.run_pipeline("j1", "iv1", self.cfg, deps=again)      # 重试
         self.assertEqual({n["term"]: n for n in store.load_knowledge()["nodes"]}["RLHF"]["asked_count"], 1)
         self.assertEqual(store.load_interview_json("iv1", "feedback.json")["j1"]["applied"], True)
 
@@ -427,7 +453,7 @@ class PipelineTest(IsolatedCase):
 
     def test_start_runs_in_a_thread_and_reaches_a_terminal_state(self):
         store.save_stream("iv1", "audio.wav", io.BytesIO(b"x" * 100), max_bytes=10_000)
-        t = interview.start("j1", "iv1", {}, deps=self._deps())
+        t = interview.start("j1", "iv1", self.cfg, deps=self._deps())
         self.assertTrue(t.daemon)                       # 主程序退出不该被转写线程拖住
         # 确定性等它真的结束（join，不是 sleep 轮询赌它跑完 —— 那正是这条用例曾经 1/5 偶发红的原因：
         # 状态先写成 done、线程登记还没摘，中间那道缝里 is_running 仍是 True）
@@ -480,7 +506,7 @@ class PipelineTest(IsolatedCase):
         store.save_interview_json = hooked_save
         self.addCleanup(setattr, store, "save_interview_json", real_save)
 
-        t = interview.start("j1", "iv1", {}, deps=self._deps())
+        t = interview.start("j1", "iv1", self.cfg, deps=self._deps())
         try:
             while len(seen) < 2:
                 try:
@@ -538,7 +564,7 @@ class PipelineTest(IsolatedCase):
 
         deps = self._deps()
         deps["runner"] = runner
-        t = interview.start("j1", "iv1", {}, deps=deps)
+        t = interview.start("j1", "iv1", self.cfg, deps=deps)
         try:
             deadline = time.time() + 5
             # 等线程真的进了转写（status.json 是线程自己写的，先等它出现再断言）
@@ -565,7 +591,7 @@ class PipelineTest(IsolatedCase):
 
     def test_pipeline_logs_start_and_done(self):
         store.save_stream("iv1", "audio.wav", io.BytesIO(b"x" * 100), max_bytes=10_000)
-        interview.run_pipeline("j1", "iv1", {}, deps=self._deps())
+        interview.run_pipeline("j1", "iv1", self.cfg, deps=self._deps())
         events = [json.loads(l)["event"] for l in store.read_text(log.LOG_FILE).splitlines() if l.strip()]
         self.assertIn("interview.pipeline_start", events)
         self.assertIn("interview.pipeline_done", events)
@@ -573,7 +599,7 @@ class PipelineTest(IsolatedCase):
     def test_pipeline_logs_error_on_failure(self):
         store.save_stream("iv1", "audio.wav", io.BytesIO(b"x" * 100), max_bytes=10_000)
         with self.assertRaises(Exception):
-            interview.run_pipeline("j1", "iv1", {}, deps=self._deps(boom="transcribe"))
+            interview.run_pipeline("j1", "iv1", self.cfg, deps=self._deps(boom="transcribe"))
         events = [json.loads(l)["event"] for l in store.read_text(log.LOG_FILE).splitlines() if l.strip()]
         self.assertIn("interview.pipeline_error", events)
 
@@ -582,7 +608,7 @@ class PipelineTest(IsolatedCase):
         store.save_stream("iv1", "audio.wav", io.BytesIO(b"x" * 100), max_bytes=10_000)
         store.save_interview_json("iv1", "status.json",
                                   {"state": "queued", "original_name": "面试录音.m4a", "audio_bytes": 100})
-        interview.run_pipeline("j1", "iv1", {}, deps=self._deps())
+        interview.run_pipeline("j1", "iv1", self.cfg, deps=self._deps())
         st = store.load_interview_json("iv1", "status.json")
         self.assertEqual(st["original_name"], "面试录音.m4a")
         self.assertEqual(st["audio_bytes"], 100)
