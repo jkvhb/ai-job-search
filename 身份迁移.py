@@ -15,15 +15,18 @@
 安全保证：
   - `--试跑` 严格只读：不写库、不建 `jds.json`、不记日志、不取备份
     （`find_duplicate_jobs` 与 `kb.read_report_data` 都只读）
-  - `--执行` **第一步**就是 `data/profiles/<key>/` 的整目录备份（带时间戳，**保留不删**；
-    拷备份时跳过旧备份目录，备份里不再套备份）；
-    任一步失败 → 用备份恢复整目录，并把迁移新建的文件删掉（备份里没有的东西一律不留下）
+  - `--执行` **有改动时**第一步是 `data/profiles/<key>/` 的整目录备份（带时间戳，**保留不删**；
+    拷备份时跳过旧备份目录与 `.bak-` 留档，备份里不再套备份）；
+    任一步失败 → 用备份恢复整目录，并把迁移新建的文件删掉（备份里没有的东西一律不留下）。
+    **算完计划确认一个字节都不会变时不建备份、也不写任何文件**：备份是回滚的**前提**，
+    没有改动就无从回滚；而整目录备份会把 `interviews/` 下的原始录音（单文件上限 500MB）
+    一起拷一遍 —— 无事可做的一轮再拷贝一次，只会让磁盘只增不减（审计 §2 P0-12）
   - **报告文件不改名、不删除**；`jd/<旧 id>.txt` 也不改名（`jd_text_file` 字段跟着指过去）
   - 幂等：JD id 由「指纹分组 + 报告派生字段 + 编号」决定，已建过的 JD 按 `migrated_from`
     （旧分析 id）认领，**不重复建、不重复涨 `seq`、不刷新 `updated_at`**
 
 迁移步骤（顺序即契约）：
-  1. 备份 `data/profiles/<key>/` 整目录
+  1. 算计划（严格只读）→ **有改动才**备份 `data/profiles/<key>/` 整目录
   2. 按 `jobdup` 指纹把**活跃分析**归组 → 每组一个 JD（**缺 JD 原文的自成一组**，不猜）
   3. 每组 `jdid.derive_fields` + `jdid.build_id`（编号从现有 `seq` 之后顺延）→ 写 `jds.json`
      * JD 级字段取**原始值**（原记录 / `REPORT_DATA`），ID 六段取**归一化值**
@@ -85,7 +88,7 @@ _JD_IMAGE_EXT = (".jpg", ".jpeg", ".png", ".webp")
 
 USAGE = """用法：
   python 身份迁移.py --试跑     # 只打印「迁移前 → 迁移后」对照表（严格只读）
-  python 身份迁移.py --执行     # 先整目录备份，再迁移
+  python 身份迁移.py --执行     # 有改动时先整目录备份，再迁移（无改动则不备份）
 """
 
 # 备份目录名前缀（`data/profiles/迁移备份_<时间戳>/`）。**唯一一份定义**：
@@ -334,6 +337,7 @@ def plan_migration():
       `groups`      —— 每个 JD 的对照信息（旧分析 id / 归组依据 / 报告文件名 / JD 记录）
       `merged`      —— 保留原样的 `merged_into` 记录
       `skipped`     —— `(no_text, too_short)` 两类自成一组的原因计数
+      `changed`     —— 这一轮会不会改动任何一个字节（`--执行` 据此决定要不要备份，P0-12）
     """
     with jdid._JD_LOCK:                        # noqa: SLF001 —— 锁顺序恒为 _JD_LOCK → _KB_LOCK
         jds_data = jdid.load_jds()
@@ -356,6 +360,19 @@ def plan_migration():
         jobs_out = _build_jobs(raw_jobs, new_ids)
         kb_out, kb_touched = _build_knowledge(new_ids, jd_by_id={r["jd_id"]: r for r in records})
         interviews, interviews_unreadable = _build_interviews(new_ids, identity_ids)
+        # ---- 需求一（P0-12）：这一轮到底会不会改动任何一个字节 ----
+        # 判据全部取自**这一份计划快照**（对象比对），不为了判断再读一次盘：
+        #   * `jobs_out != raw_jobs` / `jds_out != jds_data`：`store.write_json` 写的就是这两个对象，
+        #     对象相同 → 写出来的字节也相同（幂等性由测试里"二次执行逐字节不变"钉着）；
+        #   * `kb_touched > 0`：知识库只在 `kb_touched` 非零时才写；
+        #   * 面试记录：只有与**盘上那一份**不同才算改动（已迁移过的记录会被重算出一份一模一样的
+        #     内容，那写成同样的字节，不算改动）。
+        # 为什么要判得这么严：备份是回滚的**前提**，没有改动就无从回滚；而备份是整目录拷贝
+        # （profile 里含 `interviews/` 下的原始录音，单文件上限 500MB）—— 无事可做的一轮再拷一遍，
+        # 磁盘只增不减（审计 §2 P0-12）。
+        interviews_changed = any(store.read_json(path, None) != new for path, new in interviews)
+        changed = bool(jobs_out != raw_jobs or jds_out != jds_data
+                       or kb_touched or interviews_changed)
         skipped = {"no_text": sum(1 for r in records if r["why"] == "缺 JD 原文"),
                    "too_short": sum(1 for r in records if r["why"].startswith("原文过短"))}
         return {
@@ -364,6 +381,8 @@ def plan_migration():
             "interviews_unreadable": interviews_unreadable,
             "groups": records, "merged": merged, "skipped": skipped,
             "active": len(active), "before_jds": len(existing),
+            # 这一轮到底有没有改动（`--执行` 据此决定要不要备份，见 `execute_migration`）
+            "changed": changed,
             # 这两行量的必须是**计划这一份快照**（`_build_knowledge` 里量的），
             # 否则 `render_table` 会自己再读一次盘 → 表与计划量的不是同一次输入（P1-2）
             "before_kb": kb_out["before_kb"], "after_kb": kb_out["after_kb"],
@@ -704,8 +723,13 @@ def _from_jds_ids(data):
     return len(ids)
 
 
-def render_table(plan):
-    """「迁移前 → 迁移后」对照表（给人逐行看的）。返回整段文本。"""
+def render_table(plan, executing=False):
+    """「迁移前 → 迁移后」对照表（给人逐行看的）。返回整段文本。
+
+    `executing=True` 时说明**这张表只是预览、下面就要真动手了**：老实现把"以上只是试跑，
+    **未改动任何文件**"印在 `--执行` 的输出里，紧接着就是"迁移完成"—— 连着读很容易被理解成
+    "这次什么都没改"（实测到的误读）。表的内容一个字不变，只换表头/表尾这两句的口气。
+    """
     lines = []
     skipped = plan["skipped"]
     n_jd = len(plan["groups"])
@@ -721,7 +745,8 @@ def render_table(plan):
     after_jds = len(plan["jds_doc"]["jds"])
     new_jds = after_jds - before_jds
 
-    lines.append("身份迁移 · 试跑（严格只读，一个字节都不写）")
+    lines.append("身份迁移 · %s" % ("改动预览（下面开始执行：有改动才建备份）" if executing
+                                    else "试跑（严格只读，一个字节都不写）"))
     lines.append("profile: %s" % store.current_profile())
     lines.append("目录: %s" % store.profile_dir())
     lines.append("")
@@ -802,7 +827,13 @@ def render_table(plan):
         lines.append("  %s" % plan["interviews_unreadable"])
         lines.append("  修法：先把它修好（或从别处恢复、把它移开）再跑；0 字节 / 不存在不算读不出来。")
     lines.append("")
-    lines.append("以上只是试跑，**未改动任何文件**（加 --执行 才迁移，先整目录备份）。")
+    if executing:
+        # 这两句以前是同一句"以上只是试跑，**未改动任何文件**"，紧挨着"迁移完成"一起印出来
+        # （实测会被读成"这次什么都没改"）。表还没写盘是真的，但它紧接着就要写了。
+        lines.append("以上是**改动预览**（这张表本身还没有写任何文件）；下面开始执行 —— "
+                     "有改动才建整目录备份，没有改动会如实告诉你「无需改动、未建备份」。")
+    else:
+        lines.append("以上只是试跑，**未改动任何文件**（加 --执行 才迁移；有改动时先整目录备份）。")
     return "\n".join(lines)
 
 
@@ -811,6 +842,35 @@ def _report_count():
 
 
 # ---------------------------------------------------------------- 备份 / 恢复
+def _dir_stats(path):
+    """目录的 `(文件数, 总字节数)`：备份体积必须**如实报给用户**（不许靠猜，也不许只说路径）。"""
+    files = total = 0
+    for dirpath, _dirnames, filenames in os.walk(path):
+        for fn in filenames:
+            try:
+                total += os.path.getsize(os.path.join(dirpath, fn))
+            except OSError:                    # 数不出来就不数它，别让"报体积"本身失败
+                continue
+            files += 1
+    return files, total
+
+
+def _human_size(n):
+    """人类可读体积（1024 进制；B 不带小数，其余一位小数）。"""
+    size = float(n)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return ("%d B" % int(size)) if unit == "B" else ("%.1f %s" % (size, unit))
+        size /= 1024.0
+
+
+def _backup_note(path):
+    """备份的「在哪、多大、可删」一句话（三个维护脚本同一口径，骨架抄三遍就得更小心）。"""
+    files, total = _dir_stats(path)
+    return ("%s（%d 个文件，%d 字节 ≈ %s；确认无误后可自行删除）"
+            % (path, files, total, _human_size(total)))
+
+
 def _profile_files(root):
     """目录下所有文件的相对路径（含子目录）"""
     out = set()
@@ -924,13 +984,18 @@ def _write_json(path, obj):
 
 # ---------------------------------------------------------------- 执行
 def execute_migration():
-    """备份 → 迁移 → 落盘；失败从备份恢复。返回进程退出码。
+    """算计划 → **有改动才**备份 → 迁移 → 落盘；失败从备份恢复。返回进程退出码。
+
+    **备份是有条件的**（审计 §2 P0-12）：先算完整计划，确认这一轮一个字节都不会变时
+    **不建备份目录、不写任何文件**（备份是回滚的前提，没有改动就无从回滚；而整目录备份会把
+    `interviews/` 下的原始录音一起拷一遍）。算出来真的有改动时，**照旧无条件备份** ——
+    这条安全底线不因为"改动很小"而放松。
 
     **任何一份面试 `status.json` 读不出来 → 拒绝整次执行**（退出码 1，备份之前就中止，
     一个数据文件都没动，只往日志里记一条拒绝）：判据见下面那一段注释（与 `jdid.rename_jd` 同一口径）。
     """
     plan = plan_migration()
-    print(render_table(plan))
+    print(render_table(plan, executing=True))
     print("")
     # ---- 需求一：有面试 `status.json` 读不出来 → **拒绝整次执行**（在备份之前就中止）----
     # 判据与 `jdid.rename_jd` / `jobdup._interview_status_files` 同一口径：面试记录是每个面试
@@ -955,12 +1020,22 @@ def execute_migration():
         return 1
     root = store.profile_dir()
     had_files = _profile_files(root)
+    if not plan["changed"]:
+        # 需求一（P0-12）：**没有改动就不建备份**。这里返回得比"备份之后"更早，也意味着
+        # 这一轮**一个数据文件都不写**（连 `events.jsonl` 的 execute_done 审计行也不写 ——
+        # 与 `简历迁移.py` 同一口径：无事发生就真幂等）。备份只为回滚改动而建：没有改动可回滚，
+        # 整目录拷贝（含 `interviews/` 下的原始录音）只会白占磁盘。
+        print("")
+        print("本次无需改动：jds.json / jobs.json / 知识库 / 面试记录都已经是对的"
+              "（本次**未建备份** —— 备份只为回滚改动而建）。")
+        print("没有改动任何数据文件；报告文件与 JD 原文一个字没动。")
+        return 0
     try:
         backup = _backup_profile()
     except BaseException as e:
         sys.stderr.write("错误：备份失败，**没有改动任何文件**：%s\n" % e)
         return 1
-    print("已备份整目录：%s（保留不删）" % backup)
+    print("已备份整目录：%s" % _backup_note(backup))
     log.LOG_FILE = os.path.join(store.profile_dir(), "logs", "events.jsonl")
     try:
         with jdid._JD_LOCK:                    # noqa: SLF001 —— 锁顺序恒为 _JD_LOCK → _KB_LOCK
@@ -994,7 +1069,7 @@ def execute_migration():
     print("迁移完成：%d 个 JD（编号到 %s）| 活跃分析 %d 份 | 知识库改指 %d 条 | 面试记录改指 %d 个"
           % (len(plan["groups"]), max([r["seq"] or 0 for r in plan["groups"]] + [0]),
              plan["active"], plan["kb_touched"], len(plan["interviews"])))
-    print("报告文件没改名、没删除；备份保留在 %s（确认无误后可自行删除）" % backup)
+    print("报告文件没改名、没删除；备份保留在 %s" % _backup_note(backup))
     return 0
 
 

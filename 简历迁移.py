@@ -29,9 +29,12 @@
 
 安全保证：
   - `--试跑` 严格只读：不写库、不建 `resumes.json`、不记日志、不取备份、不动简历文件
-  - `--执行` **第一步**就是 `data/profiles/<key>/` 的整目录备份（带时间戳，**保留不删**；
-    拷备份时跳过旧备份目录，备份里不再套备份）；
-    任一步失败 → 用备份恢复整目录，并把迁移新建的文件删掉（备份里没有的东西一律不留下）
+  - `--执行` **有改动时**第一步是 `data/profiles/<key>/` 的整目录备份（带时间戳，**保留不删**；
+    拷备份时跳过旧备份目录与 `.bak-` 留档，备份里不再套备份）；
+    任一步失败 → 用备份恢复整目录，并把迁移新建的文件删掉（备份里没有的东西一律不留下）。
+    **算完计划确认一个字节都不会变时不建备份、也不写任何文件**：备份是回滚的**前提**，
+    没有改动就无从回滚；而整目录备份会把 `interviews/` 下的原始录音（单文件上限 500MB）
+    一起拷一遍 —— 无事可做的一轮再拷贝一次，只会让磁盘只增不减（审计 §2 P0-12）
   - **简历文件不移动、不改名、不删除**；报告 / `jd/` 原文 / `knowledge.json` / 面试记录**都不碰**
   - 幂等：已有版本记录按 `name`（文件名去扩展名）认领，**不重复建、不撞号**；
     已经有 `resume_id` 的分析**绝不覆盖**；第二次执行三个文件字节级不变
@@ -62,7 +65,7 @@ RESUME_EXTS = (".md", ".txt")
 
 USAGE = """用法：
   python 简历迁移.py --试跑     # 只打印对照表（严格只读，一个字节都不写）
-  python 简历迁移.py --执行     # 先整目录备份，再迁移（失败 → 从备份恢复）
+  python 简历迁移.py --执行     # 有改动时先整目录备份，再迁移（失败 → 从备份恢复；无改动则不备份）
 """
 
 # 测试注入点（生产恒为空）：`--执行` 每写一个文件后把它的相对名 append 进来；
@@ -305,10 +308,16 @@ def _evidence_rows(plan, item):
     return sorted(rows, key=lambda r: (r["created_at"], r["id"]))
 
 
-def render_table(plan):
-    """「迁移前 → 迁移后」对照表（给人逐行看的）。返回整段文本。"""
+def render_table(plan, executing=False):
+    """「文件 → 版本」对照表（给人逐行看的）。返回整段文本。
+
+    `executing=True` 时表头/表尾说明**下面就要真动手了**：老实现把"以上只是试跑，
+    **未改动任何文件**"印在 `--执行` 的输出里，紧接着就是"迁移完成"—— 连着读很容易被理解成
+    "这次什么都没改"（与 `身份迁移.py` 同一处误读）。表的内容一个字不变，只换这两句的口气。
+    """
     lines = []
-    lines.append("简历迁移 · 试跑（严格只读，一个字节都不写）")
+    lines.append("简历迁移 · %s" % ("改动预览（下面开始执行：有改动才建备份）" if executing
+                                    else "试跑（严格只读，一个字节都不写）"))
     lines.append("profile: %s" % plan["profile"])
     lines.append("目录: %s" % plan["dir"])
     if plan["had_doc"]:
@@ -391,11 +400,45 @@ def render_table(plan):
     lines.append("简历文件：不移动、不改名、不删除（%d 份 .md/.txt 就地保留）。"
                  % len(plan["items"]))
     lines.append("")
-    lines.append("以上只是试跑，**未改动任何文件**（加 --执行 才迁移，先整目录备份）。")
+    if executing:
+        # 表还没写盘是真的，但它紧接着就要写了（与 `身份迁移.py` 同一处误读的修法）。
+        lines.append("以上是**改动预览**（这张表本身还没有写任何文件）；下面开始执行 —— "
+                     "有改动才建整目录备份，没有改动会如实告诉你「无需改动、未建备份」。")
+    else:
+        lines.append("以上只是试跑，**未改动任何文件**（加 --执行 才迁移；有改动时先整目录备份）。")
     return "\n".join(lines)
 
 
 # ---------------------------------------------------------------- 备份 / 恢复
+def _dir_stats(path):
+    """目录的 `(文件数, 总字节数)`：备份体积必须**如实报给用户**（与 `身份迁移.py` 同一口径）。"""
+    files = total = 0
+    for dirpath, _dirnames, filenames in os.walk(path):
+        for fn in filenames:
+            try:
+                total += os.path.getsize(os.path.join(dirpath, fn))
+            except OSError:                    # 数不出来就不数它，别让"报体积"本身失败
+                continue
+            files += 1
+    return files, total
+
+
+def _human_size(n):
+    """人类可读体积（1024 进制；B 不带小数，其余一位小数）。"""
+    size = float(n)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return ("%d B" % int(size)) if unit == "B" else ("%.1f %s" % (size, unit))
+        size /= 1024.0
+
+
+def _backup_note(path):
+    """备份的「在哪、多大、可删」一句话（三个维护脚本同一口径，骨架抄三遍就得更小心）。"""
+    files, total = _dir_stats(path)
+    return ("%s（%d 个文件，%d 字节 ≈ %s；确认无误后可自行删除）"
+            % (path, files, total, _human_size(total)))
+
+
 def _profile_files(root):
     """目录下所有文件的相对路径（含子目录）"""
     out = set()
@@ -492,10 +535,22 @@ def _write_json(path, obj):
 
 # ---------------------------------------------------------------- 执行
 def execute_migration():
-    """备份 → 迁移 → 落盘；失败从备份恢复。返回进程退出码。"""
+    """算计划 → **有改动才**备份 → 迁移 → 落盘；失败从备份恢复。返回进程退出码。
+
+    **备份是有条件的**（审计 §2 P0-12）：计划里 `changed_resumes` / `changed_jobs` 都是空时
+    → **不建备份目录、一个文件都不写**（备份是回滚的**前提**，没有改动就无从回滚；而整目录
+    备份会把 `interviews/` 下的原始录音一起拷一遍）。算出来真的有改动时**照旧无条件备份** ——
+    这条安全底线不因为"改动很小"而放松。
+    """
     plan = plan_migration()
-    print(render_table(plan))
+    print(render_table(plan, executing=True))
     print("")
+    changed = bool(plan["changed_resumes"] or plan["changed_jobs"])
+    if not changed:
+        # 与 `身份迁移.py` 同一口径：无事发生的一轮不建备份、连审计行都不写（真幂等）。
+        print("本次无需改动：版本库与分析都已经登记过（本次**未建备份** —— 备份只为回滚改动而建）。")
+        print("没有改动任何文件；简历文件没移动、没改名、没删除。")
+        return 0
     root = store.profile_dir()
     had_files = _profile_files(root)
     try:
@@ -503,7 +558,7 @@ def execute_migration():
     except BaseException as e:
         sys.stderr.write("错误：备份失败，**没有改动任何文件**：%s\n" % e)
         return 1
-    print("已备份整目录：%s（保留不删）" % backup)
+    print("已备份整目录：%s" % _backup_note(backup))
     log.LOG_FILE = os.path.join(store.profile_dir(), "logs", "events.jsonl")
     try:
         # 顺序是契约：**先写版本库、再写引用它的 jobs.json**。
@@ -526,25 +581,21 @@ def execute_migration():
         print("错误：迁移失败：%s（%s）"
               % (e, "已用备份恢复 " + backup if restored else "恢复失败，请手工从 %s 恢复" % backup))
         return 1
-    changed = plan["changed_resumes"] or plan["changed_jobs"]
-    if changed:
-        # 无事发生就不写审计行：这样"再跑一次"连 events.jsonl 都一个字节不变（真幂等）。
-        try:
-            log.log_event("resume.migration_done", profile=plan["profile"],
-                          versions=len(plan["new_versions"]), analyses=len(plan["point"]),
-                          skipped=len(plan["skipped"]), conflicts=len(plan["conflicts"]),
-                          backup=os.path.basename(backup))
-        except Exception:
-            pass                                   # 日志写不进去不该让一次成功的迁移算失败
+    # `changed` 在上面已经算过（无改动的话早就带备份一起返回了），这里只会是有改动的那条路。
+    # 无事发生就不写审计行：这样"再跑一次"连 events.jsonl 都一个字节不变（真幂等）。
+    try:
+        log.log_event("resume.migration_done", profile=plan["profile"],
+                      versions=len(plan["new_versions"]), analyses=len(plan["point"]),
+                      skipped=len(plan["skipped"]), conflicts=len(plan["conflicts"]),
+                      backup=os.path.basename(backup))
+    except Exception:
+        pass                                       # 日志写不进去不该让一次成功的迁移算失败
     print("")
-    if changed:
-        print("迁移完成：新增 %d 条版本记录（%s）| %d 条分析补上 resume_id | 跳过 %d 条 | 冲突 %d 条"
-              % (len(plan["new_versions"]),
-                 "、".join(r["id"] for r in plan["new_versions"]) or "无",
-                 len(plan["point"]), len(plan["skipped"]), len(plan["conflicts"])))
-    else:
-        print("无需改动：版本库与分析都已经登记过（本次只做了一份备份）。")
-    print("简历文件没移动、没改名、没删除；备份保留在 %s（确认无误后可自行删除）" % backup)
+    print("迁移完成：新增 %d 条版本记录（%s）| %d 条分析补上 resume_id | 跳过 %d 条 | 冲突 %d 条"
+          % (len(plan["new_versions"]),
+             "、".join(r["id"] for r in plan["new_versions"]) or "无",
+             len(plan["point"]), len(plan["skipped"]), len(plan["conflicts"])))
+    print("简历文件没移动、没改名、没删除；备份保留在 %s" % _backup_note(backup))
     print("注意：老分析的 resume_id 是**推定**（依据：简历文件 mtime 早于这几次分析），"
           "不是当时的记录。")
     return 0

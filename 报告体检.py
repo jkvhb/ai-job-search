@@ -10,16 +10,18 @@
 
 用法：
   python 报告体检.py                 # 只体检，不改任何文件
-  python 报告体检.py --fix           # 清理非本领域来源（先自动备份）
-  python 报告体检.py --刷新模板      # 用当前模板重渲染（先自动备份）
+  python 报告体检.py --fix           # 清理非本领域来源（有改动才自动备份）
+  python 报告体检.py --刷新模板      # 用当前模板重渲染（有改动才自动备份）
 
 安全保证：
   - 只读/只改当前 profile 的 reports 目录，绝不碰简历、台账、配置
-  - --fix / --刷新模板 前必定整目录备份
-  - --fix 只删「经 knowledge.filter_relevant 判定为非本领域」的来源，
+  - `--fix` / `--刷新模板` 前**有改动才**整目录备份；备份落在**统一备份区**
+    `data/profiles/报告备份_<ts>/`（**不在 `reports/` 里** —— 那是被校验的目录）
+  - `--fix` 只删「经 knowledge.filter_relevant 判定为非本领域」的来源，
     绝不新增来源、绝不编造内容、绝不改其它字段；
     来源被清空的节点降级为 ai-generated（诚实标注），其余字段原样保留
-  - --刷新模板 只替换模板骨架，REPORT_DATA 原样保留（不重新分析、不改任何分析结果）
+  - `--刷新模板` 只替换模板骨架，REPORT_DATA 原样保留（不重新分析、不改任何分析结果）；
+    渲染结果与盘上那份**逐字相同**时**不写**（真幂等：重复跑不改文件、也不建备份）
 """
 import glob
 import json
@@ -36,6 +38,9 @@ import store      # noqa: E402
 
 MARK = "const REPORT_DATA = "
 TEMPLATE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web", "report_template.html")
+# 备份目录名前缀（`data/profiles/报告备份_<时间戳>/`）。**唯一一份定义**：
+# 备份命名与「拷备份时跳过旧备份」两处都用它（与 `身份迁移.py` / `简历迁移.py` 同一做法）。
+BACKUP_PREFIX = "报告备份"
 
 
 def read_report(path):
@@ -119,8 +124,8 @@ def fix(path):
     return dropped, wiped
 
 
-def rerender(path):
-    """用当前模板重新渲染，REPORT_DATA 原样保留（只换骨架，不动分析结果）"""
+def render(path):
+    """算出「用当前模板重渲染之后」的全文（**只算不写**）；读不出 REPORT_DATA → `None`。"""
     got = read_report(path)
     if not got:
         return None
@@ -130,8 +135,94 @@ def rerender(path):
     title = m.group(1) if m else os.path.basename(path)
     tpl = store.read_text(TEMPLATE)
     payload = json.dumps(data, ensure_ascii=False).replace("</", "<\\/")
-    store.write_text(path, tpl.replace("__TITLE__", title).replace("__REPORT_DATA__", payload))
+    return tpl.replace("__TITLE__", title).replace("__REPORT_DATA__", payload)
+
+
+def rerender(path):
+    """用当前模板重新渲染，REPORT_DATA 原样保留（只换骨架，不动分析结果）。
+
+    返回：`True` = 写过了；`False` = **盘上那份已经就是当前模板渲染出来的样子，一个字节都不用写**
+    （真幂等：重复跑 `--刷新模板` 不改文件，于是 P0-12 那条"有改动才备份"也就跟着成立）；
+    `None` = 读不出 REPORT_DATA（跳过，绝不覆盖）。
+    """
+    new = render(path)
+    if new is None:
+        return None
+    if store.read_text(path) == new:
+        return False
+    store.write_text(path, new)
     return True
+
+
+# ---------------------------------------------------------------- 备份（统一备份区，不在 reports/ 里）
+def _dir_stats(path):
+    """目录的 `(文件数, 总字节数)`：备份体积必须**如实报给用户**（与两个迁移脚本同一口径）。"""
+    files = total = 0
+    for dirpath, _dirnames, filenames in os.walk(path):
+        for fn in filenames:
+            try:
+                total += os.path.getsize(os.path.join(dirpath, fn))
+            except OSError:                    # 数不出来就不数它，别让"报体积"本身失败
+                continue
+            files += 1
+    return files, total
+
+
+def _human_size(n):
+    """人类可读体积（1024 进制；B 不带小数，其余一位小数）。"""
+    size = float(n)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return ("%d B" % int(size)) if unit == "B" else ("%.1f %s" % (size, unit))
+        size /= 1024.0
+
+
+def _backup_note(path):
+    """备份的「在哪、多大、可删」一句话（三个维护脚本同一口径，骨架抄三遍就得更小心）。"""
+    files, total = _dir_stats(path)
+    return ("%s（%d 个文件，%d 字节 ≈ %s；确认无误后可自行删除）"
+            % (path, files, total, _human_size(total)))
+
+
+def _ignore_previous_backups(_dirpath, names):
+    """`shutil.copytree` 的 ignore：**备份里绝不套备份**（与两个迁移脚本同名闸门同一口径）。
+
+    ① 名字以 `报告备份` 开头 → 跳过。这不是假设：真实数据
+       `data/profiles/default/reports/` 里就有两个 `报告备份_2026*`，不挡的话每备份一次就把
+       上一次的备份再拷一份（滚雪球）。
+    ② 还要挡住 `store.snapshot_before_overwrite` / `jobdup._snapshot` 留下的
+       `<文件>.bak-<时间戳>` **文件**（`store.BACKUP_SUFFIX`）：它们不是用户的数据，只是覆盖前的
+       留档，备份里不需要第二份（留档自身的上限由 `store._prune_backups` 轮转）。
+    """
+    out = []
+    for n in names:
+        if n.startswith(BACKUP_PREFIX):
+            out.append(n)
+        elif store.BACKUP_SUFFIX in n and not os.path.isdir(os.path.join(_dirpath, n)):
+            out.append(n)
+    return out
+
+
+def _backup_reports():
+    """把整个 `reports/` 拷到**统一备份区** `data/profiles/报告备份_<时间戳>/`，返回备份目录。
+
+    为什么不留在 `reports/报告备份_<ts>/` 里（老实现）：`reports/` 是**被校验的目录**
+    （"这次报告有几份 / 有哪些"就是扫它得出的），把备份混进去以后这个数字就永远说不清 ——
+    真实数据里已经堆了两个 `报告备份_2026*`，而且每次 `--刷新模板 --fix` 再添一个。
+    挪到 `data/profiles/` 是因为那里正是本项目既有的**统一备份区**：`身份迁移.py` 的
+    `迁移备份_<ts>/`、`简历迁移.py` 的 `简历迁移备份_<ts>/`、`jddelete.py` 的 `删除备份_<ts>/`
+    都在同一层 —— 一个地方就能看全"维护脚本在这台机器上留下了哪些备份"。
+    拷贝时按 `_ignore_previous_backups` 跳过旧备份目录与 `.bak-` 留档（备份里不再套备份）。
+    """
+    src = store.p_path("reports")
+    root = store.profiles_root()
+    os.makedirs(root, exist_ok=True)
+    dest = os.path.join(root, BACKUP_PREFIX + "_" + datetime.now().strftime("%Y%m%d_%H%M%S"))
+    if os.path.exists(dest):                     # 同一秒内重跑：补微秒，绝不覆盖上一份
+        dest = os.path.join(root, BACKUP_PREFIX + "_"
+                            + datetime.now().strftime("%Y%m%d_%H%M%S_%f"))
+    shutil.copytree(src, dest, ignore=_ignore_previous_backups)
+    return dest
 
 
 def main():
@@ -146,35 +237,59 @@ def main():
     print("profile: %s" % store.current_profile())
     print("reports: %s\n" % reports_dir)
 
-    backup = None
-    if do_fix or do_tpl:
-        backup = os.path.join(reports_dir, "报告备份_%s" % datetime.now().strftime("%Y%m%d_%H%M%S"))
-        os.makedirs(backup, exist_ok=True)
+    # ---- 先算「到底要改哪些」，再决定要不要备份（审计 §2 P0-12）----
+    # 计划阶段**一个字节都不写**：`scan` / `render` 都只读。两个判据：
+    #   * 刷新模板：用当前模板渲染出来的全文与盘上那份**逐字比对**，不同才需要写
+    #     （所以"第二次 --刷新模板"既不改文件、也不建备份）；
+    #   * 清理来源：`scan` 说有来源会被丢掉才需要写。
+    scans = {p: scan(p) for p in files} if do_fix else {}
+    tpl_targets = []
+    if do_tpl:
         for p in files:
-            shutil.copy2(p, os.path.join(backup, os.path.basename(p)))
-        print("已备份到 %s\n" % backup)
+            new = render(p)
+            if new is not None and new != store.read_text(p):
+                tpl_targets.append(p)
+    fix_targets = [p for p in files if (scans[p] or {}).get("dropped")] if do_fix else []
+    targets = sorted(set(tpl_targets) | set(fix_targets))
+
+    backup = None
+    if (do_fix or do_tpl) and targets:
+        backup = _backup_reports()
+        print("已备份 reports 整目录：%s" % _backup_note(backup))
+        print("  （备份**不在 `reports/` 里** —— 那是被校验的目录，放备份会让「报告有几份」说不清；"
+              "统一备份区就在 profile 的兄弟目录下）\n")
+    elif do_fix or do_tpl:
+        # 与两个迁移脚本同一口径：无事可做的一轮不建备份（备份是回滚的**前提**，没有改动就
+        # 无从回滚），一个字节都不写。
+        print("本次无需改动：没有任何报告需要刷新模板或清理来源"
+              "（本次**未建备份** —— 备份只为回滚改动而建）。\n")
 
     if do_tpl:
-        ok = bad = 0
+        ok = bad = same = 0
         for p in files:
             try:
-                if rerender(p):
-                    ok += 1
-                else:
-                    bad += 1
-                    print("  ⚠ 跳过（读不出 REPORT_DATA）：%s" % os.path.basename(p))
+                done = rerender(p)
             except Exception as e:
                 bad += 1
                 print("  ⚠ 失败 %s: %s" % (os.path.basename(p), e))
-        print("模板刷新完成：成功 %d 份，跳过/失败 %d 份" % (ok, bad))
-        print("备份保留在 %s（确认无误后可自行删除）\n" % backup)
+                continue
+            if done is None:
+                bad += 1
+                print("  ⚠ 跳过（读不出 REPORT_DATA）：%s" % os.path.basename(p))
+            elif done:
+                ok += 1
+            else:
+                same += 1
+        print("模板刷新完成：成功 %d 份，已是当前模板 %d 份，跳过/失败 %d 份" % (ok, same, bad))
+        if backup:
+            print("备份保留在 %s\n" % _backup_note(backup))
         if not do_fix:
             return 0
 
     tot = drop = 0
     changed = []
     for p in files:
-        r = scan(p)
+        r = scans[p] if do_fix else scan(p)
         name = os.path.basename(p)
         if r is None:
             print("  ⚠ 跳过（读不出 REPORT_DATA）：%s" % name)
@@ -209,7 +324,8 @@ def main():
             total_wiped += w
             print("  ✓ %-44s 删除 %d 条来源，%d 个节点降级为待查证" % (os.path.basename(p)[:44], d, w))
     print("\n完成：共删除 %d 条非本领域来源，%d 个节点降级为「AI 整理待查证」。" % (total_drop, total_wiped))
-    print("备份保留在 %s（确认无误后可自行删除）" % backup)
+    if backup:
+        print("备份保留在 %s" % _backup_note(backup))
     return 0
 
 

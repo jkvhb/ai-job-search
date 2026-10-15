@@ -28,6 +28,7 @@ import store
 from tests.base import IsolatedCase
 
 CLI = importlib.import_module("身份迁移")
+REPORT_CLI = importlib.import_module("报告体检")
 
 # 同一份 JD 的两次粘贴：SHORT 是 LONG 的截断（真实验测形状 0.965；jobdup 的测试里钉过）
 LONG_JD = ("数据质检验收把控：严格按评测标准对大模型语音通话数据质检验收；"
@@ -40,6 +41,20 @@ OTHER_JD = ("负责抖音电商直播运营，策划带货活动，管理达人�
 # 迁移完成之后新加的一份分析（**另一份 JD**）→ 表头必须是 `3 → 4（新增 1 个）`
 NEW_JD = ("负责图像标注平台的质检规则设计与抽检方案，跟踪标注员一致性（Kappa），"
           "输出返修闭环报告并推动标注工具迭代。")
+
+
+def dir_stats(path):
+    """目录的 `(文件数, 总字节数)`。
+
+    **测试自己算一份**（不复用被测代码的私有函数）：输出里报的那个"多大"必须是真数字，
+    拿实现自己的算法去验实现自己，等于什么都没验。
+    """
+    n = total = 0
+    for dirpath, _dirnames, filenames in os.walk(path):
+        for fn in filenames:
+            total += os.path.getsize(os.path.join(dirpath, fn))
+            n += 1
+    return n, total
 
 
 def fingerprint(root):
@@ -610,10 +625,48 @@ class IdempotenceTest(MigrationTestBase):
         self.assertEqual(code, 0)
         for name, text in snap.items():
             self.assertEqual(store.read_text(store.p_path(name)), text, "%s 被改动了" % name)
-        self.assertEqual(len(glob.glob(os.path.join(store.profiles_root(), "迁移备份_*"))),
-                         len(backups_before) + 1)      # 备份照常加一份，但库内容不变
+        # P0-12：**无事可做的一轮连备份目录都不建**（备份是回滚的前提，没有改动就无从回滚）。
+        # 老实现无条件备份 ⇒ profile 目录（含 interviews/ 下的原始录音）每次跑都被整目录复制一遍。
+        self.assertEqual(glob.glob(os.path.join(store.profiles_root(), "迁移备份_*")),
+                         backups_before, "无改动的一轮又建了一份备份（P0-12）")
         self.assertEqual(len(jdid.load_jds()["jds"]), 3)   # 没重复建 JD
         self.assertEqual(jdid.load_jds()["seq"], 3)        # seq 也没再涨
+
+    def test_no_change_run_creates_no_backup_and_says_so(self):
+        """需求一 + 需求二：无改动 → 不建备份目录，且输出**如实说**"无需改动、未建备份"。
+
+        反假绿：这一轮必须**一个数据文件都没写**（含 `logs/events.jsonl`：无事发生就不写审计行）。
+        """
+        self.assertEqual(self.run_cli(["--执行"])[0], 0)
+        before = sorted(glob.glob(os.path.join(store.profiles_root(), "迁移备份_*")))
+        self.assertEqual(len(before), 1, "夹具前提：第一次执行有改动，应当建了 1 份备份")
+        watched = [store.p_path("jds.json"), store.p_path("jobs.json"),
+                   store.p_path("knowledge.json"),
+                   os.path.join(store.p_path("logs"), "events.jsonl")]
+        bytes_before = {p: store.read_bytes(p) for p in watched}
+
+        code, text = self.run_cli(["--执行"])
+
+        self.assertEqual(code, 0)
+        self.assertEqual(sorted(glob.glob(os.path.join(store.profiles_root(), "迁移备份_*"))), before)
+        self.assertIn("无需改动", text)
+        self.assertIn("未建备份", text)
+        for p, raw in bytes_before.items():
+            self.assertEqual(store.read_bytes(p), raw, "%s 被写过了" % p)
+
+    def test_a_changed_run_says_where_the_backup_is_and_how_big_it_is(self):
+        """需求二：备份要说清**在哪、多大**（绝对路径 + 文件数 + 字节数），并明说可自行删除。"""
+        code, text = self.run_cli(["--执行"])
+
+        self.assertEqual(code, 0)
+        backups = glob.glob(os.path.join(store.profiles_root(), "迁移备份_*"))
+        self.assertEqual(len(backups), 1, "有改动却没建备份（那就失去了回滚能力）")
+        n, size = dir_stats(backups[0])
+        self.assertGreater(n, 0, "夹具前提：备份里必须有文件")
+        self.assertIn(os.path.abspath(backups[0]), text)     # 绝对路径，不是"某处"
+        self.assertIn("%d 个文件" % n, text)
+        self.assertIn("%d 字节" % size, text)
+        self.assertIn("确认无误后可自行删除", text)
 
     def test_dry_run_header_after_migration_says_no_new_jds(self):
         """**表头不能说假话**：二次执行的预览曾写成 `3 → 6`（实际 3、且执行确实幂等）。
@@ -829,7 +882,15 @@ class RestoreKeepsProfileRootTest(IsolatedCase):
             shutil.rmtree(store.p_path(sub), ignore_errors=True)
 
     def _execute_with_write_failure(self):
-        """注入「写盘立刻失败」→ 走备份恢复那条路（必须真的失败了，否则这条测试是空跑）。"""
+        """注入「写盘立刻失败」→ 走备份恢复那条路（必须真的失败了，否则这条测试是空跑）。
+
+        夹具必须**真的有改动**：P0-12 之后无改动的一轮连备份都不建、一个字节都不写，
+        那样永远走不到回滚这条路，这条用例会退化成空跑（本用例是"回滚不许削弱"的证据之一）。
+        `jd/` 里**不放** JD 原文 —— 本用例的前提就是 `jd/` 是个**空目录**（缺原文的分析
+        照样会自成 1 个 JD、照样要写 jds.json）。
+        """
+        store.upsert_job({"id": "分析X", "report": "分析X.html", "created_at": "2026-09-01 10:00",
+                          "job_title": "语音/文本评测", "score": 70.0, "resume": "周汉钦-母版"})
         with mock.patch.object(store, "write_json", side_effect=OSError("disk full (注入)")), \
                 mock.patch.object(sys, "argv", ["身份迁移.py", "--执行"]), \
                 contextlib.redirect_stdout(io.StringIO()), \
@@ -1085,6 +1146,143 @@ class GbkSafetyTest(MigrationTestBase):
         self.assertEqual(_gbk_unsafe(err2.getvalue()), [], repr(err2.getvalue()))
         err2.getvalue().encode("gbk")
         self.assertIn("备份失败", err2.getvalue())
+
+
+# ---------------------------------------------------------------- 报告体检（P0-12）
+# 一条会被 `knowledge.filter_relevant` 丢掉的来源（一个字都没命中 AI 领域词）+ 一条会留下的
+NON_AI_SOURCE = {"title": "家常菜谱：红烧肉", "snippet": "五花肉切块焯水",
+                 "url": "https://example.com/food"}
+AI_SOURCE = {"title": "Transformer (deep learning)", "snippet": "深度学习里的注意力机制",
+             "url": "https://example.com/ai"}
+
+
+class ReportHealthBackupTest(IsolatedCase):
+    """P0-12 需求二 + 需求三：`报告体检.py` 的备份必须**挪出 `reports/`**、说清在哪多大、不套备份。
+
+    为什么不能留在 `reports/报告备份_<ts>/`：`reports/` 是**被校验的目录**
+    （"reports 里到底有几份报告"就靠扫它），备份混进去以后这个数字就说不清了 ——
+    真实数据 `data/profiles/default/reports/` 里已经堆了两个 `报告备份_2026*`。
+    新位置是 `data/profiles/报告备份_<ts>/`：那正是本项目既有的**统一备份区**
+    （`迁移备份_*` / `简历迁移备份_*` / `删除备份_*` 都在同一层），一处能看全所有维护备份。
+
+    模板用**临时文件**（`mock.patch` 掉 `TEMPLATE`）：这条用例钉的是备份行为，
+    不该被 `web/report_template.html` 的并发改动牵连。
+    """
+
+    def setUp(self):
+        IsolatedCase.setUp(self)
+        os.makedirs(store.p_path("reports"), exist_ok=True)
+        self.tpl = os.path.join(self.tmp, "report_template.html")
+        store.write_text(self.tpl,
+                         "<html><head><title>__TITLE__</title></head><body>"
+                         "<script>\nconst REPORT_DATA = __REPORT_DATA__;\n</script></body></html>")
+        patcher = mock.patch.object(REPORT_CLI, "TEMPLATE", self.tpl)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def write_report(self, name, sources):
+        data = {"job_title": "语音/文本评测", "score": 70.0,
+                "knowledge": {"nodes": [{"term": "Transformer", "sources": list(sources)}]}}
+        store.write_text(os.path.join(store.p_path("reports"), name),
+                         "<html><head><title>%s</title></head><body><script>\n"
+                         "const REPORT_DATA = %s;\n</script></body></html>"
+                         % (name, json.dumps(data, ensure_ascii=False)))
+
+    def run_cli(self, argv):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(sys, "argv", ["报告体检.py"] + argv):
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = REPORT_CLI.main()
+        return code, out.getvalue(), err.getvalue()
+
+    def backups(self):
+        return sorted(glob.glob(os.path.join(store.profiles_root(),
+                                             REPORT_CLI.BACKUP_PREFIX + "_*")))
+
+    def test_the_backup_is_moved_out_of_the_reports_dir(self):
+        """需求二：`--刷新模板 --fix` 的备份**不在 `reports/` 里**（老实现每次都在那儿新建一个）。"""
+        self.write_report("脏报告.html", [AI_SOURCE, NON_AI_SOURCE])
+        before = sorted(os.listdir(store.p_path("reports")))
+
+        code, text, _err = self.run_cli(["--刷新模板", "--fix"])
+
+        self.assertEqual(code, 0)
+        # ① reports/ 下一个 `报告备份_*` 都没有，而且条目集合与跑之前**一模一样**
+        self.assertEqual([n for n in os.listdir(store.p_path("reports"))
+                          if n.startswith("报告备份")], [],
+                         "备份又留在 reports/ 里了：%s" % sorted(os.listdir(store.p_path("reports"))))
+        self.assertEqual(sorted(os.listdir(store.p_path("reports"))), before)
+        # ② 备份确实建了，只是挪到了统一备份区（profile 的兄弟目录）
+        backups = self.backups()
+        self.assertEqual(len(backups), 1, "备份没建在被要求的位置：%r" % backups)
+        self.assertEqual(os.path.abspath(os.path.dirname(backups[0])),
+                         os.path.abspath(store.profiles_root()))
+        self.assertIn(os.path.abspath(backups[0]), text)
+        # ③ 反假绿：备份里真的是**改动前**的那份报告（留档不生效就等于没备份）
+        self.assertIn("家常菜谱", store.read_text(os.path.join(backups[0], "脏报告.html")))
+        # ④ 报告真的被清理了（否则上面那些断言全是空跑）
+        self.assertNotIn("家常菜谱",
+                         store.read_text(os.path.join(store.p_path("reports"), "脏报告.html")))
+
+    def test_the_backup_path_and_size_are_printed(self):
+        """需求二：输出里给出**可删的确切路径与体积**（含文件数）。"""
+        self.write_report("脏报告.html", [AI_SOURCE, NON_AI_SOURCE])
+
+        _code, text, _err = self.run_cli(["--fix"])
+
+        backups = self.backups()
+        self.assertEqual(len(backups), 1)
+        n, size = dir_stats(backups[0])
+        self.assertGreater(n, 0)
+        self.assertIn(os.path.abspath(backups[0]), text)
+        self.assertIn("%d 个文件" % n, text)
+        self.assertIn("%d 字节" % size, text)
+        self.assertIn("确认无误后可自行删除", text)
+
+    def test_the_backup_never_copies_a_previous_backup_or_a_bak_file(self):
+        """需求三：备份里**不许套备份**（旧 `报告备份_*` 目录、`<文件>.bak-*` 留档都不拷）。
+
+        真实数据 `reports/` 下已经有两个 `报告备份_2026*`：不做闸门的话，每备份一次就把上一次
+        的备份再拷一份（滚雪球）；`.bak-` 留档同理（`store.BACKUP_SUFFIX`）。
+        """
+        self.write_report("脏报告.html", [AI_SOURCE, NON_AI_SOURCE])
+        old = os.path.join(store.p_path("reports"), "报告备份_20200101_000000")
+        os.makedirs(old)
+        store.write_text(os.path.join(old, "旧备份.html"), "旧备份，不该被拷进新备份")
+        bak = os.path.join(store.p_path("reports"),
+                           "脏报告.html" + store.BACKUP_SUFFIX + "20200101_000000")
+        store.write_text(bak, "旧留档，不该被拷进新备份")
+
+        code, _text, _err = self.run_cli(["--fix"])
+
+        self.assertEqual(code, 0)
+        new = self.backups()[0]
+        copied = [os.path.relpath(os.path.join(d, n), new)
+                  for d, _dn, fns in os.walk(new) for n in fns]
+        self.assertEqual([p for p in copied if store.BACKUP_SUFFIX in p], [],
+                         "新备份里套了 store 的留档：%s" % copied)
+        self.assertEqual([p for p in copied if os.path.basename(p).startswith("报告备份")], [],
+                         "新备份里套了上一次的备份：%s" % copied)
+        # 闸门只挡备份：正常报告一个都不能少（别做成"什么都不拷"的假绿）
+        self.assertIn("脏报告.html", copied)
+        # 旧备份 / 旧留档原地不动、一个字节没动（**绝不删除**）
+        self.assertTrue(os.path.isdir(old))
+        self.assertEqual(store.read_text(os.path.join(old, "旧备份.html")), "旧备份，不该被拷进新备份")
+        self.assertEqual(store.read_text(bak), "旧留档，不该被拷进新备份")
+
+    def test_a_run_with_nothing_to_do_creates_no_backup(self):
+        """需求一（同口径）：`--刷新模板 --fix` 无事可做时**不建备份**（第二轮的形状）。"""
+        self.write_report("脏报告.html", [AI_SOURCE, NON_AI_SOURCE])
+        self.assertEqual(self.run_cli(["--刷新模板", "--fix"])[0], 0)
+        self.assertEqual(len(self.backups()), 1)
+
+        code, text, _err = self.run_cli(["--刷新模板", "--fix"])
+
+        self.assertEqual(code, 0)
+        self.assertEqual(len(self.backups()), 1,
+                         "第二轮没有任何改动，却又建了一份备份（P0-12）")
+        self.assertIn("无需改动", text)
+        self.assertIn("未建备份", text)
 
 
 if __name__ == "__main__":

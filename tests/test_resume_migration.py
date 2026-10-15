@@ -70,6 +70,20 @@ def fingerprint(root):
     return out
 
 
+def dir_stats(path):
+    """目录的 `(文件数, 总字节数)`。
+
+    **测试自己算一份**（不复用被测代码的私有函数）：输出里报的那个"多大"必须是真数字，
+    拿实现自己的算法去验实现自己，等于什么都没验。
+    """
+    n = total = 0
+    for dirpath, _dirnames, filenames in os.walk(path):
+        for fn in filenames:
+            total += os.path.getsize(os.path.join(dirpath, fn))
+            n += 1
+    return n, total
+
+
 def count_files(directory, exts):
     try:
         names = os.listdir(directory)
@@ -454,11 +468,65 @@ class IdempotenceTest(MigrationCase):
         self.assertEqual(self.disk_bytes(store.p_path("resumes.json")), snap["resumes.json"])
         self.assertEqual(self.disk_bytes(store.p_path("jobs.json")), snap["jobs.json"])
         self.assertEqual(self.disk_bytes(logs), snap["events.jsonl"])   # 无事发生 → 不写审计行
-        self.assertEqual(len(self.backups()), 2)                        # 备份照常加一份
+        # P0-12：无事可做的一轮**连备份都不建**（备份是回滚的前提，没有改动就无从回滚）。
+        # 老实现无条件备份 ⇒ profile 目录（含 interviews/ 下的原始录音）每次跑都被整目录复制一遍。
+        self.assertEqual(len(self.backups()), 1, "无改动的一轮又建了一份备份（P0-12）")
         self.assertEqual([r["id"] for r in resumelib.load_resumes()["resumes"]], ["rv_0001"])
         jobs = self.jobs_by_id()
         self.assertEqual(jobs[MISMATCHED_ID].get("resume_id"), None)
         self.assertEqual(jobs[MATCHING_IDS[0]]["resume_id"], "rv_0001")
+
+    def test_no_change_run_creates_no_backup_and_says_so(self):
+        """需求一 + 需求二：无改动 → 不建备份目录，输出**如实说**"无需改动、未建备份"。"""
+        self.assertEqual(self.run_cli(["--执行"])[0], 0)
+        before = self.backups()
+        self.assertEqual(len(before), 1, "夹具前提：第一次执行有改动，应当建了 1 份备份")
+
+        code, text, _err = self.run_cli(["--执行"])
+
+        self.assertEqual(code, 0)
+        self.assertEqual(self.backups(), before)
+        self.assertIn("无需改动", text)
+        self.assertIn("未建备份", text)
+
+    def test_a_changed_run_says_where_the_backup_is_and_how_big_it_is(self):
+        """需求二：备份要说清**在哪、多大**（绝对路径 + 文件数 + 字节数），并明说可自行删除。"""
+        code, text, _err = self.run_cli(["--执行"])
+
+        self.assertEqual(code, 0)
+        backups = self.backups()
+        self.assertEqual(len(backups), 1, "有改动却没建备份（那就失去了回滚能力）")
+        n, size = dir_stats(backups[0])
+        self.assertGreater(n, 0, "夹具前提：备份里必须有文件")
+        self.assertIn(os.path.abspath(backups[0]), text)      # 绝对路径，不是"某处"
+        self.assertIn("%d 个文件" % n, text)
+        self.assertIn("%d 字节" % size, text)
+        self.assertIn("确认无误后可自行删除", text)
+
+    def test_the_backup_never_copies_a_store_bak_file_away(self):
+        """需求三：整目录备份**不许把 `store` 的 `<文件>.bak-*` 留档再拷一份**（滚雪球）。
+
+        闸门与 `身份迁移.py` / `报告体检.py` 同名同口径（骨架抄两遍已经漏出过一次差异）。
+        """
+        keep = os.path.join(store.profile_dir(),
+                            "jobs.json" + store.BACKUP_SUFFIX + "20200101_000000")
+        store.write_text(keep, "旧留档，不该被拷进新备份")
+        # 反假绿：先证明夹具里**真的有**留档可挡（否则这条测试什么也没钉住）
+        self.assertTrue(glob.glob(os.path.join(store.profile_dir(), "*.bak-*")))
+
+        code, _text, _err = self.run_cli(["--执行"])
+
+        self.assertEqual(code, 0)
+        new = self.backups()[0]
+        copied = [os.path.relpath(os.path.join(d, n), new)
+                  for d, _dn, fns in os.walk(new) for n in fns]
+        self.assertEqual([p for p in copied if store.BACKUP_SUFFIX in p], [],
+                         "新备份里套了 store 的留档：%s" % copied)
+        # 闸门只挡留档：正常内容一个都不能少（别做成"什么都不拷"的假绿）
+        self.assertIn("jobs.json", copied)
+        self.assertIn(os.path.join("resumes", RESUME_NAME + ".md"), copied)
+        # 留档原地不动、一个字节没动（**绝不删除**）
+        self.assertEqual(store.read_text(keep), "旧留档，不该被拷进新备份")
 
     def test_dry_run_after_migration_says_nothing_will_change(self):
         self.assertEqual(self.run_cli(["--执行"])[0], 0)
