@@ -279,6 +279,122 @@ class MergeCorruptKbTest(IsolatedCase):
                          {"drop": None, "keep": None})
 
 
+class MergeUnreadableInterviewStatusTest(IsolatedCase):
+    """面试 `status.json` **读不出来** ≠ 它没引用 drop（需求一，jobdup 侧）。
+
+    缺陷形状（批 1 独立复查实测）：造一份内容里 `job_id` 就是 `drop_id` 的坏 `status.json`
+    → `_interview_status_files` 里 `store.read_json(path, None)` 把「读不出来」当成
+    「这份没引用我」→ 返回 `[]`，合并照样成功 → 那条面试记录的 `job_id` 指向**已被合并掉的**
+    岗位（悬空引用，而且全程静默）。
+
+    策略（与 `jdid._interview_status_paths` 同一份口径）：**拒绝这次合并**，且闸门装在
+    **任何留档 / 写盘之前** —— 拒绝时用户数据一个字节都没动。为什么不选"只如实上报、照样合并"：
+    drop 的 `merged_into` 一写下去那条面试记录就永久指向一个已被合并掉的身份，
+    而这件事**事先就能判定**；按本项目「不知道 ≠ 安全」的口径就该停下（与坏知识库、
+    坏 JD 库那两条闸门同规格）。
+
+    断言为什么不是"整树指纹"：拒绝**要**记一条 `merge_rejected` 日志（与 `jdid` 同理），
+    所以钉的是用户数据逐字节未变 + **一份 `.bak-` 都没多**（后者同时钉住"闸门在留档之前"）。
+    """
+
+    def _two_jobs(self):
+        store.upsert_job({"id": "keep", "job_title": "语音/文本评测", "created_at": "2026-10-03 00:30",
+                          "jd_text_file": "keep.txt", "report": "keep.html", "score": 75.0})
+        store.upsert_job({"id": "drop", "job_title": "语音/文本评测", "created_at": "2026-10-08 16:40",
+                          "jd_text_file": "drop.txt", "report": "drop.html", "score": 72.0})
+        store.write_text(store.p_path("jd", "keep.txt"), FindDuplicatesTest.LONG)
+        store.write_text(store.p_path("jd", "drop.txt"), FindDuplicatesTest.SHORT)
+
+    def _broken_status(self, interview_id, job_id):
+        """造一份 GBK 的 `interviews/<id>/status.json`（内容里的 `job_id` 就是 `job_id`）。"""
+        path = store.interview_file(interview_id, "status.json")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        raw = json.dumps({"state": "done", "job_id": job_id, "note": "语音评测跟进记录"},
+                         ensure_ascii=False).encode("gbk")
+        try:
+            raw.decode("utf-8")
+            raise AssertionError("夹具没坏：这串字节居然能按 UTF-8 解出来")
+        except UnicodeDecodeError:
+            pass
+        store.write_bytes(path, raw)
+        return path, raw
+
+    def _baks(self):
+        """隔离根里全部 `.bak-` 的相对路径（拒绝时**一份都不该多**）。"""
+        return sorted(os.path.relpath(p, self.tmp)
+                      for p in glob.glob(os.path.join(self.tmp, "**", "*.bak-*"), recursive=True))
+
+    def test_an_unreadable_status_refuses_the_merge_and_touches_nothing(self):
+        self._two_jobs()
+        iv_path, raw = self._broken_status("iv_bad", "drop")
+        _assert_isolated(self, iv_path, store.jobs_path(), store.knowledge_path())
+        jobs_before = store.read_bytes(store.jobs_path())
+        baks_before = self._baks()
+
+        res = jobdup.merge_jobs("keep", "drop")
+
+        self.assertFalse(res["ok"], "读不出来的面试记录存在时绝不能报合并成功：%r" % res["reason"])
+        self.assertIn("读不出来", res["reason"])
+        self.assertEqual(store.read_bytes(store.jobs_path()), jobs_before, "台账一个字节都不该动")
+        self.assertIsNone({j["id"]: j for j in store.load_jobs()}["drop"].get("merged_into"),
+                          "drop 不许被标 merged_into（那就是把引用指向已合并掉的岗位）")
+        self.assertEqual(store.read_bytes(iv_path), raw, "坏的那份原样留着")
+        self.assertEqual(self._baks(), baks_before,
+                         "拒绝必须发生在留档之前：一份 `.bak-` 都不该多")
+
+    def test_a_readable_status_for_another_job_does_not_block_the_merge(self):
+        """对照组（反"有文件就拒"）：**读得出来但没引用 drop** 的那份不该挡住合并。"""
+        self._two_jobs()
+        store.save_interview_json("iv_other", "status.json", {"state": "done", "job_id": "别的岗位"})
+
+        res = jobdup.merge_jobs("keep", "drop")
+
+        self.assertTrue(res["ok"], res["reason"])
+        self.assertEqual(store.load_interview_json("iv_other", "status.json")["job_id"], "别的岗位")
+
+    def test_an_unreadable_status_for_another_job_also_refuses(self):
+        """判据是「读不出来」而不是「内容里恰好有 drop_id」（与 `jdid` 那条同一口径）。"""
+        self._two_jobs()
+        iv_path, raw = self._broken_status("iv_other", "别的岗位_标注_文本_上海_6-8K_0009")
+        jobs_before = store.read_bytes(store.jobs_path())
+
+        res = jobdup.merge_jobs("keep", "drop")
+
+        self.assertFalse(res["ok"])
+        self.assertIn("读不出来", res["reason"])
+        self.assertEqual(store.read_bytes(store.jobs_path()), jobs_before)
+        self.assertEqual(store.read_bytes(iv_path), raw)
+
+    def test_a_status_that_becomes_unreadable_after_the_gate_fails_loudly(self):
+        """同源读取**不能只改一半**：闸门通过后、写盘阶段那次再读读不出来 → 失败并回滚。
+
+        `_merge_jobs_locked` 有两处读面试记录：① 收集文件清单（闸门）② 写之前重新读内容。
+        老实现②用的是 `read_json(path, None)` + `if isinstance(st, dict)` —— 读不出来就**静默跳过**，
+        于是闸门白装、那条面试记录仍指向 drop，而合并报成功（同一条病的另一半）。
+        """
+        self._two_jobs()
+        store.save_interview_json("iv1", "status.json", {"state": "done", "job_id": "drop"})
+        iv_path = store.interview_file("iv1", "status.json")
+        real = store.read_json
+        calls = {"n": 0}
+
+        def flaky(path, default=None):
+            if path == iv_path:
+                calls["n"] += 1
+                if calls["n"] == 2:          # ① 闸门那次读得到；② 写盘那次读不出来
+                    return default
+            return real(path, default)
+
+        with mock.patch.object(store, "read_json", side_effect=flaky):
+            res = jobdup.merge_jobs("keep", "drop")
+
+        self.assertEqual(calls["n"], 2, "夹具前提：这个路径必须真的被读两次（闸门 + 写前复查）")
+        self.assertFalse(res["ok"], "写盘阶段读不出来时必须失败，不许静默跳过那条面试记录")
+        self.assertEqual(store.load_interview_json("iv1", "status.json")["job_id"], "drop",
+                         "回滚后那条面试记录还指向 drop（没有被改一半）")
+        self.assertIsNone({j["id"]: j for j in store.load_jobs()}["drop"].get("merged_into"))
+
+
 class CliTest(IsolatedCase):
     """**计划外补充**：`岗位去重.py` 这个交付物本身的测试。
 

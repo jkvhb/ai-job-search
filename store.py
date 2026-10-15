@@ -41,8 +41,14 @@ BACKUP_KEEP = 3
 # **静默丢台账** —— 两个分析各自读到同一份旧台账、各自写回，后写的把先写的那条顶掉
 # （实测 20 轮 ×2 条 → 20/20 全丢）。而 `jds.json`(`jdid._JD_LOCK`)、`knowledge.json`
 # (`kb._KB_LOCK`)、`resumes.json`(`resumelib._LOCK`)、`log`、`jobdup` 早就有锁，只有台账没有。
-# 锁加在 store 而不是调用方：app / jddelete / jdid / jobdup 四个写者因此共用同一把（包在 app 一层
-# 等于没修，另外三个写者照样互踩）。
+# 锁加在 store 而不是调用方：app / jddelete / jdid / jobdup 四个写者的**每一次** store 级
+# `load_jobs` / `save_jobs` 都过这一把锁（包在 app 一层等于没修，另外三个写者照样互踩）。
+#
+# ⚠️ 它保证的只是"**每一次** store 级读写是原子的"，**不是**"复合的读-改-写是原子的"：
+# `load_jobs()` → 改 → `save_jobs()` 这种跨多次调用的骨架（`app.py` 的 `DELETE /api/jobs`
+# 那条、`jdid.rename_jd` / `jobdup._merge_jobs_locked` / `jddelete._purge_locked`）**仍需调用方
+# 自己串行**（靠各自的上层锁或单写者约束）—— 中间挤进来另一个写者，后写的整份覆盖照样把先写的顶掉。
+# 本批只把这句话改成实话，不动那些调用方的行为（跨模块统一串行是批 2 的事）。
 #
 # 用 RLock 而不是 Lock：`upsert_job` 内部要调 `load_jobs` / `save_jobs`，同一线程必须能重入
 # （普通 Lock 会当场死锁）。名字与注释风格照 `kb._KB_LOCK` / `jdid._JD_LOCK`。
@@ -628,7 +634,8 @@ def _prune_backups(path, keep=BACKUP_KEEP):
 # **公开入口，为 `jobdup` 提供**：它给 `knowledge.json` 与每个面试 `status.json` 留 `.bak-`，
 # 也需要"只留最新 N 份"这条轮转（`snapshot_before_overwrite` 只管它自己的目标文件）。
 # 跨模块调带下划线的私有名是隐患：store 哪天把它改名/挪走，调用方就是**静默**失效
-# （备份无上限增长，没人报错）。这里是同一份实现（不是副本），旧的私有名保留给内部调用。
+# （备份无上限增长，没人报错）。这里是同一份实现（不是副本），旧的私有名保留给内部调用；
+# 公开入口的**唯一调用方**是 `jobdup._prune_backups`（`tests/test_store.py` 钉着两者是同一份实现）。
 prune_backups = _prune_backups
 
 

@@ -330,6 +330,7 @@ def plan_migration():
       `kb_touched`  —— 被改指的知识点条数
       `kb_unreadable` —— 报告读不出、引用**没敢改**的旧 id 列表（如实报告，不静默丢）
       `interviews`  —— `[(路径, 新内容 dict), …]`
+      `interviews_unreadable` —— 读不出来的面试 `status.json` 的原因（非空 = `--执行` 必须拒绝）
       `groups`      —— 每个 JD 的对照信息（旧分析 id / 归组依据 / 报告文件名 / JD 记录）
       `merged`      —— 保留原样的 `merged_into` 记录
       `skipped`     —— `(no_text, too_short)` 两类自成一组的原因计数
@@ -354,12 +355,13 @@ def plan_migration():
         jds_out = _build_jds(jds_data, records)
         jobs_out = _build_jobs(raw_jobs, new_ids)
         kb_out, kb_touched = _build_knowledge(new_ids, jd_by_id={r["jd_id"]: r for r in records})
-        interviews = _build_interviews(new_ids, identity_ids)
+        interviews, interviews_unreadable = _build_interviews(new_ids, identity_ids)
         skipped = {"no_text": sum(1 for r in records if r["why"] == "缺 JD 原文"),
                    "too_short": sum(1 for r in records if r["why"].startswith("原文过短"))}
         return {
             "jobs": jobs_out, "jds_doc": jds_out, "knowledge": kb_out["data"],
             "kb_touched": kb_touched, "kb_unreadable": failed, "interviews": interviews,
+            "interviews_unreadable": interviews_unreadable,
             "groups": records, "merged": merged, "skipped": skipped,
             "active": len(active), "before_jds": len(existing),
             # 这两行量的必须是**计划这一份快照**（`_build_knowledge` 里量的），
@@ -644,23 +646,38 @@ def _canonical_text(record, key):
 def _build_interviews(new_ids, identity_ids):
     """面试记录 `status.json.job_id` → JD id（只算不写）。
 
+    返回 `(要写的 [(路径, 新内容)], 读不出来的原因)`：**原因非空 = 有一份 `status.json`
+    有字节却读不出来**，调用方（`plan_migration` 如实带进计划、`execute_migration` 据此
+    **拒绝整次执行**）必须处理它。
+
     只改**真的会变、且是本轮身份之一**的记录：已合并记录自己的旧 id（策略 A 保留原样）
     不该被写进面试记录当身份。
+
+    为什么不能再用 `store.read_json(path, None)` 把"读不出来"当成"它没引用我"（口径照
+    `jdid._interview_status_paths`，两处是同一个闸门）：面试记录是**每个面试目录一个文件**，
+    漏掉一份没有任何集中信号。被跳过的那一份，迁移后 `job_id` 会**静默**留着旧分析 id ——
+    而那时 `jds.json` 里只有新 JD id、也没有哪条台账的 `jd_id` 等于它，于是同岗位两种身份
+    **加悬空引用**，用户在试跑表和执行输出里都看不到任何提示（批 1 独立复查在真实数据副本上实测）。
+    **"读不出来"就是"不知道它指向谁"**，而"不知道"不许当成"安全"。
+    0 字节 / 文件不存在**不算**读不出来：里面一个字节都没有，也就没有 `job_id` 可指。
     """
     out = []
+    err = ""
     for path in sorted(glob.glob(store.interview_file("*", "status.json"))):
         st = store.read_json(path, None)
-        if not isinstance(st, dict):
+        if isinstance(st, dict):
+            old = st.get("job_id")
+            if not isinstance(old, str) or old not in new_ids:
+                continue
+            if old not in identity_ids and new_ids[old] == old:
+                continue
+            new = dict(st)
+            new["job_id"] = new_ids[old]
+            out.append((path, new))
             continue
-        old = st.get("job_id")
-        if not isinstance(old, str) or old not in new_ids:
-            continue
-        if old not in identity_ids and new_ids[old] == old:
-            continue
-        new = dict(st)
-        new["job_id"] = new_ids[old]
-        out.append((path, new))
-    return out
+        if store.file_has_bytes_to_lose(path):
+            err = err or ("面试记录 `%s` 读不出来（拿不到它的 `job_id`）" % path)
+    return out, err
 
 
 # ---------------------------------------------------------------- 对照表
@@ -774,6 +791,16 @@ def render_table(plan):
     if plan["kb_unreadable"]:
         lines.append("注意：有 %d 处知识库引用读不出报告、**没敢改**（保持原样，绝不指丢）：%s"
                      % (len(plan["kb_unreadable"]), "、".join(plan["kb_unreadable"][:5])))
+    # ---- 需求一：读不出来的面试记录**必须在试跑表里如实说**（老实现一个字都不提）----
+    # 为什么口径是"读不出来 = 不知道它指向谁"（照 `jdid._interview_status_paths`）：面试记录是
+    # 每个面试目录一个文件，漏一份没有任何集中信号；照改会留下一条 `job_id` 指着旧分析 id 的
+    # 面试记录，而那时 jds.json 里只有新 JD id（同岗位两种身份 + 悬空引用），全程静默。
+    if plan.get("interviews_unreadable"):
+        lines.append("注意：**有一份面试记录读不出来**，读不出来就无法确认它挂在哪个 JD 下面，"
+                     "这次迁移**不能执行**（照改会留下一条 `job_id` 指着旧分析 id 的面试记录 —— "
+                     "同一个岗位两种身份，而且那份文件不会出现在任何一行里）：")
+        lines.append("  %s" % plan["interviews_unreadable"])
+        lines.append("  修法：先把它修好（或从别处恢复、把它移开）再跑；0 字节 / 不存在不算读不出来。")
     lines.append("")
     lines.append("以上只是试跑，**未改动任何文件**（加 --执行 才迁移，先整目录备份）。")
     return "\n".join(lines)
@@ -897,10 +924,35 @@ def _write_json(path, obj):
 
 # ---------------------------------------------------------------- 执行
 def execute_migration():
-    """备份 → 迁移 → 落盘；失败从备份恢复。返回进程退出码。"""
+    """备份 → 迁移 → 落盘；失败从备份恢复。返回进程退出码。
+
+    **任何一份面试 `status.json` 读不出来 → 拒绝整次执行**（退出码 1，备份之前就中止，
+    一个数据文件都没动，只往日志里记一条拒绝）：判据见下面那一段注释（与 `jdid.rename_jd` 同一口径）。
+    """
     plan = plan_migration()
     print(render_table(plan))
     print("")
+    # ---- 需求一：有面试 `status.json` 读不出来 → **拒绝整次执行**（在备份之前就中止）----
+    # 判据与 `jdid.rename_jd` / `jobdup._interview_status_files` 同一口径：面试记录是每个面试
+    # 目录一个文件，"读不出来"就是"不知道它指向谁"。老实现把读不出来当"这份没引用我"跳过，
+    # 于是这次迁移照跑（退出码 0），那份文件的 `job_id` 静默留在旧分析 id 上，而迁移后
+    # `jds.json` 里只有新 JD id —— 同岗位两种身份 + 悬空引用（批 1 独立复查实测）。
+    # 为什么在备份**之前**就返回：这时一个数据文件都没动（连备份目录都不建），用户修好再跑即可；
+    # 也避免在"注定要中止"的情况下往用户的 profiles 目录里再堆一份整目录备份。
+    if plan["interviews_unreadable"]:
+        msg = ("%s。**已拒绝这次迁移**：读不出来就无法确认它挂在哪个 JD 下面，照改会留下一条 "
+               "`job_id` 指着旧分析 id 的面试记录（同一个岗位两种身份 + 悬空引用）。"
+               "这次迁移**没有改动任何数据文件**（只往日志里记了这一条拒绝，连整目录备份都没建）"
+               "—— 请先把它修好（或从别处恢复、把它移开）再跑。"
+               % plan["interviews_unreadable"])
+        try:
+            log.log_event("migration.rejected", level="warn", reason=msg,
+                          profile=store.current_profile())
+        except Exception:
+            pass                               # 日志写不进去不该改变"拒绝"这个结论
+        sys.stderr.write("错误：%s\n" % msg)
+        print("错误：%s" % msg)
+        return 1
     root = store.profile_dir()
     had_files = _profile_files(root)
     try:

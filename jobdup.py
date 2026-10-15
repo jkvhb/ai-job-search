@@ -204,12 +204,16 @@ def _prune_backups(path):
     整目录备份还会把它们一起拷走）。而 `store.snapshot_before_overwrite` 的轮转**只管它自己的
     目标**（`config.json` / `jobs.json`），这两处不在里面。
 
-    为什么直接调带下划线的 `store._prune_backups`：它本来就是"按路径轮转 `<path>.bak-*`"的通用
-    实现（`snapshot_before_overwrite` 只是它的调用方之一），而"新旧怎么判"是个**已经踩过坑**的
-    判据（仓库里两种真实命名、按文件名里的时间戳去掉分隔符比数字；见它的注释）。另写一套 =
-    两份轮转实现各自漂移，正是本项目在修的那类病。上限也直接用 `store.BACKUP_KEEP`（同一个数）。
+    为什么走 `store` 的**公开入口** `store.prune_backups`（而不是带下划线的私有名）：它本来就是
+    "按路径轮转 `<path>.bak-*`"的通用实现（`snapshot_before_overwrite` 只是它的调用方之一），
+    而"新旧怎么判"是个**已经踩过坑**的判据（仓库里两种真实命名、按文件名里的时间戳去掉分隔符比
+    数字；见它的注释）。另写一套 = 两份轮转实现各自漂移，正是本项目在修的那类病 —— 而且
+    `docstring` 里论证"为什么可以调私有名"是一次**自相矛盾**：跨模块调带下划线的名字，`store`
+    哪天把它改名 / 挪走，调用方就是**静默**失效（备份无上限增长，没人报错）。`store` 已经把这份
+    实现作为公开入口提供（`prune_backups`，同一份实现、不是副本），这里就直接用它。
+    上限也直接用 `store.BACKUP_KEEP`（同一个数）。
     """
-    return store._prune_backups(path, keep=store.BACKUP_KEEP)
+    return store.prune_backups(path, keep=store.BACKUP_KEEP)
 
 
 def _snapshot(path, ts, backups):
@@ -340,14 +344,29 @@ def _repoint_kb(keep_id, drop_id):
 
 
 def _interview_status_files(drop_id):
-    """所有 `interviews/<面试id>/status.json` 里 `job_id == drop_id` 的文件路径（有序）"""
+    """扫 `interviews/<面试id>/status.json`，返回 `(job_id == drop_id 的文件路径, 读不出来的原因)`。
+
+    **原因非空 = 有一份 status.json 有字节却读不出来**，调用方（`_merge_jobs_locked`）必须
+    据此**拒绝这次合并**（闸门装在任何留档 / 写盘之前）。
+
+    口径与 `jdid._interview_status_paths` 逐字同一份（同一个闸门的两处骨架）：老实现
+    `store.read_json(path, None)` 把"读不出来"当成"这份没引用我" → 返回 `[]`，合并照样成功
+    → 那条面试记录的 `job_id` 指向**已被合并掉**的岗位（悬空引用，而且全程静默）。
+    **"读不出来"就是"不知道它指向谁"**，而"不知道"不许当成"安全"。
+    0 字节 / 文件不存在**不算**读不出来：里面一个字节都没有，也就没有 `job_id` 可指。
+    """
     pattern = os.path.join(store.interviews_dir(), "*", "status.json")
     out = []
+    err = ""
     for path in sorted(glob.glob(pattern)):
         st = store.read_json(path, None)
-        if isinstance(st, dict) and st.get("job_id") == drop_id:
-            out.append(path)
-    return out
+        if isinstance(st, dict):
+            if st.get("job_id") == drop_id:
+                out.append(path)
+            continue
+        if store.file_has_bytes_to_lose(path):
+            err = err or ("面试记录 `%s` 读不出来（拿不到它的 `job_id`）" % path)
+    return out, err
 
 
 def merge_jobs(keep_id, drop_id):
@@ -388,6 +407,23 @@ def _merge_jobs_locked(keep_id, drop_id):
         return _result(True, "drop 已是合并过的记录（merged_into=%s），本次不做任何改动" % done,
                        noop=True)
 
+    # ---- 需求一：任何一份面试 status.json 读不出来 → **拒绝这次合并** ----
+    # 判据与 `jdid._interview_status_paths` 同一份（见 `_interview_status_files`）：面试记录是
+    # 每个面试目录一个文件，漏一份没有任何集中信号；老实现把它当成"这份没引用我"跳过，
+    # 于是 drop 被标 `merged_into`、那条面试记录的 `job_id` 仍指向**已被合并掉**的岗位
+    # （悬空引用 + 同岗位两种身份，全程静默）。
+    # 闸门必须在**任何 `_snapshot` / 写盘之前**：拒绝时一个数据文件都没动（连一份 `.bak-` 都不多）。
+    iv_files, iv_err = _interview_status_files(drop_id)
+    if iv_err:
+        msg = ("%s。**已拒绝这次合并**：读不出来就无法确认它是不是挂在 %s 下面，"
+               "照合会留下一条 `job_id` 指向已被合并掉的岗位的面试记录（悬空引用）。"
+               "这次合并**没有改动任何数据文件**（只往日志里记了这一条拒绝，连一份 `.bak-` 都没多）"
+               "—— 请先把它修好（或从别处恢复、把它移开）再合并。"
+               % (iv_err, drop_id))
+        log.log_event("jobdup.merge_rejected", level="warn", reason=msg,
+                      keep=keep_id, drop=drop_id)
+        return _result(False, msg)
+
     before = kb.stats(store.load_knowledge())["multi_jd"]
     ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     backups = []
@@ -399,14 +435,22 @@ def _merge_jobs_locked(keep_id, drop_id):
             _snapshot(store.knowledge_path(), ts, backups)
             repointed, deduped = _repoint_kb(keep_id, drop_id)
 
-        iv_files = _interview_status_files(drop_id)
+        # 面试记录的清单**不在这里重新扫**：上面那道闸门已经扫过一次（并据此拒绝读不出来的情况），
+        # 这里复用同一份清单 —— 否则"闸门扫的"与"写盘扫的"是两个时刻的输入（同源读取只改一半）。
         for path in iv_files:
             _snapshot(path, ts, backups)
         for path in iv_files:
+            # 同源读取**不能只改一半**：闸门那次读得到，写盘这次再读也可能读不出来（文件被锁 /
+            # 被别的编辑器改坏 / 权限）。老实现 `if isinstance(st, dict)` 在这种时候**静默跳过**
+            # —— 闸门白装，那条面试记录仍指向 drop，而合并报成功。这里响亮失败 → 走下面的回滚
+            # （这些面试记录上面都留过档，回滚前提齐备）。
             st = store.read_json(path, None)
-            if isinstance(st, dict):
-                st["job_id"] = keep_id
-                store.write_json(path, st)
+            if not isinstance(st, dict):
+                raise RuntimeError(
+                    "面试记录 `%s` 在写盘阶段读不出来（拿不到它的 `job_id`）：本次合并中止并回滚，"
+                    "绝不把它静默留在指向 %s 的旧身份上。" % (path, drop_id))
+            st["job_id"] = keep_id
+            store.write_json(path, st)
 
         drop["merged_into"] = keep_id
         store.save_jobs(raw)              # 原样写回整份台账，只多了一个 merged_into

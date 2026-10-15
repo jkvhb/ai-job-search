@@ -472,6 +472,132 @@ class ExecuteTest(MigrationTestBase):
         self.assertEqual(store.read_text(keep), "旧留档，不该被拷进新备份")
 
 
+class UnreadableInterviewStatusTest(MigrationTestBase):
+    """面试 `status.json` **读不出来** ≠ 它没引用我（照 `jdid._interview_status_paths` 的口径）。
+
+    缺陷形状（批 1 独立复查在**真实 data/ 的只读副本**上实测）：
+      `interviews/iv_bad/status.json` 被别的编辑器存成 GBK（含中文）→ `store.read_json(path, None)`
+      把「读不出来」当成「这份没引用我」→ `continue`：`--试跑` 表里**一个字都不提**、
+      `--执行` 退出码 0，而那份文件的 `job_id` 仍指向 `jds.json` 里**已不存在**的旧分析 id
+      （新 id 已经建好）—— 同岗位两种身份 + 悬空引用，全程静默。
+
+    策略（与 `jdid.rename_jd` / `jobdup._interview_status_files` 同一口径，也是本项目
+    「不知道 ≠ 安全」的一贯做法）：**试跑如实点名 + 拒绝整次执行**（执行时在备份之前中止，
+    一个数据文件都不写 —— 只往日志里记一条拒绝事件）。为什么不选"只提示、照样执行"：
+    面试记录是**每个面试目录一个文件**，漏掉一份没有任何集中信号；照改就会留下「台账已指向
+    新 JD、那份面试记录仍指向旧 id」的两种身份，而且**越晚发现越难还原**（用户以为迁移干净了）。
+    宁可这次不迁，也不静默改一半。
+    日志仍会记一条拒绝事件（与 `jdid.rename_rejected` 同规格），所以断言钉的是**用户数据文件**
+    逐字节未变 + 没有新建备份目录，而不是整树指纹。
+    """
+
+    IV_ID = "iv_bad"
+    OLD_ID = "分析A"                       # `MigrationTestBase` 里 iv1 用的那种会被迁移的旧 id
+
+    def _write_gbk_status(self):
+        """造一份 GBK 的 `interviews/iv_bad/status.json`（`job_id` 指向会被迁移的旧分析 id）。"""
+        path = store.interview_file(self.IV_ID, "status.json")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        raw = json.dumps({"state": "done", "job_id": self.OLD_ID, "note": "语音评测跟进记录"},
+                         ensure_ascii=False).encode("gbk")
+        # 自证：这份夹具**必须**是 UTF-8 读不出来的（否则这条测试什么也没钉住）
+        with self.assertRaises(UnicodeDecodeError):
+            raw.decode("utf-8")
+        store.write_bytes(path, raw)
+        return path, raw
+
+    def _user_data_bytes(self):
+        """用户数据文件的逐字节快照（**不含**日志：拒绝事件本来就要写进 events.jsonl）。"""
+        return {
+            "jds": store.read_bytes(store.p_path("jds.json")),
+            "jobs": store.read_bytes(store.jobs_path()),
+            "kb": store.read_bytes(store.knowledge_path()),
+            "iv1": store.read_bytes(store.interview_file("iv1", "status.json")),
+        }
+
+    def test_dry_run_says_the_unreadable_status_file_out_loud(self):
+        """① `--试跑` 必须**点名**这份坏文件（不能一个字都不提），且仍然严格只读。"""
+        path, raw = self._write_gbk_status()
+        before = fingerprint(store.DATA_ROOT)
+
+        code, text = self.run_cli(["--试跑"])
+
+        self.assertEqual(code, 0)
+        self.assertEqual(fingerprint(store.DATA_ROOT), before, "试跑必须严格只读")
+        self.assertIn(self.IV_ID, text, "试跑表里没点名那份读不出来的面试记录：\n%s" % text)
+        self.assertIn("读不出来", text, "试跑表没如实说「读不出来」：\n%s" % text)
+        self.assertEqual(store.read_bytes(path), raw)
+
+    def test_execute_refuses_and_changes_nothing(self):
+        """② `--执行` 必须**拒绝整次迁移**：退出码非 0、用户数据逐字节未变、没有备份目录。"""
+        path, raw = self._write_gbk_status()
+        before = self._user_data_bytes()
+        backups_before = glob.glob(os.path.join(store.profiles_root(), "迁移备份_*"))
+
+        code, text = self.run_cli(["--执行"])
+
+        self.assertNotEqual(code, 0, "读不出来时绝不能报成功：\n%s" % text)
+        self.assertIn(self.IV_ID, text)                       # 拒绝理由要点名那份文件
+        self.assertIn("读不出来", text)
+        self.assertEqual(self._user_data_bytes(), before,
+                         "拒绝时用户数据一个字节都不该动（拒绝事件本身会写日志）")
+        self.assertEqual(store.read_bytes(path), raw, "坏的那份原样留着")
+        self.assertEqual(glob.glob(os.path.join(store.profiles_root(), "迁移备份_*")),
+                         backups_before, "拒绝必须发生在备份之前（连备份目录都不该建）")
+        # 对照组：可读的那份（iv1）**不许**被先改成新 id（没有半改状态）
+        self.assertEqual(store.load_interview_json("iv1", "status.json")["job_id"], self.OLD_ID)
+        self.assertFalse(os.path.exists(store.p_path("jds.json")), "jds.json 一个字节都不该写")
+
+    def test_the_fixture_really_is_a_dangling_shape(self):
+        """③ 反假绿：这份坏文件里的旧 id 在本轮**真的会被改指**（不是一条无关夹具）。
+
+        没有闸门时必然留下的形状：那份文件的 `job_id` 留在**旧分析 id** 上，而迁移后
+        `jds.json` 里只有新 JD id、也没有任何一条台账的 `jd_id` 等于它 —— 即**悬空引用**
+        （同岗位两种身份）。这条只钉"夹具确实咬得住"+ 计划必须如实带上它。
+        """
+        path, raw = self._write_gbk_status()
+
+        plan = CLI.plan_migration()
+
+        new_ids = {rid: r["jd_id"] for r in plan["groups"] for rid in r["ids"]}
+        self.assertIn(self.OLD_ID, new_ids, "夹具前提：这个旧 id 本轮确实会被迁移")
+        self.assertNotEqual(new_ids[self.OLD_ID], self.OLD_ID, "夹具前提：新身份与旧 id 不同")
+        self.assertIn(self.OLD_ID, raw.decode("gbk"), "夹具前提：坏文件里写的确实是旧 id")
+        jds_ids = {r.get("id") for r in plan["jds_doc"]["jds"]}
+        job_jd_ids = {j.get("jd_id") for j in plan["jobs"] if j.get("jd_id")}
+        self.assertNotIn(self.OLD_ID, jds_ids, "迁移后旧分析 id 不是 JD 身份")
+        self.assertNotIn(self.OLD_ID, job_jd_ids, "迁移后旧分析 id 也不是任何台账的 jd_id")
+        self.assertIn(self.IV_ID, plan["interviews_unreadable"],
+                      "计划没把「读不出来的面试记录」如实带上：%r" % plan["interviews_unreadable"])
+
+
+class JobsLockCommentTruthTest(IsolatedCase):
+    """需求二①：`store._JOBS_LOCK` 的注释不许再声称"四个写者共用一把锁完成复合读-改-写"。
+
+    它的真实语义只有一半：锁让**每一次** `load_jobs` / `save_jobs` 原子；**跨多次调用的复合
+    读-改-写**（`load_jobs()` → 改 → `save_jobs()`）仍无锁，得靠调用方自己串行
+    （`app.py` 的 `DELETE /api/jobs` / `jdid.rename_jd` / `jobdup._merge_jobs_locked` /
+    `jddelete._purge_locked`）。
+
+    ⚠️ 这条**只能钉文案**（注释没有行为）：断言"说过头的那一句不在了"+"限定句必须在"。
+    更细的措辞漂移只能靠 review —— 不要指望这条断言能代替人读。
+    """
+
+    def _block(self):
+        """`_JOBS_LOCK` 定义前那一整段"并发"注释。"""
+        src = store.read_text(os.path.join(store.ROOT, "store.py"))
+        end = src.index("_JOBS_LOCK = threading.RLock()")
+        begin = src.rindex("# ---------- 并发", 0, end)
+        return src[begin:end]
+
+    def test_the_comment_does_not_overclaim_composite_read_modify_write(self):
+        block = self._block()
+        self.assertIn("每一次", block, "注释必须说清锁保护的是**每一次** store 级读写")
+        self.assertIn("复合", block, "注释必须说清复合的读-改-写仍需调用方自己串行")
+        self.assertNotIn("四个写者因此共用同一把", block,
+                         "注释还在声称四个写者共用一把锁（那是把「每次原子」说成了「复合原子」）")
+
+
 class IdempotenceTest(MigrationTestBase):
     """④ 跑两次，第二次一个字节都不改（jds.json / jobs.json / knowledge.json 字节级相同）。"""
 
