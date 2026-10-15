@@ -1027,3 +1027,152 @@ class JudgeTest(IsolatedCase):
             raise AssertionError("空库不该发起模型调用")
 
         self.assertEqual(kbreuse.judge(self._nodes("ASR"), kbreuse.Index([]), must_not_call), {})
+
+
+class ReuseTest(IsolatedCase):
+    """阶段 E 的**执行者**：`Reuse(cfg).plan(nodes)` = 建目录 → 匹配（含一次模型判定）→ 统计。
+
+    **头号契约是不许抛**（spec §9）：知识库读不出来 / 索引建不起来 / 模型判定失败，
+    都必须如实落进 `stats`，让分析照常做完（联网兜底）。所以每条失败路径都同时盯着三件事：
+    「不抛」「如实说」「节点没被复用」。
+    """
+
+    def _node(self, term="语音识别"):
+        return {"id": store.slug(term), "term": term, "definition": "本次写的定义",
+                "plain_explanation": "本次写的通俗解释", "category": "核心概念", "layer": 0,
+                "sources": [], "timeline": [], "related": [], "interview_questions": [],
+                "confidence": "ai-generated", "state": "待学习"}
+
+    def _card(self, term="语音识别", **kw):
+        c = {"id": kb.normalize_id(term), "term": term, "definition": "库里的定义",
+             "plain_explanation": "库里的通俗解释", "category": "核心概念", "layer": 0,
+             "sources": [{"url": "https://w"}], "timeline": [{"year": "2010", "text": "t"}],
+             "from_jds": [{"id": "j1", "job_title": "岗位一", "date": "2025-01-02"}]}
+        c.update(kw)
+        return c
+
+    def _cfg(self, **tm):
+        model = {"base_url": "https://b/v1", "api_key": "k", "model": "m", "temperature": 0.3}
+        model.update(tm)
+        return {"text_model": model}
+
+    def test_a_readable_base_is_planned_and_marked_used(self):
+        """库读得出来：`used` 为真、节点被整条填上、`stats` 就是 `plan` 的返回值。"""
+        store.save_knowledge({"nodes": [self._card()]})
+        node = self._node()
+        reuse = kbreuse.Reuse({})
+        stats = reuse.plan([node])
+        self.assertTrue(reuse.used, "跑过就要记下来 —— 报告据此区分「跑了但库里是空的」与「根本没跑」")
+        self.assertEqual(stats["reusable"], 1)
+        self.assertEqual(stats["knowledge_error"], "")
+        self.assertEqual(node["definition"], "库里的定义", "够格的整条复用（spec 决策 5）")
+        self.assertEqual(node["kb_reuse"]["matched_by"], "exact")
+        self.assertEqual(reuse.stats, stats, "报告读的就是 `self.stats` 那份（同一个统计）")
+
+    def test_a_broken_base_never_throws_and_is_reported(self):
+        """知识库坏掉：`plan` **不抛**、如实写 `knowledge_error`、节点**没被复用**（退回联网）。"""
+        with open(store.knowledge_path(), "wb") as f:
+            f.write(b'{"nodes": [ <<<CORRUPT>>>')
+        node = self._node()
+        reuse = kbreuse.Reuse({})
+        stats = reuse.plan([node])                      # 不许抛
+        self.assertTrue(reuse.used, "库坏了也是「跑过」——报告要标的是那条 error，不是 cached")
+        self.assertTrue(stats["knowledge_error"], "坏库必须如实说（报告要标 ⚠，spec §9）")
+        self.assertIn("knowledge.json", stats["knowledge_error"], "原因里要说清是哪个文件")
+        self.assertEqual(stats["reusable"], 0)
+        self.assertEqual(stats["searched"], 1, "一条都没复用 → 这次照旧联网")
+        self.assertNotIn("kb_reuse", node, "库读不出来时不许假装命中")
+        self.assertEqual(node["definition"], "本次写的定义", "不许动节点内容")
+
+    def test_a_config_without_a_usable_text_model_skips_the_judge_only(self):
+        """`cfg` 里没有可用的文本模型 → `_judge_caller` 返回 `None` → **只做确定性匹配**。
+
+        确定性匹配是**免费**的那一半，必须照跑（少了它这项功能就没意义了）；
+        被省掉的只有那次模型判定。
+        """
+        for cfg in (None, {}, {"text_model": {}}, {"text_model": None},
+                    {"text_model": {"base_url": "b", "api_key": "k"}},        # 缺 model
+                    {"text_model": {"base_url": "b", "model": "m"}},          # 缺 api_key
+                    {"text_model": {"api_key": "k", "model": "m"}}):           # 缺 base_url
+            self.assertIsNone(kbreuse._judge_caller(cfg), "不该给出可用的调用器：%r" % (cfg,))
+        self.assertTrue(callable(kbreuse._judge_caller(self._cfg())),
+                        "配好了文本模型时**必须**给出调用器（否则模型判定永远跑不到）")
+
+        store.save_knowledge({"nodes": [self._card()]})
+        node = self._node()
+        seen = []
+
+        def spy(*a, **kw):
+            seen.append(a)
+            return {}
+
+        with mock.patch.object(kbreuse, "judge", spy):
+            stats = kbreuse.Reuse({}).plan([node])
+        self.assertEqual(seen, [], "没有可用文本模型时不许调判定")
+        self.assertEqual(stats["reusable"], 1, "确定性命中照样复用")
+        self.assertEqual(node["definition"], "库里的定义")
+
+    def test_a_configured_text_model_gets_one_judge_call_that_can_rescue_a_miss(self):
+        """配好文本模型时，那次判定要**真的发生**，并且能救回确定性匹配认不出的同义写法。
+
+        节点「ASR」与库里那张卡（term「语音识别」、无 aliases）确定性**不可能**对上 ——
+        只有模型判定能把它认出来。所以这条同时是 `Reuse.plan` 里 `call=...` 的牙：
+        不传 `call`，这里 `reusable` 就会掉到 0（实测该变异全量红）。
+        """
+        store.save_knowledge({"nodes": [self._card()]})
+        node = self._node("ASR")
+        seen = []
+
+        def fake_chat(base_url, api_key, model, messages, **kw):
+            seen.append((base_url, api_key, model, messages, kw))
+            return json.dumps({"pairs": [{"node": "ASR", "card_id": "语音识别"}]},
+                              ensure_ascii=False)
+
+        with mock.patch.object(kbreuse.llm, "call_openai_compatible", fake_chat):
+            stats = kbreuse.Reuse(self._cfg()).plan([node])
+        self.assertEqual(stats["reusable"], 1, "配好的模型判定必须被用来认同义写法")
+        self.assertEqual(node["kb_reuse"]["matched_by"], "assisted")
+        self.assertEqual(node["term"], "语音识别", "assisted 也要做身份对齐（spec §7）")
+        self.assertEqual(len(seen), 1, "一次分析只判一次")
+        self.assertEqual(seen[0][:3], ("https://b/v1", "k", "m"), "走的是 cfg 里那个文本模型")
+        self.assertEqual(seen[0][4].get("temperature"), 0.3, "温度沿用配置")
+        self.assertIn("知识库管理员", seen[0][3][0]["content"])
+
+    def test_a_raising_model_call_is_swallowed_into_the_stats(self):
+        """模型判定失败（网络/额度/返回畸形）→ **绝不抛**，等于"没命中"，这次退回联网。"""
+        store.save_knowledge({"nodes": [self._card()]})
+        node = self._node("ASR")
+
+        def boom(*a, **kw):
+            raise RuntimeError("模型炸了")
+
+        with mock.patch.object(kbreuse.llm, "call_openai_compatible", boom):
+            stats = kbreuse.Reuse(self._cfg()).plan([node])      # 不许抛
+        self.assertEqual(stats["knowledge_error"], "")
+        self.assertEqual(stats["reusable"], 0, "判不出来就当没命中，绝不猜")
+        self.assertEqual(stats["searched"], 1)
+        self.assertNotIn("kb_reuse", node)
+
+    def test_a_missing_temperature_falls_back_to_a_default_and_never_passes_none(self):
+        """`temperature` 缺失/为 `None`/为 `0` 时一律退回 0.3 —— 与 `knowledge._call` 同一条口径。
+
+        往模型接口送 `None` 是另一套语义（"不带这个参数"），而这个字段在配置里是可选装饰；
+        口径是 `float(tm.get("temperature") or 0.3)`（既有写法就这么写，不另造一套）。
+        """
+        store.save_knowledge({"nodes": [self._card(term="别的概念")]})     # 造一个"未命中"让判定跑起来
+        seen = {}
+
+        def fake_chat(base_url, api_key, model, messages, **kw):
+            seen.update(kw)
+            return json.dumps({"pairs": []})
+
+        for extra in ({}, {"temperature": None}, {"temperature": 0}, {"temperature": "0.3"}):
+            tm = {"base_url": "b", "api_key": "k", "model": "m"}
+            tm.update(extra)
+            seen.clear()
+            with mock.patch.object(kbreuse.llm, "call_openai_compatible", fake_chat):
+                kbreuse.Reuse({"text_model": tm}).plan([self._node("没见过")])
+            want = 0.3      # 四种输入都该送 0.3（"0.3" 转成 float）
+            self.assertEqual(seen.get("temperature"), want,
+                             "temperature=%r 时该送出 %r" % (extra, want))
+            self.assertIsInstance(seen.get("temperature"), float, "不许把 None / int 原样送出去")

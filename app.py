@@ -9,6 +9,7 @@ AI 求职助手 · 本地工具（Python 标准库，零第三方依赖）
 """
 import base64
 import contextlib
+import inspect
 import json
 import os
 import re
@@ -26,6 +27,7 @@ import jddelete
 import jdid
 import jobdup
 import kb
+import kbreuse
 import knowledge
 import interview
 import llm
@@ -1028,6 +1030,47 @@ def _as_bool(value):
     return bool(value)                  # 非字符串：原语义（True/1/2 → 真；0/None/[]/{} → 假）
 
 
+def _accepts_reuse(fn):
+    """这个 builder 收不收 `reuse` 关键字参数？（判据只有签名，见 `_builder_with_reuse`）"""
+    try:
+        params = inspect.signature(fn).parameters.values()
+    except (TypeError, ValueError):
+        return False        # 查不出签名（内建 / C 扩展）：按那条缝的老契约两个参数调
+    for p in params:
+        if p.kind is inspect.Parameter.VAR_KEYWORD:
+            return True     # `**kw` → 收
+        if p.name == "reuse" and p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                                           inspect.Parameter.KEYWORD_ONLY):
+            return True
+    return False
+
+
+def _builder_with_reuse(reuse):
+    """把阶段 E 的 `reuse` 绑进 `jdfacts.resolve` 那条 builder 缝，返回 `builder(jd_text, cfg)`。
+
+    ⚠️ **为什么必须闭包**：`jdfacts._compute_once` 是用 `builder(jd_text, cfg)`（两个位置参数）
+    调的。直接把 `knowledge.build_for_jd` 传进去的话，`reuse` 永远留在默认值 `None` ——
+    知识地图照旧出得来、报告也照旧写，只是**每条都去联网**：阶段 E 会**静默失效**，
+    而且看不出来（这正是本项目最忌讳的失败形态）。
+
+    ⚠️ **为什么还要看签名**：那条缝原本的契约就是 `builder(jd_text, cfg)`，注入的替身/别的实现
+    只收这两个参数。硬塞 `reuse=` 会让它们 `TypeError` —— 那是"替身没跟上新签名"，
+    不是被测代码该出的错（实测：不加这道判断，`tests/test_analyze_knowledge_cache.py` 里
+    一批两参数的假 builder 会在**进入函数体之前**就炸，`calls` 全空）。
+    所以只把对方**真的收**的参数传过去。
+
+    ⚠️ 这里**没有** try/except：`Reuse` 自己不许抛（读不出来只落在 `stats` 里），
+    真抛出来的话那是别处的 bug，应当响亮地失败。
+    """
+    def call(jd_text, cfg):
+        fn = knowledge.build_for_jd        # 每次真算时**重新取**：测试会替换这个属性
+        if _accepts_reuse(fn):
+            return fn(jd_text, cfg, reuse=reuse)
+        return fn(jd_text, cfg)
+
+    return call
+
+
 def _discard_orphan_jd(jd_id):
     """删掉**本次这次调用刚建、却什么也没落上**的那条 JD 记录（善后；不删任何文件）。
 
@@ -1297,12 +1340,18 @@ def do_analyze(jd_text, image_data_url, resume_name, link="", overwrite_id="", a
 
         # 三级回退（规格 §4）：① 缓存 → ② 该 JD 自己旧报告的播种 → ③ 真算（builder）。
         # 真算那一步（= 206 秒 + 53 次搜索）**只有这一个入口**，所以这是本阶段收益的全部来源。
+        #
+        # 阶段 E：真算那一步里**先查本地知识库**（够格的整条复用、跳过那次联网搜索）。
+        # `reuse` 必须在 resolve **之前**建好，并由 `_builder_with_reuse` 用闭包绑进那条
+        # 「两个位置参数」的 builder 缝 —— 直接写 `builder=knowledge.build_for_jd` 的话
+        # `reuse` 永远是 `None`，这个功能会**静默失效**（见 `_builder_with_reuse`）。
+        reuse = kbreuse.Reuse(cfg)
         know_nodes = []
         try:
             _t = time.time()
             know_nodes, know_source = jdfacts.resolve(
                 jd_id, jd_text, cfg, refresh=refresh_jd_facts,
-                builder=knowledge.build_for_jd)
+                builder=_builder_with_reuse(reuse))
             # 「复用/播种/真算」各自的事件由 jdfacts 记（analyze.knowledge_reused / _seeded /
             # _computed）；这一条留着是为了**耗时**（复用时应接近 0，真算时 206 秒）。
             log.log_event("analyze.knowledge_done", ms=int((time.time() - _t) * 1000),
@@ -1317,6 +1366,14 @@ def do_analyze(jd_text, image_data_url, resume_name, link="", overwrite_id="", a
             at = jdfacts.get(jd_id).get("knowledge_at")
             if isinstance(at, str) and at.strip():
                 meta["at"] = at
+            # 阶段 E 的统计（复用了几条 / 命中几条 / 库读不出来的原因）。
+            # ⚠️ 两支**不是同一件事**，报告里不许混：
+            #   * `used` 为真 = 这次**真的跑过**"库优先" → 如实带上统计（`stats` 为空 dict
+            #     也是"跑了"，那表示"库是空的、复用了 0 条"）；
+            #   * `used` 为假 = 知识地图是从**缓存/旧报告**里拿的（三级回退的①②），
+            #     这次**根本没跑** → 只标 `cached`。这时写「复用了 0 条」是**假话**
+            #     （读报告的人会以为查过库、只是没查到，实际上压根没查）。
+            meta["kb_reuse"] = dict(reuse.stats) if reuse.used else {"cached": True}
             d["knowledge_meta"] = meta
         except Exception as e:
             # 明确区分「管线失败」与「真的没有知识点」，避免静默变成空模块。

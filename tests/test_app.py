@@ -1824,6 +1824,160 @@ class JdIdentityTest(_AnalyzeRouteCase):
         self.assertNotIn(report_id, ids, "from_jds 指到了报告文件名（身份又绑回日期+分数）")
 
 
+# ------------------------------------------------- 阶段 E：知识库优先复用（接上总闸）
+# 前面几条 Task 只把 `kbreuse` 与 `knowledge.build_for_jd(reuse=…)` 建好，**默认关闭**。
+# 这一组钉的是「总闸真的接上了」：`do_analyze` 必须把 `Reuse` 注入那条 builder 缝，
+# 并把统计带进报告元数据。三条纪律（每条都对着一种假绿）：
+#   ① 「复用了」必须同时断言**那一次联网搜索没发生** —— 只断言"报告里有卡片内容"是恒真的；
+#   ② 库坏了必须**如实说**（`kb_reuse.knowledge_error` 非空），不许假装一切正常；
+#   ③ 缓存命中时**根本没跑**库优先 —— 不许写「复用了 0 条」（那是在说假话）。
+class AnalyzeKbReuseTest(_AnalyzeRouteCase):
+    """`do_analyze` 的 `kbreuse.Reuse` 接线：闭包注入 + 统计进 `knowledge_meta`。"""
+
+    # 抽出来的两个术语：「语音识别」库里有**够格**的整条卡；另一个库里没有 → 必须照旧联网。
+    REUSABLE_TERM = "语音识别"
+    MISS_TERM = "完全没见过的概念"
+
+    def setUp(self):
+        super().setUp()
+        store.ensure_profile()
+        self.searches = []      # 每次联网搜索的 query
+        self.judged = []        # 每次知识库判定（默认配置没有 api_key → 一次都不该有）
+        # 真 `knowledge.build_for_jd`（本组要测的正是它的注入点）→ 三个花钱入口全是替身。
+        self._patch(app.search_mod, "search", self._fake_search)
+        self._patch(app.llm, "call_openai_compatible", self._fake_chat)
+        self._patch(app.llm, "repair_json",
+                    mock.Mock(side_effect=AssertionError("测试里不该真去修 JSON")))
+
+    # ---------------- 夹具
+    def _card(self):
+        """库里那张**够格**的卡：定义 + 通俗解释 + ≥1 条带 url 的来源（+时间线，省掉 ④）。"""
+        return {"id": kb.normalize_id(self.REUSABLE_TERM), "term": self.REUSABLE_TERM,
+                "definition": "库里的定义", "plain_explanation": "库里的通俗解释",
+                "category": "核心概念", "layer": 0,
+                "sources": [{"title": "维基", "url": "https://w"}],
+                "timeline": [{"year": "2010", "text": "库里的时间线"}],
+                "from_jds": [{"id": "old", "job_title": "老岗位", "date": "2025-01-02"}]}
+
+    def _fake_search(self, query, providers=None, **kw):
+        self.searches.append(query)
+        return [{"title": "搜索结果", "url": "https://x", "snippet": "大模型 语音 标注"}]
+
+    def _fake_chat(self, base_url, api_key, model, messages, json_mode=False, **kw):
+        """按系统提示词**分派**：do_analyze 自己的 SOP 分析 / ①拆解 / ②头脑风暴 / ④时间线 / 判定。
+
+        为什么必须分派：这几步走同一个模型入口，回错形状会让被测那一步**静默降级** ——
+        那样断言就变成"什么也没测"。
+        """
+        sys_prompt = messages[0]["content"]
+        if "求职顾问" in sys_prompt:                       # do_analyze 的 SOP 分析
+            return self.REPLY
+        if "从岗位 JD 中抽出" in sys_prompt:                # 知识地图 ① 拆解
+            return json.dumps({"nodes": [
+                {"id": "a", "term": self.REUSABLE_TERM, "definition": "本次模型写的定义",
+                 "plain_explanation": "本次模型写的通俗", "category": "核心概念"},
+                {"id": "b", "term": self.MISS_TERM, "definition": "x",
+                 "plain_explanation": "y", "category": "核心概念"}]}, ensure_ascii=False)
+        if "知识网络构建专家" in sys_prompt:                # ② 头脑风暴
+            return json.dumps({"related": []}, ensure_ascii=False)
+        if "技术史专家" in sys_prompt:                      # ④ 时间线
+            return json.dumps({"timeline": [{"year": "2020", "text": "补算的时间线"}]},
+                              ensure_ascii=False)
+        if "知识库管理员" in sys_prompt:                    # 知识库判定
+            self.judged.append(messages)
+            return json.dumps({"pairs": []}, ensure_ascii=False)
+        raise AssertionError("假模型收到了认不出的提示词：%s" % sys_prompt[:60])
+
+    def _data_of(self, report):
+        data = kb.read_report_data(os.path.join(store.p_path("reports"), report))
+        self.assertIsInstance(data, dict, "报告 %s 里抽不出 REPORT_DATA" % report)
+        return data
+
+    def _kb_reuse_of(self, report):
+        meta = self._data_of(report).get("knowledge_meta")
+        self.assertIsInstance(meta, dict, "报告 %s 里没有 knowledge_meta" % report)
+        reuse = meta.get("kb_reuse")
+        self.assertIsInstance(reuse, dict, "报告元数据里没有 kb_reuse 统计：%r" % (meta,))
+        return reuse
+
+    def _run(self, resume=None, **extra):
+        body = {"jd_text": self.LONG, "source_type": "粘贴文本",
+                "resume_name": self._resume(resume or "我的简历.md")}
+        body.update(extra)
+        code, rbody = self._post_json("/api/analyze", body)
+        self.assertEqual((code, rbody.get("ok")), (200, True), rbody)
+        self.assertNotIn("knowledge_error", self._data_of(rbody["report"]),
+                         "知识地图整步失败了：%r" % (rbody["report"],))
+        return rbody["report"]
+
+    # ---------------- ① 够格的卡：整条复用 + 那次搜索真的被省下
+    def test_a_reusable_card_is_used_and_that_term_is_never_searched(self):
+        store.save_knowledge({"nodes": [self._card()]})
+        report = self._run()
+        reuse = self._kb_reuse_of(report)
+        self.assertGreaterEqual(reuse["reusable"], 1, "库里那张完整的卡没被复用：%r" % (reuse,))
+        self.assertEqual(reuse["knowledge_error"], "", "库是好的，不该有 error")
+        # 被复用的那个术语**一次都没搜**（本功能的全部意义，spec §10.3）
+        self.assertEqual([q for q in self.searches if self.REUSABLE_TERM in q], [],
+                         "够格复用就不该再联网搜：%r" % (self.searches,))
+        # 反向：没命中的那个**照旧联网** —— 否则"没搜"可能只是因为压根没搜过任何东西
+        self.assertTrue([q for q in self.searches if self.MISS_TERM in q],
+                        "没命中的概念必须照旧搜（否则上面那条是假绿）：%r" % (self.searches,))
+        # 默认 profile 的 text_model 没有 api_key → 那次"模型判定"一次都不该发生（省额度）
+        self.assertEqual(self.judged, [], "没有可用文本模型时不该发起判定调用")
+        # 报告节点里读到的必须是**库里那份**内容（不是本次模型的输出）
+        nodes = {n["term"]: n for n in self._data_of(report)["knowledge"]}
+        self.assertEqual(nodes[self.REUSABLE_TERM]["definition"], "库里的定义")
+        self.assertEqual(nodes[self.REUSABLE_TERM]["timeline"],
+                         [{"year": "2010", "text": "库里的时间线"}], "库里有时间线 → ④ 也不许跑")
+
+    def test_a_builder_that_only_accepts_the_old_two_arguments_still_works(self):
+        """`jdfacts` 那条缝的**老契约**就是 `builder(jd_text, cfg)`（两个位置参数）。
+
+        注入的替身/别的实现只会收这两个参数 —— 硬塞一个 `reuse=` 会让它们 `TypeError`
+        （那是替身没跟上新签名，不是被测代码该出的错）。所以接线必须**看签名**传参。
+        同时钉住：替身收不到 `reuse` 时，报告里**不许编**一份统计出来。
+        """
+        calls = []
+
+        def old_builder(jd_text, cfg):
+            calls.append(jd_text)
+            return [{"id": "x", "term": "RLHF", "definition": "d", "layer": 0,
+                     "sources": [], "timeline": [], "related": [], "interview_questions": [],
+                     "confidence": "ai-generated"}]
+
+        self._patch(app.knowledge, "build_for_jd", old_builder)
+        report = self._run()
+        self.assertEqual(calls, [self.LONG], "两参数的老 builder 没被正常调到（签名适配没生效）")
+        self.assertEqual(self._kb_reuse_of(report), {"cached": True},
+                         "库优先根本没跑 → 不许编 reusable: 0 这种假统计")
+
+    # ---------------- ② 库坏了：分析照做，但坦白说清楚
+    def test_a_broken_knowledge_base_is_reported_not_papered_over(self):
+        with open(store.knowledge_path(), "wb") as f:
+            f.write(b'{"nodes": [ <<<CORRUPT>>>')
+        report = self._run()                     # 分析照常出（HTTP 200 / ok:true）
+        reuse = self._kb_reuse_of(report)
+        self.assertTrue(reuse["knowledge_error"], "坏库必须如实说 —— 不许假装一切正常（spec §9）")
+        self.assertIn("knowledge.json", reuse["knowledge_error"])
+        self.assertEqual(reuse["reusable"], 0)
+        self.assertTrue(self.searches, "库读不出来 → 全部退回联网（一个都不能省）")
+
+    # ---------------- ③ 缓存命中：这次**根本没跑**库优先
+    def test_a_cached_map_does_not_claim_zero_reuse(self):
+        store.save_knowledge({"nodes": [self._card()]})
+        first = self._run()
+        self.assertGreaterEqual(self._kb_reuse_of(first)["reusable"], 1, "夹具前提：第一次真的复用了")
+        searches_before = len(self.searches)
+        second = self._run(resume="第二版.md", allow_duplicate=True)
+        reuse = self._kb_reuse_of(second)
+        self.assertEqual(self._data_of(second)["knowledge_meta"]["source"], "cache",
+                         "夹具前提：第二次真的走了缓存")
+        self.assertEqual(reuse, {"cached": True},
+                         "缓存命中时这次**根本没跑**库优先 —— 不许写 reusable: 0 这种假话")
+        self.assertEqual(len(self.searches), searches_before, "复用缓存时一次搜索都不该有")
+
+
 # ⚠️ 本块的另一组高风险假绿：
 #   ① `do_POST` 有外层 try → 异常会变成 500 的「服务器内部错误：…」；
 #   ② `/api/analyze` 那条路由自己 `except Exception` → **200 + {"ok": false}**。

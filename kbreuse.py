@@ -17,6 +17,7 @@ import json
 import re
 
 import kb
+import llm
 import log
 import store
 
@@ -480,3 +481,53 @@ def judge(nodes, index, call):
                 continue          # 一张卡只认一条
             out[node_term] = cid
     return out
+
+
+def _judge_caller(cfg):
+    """把"调一次文本模型"包成 `judge` 要的 `call(messages) -> 文本`。
+
+    `cfg` 里没有可用的文本模型（`base_url` / `api_key` / `model` 缺一）→ 返回 `None`：
+    调用方（`plan_nodes`）会**只做确定性匹配** —— 那是免费的那一半，照跑；
+    被省掉的只有这次模型判定（省一次额度，也不因为没配模型就报错）。
+
+    调用方式与 `knowledge._call` **完全同一套**（`llm.call_openai_compatible`，就是那里
+    `chat or …` 的默认值）：本模块不 import `knowledge`（成环，见模块 docstring），
+    所以这里直接落到同一个底层函数上，绝不另造一条模型调用路径。
+
+    `temperature` 走 `float(tm.get("temperature") or 0.3)`（与 `knowledge._call` 的口径一致）：
+    往接口送 `None` 是"不带这个参数"的另一套语义，而这个字段在配置里是可选装饰。
+    """
+    tm = (cfg or {}).get("text_model") or {}
+    if not (tm.get("base_url") and tm.get("api_key") and tm.get("model")):
+        return None
+
+    def call(messages):
+        return llm.call_openai_compatible(tm["base_url"], tm["api_key"], tm["model"], messages,
+                                          temperature=float(tm.get("temperature") or 0.3))
+    return call
+
+
+class Reuse:
+    """"库优先"的执行者：**一次分析建一次目录** → 跑匹配（含一次模型判定）→ 返回统计。
+
+    这个类**不许抛**：知识库读不出来、索引建不起来、模型判定失败，
+    都必须在 `stats` 里如实反映，让分析照常做完（联网兜底）—— spec §9。
+    做到这件事靠的是**下游**：`build_index` 把读盘失败转成 `(空目录, 原因)`、
+    `plan_nodes` 不抛、`judge` 把模型失败吞成"没命中"。这里刻意**不加** try/except ——
+    真抛出来的话那是别处的 bug，应当响亮地失败（静默兜底会把它藏起来）。
+
+    `used` 记录的是"**这次真的跑过库优先**"：`do_analyze` 靠它区分
+    「跑了、库是空的（复用了 0 条）」与「根本没跑（知识地图是从缓存/旧报告拿的）」——
+    后者在报告里写"复用了 0 条"就是**说假话**（spec §9）。
+    """
+
+    def __init__(self, cfg=None):
+        self.cfg = cfg or {}
+        self.stats = {}
+        self.used = False      # 是否真的跑过（缓存命中时不会跑）
+
+    def plan(self, nodes):
+        self.used = True
+        index, err = build_index()
+        self.stats = plan_nodes(nodes, index, call=_judge_caller(self.cfg), error=err)
+        return self.stats
