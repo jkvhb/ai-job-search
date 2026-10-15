@@ -696,6 +696,13 @@ def _apply_feedback(jd_id, transcript, analysis, interview_id=None):
             seen.add(nid)
             asked_u.append(t)
     result = kb.record_interview(jd_id, asked=asked_u, weak=weak_u)
+    # kb.record_interview 在「库读不出来且坏文件留档也失败」时返回 None = **本次一个字节都没写**。
+    # 那时绝不能落标记：标记一落，这次反哺就被 _feedback_done 永远挡掉，用户的面试记录静默丢失
+    # （与上面 _mark_feedback 的注释同一条理由的另一个方向）。
+    if result is None:
+        log.log_event("interview.feedback_not_applied", level="warn", interview=interview_id,
+                      job=jd_id, reason="知识库读不出来，本次没有写入")
+        return None
     if interview_id:
         _mark_feedback(interview_id, jd_id)               # 只在真写进知识库之后才标记
     return result

@@ -335,6 +335,65 @@ def _quarantine_corrupt_kb():
     return True
 
 
+_KB_WRITE_REFUSED = "知识库读不出来，本次没有写入（坏文件已按 .corrupt-* 留档，先修好库再操作）"
+
+
+def _with_kb_write(fn, refuse_when=None, write_when_unreadable=True):
+    """knowledge.json 唯一写入口：持 `_KB_LOCK` → load → 改 → save，写盘前先隔离读不出来的旧文件。
+
+    `fn(data)` 返回调用方要的返回值。
+    `refuse_when(data) -> str | None` 是可选的**入参守卫**，返回非空字符串 = "这次没什么可写的"
+    （如"找不到该知识点"）。`write_when_unreadable=False` 表示这个入口在**库读不出来时一律不写**
+    （`set_state` / `record_review` / `merge_nodes`：它们写的**就是库里那张已有的卡**）。
+
+    返回 `(是否真的调用过 fn, fn 的返回值或守卫给的原因)`：
+
+      * `(False, 守卫给的原因 / _KB_WRITE_REFUSED)` —— 没写。
+      * `(True, result)` —— fn 跑过了；库读不出来时坏文件已先被改名留档（这次写入不丢用户的卡）。
+
+    **为什么必须抽出来（P0-1）**：`absorb` 早就接了哨兵，而另外五个写入口各写各的样板。
+    `record_interview` 那条漏了哨兵 —— 实测把 GBK 写坏的库（300 字节、用户 145 张卡）换成
+    36 字节空库、`.corrupt-*` 一个都没有。其余四条当时"数据不丢"只是**副作用**：读到空库 →
+    找不到目标卡 → 恰好没走到 save。那不是契约，任何一次"顺手把 save 挪到前面 / 加一句无条件
+    save"都会立刻复现同一个事故。把哨兵放在**唯一入口**上，就不可能再有"哪条路忘了装闸门"。
+
+    **库读不出来时写不写，按入口的语义分两类**（`load_knowledge()` 给的是空库，
+    "空库"与"库真的空了"分不开 —— 所以"库里有没有这张卡"这个判据在此时整个失效）：
+
+      * 写的**就是库里那张已有的卡**（`write_when_unreadable=False`）：目标无从判断，就不写。
+        一次点空了的调用不该让用户的文件消失（哪怕留下备份）。如实报 `_KB_WRITE_REFUSED`，
+        调用方/界面就能说"库读不出来，先去修库" —— 比"静默干了半件事"有用得多。
+      * 写的是**用户这次的操作**（`absorb` 的沉淀、`upsert_check` 的勾、`record_interview`
+        的反哺）：坏文件先逐字节留档，然后照常写新库。放弃写入等于让用户刚做完的操作静默丢失，
+        而留档之后"用户的卡会被空库顶掉"这件事已经不成立了（P0-1 的修法正是这个）。
+
+    **守卫的位置**：
+      * 库**读得出来** → 先问守卫（这是 `absorb` 那条"零可吸收节点先返回"的一般化）：
+        一次"点空了"的调用本该什么都不做，那就**一个字节都别动**（连隔离都不做）。顺序反过来时，
+        这种调用会把好库隔离走再写回一份空库 —— 用户看到"点一下，知识库没了（多了个 .corrupt-*）"。
+      * 库**读不出来** → 守卫拿到的 `data` 是空库、判据失效，**所以不拿它做决定**（隔离之后
+        读回来的也还是空文件，同样不可用）。要不要写只由 `write_when_unreadable` 决定。
+
+    **为什么新库必须重新 `load()`**（不接收调用方传进来的库对象）：隔离会把坏文件**改名走**，
+    此刻盘上已经没有 knowledge.json 了；拿一份外部传进来的内存副本当底本，等于把坏文件被改名
+    之前的旧内容又写回去 —— 那正好是 P0-1 要修的那件事。代价是每次写多一次读盘（几毫秒）。
+    """
+    with _KB_LOCK:
+        read_ok = store.knowledge_safe_to_write()[0]
+        if read_ok and refuse_when is not None:
+            because = refuse_when(ensure_kb(store.load_knowledge()))
+            if because:
+                return False, because              # 没什么可写的：连隔离都不做，文件原样不动
+        if not read_ok and not write_when_unreadable:
+            log.log_event("kb.write_refused", level="warn", reason="corrupt_kb_unreadable")
+            return False, _KB_WRITE_REFUSED
+        if not _quarantine_corrupt_kb():
+            # 坏文件留档失败：宁可这次不沉淀，也绝不能让用户的卡被内存里的空库顶掉
+            log.log_event("kb.write_refused", level="warn", reason="corrupt_backup_failed")
+            return False, _KB_WRITE_REFUSED
+        return True, fn(ensure_kb(store.load_knowledge()))
+
+
 def absorb(nodes, jd=None, kb=None):
     """把一次分析（或一份报告）的知识点并入知识库。返回 (added, merged)。
 
@@ -347,6 +406,13 @@ def absorb(nodes, jd=None, kb=None):
     纯标点）本来就没有任何东西可沉淀，却会走完隔离 + save_knowledge —— 于是「库文件坏 + 本次
     零知识点」的组合会先把用户的库改名走，再写回一份空库，等于「吸收了个寂寞还把库清空」。
     判断必须在 _quarantine_corrupt_kb() **之前**做，否则坏文件已经被改名走了。
+
+    哨兵与 load→save 这段整体由 `_with_kb_write` 承担（P0-1：五个写入口共用同一条闸门）。
+
+    `kb` 参数**保留但已不再使用**（P0-1 的后续）：P0-1 要的就是"写盘用的底本必须是**当场从盘上读
+    回来的**"，而不是调用方手里那份可能已经过期的内存副本 —— 拿旧副本当底本正是"坏文件被改名走
+    之后又把旧内容写回去"的来源。签名不改是为了不惊动既有调用方（本函数是模块里被外部用得最多
+    的一个）。其余四个写入口的 `kb=None` 参数一并删掉了（仓库里 0 个调用方在传）。
     """
     # 先筛出真正可吸收的节点（术语是非空字符串、normalize_id 后也非空），再决定做不做隔离与写盘。
     # 这里必须整节点保留（不是只留 term）：_new_card / _merge_into 还要读 definition / sources /
@@ -362,12 +428,14 @@ def absorb(nodes, jd=None, kb=None):
     if not absorbable:
         return 0, 0                      # 零可吸收节点：连隔离都不做，文件原样不动
 
-    # 整段「检查坏文件 → load → 改内存 → save」必须串行：见 _KB_LOCK 的注释
-    with _KB_LOCK:
-        if not _quarantine_corrupt_kb():
-            return 0, 0
-        kb = ensure_kb(kb if kb is not None else store.load_knowledge())
-        index = {n.get("id"): n for n in kb["nodes"] if n.get("id")}
+    def _absorb_into(kb):
+        # P0-7：索引必须**同时**收 id 与归一化 term。kbreuse 是按 normalize_id(term) 找卡的，
+        # 只按 card["id"] 建索引的话，一张 id 与 term 不一致的卡（手改 / 别的写入者造成，
+        # 实测形态 `{"id": "yuyinshibie", "term": "ASR"}`）在这里会"找不到"
+        # → 明明复用了旧卡却又新建一张同概念卡（added=1，卡片数 1 → 2）。
+        # 先 id 后 term、用 setdefault：**id 优先**，与 `kbreuse.Index` 的
+        # `by_name[normalize_id(term)]` + 既有 id 索引合起来是同一把尺子。
+        index = _card_index(kb)
         added = merged = 0
         for node in absorbable:
             nid = normalize_id(node["term"].strip())   # 上面已保证 term 是字符串且非空
@@ -376,6 +444,7 @@ def absorb(nodes, jd=None, kb=None):
                 card = _new_card(node, jd)
                 kb["nodes"].append(card)
                 index[nid] = card
+                index.setdefault(card.get("id"), card)
                 added += 1
             else:
                 _merge_into(card, node)
@@ -386,25 +455,67 @@ def absorb(nodes, jd=None, kb=None):
         store.save_knowledge(kb)
         return added, merged
 
+    invoked, result = _with_kb_write(_absorb_into)
+    if not invoked:
+        return 0, 0                       # 坏文件留档失败：照旧"什么都没吸收"
+    return result
 
-def set_state(node_id, state, kb=None):
+
+def _card_index(data):
+    """知识库的「身份键 → 卡」索引：**同时**收 `id` 与 `normalize_id(term)`，`id` 优先。
+
+    P0-7：`kbreuse.Index` 是按 `normalize_id(term)` 找卡的，`kb.absorb` 却只按 `card["id"]`
+    建索引 —— 一张 id 与 term 不一致的卡（手改 / 别的写入者造成，实测
+    `{"id": "yuyinshibie", "term": "ASR"}`）在 absorb 这里会"找不到"，于是明明复用了旧卡
+    又新建一张同概念卡。两把尺子必须合成一把：**两张键都收，先 id 后 term（`setdefault`）**。
+
+    `id` 优先的理由：id 是这张卡的**真身份**（报告里的关联概念图、`from_jds` 都按它连线），
+    term 只是显示名。两者冲突时以 id 为准，与 `kbreuse.Index` 两层键里"精确名永远赢"同源。
+    """
+    index = {}
+    for n in data["nodes"]:
+        nid = n.get("id")
+        if nid:
+            index.setdefault(nid, n)
+        term_key = normalize_id(n.get("term"))
+        if term_key:
+            index.setdefault(term_key, n)
+    return index
+
+
+def set_state(node_id, state):
     """只改学习状态，不碰任何其它字段。返回 (ok, msg)。
 
     参数可以是**身份键**也可以是**原始术语**（内部先 normalize_id，对已归一化的 id 是 no-op）。
+
+    **不建卡**：找不到就返回 (False, "找不到该知识点")。库读不出来时同样返回 False，
+    但理由不同（见 `_with_kb_write` 的 `_KB_WRITE_REFUSED`）—— 调用方据 msg 就能如实回报。
+
+    哨兵与 load→save 这段整体由 `_with_kb_write` 承担（P0-1）。**守卫要在哨兵之前**：
+    "状态不合法"是纯粹的入参问题，不该因为一次失败调用就把好库隔离走。
     """
     if state not in STATE_VALUES:
         return False, "状态不合法：%s" % state
     node_id = normalize_id(node_id)
     # load → 改 → save 整段串行：不加锁会被并发的 absorb 用「它读到的旧库」覆盖掉这次掌握度
-    with _KB_LOCK:
-        kb = ensure_kb(kb if kb is not None else store.load_knowledge())
-        for n in kb["nodes"]:
-            if n.get("id") == node_id:
-                n["state"] = state
-                store.save_knowledge(kb)
-                log.log_event("kb.state_set", id=node_id, state=state)
-                return True, ""
-        return False, "找不到该知识点"
+    invoked, result = _with_kb_write(
+        lambda kb: _set_state_in(kb, node_id, state),
+        refuse_when=lambda kb: None if _card_index(kb).get(node_id) else "找不到该知识点",
+        write_when_unreadable=False)
+    if not invoked:
+        return False, result or _KB_WRITE_REFUSED
+    return result
+
+
+def _set_state_in(kb, node_id, state):
+    """`set_state` 的主体（调用方已持锁、已过入参守卫、已隔离坏库）。"""
+    for n in kb["nodes"]:
+        if n.get("id") == node_id:
+            n["state"] = state
+            store.save_knowledge(kb)
+            log.log_event("kb.state_set", id=node_id, state=state)
+            return True, ""
+    return False, "找不到该知识点"
 
 
 _REVIEW_WEIGHT = {"待学习": 3, "学习中": 2, "已掌握": 1}
@@ -471,34 +582,46 @@ def review_queue(kb, limit=20):
     return out[:limit] if limit else out
 
 
-def record_review(node_id, result, kb=None):
+def record_review(node_id, result):
     """记录一次自测结果并推进状态。返回 (ok, 节点或 None)。
 
     答上了 → 直接「已掌握」；没答上 → 退一档（已掌握→学习中→待学习，待学习留在原地）。
     退档而不是清零：答错一次不该把「学习中」打回原点，但也不该留在原位骗自己。
 
-    load → 改 → save 整段进 _KB_LOCK：与 absorb / set_state 同类，无锁并发会丢更新。
+    **不建卡**：找不到就返回 (False, None)。库读不出来时同样返回 (False, None) ——
+    盘上的坏文件一个字节都不动（调用方要更细的原因，看 `kb._KB_WRITE_REFUSED`）。
+
+    load → 改 → save 整段进 _with_kb_write：与 absorb / set_state 同类，无锁并发会丢更新。
     """
     if result not in _RESULTS:
         return False, None
     nid = normalize_id(node_id)
     if not nid:
         return False, None
-    with _KB_LOCK:
-        data = ensure_kb(kb if kb is not None else store.load_knowledge())
-        for n in data["nodes"]:
-            if n.get("id") == nid:
-                if result == RESULT_UP:
-                    n["state"] = "已掌握"
-                else:
-                    rank = _STATE_RANK.get(str(n.get("state")), 0)
-                    n["state"] = STATE_VALUES[max(0, rank - 1)]
-                n["review_count"] = _as_int(n.get("review_count")) + 1
-                n["last_reviewed_at"] = _today()
-                n["last_result"] = result
-                store.save_knowledge(data)
-                log.log_event("kb.review_recorded", id=nid, result=result, state=n["state"])
-                return True, n
+    invoked, outcome = _with_kb_write(
+        lambda data: _record_review_in(data, nid, result),
+        refuse_when=lambda data: None if _card_index(data).get(nid) else "找不到该知识点",
+        write_when_unreadable=False)
+    if not invoked:
+        return False, None
+    return outcome
+
+
+def _record_review_in(data, nid, result):
+    """`record_review` 的主体（调用方已持锁、已过入参守卫、已隔离坏库）。"""
+    for n in data["nodes"]:
+        if n.get("id") == nid:
+            if result == RESULT_UP:
+                n["state"] = "已掌握"
+            else:
+                rank = _STATE_RANK.get(str(n.get("state")), 0)
+                n["state"] = STATE_VALUES[max(0, rank - 1)]
+            n["review_count"] = _as_int(n.get("review_count")) + 1
+            n["last_reviewed_at"] = _today()
+            n["last_result"] = result
+            store.save_knowledge(data)
+            log.log_event("kb.review_recorded", id=nid, result=result, state=n["state"])
+            return True, n
     return False, None
 
 
@@ -530,45 +653,68 @@ def interview_hits(text, kb=None):
     return out
 
 
-def record_interview(jd_id, asked=None, weak=None, good=None, kb=None):
+def record_interview(jd_id, asked=None, weak=None, good=None):
     """把一次面试的结果写回知识库。返回 (hits, weak, downgraded) 计数。
 
     **顺序**：先 +1（asked_count），再写 last_outcome，最后做「已掌握 → 学习中」的降级
     —— 保证降级不会被后续写回覆盖掉。
     **找不到的术语直接忽略，绝不自动建卡**（新词由用户在复盘报告里手动加入）。
+
+    ⚠️ **本函数无条件 save** —— 它是 P0-1 唯一真正丢数据的那条路（实测：GBK 写坏的库
+    300 字节 → 36 字节、用户卡全没、`.corrupt-*` 一个都没有）。现在整段走
+    `_with_kb_write`：坏库先留档再写。
+
+    **库读不出来且留档失败时返回 `None`**（不是 `(0, 0, 0)`）：`(0, 0, 0)` 是**合法结果**
+    （这次面试一个知识点都没提到），调用方没法拿它区分"写成了"与"压根没写"。
+    `interview._apply_feedback` 依赖这个区分：它只在**真写进库之后**才落 feedback 标记，
+    否则那次反哺永远补不回来（标记已落盘、重试会被幂等挡掉）。
     """
-    with _KB_LOCK:
-        data = ensure_kb(kb if kb is not None else store.load_knowledge())
-        index = {n.get("id"): n for n in data["nodes"] if n.get("id")}
-        hits = weak_n = downgraded = 0
-        for term in _as_list(asked):
-            card = index.get(normalize_id(term))
-            if card is None:
-                continue
-            card["asked_count"] = _as_int(card.get("asked_count")) + 1
-            hits += 1
-        for term, outcome in [(t, "没答上") for t in _as_list(weak)] + \
-                             [(t, "答上了") for t in _as_list(good)]:
-            card = index.get(normalize_id(term))
-            if card is None:
-                continue
-            card["last_outcome"] = outcome
-            card["last_interview_jd"] = str(jd_id or "")
-        for term in _as_list(weak):
-            card = index.get(normalize_id(term))
-            if card is None:
-                continue
-            weak_n += 1
-            if str(card.get("state")) == "已掌握":
-                card["state"] = "学习中"          # 你以为会了，其实不会
-                downgraded += 1
-        store.save_knowledge(data)
-        log.log_event("kb.interview_recorded", jd=jd_id, hits=hits,
-                      weak=weak_n, downgraded=downgraded)
-        return hits, weak_n, downgraded
+    invoked, result = _with_kb_write(
+        lambda data: _record_interview_in(data, jd_id, asked, weak, good))
+    if not invoked:
+        return None                      # 没写：调用方必须能分辨，绝不能报一个假 (0, 0, 0)
+    return result
 
 
-def upsert_check(term, state, meta=None, kb=None):
+def _record_interview_in(data, jd_id, asked, weak, good):
+    """`record_interview` 的主体（调用方已持锁、已隔离坏库）。"""
+    index = {}
+    for n in data["nodes"]:
+        nid = n.get("id")
+        if nid:
+            index.setdefault(nid, n)
+        term_key = normalize_id(n.get("term"))
+        if term_key:
+            index.setdefault(term_key, n)          # 与 absorb 同一把尺子（P0-7）
+    hits = weak_n = downgraded = 0
+    for term in _as_list(asked):
+        card = index.get(normalize_id(term))
+        if card is None:
+            continue
+        card["asked_count"] = _as_int(card.get("asked_count")) + 1
+        hits += 1
+    for term, outcome in [(t, "没答上") for t in _as_list(weak)] + \
+                         [(t, "答上了") for t in _as_list(good)]:
+        card = index.get(normalize_id(term))
+        if card is None:
+            continue
+        card["last_outcome"] = outcome
+        card["last_interview_jd"] = str(jd_id or "")
+    for term in _as_list(weak):
+        card = index.get(normalize_id(term))
+        if card is None:
+            continue
+        weak_n += 1
+        if str(card.get("state")) == "已掌握":
+            card["state"] = "学习中"          # 你以为会了，其实不会
+            downgraded += 1
+    store.save_knowledge(data)
+    log.log_event("kb.interview_recorded", jd=jd_id, hits=hits,
+                  weak=weak_n, downgraded=downgraded)
+    return hits, weak_n, downgraded
+
+
+def upsert_check(term, state, meta=None):
     """报告里勾选/取消一个知识点：不存在就建卡，存在就只改 state。
 
     返回 (ok, created, card)。**只改 state 与"填空"，绝不用更短的定义覆盖已有内容**
@@ -577,7 +723,13 @@ def upsert_check(term, state, meta=None, kb=None):
     为什么要自动建卡：报告里的勾是**用户已经做出的判断**。概念在知识库里还没有卡时
     直接拒绝，勾就丢了（正是「关掉程序勾就没了」的复发）。宁可多一张卡，也不能丢用户的勾。
 
-    load → 改 → save 整段进 _KB_LOCK：与 absorb / set_state 同类，无锁并发会丢更新。
+    ⚠️ **建卡那一支会无条件 save** —— 与 `record_interview` 同一个坑：库读不出来时
+    内存里的空库会把用户的整库顶掉。整段走 `_with_kb_write`，坏库先留档。
+
+    库读不出来且留档失败时返回 `(False, False, None)`：与"术语不合法 / state 不合法"
+    同一个外形，调用方（路由）本来就把 ok=False 当"这次没勾上"处理。
+
+    load → 改 → save 整段进 _with_kb_write：与 absorb / set_state 同类，无锁并发会丢更新。
     """
     if state not in STATE_VALUES:
         return False, False, None
@@ -585,27 +737,34 @@ def upsert_check(term, state, meta=None, kb=None):
     if not nid:
         return False, False, None
     meta = meta if isinstance(meta, dict) else {}
-    with _KB_LOCK:
-        data = ensure_kb(kb if kb is not None else store.load_knowledge())
-        for n in data["nodes"]:
-            if n.get("id") == nid:
-                n["state"] = state
-                for key in ("definition", "plain_explanation", "category"):
-                    new_val = str(meta.get(key) or "").strip()
-                    if len(new_val) > len(str(n.get(key) or "").strip()):
-                        n[key] = new_val
-                store.save_knowledge(data)
-                return True, False, n
-        card = _new_card({"term": str(term).strip(),
-                          "definition": str(meta.get("definition") or "").strip(),
-                          "plain_explanation": str(meta.get("plain_explanation") or "").strip(),
-                          "category": str(meta.get("category") or "").strip()}, None)
-        card["state"] = state
-        _normalise_review_fields(card)
-        data["nodes"].append(card)
-        store.save_knowledge(data)
-        log.log_event("kb.check_created", id=nid, state=state)
-        return True, True, card
+    invoked, result = _with_kb_write(
+        lambda data: _upsert_check_in(data, nid, term, state, meta))
+    if not invoked:
+        return False, False, None
+    return result
+
+
+def _upsert_check_in(data, nid, term, state, meta):
+    """`upsert_check` 的主体（调用方已持锁、已过入参守卫、已隔离坏库）。"""
+    for n in data["nodes"]:
+        if n.get("id") == nid:
+            n["state"] = state
+            for key in ("definition", "plain_explanation", "category"):
+                new_val = str(meta.get(key) or "").strip()
+                if len(new_val) > len(str(n.get(key) or "").strip()):
+                    n[key] = new_val
+            store.save_knowledge(data)
+            return True, False, n
+    card = _new_card({"term": str(term).strip(),
+                      "definition": str(meta.get("definition") or "").strip(),
+                      "plain_explanation": str(meta.get("plain_explanation") or "").strip(),
+                      "category": str(meta.get("category") or "").strip()}, None)
+    card["state"] = state
+    _normalise_review_fields(card)
+    data["nodes"].append(card)
+    store.save_knowledge(data)
+    log.log_event("kb.check_created", id=nid, state=state)
+    return True, True, card
 
 
 def _strip_tail(t):
@@ -678,7 +837,7 @@ def find_duplicates(kb, limit=20):
     return out
 
 
-def merge_nodes(keep_id, drop_id, kb=None):
+def merge_nodes(keep_id, drop_id):
     """手动合并：把 drop 并入 keep，drop 的写法记进 aliases 后移除。返回 (ok, msg)。
 
     参数可以是**身份键**也可以是**原始术语**（内部先 normalize_id，对已归一化的 id 是 no-op）。
@@ -686,27 +845,41 @@ def merge_nodes(keep_id, drop_id, kb=None):
     学习进度**取并集**（见下方注释）：手动合并的是两张「用户卡」，两张卡的进度都是用户的真实
     作答结果，选错方向（把已掌握的并进待学习的）不该静默丢掉复习进度。这与 _merge_into 的
     「只保 keep 进度」并不矛盾 —— 那条铁律守的是「AI 新节点不许覆盖你的进度」，这里两边都是你。
+
+    ⚠️ **本函数无条件 save** —— 与 `record_interview` 同一个坑（P0-1）：整段走 `_with_kb_write`。
+
+    两张卡缺一张时（含"库读不出来 ⇒ 读成空库"）**连隔离都不做**，原样返回
+    "找不到要合并的知识点"、盘上一个字节不动（`refuse_when`）。留档也失败时返回
+    `(False, _KB_WRITE_REFUSED)`：调用方（路由）本来就按 ok=False 如实回报，
+    这句 msg 还会说清是"库读不出来"，用户据此知道该去修库、而不是去核对卡片。
     """
     keep_id, drop_id = normalize_id(keep_id), normalize_id(drop_id)
     if not keep_id or not drop_id:
         return False, "两个知识点都要选"
     if keep_id == drop_id:
         return False, "不能和自己合并"
-    # load → 改两张卡 → save 整段串行：不加锁时并发的 absorb/set_state 会把这次合并整个覆盖掉
-    with _KB_LOCK:
-        return _merge_nodes_locked(keep_id, drop_id, kb)
+    # load → 改两张卡 → save 整段串行：不加锁时并发的 absorb/set_state 会把这次合并整个覆盖掉。
+    # refuse_when：两张卡缺一张就什么都不写（连隔离都不做）—— 与 _merge_nodes_locked 里原来的
+    # "找不到要合并的知识点"完全同一个判据、同一句人话，只是提到隔离之前判。
+    invoked, refusal = _with_kb_write(
+        lambda kb: _merge_nodes_locked(kb, keep_id, drop_id),
+        refuse_when=lambda kb: None if (_card_index(kb).get(keep_id)
+                                        and _card_index(kb).get(drop_id))
+        else "找不到要合并的知识点",
+        write_when_unreadable=False)
+    if not invoked:
+        return False, refusal or _KB_WRITE_REFUSED
+    return refusal
 
 
-def _merge_nodes_locked(keep_id, drop_id, kb):
-    """merge_nodes 的主体，**调用方必须已持有 _KB_LOCK**（拆出来只是为了让锁的范围一眼可见）。
+def _merge_nodes_locked(kb, keep_id, drop_id):
+    """merge_nodes 的主体，**由 `_with_kb_write` 调用**（锁、哨兵与"两张卡在不在"的守卫都在那里）。
 
+    到这一步两张卡一定都在（`_card_index` 是同一个判据），所以这里是直取而不是再判一次缺失。
     入参的 keep_id / drop_id 已 normalize、且已排除「空 id」与「自己和自己合并」。
     """
-    kb = ensure_kb(kb if kb is not None else store.load_knowledge())
-    index = {n.get("id"): n for n in kb["nodes"] if n.get("id")}
-    keep, drop = index.get(keep_id), index.get(drop_id)
-    if keep is None or drop is None:
-        return False, "找不到要合并的知识点"
+    index = _card_index(kb)
+    keep, drop = index[keep_id], index[drop_id]
 
     # 进度并集在 _merge_into **之后**取（计划原文顺序）：_merge_into 只写 keep、从不写 drop
     # （对 drop 只有 clean_*(node.get(...)) 这类读取），所以「先合并内容」与「先取进度快照」

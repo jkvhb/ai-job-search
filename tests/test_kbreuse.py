@@ -2172,3 +2172,41 @@ class IncompleteHitIdentityTest(_WriteBackCase):
         added, merged = kb.absorb([node], self.JD_NEW)
         self.assertEqual((added, merged), (0, 1), "写回仍然并进原来那张卡")
         self.assertEqual(len(store.load_knowledge()["nodes"]), 1)
+
+
+class MismatchedCardIdentityEndToEndTest(_WriteBackCase):
+    """P0-7 端到端：库里那张卡的 `id` **不等于**归一化 `term` 时，复用与写回是同一把尺子。
+
+    实测（报告 §2 P0-7）：库里 `{"id": "yuyinshibie", "term": "ASR"}`（手改 / 别的写入者造成）
+    → `kbreuse.Index.lookup("ASR")` 命中、`plan_nodes` 身份对齐也做了，但 `kb.absorb`
+    仍 `added=1` → 库变成 `['yuyinshibie', 'asr']` **两张同概念卡**。
+    根因：`kb.absorb` 按 `card["id"]` 建索引，`kbreuse` 按 `normalize_id(term)` 建索引。
+
+    这条用例把**整条复用路径**串起来跑：认出是哪张卡（kbreuse）→ 写回（kb.absorb）→
+    卡片数不变。单测里只钉一半的话，"两边又分叉"可以悄悄回来。
+    """
+
+    def test_reuse_then_write_back_does_not_create_a_second_card(self):
+        # 库里那张卡 id ≠ 归一化 term（真 `merge_nodes` 造不出这种形态，只能手写盘）
+        store.save_knowledge({"nodes": [dict(self._hand_card("ASR"), id="yuyinshibie")]})
+        card = store.load_knowledge()["nodes"][0]
+        self.assertNotEqual(card["id"], kb.normalize_id(card["term"]),
+                            "夹具前提：这张卡的 id 与归一化 term 本来就不一致")
+
+        node = self._node("ASR")                       # 同一次分析又见到这个概念
+        index = kbreuse.Index(store.load_knowledge()["nodes"])
+        hit, how = index.lookup("ASR")                 # 返回 (卡, 命中线索)
+        self.assertEqual((hit["id"], how), ("yuyinshibie", "exact"),
+                         "kbreuse 认出的是同一张卡（按归一化 term）")
+
+        stats = kbreuse.plan_nodes([node], index)      # 同名命中，不需要模型判定
+        self.assertEqual(stats["matched"], 1, "夹具前提：命中库里那张卡")
+
+        added, merged = kb.absorb([node], self.JD_NEW)  # ← 真的 kb.absorb
+        self.assertEqual((added, merged), (0, 1),
+                         "写回必须并进原来那张卡（只按 id 建索引时会新建一张 'asr' 重复卡）")
+        after = store.load_knowledge()["nodes"]
+        self.assertEqual(len(after), 1, "库变成两张同概念卡就是 P0-7 复发")
+        self.assertEqual(after[0]["id"], "yuyinshibie", "还是原来那张卡")
+        self.assertEqual([j["id"] for j in after[0]["from_jds"]], [self.JD_OLD["id"], self.JD_NEW["id"]],
+                         "只多了一条 from_jds（不是新建的卡）")

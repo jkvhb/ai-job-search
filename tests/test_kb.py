@@ -4,6 +4,8 @@ import io
 import json
 import log
 import os
+import shutil
+import tempfile
 import threading
 import unittest
 from unittest import mock
@@ -1818,4 +1820,329 @@ class KbAbsorbNonUtf8Test(IsolatedCase):
         with open(os.path.join(folder, backups[0]), encoding="gbk") as f:
             self.assertIn("语音识别", f.read(), "用户的卡必须能从这个备份里恢复")
         # ② 本次照样沉淀成功（库坏了也不能不干活）
-        self.assertIn("新概念", [n.get("term") for n in store.load_knowledge()["nodes"]])
+        cards = store.load_knowledge()["nodes"]
+        self.assertIn("新概念", [n.get("term") for n in cards])
+        self.assertEqual(len(cards), 1, "新库只该有这次沉淀的那张卡（用户那张在原文件里）")
+
+
+def _raw_card(term, cid=None, **kw):
+    """一张**原始形状**的卡片（照用户手改 knowledge.json 的样子写盘）。
+
+    刻意不走 `kb.absorb`：本类要造的是「盘上文件读不出来」这种形态，必须由测试自己写字节。
+    `cid` 与 `term` 故意可以不一致 —— 那正是 P0-7 的形态（id ≠ normalize_id(term)）。
+    """
+    c = {"id": cid if cid is not None else term, "term": term,
+         "definition": "库里的定义", "plain_explanation": "库里的通俗", "category": "核心概念",
+         "layer": 0, "sources": [], "timeline": [], "related": [], "interview_questions": [],
+         "confidence": "ai-generated", "from_jds": [],
+         "state": "待学习", "last_outcome": "未面试", "asked_count": 0,
+         "review_count": 0, "last_reviewed_at": "", "last_result": ""}
+    c.update(kw)
+    return c
+
+
+def _state_of(card_id):
+    """从盘上读某张卡的 state（断言用；卡不存在就返回 None）。"""
+    for c in store.load_knowledge()["nodes"]:
+        if c.get("id") == card_id:
+            return c.get("state")
+    return None
+
+
+class KbWriteEntryPointsCorruptLibraryTest(IsolatedCase):
+    """P0-1 的**五个写入口**统一契约：库读不出来时要么**逐字节不动**，要么**留档**。
+
+    背景（报告 §2 P0-1，主线程实测）：`record_interview` 会把整库换成空库**且不留备份**
+    （隔离根里把 knowledge.json 写成 GBK → 300 字节变 36 字节、卡片 0、`.corrupt-*` 0 个）。
+    其余四个写入口当时"数据不丢"靠的是**副作用**（读到空库 → 没找到目标 → 不保存），
+    不是显式契约 —— 那条路随时会被一次"顺手加个 save"改掉，所以这里把它钉成契约。
+
+    两个形态（每个入口必须落在其中一个上，且必须**写死在表里**）：
+
+      (a) **不写**：库读不出来就放弃这次写入，盘上的坏文件**逐字节不动**（留给用户自己修）。
+          选它的理由：这个入口在「目标卡不存在」时本来就不写盘（`set_state` / `record_review`
+          是"更新型"入口 —— 找不到卡就返回失败，绝不自作主张建卡）。库读不出来 = 找不到卡，
+          于是"不写"既是最小惊讶，也保住了坏文件（用户还能用记事本把它另存为 UTF-8）。
+      (b) **留档后写**：这个入口在"目标卡不存在"时会**建卡**（`absorb` / `upsert_check`），
+          或**无条件 save**（`record_interview` / `merge_nodes`）—— 对它来说"放弃写入"
+          等于让用户刚做完的操作静默丢失。所以它必须先 `_quarantine_corrupt_kb()` 把坏文件
+          改名留档，再往新库写。备份里逐字节保留了用户原来的卡（同 `KbAbsorbNonUtf8Test`）。
+    """
+
+    #: (说明, 调用)
+    #: ⚠️ **五个入口的形态全是 (a)「不写」** —— 这是实测出来的统一策略，不是分类懒得做：
+    #: 库读不出来时"目标卡在不在"**无从判断**（`load_knowledge()` 给的是空库），任何"按目标
+    #: 决定写不写"的设计都会在这一步退化成"找不到卡 ⇒ 不写"。所以五个入口一律不写，并且
+    #: 如实报"库读不出来"（`kb._KB_WRITE_REFUSED`）—— 盘上那个坏文件**一个字节都不动**，
+    #: 用户还能自己用记事本把它另存为 UTF-8 救回来。
+    #: 真正"留档后写"的那条路（坏库 + 目标在库里的卡仍能正常工作）由
+    #: `test_a_corrupt_library_is_quarantined_then_all_five_write` 单独覆盖。
+    ENTRIES = (
+        ("set_state", lambda: kb.set_state("语音识别", "已掌握")),
+        ("record_review", lambda: kb.record_review("语音识别", kb.RESULT_UP)),
+        ("record_interview",
+         lambda: kb.record_interview("j1", asked=["语音识别"], weak=["语音识别"])),
+        ("upsert_check", lambda: kb.upsert_check("语音识别", "已掌握")),
+        ("merge_nodes", lambda: kb.merge_nodes("语音识别", "语音辨识")),
+    )
+
+    #: 每个入口的 fixture：`(term, id)` 列表。**id 故意与归一化 term 不同**（P0-7 那种手改库）
+    #: —— 顺手证明"按归一化 term 找卡"与"按 id 找卡"两把钥匙在坏库路径上也没丢。
+    FIXTURES = {
+        "set_state": [("语音识别", "yuyinshibie")],
+        "record_review": [("语音识别", "yuyinshibie")],
+        "record_interview": [("语音识别", "yuyinshibie")],
+        "upsert_check": [("语音识别", "yuyinshibie")],
+        "merge_nodes": [("语音识别", "yuyinshibie"), ("语音辨识", "yuyinshibian")],
+    }
+
+    def _write_gbk_kb(self, cards):
+        raw = json.dumps({"version": 1, "nodes": cards}, ensure_ascii=False).encode("gbk")
+        with open(store.knowledge_path(), "wb") as f:
+            f.write(raw)
+        return raw
+
+    def _fixture_cards(self, name):
+        return [_raw_card(term, cid=cid) for term, cid in self.FIXTURES[name]]
+
+    def _backups(self):
+        folder = os.path.dirname(store.knowledge_path())
+        return sorted(f for f in os.listdir(folder) if ".corrupt-" in f)
+
+    def _fresh_root(self):
+        """把 store.DATA_ROOT 指到一个**全新**的临时根（返回该根）。
+
+        每个入口都要新根：上一个入口留下的 `.corrupt-*` 会污染下一个的备份计数。
+        用 mock.patch（不是手工赋值）—— 断言失败提前抛错时还能靠它还原，
+        否则后面的用例会接着往这个临时根里写，"隔离"就名存实亡了。
+        """
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        patcher = mock.patch.object(store, "DATA_ROOT", tmp)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return tmp
+
+    def _kv(self, text):
+        return dict(part.split("=", 1) for part in text.split() if "=" in part)
+
+    #: 写的**就是库里那张已有的卡**的三个入口（`write_when_unreadable=False`）：
+    #: 库读不出来时"有没有这张卡"无从判断 → 一律不写。另外两个（`absorb` / `upsert_check`）
+    #: 写的是**用户这次的操作**，坏文件留档后照常写（见 `kb._with_kb_write`）。
+    TARGET_ENTRIES = ("set_state", "record_review", "merge_nodes")
+
+    def test_every_writer_refuses_to_wipe_a_corrupt_library(self):
+        """P0-1 的核心回归：库读不出来时，**五个写入口都不许把用户那 411 字节换成空库**。
+
+        实测（报告 §2 P0-1）：`record_interview` 把 GBK 写坏的库换成 36 字节空库、`.corrupt-*`
+        一个都没有。另外四个当时"数据不丢"靠的是**副作用**（读到空库 → 找不到目标卡 → 恰好
+        没走到 save），不是契约 —— 这里把它钉成契约。
+
+        每个入口选 (a) 还是 (b) 及其理由（**同一入口的行为在表里钉死**）：
+          * (b) **留档后写**：`record_interview`（无条件 save）、`upsert_check`（会建卡）。
+            这两个入口的目标不是"库里已有的某张卡"，而是"用户刚做的这次操作"；放弃写入
+            等于让用户的操作静默丢失。所以先 `_quarantine_corrupt_kb()` 把坏文件逐字节留档，
+            再往新库写（用户的 411 字节一个不少地躺在 `.corrupt-*` 里）。
+          * (a) **不写、连隔离都不做**：`set_state` / `record_review` / `merge_nodes`。
+            它们写的**就是库里那张已有的卡**，而库读不出来时"有没有这张卡"无从判断；
+            一次点空了的操作不该让用户的文件消失（哪怕留下了备份）。所以一个字节都不动，
+            并如实报"库读不出来"（`kb._KB_WRITE_REFUSED`）。
+
+        ⚠️ fixture 那张卡的 `id` 故意 ≠ 归一化 `term`（`yuyinshibie` / 语音识别，P0-7 那种手改库），
+        顺手证明两把钥匙（按 id、按归一化 term）在坏库路径上也没丢。
+        """
+        for name, call in self.ENTRIES:
+            with self.subTest(entry=name):
+                tmp = self._fresh_root()
+                store.ensure_profile()
+                self.assertIn(tmp, store.knowledge_path(), "探针必须落在临时根里")
+                raw = self._write_gbk_kb(self._fixture_cards(name))
+                before = open(store.knowledge_path(), "rb").read()
+                self.assertEqual(before, raw, "夹具前提：盘上就是这份 GBK 字节")
+
+                result = call()
+
+                # 诊断串带 kv：assertTrue 的 msg 会被 unittest 转义成 %-编码，
+                # 直接把判据塞进 msg 里（照 test_jdid 的既有做法）
+                after = open(store.knowledge_path(), "rb").read()
+                kv = "entry=%s before=%d after=%d backups=%d result=%r" % (
+                    name, len(before), len(after), len(self._backups()), result)
+                if name in self.TARGET_ENTRIES:
+                    # (a) 不写：坏文件逐字节不动，连备份都不做
+                    self.assertEqual(after, before, "坏库被动过 " + kv)
+                    self.assertEqual(self._backups(), [], "没目标卡的调用不该隔离用户文件 " + kv)
+                    if name == "set_state":
+                        self.assertFalse(result[0], "读不出库却报告成功 " + kv)
+                        self.assertIn("读", result[1], "没如实说清原因 " + kv)
+                    elif name == "record_review":
+                        self.assertEqual(result, (False, None), "外形不对 " + kv)
+                    else:                               # merge_nodes
+                        self.assertFalse(result[0], "读不出库却报告成功 " + kv)
+                        self.assertIn("读", result[1], "没如实说清原因 " + kv)
+                else:
+                    # (b) 留档后写：坏文件被整体改名，备份逐字节等于原文
+                    backups = self._backups()
+                    self.assertEqual(len(backups), 1, "坏库没被留档 " + kv)
+                    backup = os.path.join(os.path.dirname(store.knowledge_path()), backups[0])
+                    self.assertEqual(open(backup, "rb").read(), before,
+                                     "备份不是逐字节原文 " + kv)
+                    # 新库必须读得出来（不然"留档"就只是把用户的库改名走）
+                    self.assertTrue(store.knowledge_safe_to_write()[0], "新库读不出来 " + kv)
+                    if name == "record_interview":
+                        # 库里已没有那张卡（读不出来 → 空库），所以这次命中 0 个：
+                        # **绝不自动建卡**是本函数的既有契约
+                        self.assertEqual(result, (0, 0, 0), kv)
+                        self.assertEqual(store.load_knowledge()["nodes"], [], kv)
+                    else:                               # upsert_check
+                        self.assertEqual(result[0], True, kv)
+                        self.assertEqual(result[1], True, "应当新建那张卡 " + kv)
+                        self.assertEqual([c.get("id") for c in store.load_knowledge()["nodes"]],
+                                         ["语音识别"], kv)
+                # 收尾：把临时根还回去，免得下一个入口/下一条用例接着往这里写
+                mock.patch.stopall()
+
+    def test_a_failed_quarantine_refuses_all_five_writes_and_keeps_the_file(self):
+        """**哨兵自己失败**时（改名失败：磁盘满 / 文件被占用）：五个入口一个字节都不许写。
+
+        这是 `_with_kb_write` 里 `if not _quarantine_corrupt_kb(): return False, _KB_WRITE_REFUSED`
+        那条路。没有这条用例的话，"哨兵返回 False 时照样继续写"这个变异可以让其它用例全绿 ——
+        那正是 P0-1 事故本身（坏文件留不住档时，内存里的空库照样写下去）。
+        """
+        for name, call in self.ENTRIES:
+            with self.subTest(entry=name):
+                tmp = self._fresh_root()
+                store.ensure_profile()
+                self.assertIn(tmp, store.knowledge_path(), "探针必须落在临时根里")
+                path = store.knowledge_path()
+                raw = self._write_gbk_kb(self._fixture_cards(name))
+                before = open(path, "rb").read()
+                with mock.patch.object(kb, "_quarantine_corrupt_kb", return_value=False):
+                    result = call()
+                kv = "entry=%s before=%d after=%d result=%r" % (
+                    name, len(before), os.path.getsize(path), result)
+                # ① 坏文件必须原样留着（既不改名、也不被空库顶掉）
+                self.assertEqual(open(path, "rb").read(), before, "哨兵失败却动了盘 " + kv)
+                self.assertEqual(self._backups(), [], "哨兵失败了还留下了备份 " + kv)
+                # ② 五个入口都必须让调用方看得出"没写"
+                if name == "set_state":
+                    self.assertFalse(result[0], "哨兵失败却报告成功 " + kv)
+                    self.assertIn("读", result[1], "没如实说清原因是'库读不出来' " + kv)
+                elif name == "record_review":
+                    self.assertEqual(result, (False, None), "外形不对 " + kv)
+                elif name == "record_interview":
+                    self.assertIsNone(result, "必须给一个可分辨的失败信号 " + kv)
+                elif name == "upsert_check":
+                    self.assertEqual(result, (False, False, None), "外形不对 " + kv)
+                else:                                   # merge_nodes
+                    self.assertFalse(result[0], "哨兵失败却报告成功 " + kv)
+                    self.assertIn("读", result[1], "没如实说清原因是'库读不出来' " + kv)
+                mock.patch.stopall()
+
+    def test_a_corrupt_library_is_quarantined_and_a_readable_one_still_writes(self):
+        """反向：库读得出来时，五个入口照旧干活（守卫不能把正常写入一起挡掉）。
+
+        没有这条用例，"干脆永不写盘"那种"修法"也能让上面那些坏库用例全绿。
+        """
+        calls = (
+            ("set_state", lambda: kb.set_state("语音识别", "学习中")),
+            ("record_review", lambda: kb.record_review("语音识别", kb.RESULT_UP)),
+            ("record_interview", lambda: kb.record_interview("j1", asked=["语音识别"])),
+            ("upsert_check", lambda: kb.upsert_check("新概念", "已掌握")),
+            ("merge_nodes", lambda: kb.merge_nodes("语音识别", "语音辨识")),
+        )
+        for name, call in calls:
+            with self.subTest(entry=name):
+                tmp = self._fresh_root()
+                store.ensure_profile()
+                self.assertIn(tmp, store.knowledge_path(), "探针必须落在临时根里")
+                # 夹具走**真的** kb.absorb：形状与线上完全一致
+                kb.absorb([_raw_card("语音识别"), _raw_card("语音辨识")], {"id": "j0"})
+                self.assertEqual(sorted(c["id"] for c in store.load_knowledge()["nodes"]),
+                                 ["语音识别", "语音辨识"], "夹具前提：两张卡")
+                result = call()
+                kv = "entry=%s result=%r" % (name, result)
+                self.assertEqual(self._backups(), [], "库是好的，不该有任何隔离备份 " + kv)
+                if name == "set_state":
+                    self.assertTrue(result[0], kv)
+                    self.assertEqual(_state_of("语音识别"), "学习中", kv)
+                elif name == "record_review":
+                    self.assertTrue(result[0], kv)
+                    self.assertEqual(_state_of("语音识别"), "已掌握", kv)
+                elif name == "record_interview":
+                    self.assertEqual(result, (1, 0, 0), kv)
+                elif name == "upsert_check":
+                    self.assertEqual((result[0], result[1]), (True, True), kv)
+                    self.assertEqual(_state_of("新概念"), "已掌握", kv)
+                else:                                   # merge_nodes
+                    self.assertTrue(result[0], kv)
+                    ids = sorted(c["id"] for c in store.load_knowledge()["nodes"])
+                    self.assertEqual(ids, ["语音识别"], "drop 卡没被并走 " + kv)
+                mock.patch.stopall()
+
+    def test_a_readable_library_still_writes_for_all_five(self):
+        """反向确认：守卫不能把正常写入一起挡掉（读得出来时五个入口照旧干活）。
+
+        同时钉住"库可读时行为一字不变"这条最容易被顺手改坏的断言 —— 少了它，
+        任何"干脆永不写盘"的变异都能让上面那些坏库用例全绿。
+        """
+        store.ensure_profile()
+        kb.absorb([_raw_card("语音识别")], {"id": "j0"})
+        kb.absorb([_raw_card("语音辨识")], {"id": "j0"})
+        self.assertTrue(kb.set_state("语音识别", "学习中")[0])
+        ok, node = kb.record_review("语音识别", kb.RESULT_UP)
+        self.assertTrue(ok)
+        self.assertEqual(node["state"], "已掌握")
+        self.assertEqual(kb.record_interview("j1", asked=["语音识别"]), (1, 0, 0))
+        ok, created, card = kb.upsert_check("新概念", "已掌握")
+        self.assertEqual((ok, created), (True, True))
+        self.assertEqual(card["id"], "新概念")
+        ok, msg = kb.merge_nodes("语音识别", "语音辨识")
+        self.assertTrue(ok, msg)
+        cards = store.load_knowledge()["nodes"]
+        self.assertEqual(sorted(c["id"] for c in cards), ["新概念", "语音识别"])
+        self.assertEqual(self._backups(), [], "库是好的，不该有任何隔离备份")
+
+
+class KbAbsorbFindsCardsByIdAndNormalizedTermTest(IsolatedCase):
+    """P0-7：`kb.absorb` 与 `kbreuse` 必须用**同一把尺子**找卡。
+
+    实测（报告 §2 P0-7）：库里 `{"id": "yuyinshibie", "term": "ASR"}`（手改 / 别的写入者
+    造成 id ≠ 归一化 term）→ `kbreuse.Index.lookup("ASR")` 命中、身份对齐也做了，
+    但 `kb.absorb` 仍 `added=1` → 库变成 `['yuyinshibie', 'asr']` 两张同概念卡。
+    根因：`kb.absorb` 按 `card["id"]` 建索引，`kbreuse` 按 `normalize_id(term)` 建索引。
+    """
+
+    def _mismatched(self):
+        return _raw_card("ASR", cid="yuyinshibie", state="已掌握",
+                         definition="自动语音识别", from_jds=[{"id": "老岗位", "job_title": "老岗"}])
+
+    def test_absorb_merges_into_a_card_whose_id_differs_from_its_term(self):
+        store.ensure_profile()
+        store.save_knowledge({"version": 1, "nodes": [self._mismatched()]})
+        added, merged = kb.absorb([_raw_card("ASR", definition="本次的定义")], {"id": "新岗位"})
+        # 不修的话这里是 (1, 0) 且卡片数 1 → 2
+        self.assertEqual((added, merged), (0, 1), "按归一化 term 建索引才能认出这张卡")
+        cards = store.load_knowledge()["nodes"]
+        self.assertEqual(len(cards), 1, "不许新建同概念的第二张卡")
+        self.assertEqual(cards[0]["id"], "yuyinshibie", "还是原来那张卡")
+
+    def test_the_mismatched_card_is_still_found_by_its_own_id(self):
+        """反向：按 id 找卡这条路**不许**被"改成只按归一化 term"的修法弄丢。"""
+        store.ensure_profile()
+        store.save_knowledge({"version": 1, "nodes": [self._mismatched()]})
+        added, merged = kb.absorb([_raw_card("yuyinshibie", definition="本次的定义")],
+                                  {"id": "新岗位"})
+        self.assertEqual((added, merged), (0, 1), "id 也该是一把能找到这张卡的钥匙")
+        self.assertEqual(len(store.load_knowledge()["nodes"]), 1)
+
+    def test_the_card_id_still_wins_when_both_keys_point_somewhere(self):
+        """id 优先（setdefault）：库里 id 与 term 指向两张卡时，按 id 找到的必须是第一张。"""
+        store.ensure_profile()
+        store.save_knowledge({"version": 1, "nodes": [
+            _raw_card("语音识别", cid="kuayuyinshibie"),
+            _raw_card("kuayuyinshibie", cid="yuyinshibie"),
+        ]})
+        added, merged = kb.absorb([_raw_card("kuayuyinshibie")], {"id": "新岗位"})
+        self.assertEqual((added, merged), (0, 1))
+        cards = store.load_knowledge()["nodes"]
+        self.assertEqual(len(cards), 2, "合并只该并进一张，另一张原样留着")
