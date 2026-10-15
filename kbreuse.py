@@ -152,7 +152,7 @@ class Index:
     **分两层**（I-1 —— 这是"能不能真正复用"的关键）：
       1. `by_name`：卡片的**精确名** = `kb.normalize_id(term)`。查这一层命中一律算 `exact`。
       2. `by_key` ：**派生键** = term 里的 ASCII 括号缩写 / 头名（去括号后的全名）/ 卡片
-         记录过的 `aliases`。查这一层按来源判 `abbrev` / `alias`。
+         记录过的 `aliases`。查这一层按**键的真实来源**判 `abbrev` / `head` / `alias`。
 
     为什么必须分层（反例 · 复查实测）：一张扁平表下，同一把键既可能来自"某张卡的**全名**"，
     也可能来自"另一张**更早**的卡的**括号**"，`setdefault` 一视同仁 → 返回先落盘的那张。
@@ -169,7 +169,8 @@ class Index:
         self.cards = {}       # card_id -> card
         self.by_name = {}     # kb.normalize_id(term) -> card（**精确名**，第一层）
         self.by_key = {}      # 其余派生键（ASCII 括号 / 头名 / aliases），第二层（先到先得）
-        self.key_source = {}  # 派生键 -> "abbrev" | "alias"（M-3：归属按**键的真实来源**判）
+        # 派生键 -> "abbrev" | "head" | "alias"（M-3：归属按**键的真实来源**判）
+        self.key_source = {}
         for c in (cards or []):
             if not isinstance(c, dict):
                 continue
@@ -193,9 +194,18 @@ class Index:
             #   生产可达：`kb.absorb({'term': 'A'})` + `kb.merge_nodes` 真能把 `['A']` 写进
             #   `aliases`。
             derived = []
-            for k in list(_paren_keys(c.get("term"))) + [_head_key(c.get("term"))]:
+            # 头名键**单独记 `head`**（Minor④，终审实测）：节点 `词错率` 命中库里
+            # `词错率（WER）` 靠的是**去掉括号后的头名**，而节点自己**一个括号都没有** ——
+            # 报成 `abbrev` 时报告会对用户说「括号缩写命中」，那句话让人莫名其妙（也说不通）。
+            # 两个档位必须分得开，因为它们是两条不同的线索：
+            #   * `abbrev` = 卡侧 term 的 **ASCII 括号内容**（`词错率（WER）` 贡献 `wer`）；
+            #   * `head`   = 卡侧 term **去掉括号后的头名**（同一张卡贡献 `词错率`）。
+            for k in _paren_keys(c.get("term")):
                 if k:
                     derived.append((k, "abbrev"))
+            head = _head_key(c.get("term"))
+            if head:
+                derived.append((head, "head"))
             for a in kb._as_list(c.get("aliases")):
                 k = kb.normalize_id(a)
                 if k:
@@ -227,7 +237,10 @@ class Index:
         `matched_by` 的**精确定义**（别用"键等于全名"这种代理判断 —— 那会把
         "节点叫 `WER`、库里叫 `词错率（WER）`"错报成 `exact`）：
           * `exact`  —— **两边全名去噪后完全相同**（`normalize_id(term) == normalize_id(card.term)`）
-          * `abbrev` —— 通过**卡侧**的括号缩写 / 头名命中的（如节点 `WER` ↔ 库里 `词错率（WER）`）
+          * `abbrev` —— 通过**卡侧**的括号缩写命中的（如节点 `WER` ↔ 库里 `词错率（WER）`）
+          * `head`   —— 通过**卡侧的"去括号头名"**命中的（如节点 `词错率` ↔ 库里 `词错率（WER）`）。
+            与 `abbrev` 分开是**必须**的：这条线索的节点侧**没有括号**，报 `abbrev` 时报告会说
+            「括号缩写命中」—— 用户看不出这是怎么认出来的（Minor④）。
           * `alias`  —— 通过卡片**记录过的** `aliases` 命中的
 
         **先查精确名那一层**（命中即 `exact`），未中再过派生键那一层 —— 顺序由
@@ -254,6 +267,9 @@ class Index:
             if k != full:
                 card = self.by_name.get(k)      # 节点的括号键 == 库里那张卡的精确名
                 if card is not None:
+                    # 这里如实报 `abbrev`：能走到这一行的 `k` 只可能来自 `_keys_of_term`
+                    # 的**括号键**（`_head_key(节点)` 不在那张清单里），所以线索确实是
+                    # "节点里的括号缩写正好就是那张卡的精确名" —— 与 `head` 不是一回事。
                     return card, "abbrev"
         return None, ""
 
@@ -317,10 +333,11 @@ def _origin_of(card):
     return {"job_title": str(first.get("job_title") or ""), "date": str(first.get("date") or "")}
 
 
-def _align_term(node, card):
+def _align_term(node, card, matched_by="", reason=""):
     """**身份对齐**：把节点的 `term` 换成库里的规范名，返回节点**原来的**写法。
 
-    这件事**不是内容覆盖，是身份对齐** —— 所以它**只要命中就跑**（够格 / 不够格都一样）：
+    这件事**不是内容覆盖，是身份对齐** —— 所以它**只要命中就跑**
+    （够格 / 不够格 / 被禁选挡下只对齐身份，三条支路都一样）：
     `kb.absorb` 是按 `kb.normalize_id(node["term"].strip())` 找卡的（kb.py:373），节点名不改，
     写回时就找不到库里那张卡 → **新建一张重复卡**（spec §7 要防的"知识库越长越乱"）。
 
@@ -331,19 +348,35 @@ def _align_term(node, card):
     刻意**不动** `node["id"]`：报告里的关联概念图按它连线，改它会打断 `related`（spec §7）。
     `card["term"]` 为空（手改坏）时保留节点自己的写法，绝不把 `term` 变成空串 ——
     空名节点写回时连"可吸收"都不算（`kb.absorb` 第 359-361 行）。
+
+    **留痕**（必修③）：改名是"库里那张卡为什么是这个写法"的唯一线索 —— 卡内容**没有版本
+    历史**（`kb._merge_into` 的"更长者胜"会直接把 definition 换成另一个概念的文本），
+    所以改名的这一刻必须落一条**可查**的事件。字段：`card_id` / `from` / `to` /
+    `matched_by`（怎么命中的）+ `reason`（哪条支路改的：`reused` 够格整条复用 /
+    `incomplete` 命中但不够格 / `card_taken` 被禁选或一卡一条挡下、只对齐身份）。
+    只在**真的改了**（原写法非空、且与规范名字面不同）时记 —— 否则日志会被每一次
+    "命中同名卡"刷满，真出问题时反而查不到。
+    ⚠️ `from` 是 Python 关键字，只能靠 `**{...}` 传（`log.log_event` 收 `**kwargs`）。
     """
     original = str(node.get("term") or "")
     node["term"] = str(card.get("term") or original)
+    if original and original != node["term"]:
+        log.log_event("kbreuse.term_aligned",
+                      card_id=kb.normalize_id(card.get("term")),
+                      matched_by=str(matched_by or ""), reason=str(reason or ""),
+                      **{"from": original, "to": node["term"]})
     return original
 
 
-def _fill_from_card(node, card):
+def _fill_from_card(node, card, matched_by=""):
     """把库里那份**整条**覆盖到节点上，返回节点**原来的**写法（`term_original`）。
 
     三处刻意不动：
       * `node["id"]` —— 报告里的关联概念图按它连线，改它会打断 `related`；
       * `node["related"]` —— 见 `_COPY_FIELDS` 上面的注释；
       * `node["kb_reuse"]` —— 由调用方 `plan_nodes` 写（这里只管内容）。
+
+    `matched_by` 只用来给 `_align_term` 的留痕事件带上"怎么命中的"（默认空串 = 不留痕字段）。
     """
     for k in _COPY_FIELDS:
         if k not in card:
@@ -369,7 +402,7 @@ def _fill_from_card(node, card):
     # 身份对齐与"不够格"那一支**同一处实现**（I-1）：两条支路各写一遍迟早就漂移，
     # 而这里漂移的代价正是本轮修掉的那条真缺陷（写回新建重复卡）。
     # 返回值就是节点**原来的**写法（`_align_term` 唯一一处算它的地方）。
-    return _align_term(node, card)
+    return _align_term(node, card, matched_by=matched_by, reason="reused")
 
 
 def plan_nodes(nodes, index, call=None, error=""):
@@ -390,12 +423,22 @@ def plan_nodes(nodes, index, call=None, error=""):
     `term_original` **抹成 `""`**（改名记录丢失）。注意去重按**对象身份**，
     不是按名字 —— 两个内容相同的真节点是两条，都要处理。
 
-    **两条支路的差别只有"要不要拿库里的内容"（I-1）**：
+    **三条支路的差别只有"要不要拿库里的内容"（I-1 / 必修②）**：
       * 够格 → `_fill_from_card`：改名 + **整条内容覆盖**；
       * 不够格 → 只 `_align_term` 改名，内容一个字不动（definition / sources / timeline
-        全归 ③④ 去跑）。
-    改名这件事两条支路**都要做**，因为它决定 `kb.absorb` 写回时认不认得出原来那张卡
+        全归 ③④ 去跑）；
+      * **被禁选 / 一卡一条挡下**（`aligned_only`）→ 同样只改名，内容一个字不动。
+    改名这三条支路**都要做**，因为它决定 `kb.absorb` 写回时认不认得出原来那张卡
     （见 `_align_term`）。
+
+    ⚠️ `searched` 在这里是**推测值**（`total - reusable`）：本函数只知道"复用省下了几次"，
+    **不知道** `knowledge.attach_sources` 的 `max_searches` 上限。真值由 ③ 算完写回来
+    （`build_for_jd` 把 `attach_sources(stats=reuse.stats)` 原地更新）—— 报告里读到的必须是
+    真值，否则会对"超出上限、根本没搜"的卡说「已联网补全」（必修①）。
+
+    统计口径：`matched` = **拿到 `kb_reuse` 标记的节点数**（够格 + 不够格 + 只对齐身份），
+    于是 `matched == reusable + enriched + aligned_only` —— 报告里那句
+    「命中 M 条（其中 E 条不够格、A 条与其它节点指向同一张卡）」才自洽。
     """
     nodes = list(nodes or [])
     uniq, seen = [], set()
@@ -406,7 +449,8 @@ def plan_nodes(nodes, index, call=None, error=""):
         uniq.append(n)
     nodes = uniq
     stats = {"total": len(nodes), "matched": 0, "reusable": 0, "timeline_reused": 0,
-             "enriched": 0, "searched": len(nodes), "knowledge_error": str(error or "")}
+             "enriched": 0, "aligned_only": 0,
+             "searched": len(nodes), "knowledge_error": str(error or "")}
     idx = index if index is not None else Index([])
     if len(idx) == 0:
         # 空库直接早退：省掉那次模型判定（本来也没什么可判的）。
@@ -420,9 +464,12 @@ def plan_nodes(nodes, index, call=None, error=""):
             cid = kb.normalize_id(card.get("term"))
             if cid:
                 occupied.add(cid)
+    # 只对齐身份、不抄内容的那些节点：id(node) -> (card, matched_by, reason)
+    align_only = {}
     rest = [n for n in nodes if id(n) not in found]
     if call is not None and rest:
-        pairs = judge(rest, idx, call, forbidden=occupied)
+        dropped = {}          # `judge` 的出参：模型判成同一概念、但这次没采纳的配对
+        pairs = judge(rest, idx, call, forbidden=occupied, dropped=dropped)
         # 填充前的**第二道收口**（I-1）：判定命中不许拿已被确定性占用的卡，判定命中之间
         # 也互不共享一张卡（先出现的赢）。它与 `judge` 里的 `forbidden` **不是**重复的摆设：
         # 两处各有独立的测试盯着（`test_the_plan_gate_drops_a_judged_card_that_the_exact_hit_already_took`
@@ -433,14 +480,46 @@ def plan_nodes(nodes, index, call=None, error=""):
         # "判定命中去拿别人已经占上的卡"，不是"一张卡只能填一个节点"。
         for n in rest:
             cid = pairs.get(str(n.get("term") or ""))
-            if not cid or cid in occupied:
+            if not cid:
                 continue
             card = idx.cards.get(cid)
             if card is None:
                 continue            # 判定层已经校验过，这里是"别处的 bug 也别炸"的一层
+            if cid in occupied:
+                # 这张卡已经归别人了 → **只对齐身份**，内容一个字不动（见下面的长注释）
+                align_only[id(n)] = (card, "assisted", "card_taken")
+                continue
             found[id(n)] = (card, "assisted")
             occupied.add(cid)
+        # **被禁选丢掉的那条也要做身份对齐**（必修②，真缺陷）：`judge` 把"模型**确实**判成了
+        # 同一概念、但这次没采纳"的配对放进 `dropped`（禁选卡 / 一卡一条，见 `judge`）。
+        # 只"丢掉不采纳"而不对齐的话，那条节点的 `term` 保持 JD 里的写法 →
+        # `kb.absorb` 按归一化名找不到库里那张卡 → **新建重复卡**
+        # （终审实测两张：`语音识别` + `asr`、`泛化能力` + `模型泛化`）。
+        # ⚠️ 只对齐 `term`，内容**一个字节都不动**（不调 `_fill_from_card`）：那张卡的内容
+        # 已经归另一个节点了，这条照旧联网、内容由 ③④ 产出。
+        # ⚠️ 于是报告里会出现"**两条同名节点**"（一条是库里的、一条是本次生成的）——
+        # **这是可接受的**，不是 bug：写回时它们并进同一张卡（`kb.absorb` 按归一化名找卡）。
+        # 别为了"报告好看"把后者改名或者干脆丢掉对齐 —— 那会正好把重复卡放回来。
+        for n in rest:
+            if id(n) in found or id(n) in align_only:
+                continue                     # 它已经拿到了更好的归宿（合法配对优先）
+            cid = dropped.get(str(n.get("term") or ""))
+            card = idx.cards.get(cid) if cid else None
+            if card is None:
+                continue                     # 判定层已经校验过卡在库里，这里是兜底
+            align_only[id(n)] = (card, "assisted", "card_taken")
     for n in nodes:
+        only = align_only.get(id(n))
+        if only is not None:
+            card, how, why = only
+            original = _align_term(n, card, matched_by=how, reason=why)
+            stats["matched"] += 1
+            stats["aligned_only"] += 1
+            # 内容一个字不动 ⇒ 复用资格一律 False（③④ 照旧要跑，`_already_reused` 也是读它）
+            _reusable, missing = _card_completeness(card)
+            _mark_reuse(n, card, how, False, missing, original, aligned_only=True)
+            continue
         hit = found.get(id(n))
         if hit is None:
             continue
@@ -449,7 +528,7 @@ def plan_nodes(nodes, index, call=None, error=""):
         stats["matched"] += 1
         original = ""
         if reusable:
-            original = _fill_from_card(n, card)
+            original = _fill_from_card(n, card, how)
             stats["reusable"] += 1
             if card.get("timeline"):
                 stats["timeline_reused"] += 1
@@ -458,27 +537,50 @@ def plan_nodes(nodes, index, call=None, error=""):
             # **不够格也要做身份对齐**（I-1，真缺陷）：改名不是内容覆盖，只要命中就该做。
             # 不做的话写回会新建一张重复卡（`kb.absorb` 按 `normalize_id(term)` 找卡）。
             # 内容（definition / sources / timeline / …）一个字都不动 —— 那是 ③④ 的事。
-            original = _align_term(n, card)
-        n["kb_reuse"] = {
-            "card_id": kb.normalize_id(card.get("term")),
-            "card_term": str(card.get("term") or ""),
-            # ⚠️ **只在真的改名时才记**（M-8）：
-            #   * 名字与规范名**字面**相同时留空串 —— 否则报告里会冒出一句多余的
-            #     「JD 里写作 语音识别」；
-            #   * 两条支路（够格 / 不够格）都记，判据只有"改名有没有真的发生"这一条：
-            #     不够格时也改名了（I-1），所以这里**不再**掺 `reusable` —— 那会把
-            #     一个真发生过的改名记成没发生（报告与事实相反）。
-            "term_original": (original if (original
-                                           and original != str(card.get("term") or "")) else ""),
-            "matched_by": how,
-            "reusable": bool(reusable),
-            "missing": list(missing),
-            "got": ("all" if (reusable and card.get("timeline")) else
-                    ("sources" if reusable else "")),
-            "origin": _origin_of(card),
-        }
+            original = _align_term(n, card, matched_by=how, reason="incomplete")
+        _mark_reuse(n, card, how, reusable, missing, original)
     stats["searched"] = stats["total"] - stats["reusable"]
     return stats
+
+
+def _mark_reuse(node, card, how, reusable, missing, original, aligned_only=False):
+    """把"这次到底拿到了什么"写在节点上（`node["kb_reuse"]`）—— **口径只有这一处**。
+
+    三条支路（够格 / 不够格 / 只对齐身份）共用它，理由与 `_align_term` 一样：各写一遍迟早
+    漂移，而这里漂移的代价是报告说假话（报告逐字读这些字段）。
+
+    字段口径（报告 `kReuseLine` 与测试都按它读）：
+      * `card_id` / `card_term` —— 命中的那张卡（`card_id` 是归一化后的身份键）；
+      * `term_original` —— **只在真的改名时才记**（M-8）：
+          - 名字与规范名**字面**相同时留空串 —— 否则报告里会冒出一句多余的
+            「JD 里写作 语音识别」；
+          - 够格 / 不够格 / 只对齐三条支路都记，判据只有"改名有没有真的发生"这一条：
+            不够格与只对齐时也改名了（I-1 / 必修②），所以这里**不再**掺 `reusable` ——
+            那会把一个真发生过的改名记成没发生（报告与事实相反）。
+      * `reusable` —— **这条节点有没有拿到库里那份内容**。只对齐身份那条一律 `False`
+        （它的内容全归 ③④，也必须继续联网：`knowledge._already_reused` 就读这个字段）；
+      * `missing` —— 库里那张卡缺什么（够格判定用的那三个字段 + timeline）；
+      * `got` —— `all` / `sources` / `""`；
+      * `origin` —— 这张卡最早来自哪个岗位；
+      * `aligned_only` —— **只有**只对齐身份那条才有这个键（值 `True`）。报告靠它把
+        "与另一条节点指向同一张卡"与"库里内容不够格"分开说 —— 后者对一张**内容齐全**
+        的卡是假话（它没什么"不够格"的，只是这张卡已经归别人了）。
+    """
+    node["kb_reuse"] = {
+        "card_id": kb.normalize_id(card.get("term")),
+        "card_term": str(card.get("term") or ""),
+        "term_original": (original if (original
+                                       and original != str(card.get("term") or "")) else ""),
+        "matched_by": how,
+        "reusable": bool(reusable),
+        "missing": list(missing),
+        "got": ("all" if (reusable and card.get("timeline")) else
+                ("sources" if reusable else "")),
+        "origin": _origin_of(card),
+    }
+    if aligned_only:
+        node["kb_reuse"]["aligned_only"] = True
+    return node["kb_reuse"]
 
 
 def _chunks(seq, size):
@@ -496,7 +598,7 @@ def _chunks(seq, size):
         yield seq[i:i + size]
 
 
-def judge(nodes, index, call, forbidden=None):
+def judge(nodes, index, call, forbidden=None, dropped=None):
     """让模型判一次"这些知识点是不是库里已有的某个概念"。
 
     返回 `{节点 term 原文: card_id}`。**逐条校验**，任何可疑的一律丢弃：
@@ -514,6 +616,20 @@ def judge(nodes, index, call, forbidden=None):
         一条都不用（等同"没命中"），记日志（含**块序号与总块数**，且异常原文**截断**后
         再落盘 —— HTTP 报错常带整段 prompt/回复）。**某一块坏了只作废那一块**，
         其余块照常生效（`continue`），绝不"整步退回确定性匹配"。
+
+    `dropped`（**可选出参**，必修②）：传进来一个 dict，本函数把"模型**确实**判成了同一概念、
+    但这次**没采纳**"的配对照样原地写进去（`{节点 term 原文: card_id}`），给调用方做
+    **只对齐身份、不抄内容**。两类被丢弃的配对都要报：
+      * 禁选卡（`forbidden`）—— 采纳会破坏"一卡一条"；
+      * 一卡一条的内层去重（同一张卡被两条节点认领，先出现的赢）。
+    **不报的代价**（本轮修掉的真缺陷）：那条节点的 `term` 保持 JD 里的写法 →
+    `kb.absorb` 按归一化名找不到库里那张卡 → **新建重复卡**（终审实测：`语音识别` + `asr`）。
+    **不在这一块的** `card_id`（模型在发明概念/记错了块）**不报** —— 那不是库里的卡，
+    拿它对齐等于按幻觉改名。
+
+    为什么是出参而不是把它并进返回值：返回值 `{term: card_id}` 是**既有契约**（一批测试直接
+    断言它等于某个 dict），改成 `(out, dropped)` 会把所有调用点拖进这次改动。
+    与 `knowledge.attach_sources` 的 `stats` 出参同一个理由。
 
     ⚠️ 已知无上限（M-7，如实记一句）：B 清单（要问的节点）**每一块都重发整份**，
     块数越多重复越多。当前不做优化 —— 生产上节点 ≤ 60、块数通常为 1，收益为零。
@@ -559,17 +675,29 @@ def judge(nodes, index, call, forbidden=None):
             continue
         # `allowed` 是**当前这一块**的清单（减掉确定性已占用的）——不是全部 terms：
         # 小库里两者恰好相同，所以这条要有牙就必须真的分块（见 `test_a_card_id_from_another_chunk_is_dropped`）。
-        allowed = {c["card_id"] for c in chunk} - banned
+        chunk_ids = {c["card_id"] for c in chunk}
+        allowed = chunk_ids - banned
         for p in pairs:
             if not isinstance(p, dict):
                 continue
             node_term = str(p.get("node") or "")
             cid = str(p.get("card_id") or "")
-            if node_term not in wanted or cid not in allowed:
+            # `cid` 必须在**这一块**的清单里：模型不许发明概念，也不该拿着别块的 id
+            # （那种连"判过"都不算 —— 拿它对齐等于按幻觉改名，所以**不进 `dropped`**）。
+            if node_term not in wanted or cid not in chunk_ids:
                 continue
-            if node_term in out or cid in out.values():
-                continue          # 一卡一条 / 一条一张卡：**先出现的赢**（M-5）
-            out[node_term] = cid
+            if node_term in out:
+                continue          # 一条节点只认一张卡：**先出现的赢**（M-5）
+            if cid in allowed and cid not in out.values():
+                out[node_term] = cid
+                continue
+            # 到这里 = "模型**确实**判成了同一概念、但这次没采纳"（禁选卡 / 一卡一条）。
+            # 采纳会破坏"一卡一条"（spec §5/§6）；**直接丢掉又会让调用方失去身份对齐的机会**
+            # —— 那条节点的 term 保持 JD 写法，写回时 `kb.absorb` 认不出库里那张卡，
+            # **新建重复卡**（必修② 实测：`语音识别` + `asr`）。所以如实报给 `dropped`，
+            # 由 `plan_nodes` 只对齐身份、内容一个字不动。
+            if dropped is not None:
+                dropped.setdefault(node_term, cid)
     return out
 
 

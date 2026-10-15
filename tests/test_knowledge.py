@@ -335,6 +335,125 @@ class SearchQualityTest(IsolatedCase):
         self.assertEqual(seen.get("max_results"), 5)
 
 
+class SearchCapStatsTest(IsolatedCase):
+    """必修①：`searched` 必须是**真的搜了几次**，并且要报出"超出上限、本次没搜"的条数。
+
+    终审实测：10 个节点 + 上限 2 → 报告说「本次联网 4 条」，实际只搜了 2 次；更糟的是
+    **超出上限、根本没搜**的那条卡，报告仍写「已联网补全」（它的 `sources` 明明是空的）。
+    根因：`plan_nodes` 只能给出推测值 `total - reusable`（它不知道 `max_searches` 上限），
+    真值只有 ③ 知道 —— 所以 ③ 必须把它**回报**出来，`build_for_jd` 再写回 `reuse.stats`。
+    """
+
+    def _nodes(self, n=5):
+        """`layer` 与真路径一致（核心优先）：前两条 layer 0，其余 layer 1。"""
+        return [{"id": "n%d" % i, "term": "T%d" % i, "definition": "d",
+                 "plain_explanation": "p", "sources": [], "timeline": [], "related": [],
+                 "confidence": "ai-generated", "layer": 1 if i >= 2 else 0}
+                for i in range(n)]
+
+    @staticmethod
+    def _counting(calls):
+        def search(query, providers=None, **kw):
+            calls.append(query)
+            return [{"title": "大模型 A", "url": "https://a", "snippet": "模型"}]
+        return search
+
+    def test_the_stats_report_the_real_count_and_the_capped_count(self):
+        calls = []
+        nodes = self._nodes(5)
+        stats = {}
+        knowledge.attach_sources(nodes, [{"name": "t", "base_url": "u", "api_key": "k"}],
+                                 search=self._counting(calls), max_searches=2, stats=stats)
+        self.assertEqual(len(calls), 2, "夹具前提：上限 2 → 真的只搜 2 次")
+        # ★ 这条就是必修①：`searched` 报的是**真值**。写法若退回 `total - reusable`
+        # （= 5 - 0 = 5），下面这条断言立刻红 —— 报告会多报 3 条联网。
+        self.assertEqual(stats["searched"], 2, "报的不是真实搜索次数（多报了没搜的那些）")
+        self.assertEqual(stats["skipped_by_cap"], 3, "超出上限、本次没搜的条数没报出来")
+        # 被截断的那三条：**来源是空的**（这条证明它们真的没搜），并且节点上留了戳
+        capped = [n for n in nodes if n.get("search_skipped") == knowledge.SEARCH_SKIPPED_CAPPED]
+        self.assertEqual(len(capped), 3, "被截断的节点没留 `search_skipped` 戳 → 报告分不出"
+                                         "「联网了没搜到」与「压根没联网」")
+        for n in capped:
+            self.assertEqual(n["sources"], [], "%s 被截断了却拿到了来源？" % n["term"])
+            self.assertEqual(n["confidence"], "ai-generated")
+        for n in nodes[:2]:
+            self.assertTrue(n["sources"], "%s 在上限之内，必须真的搜过" % n["term"])
+            self.assertNotIn("search_skipped", n)
+
+    def test_nothing_is_capped_when_no_cap_is_in_force(self):
+        """`max_searches` 为 0/None = 不限制 → 每条都搜、`skipped_by_cap` 必须是 0。
+
+        没有这条的话，"把 `skipped_by_cap` 写成 `len(nodes)`"这种错会被上面那条用例放过。
+        """
+        calls = []
+        nodes = self._nodes(5)
+        stats = {}
+        knowledge.attach_sources(nodes, [{"name": "t", "base_url": "u", "api_key": "k"}],
+                                 search=self._counting(calls), max_searches=0, stats=stats)
+        self.assertEqual(len(calls), 5, "不限制时每条都该搜")
+        self.assertEqual((stats["searched"], stats["skipped_by_cap"]), (5, 0))
+
+    def test_reused_nodes_are_not_counted_as_capped(self):
+        """复用节点被上限挤出 `selected` 时**不算被上限坑的**：它们本来就不需要搜。
+
+        算进去的话，报告会说"它们没联网"（读的人会以为复用节点被上限挤掉了）。
+        """
+        calls = []
+        nodes = self._nodes(3)
+        nodes[2]["kb_reuse"] = {"reusable": True}       # 这条从库里整条复用了 → 永不搜
+        stats = {}
+        knowledge.attach_sources(nodes, [{"name": "t", "base_url": "u", "api_key": "k"}],
+                                 search=self._counting(calls), max_searches=2, stats=stats)
+        self.assertEqual(len(calls), 2, "复用那条就算在 selected 里也不许搜")
+        self.assertEqual(stats["searched"], 2)
+        self.assertEqual(stats["skipped_by_cap"], 0, "复用节点不是被上限坑的，不该算进来")
+
+    def _cfg(self, max_searches=2):
+        return {"text_model": {"base_url": "b", "api_key": "k", "model": "m"},
+                "search_providers": [{"name": "t", "base_url": "u", "api_key": "k"}],
+                "max_searches": max_searches}
+
+    def _chat(self):
+        """假模型：①拆解出 4 条 / ②头脑风暴 0 条 / ④时间线 / 判定。"""
+        def fake_chat(base_url, api_key, model, messages, **kw):
+            sys_prompt = messages[0]["content"]
+            if "从岗位 JD 中抽出" in sys_prompt:
+                return json.dumps({"nodes": [
+                    {"id": "n%d" % i, "term": "T%d" % i, "definition": "本次定义",
+                     "plain_explanation": "本次通俗", "category": "核心概念"}
+                    for i in range(4)]}, ensure_ascii=False)
+            if "知识网络构建专家" in sys_prompt:
+                return json.dumps({"related": []}, ensure_ascii=False)
+            if "技术史专家" in sys_prompt:
+                return json.dumps({"timeline": [{"year": "2020", "text": "本次算的"}]},
+                                  ensure_ascii=False)
+            if "知识库管理员" in sys_prompt:
+                return json.dumps({"pairs": []}, ensure_ascii=False)
+            raise AssertionError("假模型收到了认不出的提示词：%s" % sys_prompt[:60])
+        return fake_chat
+
+    def test_build_for_jd_writes_the_real_count_back_into_reuse_stats(self):
+        """★ 必修① 的收口那一半：`reuse.stats`（报告读的就是它）必须是**真值**。
+
+        夹具：库是空的 → `plan_nodes` 给出 `searched = total - reusable = 4`（推测值），
+        而上限是 2 → 真实搜索 2 次。不加这条收口，报告里就会写「本次联网 4 条」。
+        `reuse.stats` 与 `build_for_jd` 内部那个 dict 是**同一个对象**（原地更新）。
+        """
+        calls = []
+        reuse = kbreuse.Reuse(self._cfg())
+        nodes = knowledge.build_for_jd("JD 原文", self._cfg(), reuse=reuse,
+                                       search=self._counting(calls), chat=self._chat())
+        self.assertEqual(len(nodes), 4, "夹具前提：①拆出 4 条、②不扩")
+        self.assertEqual(len(calls), 2, "夹具前提：上限 2 → 真的只搜 2 次")
+        self.assertEqual(reuse.stats["searched"], 2,
+                         "`reuse.stats['searched']` 还是 plan_nodes 的推测值"
+                         "（total - reusable = 4）—— 报告会多报联网条数")
+        self.assertEqual(reuse.stats["skipped_by_cap"], 2)
+        capped = [n for n in nodes if n.get("search_skipped")]
+        self.assertEqual(len(capped), 2, "被截断的节点没留戳")
+        self.assertEqual([n["sources"] for n in capped], [[], []], "被截断的确实没搜（来源为空）")
+
+
 class _FakeReuse:
     """只实现 `knowledge.py` 需要的那个接口：`plan(nodes) -> stats`。
 

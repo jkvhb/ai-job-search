@@ -413,14 +413,26 @@ function kbReuseNote(m){
   if(total === null) return '';
   const matched = num(r.matched) || 0, reused = num(r.reusable) || 0;
   const tl = num(r.timeline_reused) || 0, enriched = num(r.enriched) || 0;
+  const aligned = num(r.aligned_only) || 0;
+  // 「超出搜索上限、**本次一次都没搜**」的条数（`knowledge.attach_sources` 写进来的真值）。
+  // 老报告没有这个字段 → 0，文案与改动前**一字不变**（`searched` 那条老口径的兜底同理）。
+  const capped = num(r.skipped_by_cap) || 0;
   const searched = (num(r.searched) === null) ? Math.max(total - reused, 0) : num(r.searched);
   let out = '；知识库：复用 '+esc(String(reused))+' 条';
   if(tl > 0) out += '（含时间线 '+esc(String(tl))+' 条）';
   out += ' · 命中 '+esc(String(matched))+' 条';
-  // 「不够格」那几条正是 `enriched`（命中、但库里内容不全，本次联网补全并写回）。
-  if(enriched > 0) out += '（其中 '+esc(String(enriched))+' 条不够格，已联网补全）';
+  const detail = [];
+  // 「不够格」= 库里那份不全（缺来源/缺通俗解释），**不等于**"这次真的联网补上了" ——
+  // 所以只有在上限没截断任何一条时才敢接着说「已联网补全」（那时 `enriched` 条条都搜过）。
+  if(enriched > 0) detail.push(esc(String(enriched))+' 条不够格'
+                               + (capped === 0 ? '，已联网补全' : ''));
+  if(aligned > 0) detail.push(esc(String(aligned))+' 条与其它节点指向同一张卡（内容为本次生成）');
+  if(detail.length) out += '（其中 '+detail.join('、')+'）';
   out += ' · 本次联网 '+esc(String(searched))+' 条';
-  if(searched === 0) out += '（本次没有联网搜索）';
+  // 超出上限的那批**一条都没搜**、`sources` 仍然是空的（节点上有 `search_skipped` 戳）——
+  // 必须单独说出来，否则读的人会把它们当成"联网补全了"（说假话，必修①修掉的那条）。
+  if(capped > 0) out += '（另有 '+esc(String(capped))+' 条超出本次搜索上限，本次没有联网）';
+  else if(searched === 0) out += '（本次没有联网搜索）';
   return out;
 }
 
@@ -552,11 +564,17 @@ function kListView(){
 }
 
 /* 阶段 E（spec §8）：卡片上那行逐条出处 —— 「这条最早来自哪个岗位、什么时候；
-   JD 里原本怎么写」。两种命中的话**分开说**（混起来就是假话）：
+   JD 里原本怎么写」。三种命中的话**分开说**（混起来就是假话）：
      * 够格复用（`reusable === true`）→ 说「来自本地知识库」，并说清是哪一种命中
-       （同名 / 别名 / 括号缩写 / AI 判定，一律**说人话**，绝不把英文码甩给用户）；
+       （同名 / 别名 / 括号缩写 / 简写 / AI 判定，一律**说人话**，绝不把英文码甩给用户）；
      * 命中但不够格（`reusable === false`）→ **绝不说内容「来自本地知识库」**（那是本次
-       联网搜来的），只如实说「命中了库里的卡、但不够格，这次仍联网补齐」。
+       联网搜来的），只如实说「命中了库里的卡、但不够格，这次仍联网补齐」；
+     * 只对齐身份（`aligned_only === true`，必修②）→ 那条节点与**另一条**节点指向库里
+       **同一张卡**，内容全是本次生成的。**不许**说它"不够格"（那张卡可能内容齐全，
+       只是已经归别人了）、也**不许**说内容来自知识库。
+   `n.search_skipped === 'capped'`（超出搜索上限、本次一次都没联网，见
+   `knowledge.SEARCH_SKIPPED_CAPPED`）时，**任何**"本次仍联网补齐"的话都不许说 ——
+   它的 `sources` 是空的，正因为它压根没搜（必修①）。
    没有 `kb_reuse`（老报告 / 联网算的卡片）、或标记形状不对（连 `reusable` 都不是布尔）
    → 回空，绝不编一句话。`id` 是给探针用的：探针取的是**这个元素自己的文本**。 */
 function kReuseLine(n){
@@ -565,13 +583,21 @@ function kReuseLine(n){
   if(!r) return '';
   if(r.reusable !== true && r.reusable !== false) return '';   // 形状不对 = 垃圾，不渲染
   const s = v => (typeof v === 'string') ? v.trim() : '';
-  const by = ({exact:'同名命中', alias:'别名命中',
-               abbrev:'括号缩写命中', assisted:'AI 判定命中'})[s(r.matched_by)] || '';
+  // `head` = 靠**卡侧"去括号头名"**命中的（节点 `词错率` ↔ 库里 `词错率（WER）`）。
+  // 它与 `abbrev` 必须分开说：这条线索的节点侧**没有括号**，报「括号缩写命中」时用户
+  // 看不出是怎么认出来的（Minor④）。
+  const by = ({exact:'同名命中', alias:'别名命中', abbrev:'括号缩写命中',
+               head:'简写命中', assisted:'AI 判定命中'})[s(r.matched_by)] || '';
   const org = (r.origin && typeof r.origin === 'object' && !Array.isArray(r.origin)) ? r.origin : {};
   const job = s(org.job_title), date = s(org.date);
   const from = (job && date) ? '《'+esc(job)+'》· '+esc(date)
              : (job ? '《'+esc(job)+'》' : esc(date));
   const orig = s(r.term_original);
+  // 本次到底联没联网：超上限被截断的节点上有 `search_skipped` 戳（老报告没有 → 按"联网了"说，
+  // 因为那时压根没有上限这回事）。
+  const capped = s(n && n.search_skipped) === 'capped';
+  const online = capped ? '，但本次没有联网搜索（超出本次搜索上限），来源与时间线都还没补'
+                        : '，本次仍全部联网搜索补齐';
   let out;
   if(r.reusable === true){
     // `got` 说清库里给了什么：`all` = 来源 + 时间线都是库里的；`sources` = 只有来源。
@@ -584,6 +610,12 @@ function kReuseLine(n){
     out += '；本次没有重新搜索';
     if(orig) out += '；JD 里写作「'+esc(orig)+'」';
     if(r.got === 'sources') out += '；时间线为本次补算，已写回知识库';
+  } else if(r.aligned_only === true){
+    // 必修②：这条节点与**另一条**节点被判成库里同一张卡，内容没有从库里拿（全归 ③④）。
+    // 报告里因此会出现两条同名节点 —— 可接受：写回时 `kb.absorb` 会把它并进同一张卡。
+    out = '⚠ 与另一条节点指向本地知识库里的同一张卡'+(from ? '（最早来自 '+from+'）' : '')
+        + '，这条的内容是本次生成的'+(by ? '（'+by+'）' : '')+online;
+    if(orig) out += '；JD 里写作「'+esc(orig)+'」';
   } else {
     const miss = Array.isArray(r.missing)
       ? r.missing.map(k => ({sources:'来源链接', timeline:'时间线', definition:'定义',
@@ -591,7 +623,10 @@ function kReuseLine(n){
       : '';
     out = '⚠ 命中了本地知识库里的卡片'+(from ? '（最早来自 '+from+'）' : '')
         + '，但库里内容不够格'+(miss ? '（缺 '+miss+'）' : '')
-        + (by ? '，'+by : '')+'，本次仍全部联网搜索补齐';
+        + (by ? '，'+by : '')+online;
+    // 必修③：不够格这一支也要把 JD 原本的写法渲染出来 —— 判定认错（模型说 A 就是 B）时
+    // 写回会改动库里那张卡的内容，而**卡内容没有版本历史**；让用户至少看得见"JD 里写作 XX"。
+    if(orig) out += '；JD 里写作「'+esc(orig)+'」';
   }
   return '<div class="kreuse" id="kreuse-'+esc(n.id)+'">'+out+'</div>';
 }

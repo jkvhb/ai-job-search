@@ -1016,6 +1016,39 @@ class KbReuseTemplateTest(IsolatedCase):
         self.assertIn("命中 5 条（其中 2 条不够格，已联网补全）", got)
         self.assertIn("本次联网 12 条", got)
 
+    def test_the_summary_never_claims_a_capped_card_went_online(self):
+        """★ 必修①：`skipped_by_cap > 0` 时**绝不许**说「已联网补全」。
+
+        终审实测：超出搜索上限、根本没搜的那条卡 `sources` 是空的，而报告仍写「已联网补全」
+        —— 那句对它是假话。上限没截断任何一条时才敢接着说那句（那时 `enriched` 条条都搜过）。
+        """
+        got = self._line({"total": 6, "matched": 2, "reusable": 0, "timeline_reused": 0,
+                          "enriched": 2, "searched": 2, "skipped_by_cap": 4,
+                          "knowledge_error": ""})
+        self.assertIsNotNone(got)
+        self.assertNotIn("已联网补全", got, "对没搜的卡说了「已联网补全」（说假话）")
+        self.assertIn("其中 2 条不够格", got)
+        self.assertIn("本次联网 2 条", got)
+        self.assertIn("另有 4 条超出本次搜索上限，本次没有联网", got)
+
+    def test_the_summary_says_which_hits_share_one_card(self):
+        """必修②的报告口径：只对齐身份的那些卡片**不许**被说成「不够格」——
+        那张卡可能内容齐全，只是已经归另一个节点了。"""
+        got = self._line({"total": 5, "matched": 3, "reusable": 1, "timeline_reused": 0,
+                          "enriched": 0, "aligned_only": 2, "searched": 2,
+                          "knowledge_error": ""})
+        self.assertIsNotNone(got)
+        self.assertIn("命中 3 条（其中 2 条与其它节点指向同一张卡（内容为本次生成））", got)
+        self.assertNotIn("不够格", got)
+        self.assertNotIn("已联网补全", got)
+
+    def test_an_old_report_without_the_new_counters_is_unchanged(self):
+        """老报告没有 `skipped_by_cap` / `aligned_only` → 文案与改动前**一字不变**。"""
+        got = self._line({"total": 15, "matched": 5, "reusable": 3, "timeline_reused": 2,
+                          "enriched": 2, "searched": 12, "knowledge_error": ""})
+        self.assertEqual(got, "📚 知识地图：本次新算；知识库：复用 3 条（含时间线 2 条）"
+                              " · 命中 5 条（其中 2 条不够格，已联网补全） · 本次联网 12 条")
+
     def test_a_run_against_an_empty_kb_says_zero_reused(self):
         """**跑了、但库是空的** → 如实说「复用 0 条」（这才轮到这句话出场）。"""
         got = self._line({"total": 5, "matched": 0, "reusable": 0, "timeline_reused": 0,
@@ -1091,12 +1124,77 @@ class KbReuseTemplateTest(IsolatedCase):
 
     def test_the_match_method_is_said_in_plain_chinese(self):
         for code, want in (("exact", "同名命中"), ("alias", "别名命中"),
-                           ("abbrev", "括号缩写命中"), ("assisted", "AI 判定命中")):
+                           ("abbrev", "括号缩写命中"), ("head", "简写命中"),
+                           ("assisted", "AI 判定命中")):
             with self.subTest(matched_by=code):
                 got = _kreuse_text(self._data(node_extra={"kb_reuse": self._kb(matched_by=code)}))
                 self.assertIsNotNone(got)
                 self.assertIn(want, got)
                 self.assertNotIn(code, got, "把英文码直接甩给用户了：%r → %r" % (code, got))
+
+    def test_a_head_name_hit_is_not_called_an_abbreviation_hit(self):
+        """★ Minor④：靠**卡侧"去括号头名"**命中的（节点 `词错率` ↔ 库里 `词错率（WER）`）
+        不许说成「括号缩写命中」—— 那个节点里**一个括号都没有**，用户看了莫名其妙。
+
+        `matched_by` 是新的 `head` 档位；报告里的措辞里也不许出现「括号」。
+        """
+        got = _kreuse_text(self._data(node_extra={"kb_reuse": self._kb(matched_by="head")}))
+        self.assertIsNotNone(got)
+        self.assertIn("简写命中", got)
+        self.assertNotIn("括号", got, "把'去括号头名'说成了「括号缩写命中」（Minor④）")
+
+    def test_a_capped_card_line_says_it_did_not_go_online(self):
+        """★ 必修①：超出搜索上限、**本次没搜**的那条卡不许说「本次仍全部联网搜索补齐」。
+
+        它 `sources` 是空的，正因为它压根没搜 —— 节点上的 `search_skipped` 戳是报告唯一的
+        依据（只看 `sources` 分不出"搜了没搜到"与"没搜"）。
+        """
+        got = _kreuse_text(self._data(node_extra={
+            "kb_reuse": self._kb(reusable=False, missing=["sources"], got=""),
+            "search_skipped": "capped"}))
+        self.assertIsNotNone(got)
+        self.assertNotIn("联网搜索补齐", got, "对没联网的卡说「仍全部联网搜索补齐」（说假话）")
+        self.assertIn("本次没有联网搜索", got)
+        self.assertIn("超出本次搜索上限", got)
+
+    def test_an_insufficient_hit_also_shows_the_original_jd_wording(self):
+        """★ 必修③：**不够格**那一支也要渲染 `term_original`。
+
+        判定认错（模型说 A 就是 B）时这条路径会永久改掉库里那张卡的内容，而**卡内容没有
+        版本历史** —— 让用户至少看得见"JD 里写作 XX"。
+        """
+        got = _kreuse_text(self._data(node_extra={"kb_reuse": self._kb(
+            reusable=False, missing=["sources"], got="", term_original="ASR",
+            matched_by="assisted")}))
+        self.assertIsNotNone(got)
+        self.assertIn("库里内容不够格", got)
+        self.assertIn("JD 里写作「ASR」", got, "不够格那一支没渲染 JD 原本的写法（必修③）")
+
+    def test_an_aligned_only_card_does_not_claim_the_kb_content(self):
+        """★ 必修②的报告口径：只对齐身份那条**不是**"不够格"，内容也不是库里的。
+
+        它的卡片与**另一条**节点指向同一张卡（那张卡可能内容齐全），内容全是本次生成的。
+        """
+        got = _kreuse_text(self._data(node_extra={"kb_reuse": self._kb(
+            reusable=False, missing=[], got="", matched_by="assisted",
+            term_original="ASR", aligned_only=True)}))
+        self.assertIsNotNone(got)
+        self.assertNotIn("来自本地知识库", got, "内容不是库里的，这样说就是假话")
+        self.assertNotIn("不够格", got, "那张卡只是已经归另一个节点了，不是'内容不够格'")
+        self.assertIn("同一张卡", got)
+        self.assertIn("这条的内容是本次生成的", got)
+        self.assertIn("AI 判定命中", got)
+        self.assertIn("JD 里写作「ASR」", got)
+
+    def test_an_aligned_only_card_that_was_capped_says_so(self):
+        """两条修一起时的交叉情形：只对齐身份 **且** 超出搜索上限 → 不许说"仍联网"。"""
+        got = _kreuse_text(self._data(node_extra={
+            "kb_reuse": self._kb(reusable=False, missing=[], got="", aligned_only=True),
+            "search_skipped": "capped"}))
+        self.assertIsNotNone(got)
+        self.assertIn("同一张卡", got)
+        self.assertNotIn("联网搜索补齐", got)
+        self.assertIn("本次没有联网搜索", got)
 
     def test_a_reused_card_says_the_original_jd_wording_and_the_timeline_catch_up(self):
         got = _kreuse_text(self._data(node_extra={"kb_reuse": self._kb(

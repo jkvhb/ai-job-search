@@ -213,19 +213,27 @@ class IndexTest(IsolatedCase):
 
         中文括号那类（`响应延迟（首字延迟）`）也要能中 —— 它不贡献 ASCII 缩写键
         （括号内容是中文，见上），但**头名键**照样建。
+
+        ⚠️ Minor④：档位是 **`head`**，不是 `abbrev` —— 节点 `词错率` 里**一个括号都没有**，
+        报 `abbrev` 时报告会说「括号缩写命中」（用户看不出这条是怎么认出来的）。
+        下面同时钉住**另一侧**：靠卡侧**括号内容**命中的仍然是 `abbrev`（两个档位不许混）。
         """
         idx = kbreuse.Index([{"id": "词错率wer", "term": "词错率（WER）", "definition": "d"}])
         card, how = idx.lookup("词错率")
         self.assertIsNotNone(card, "中文头名要能查到带括号的那张卡")
         self.assertEqual(card["id"], "词错率wer")
-        self.assertEqual(how, "abbrev")
+        self.assertEqual(how, "head", "去括号的头名命中要报 head（不是 abbrev）")
+        # 反向：真的走**括号缩写键**（节点叫 `WER`）的仍然是 abbrev —— 档位没被一起改坏
+        card_a, how_a = idx.lookup("WER")
+        self.assertIsNotNone(card_a, "夹具前提：括号缩写也要能中")
+        self.assertEqual((card_a["id"], how_a), ("词错率wer", "abbrev"))
 
         idx2 = kbreuse.Index([{"id": "响应延迟首字延迟", "term": "响应延迟（首字延迟）",
                                "definition": "d"}])
         card2, how2 = idx2.lookup("响应延迟")
         self.assertIsNotNone(card2, "中文括号那类也要建头名键")
         self.assertEqual(card2["id"], "响应延迟首字延迟")
-        self.assertEqual(how2, "abbrev")
+        self.assertEqual(how2, "head")
 
     def test_an_exact_name_always_beats_an_earlier_derived_key(self):
         """**精确名优先于派生键** —— 与"谁先落盘"无关（I-1）。
@@ -566,8 +574,8 @@ class PlanNodesTest(IsolatedCase):
         node = self._node("完全不相干的概念")
         stats = kbreuse.plan_nodes([node], kbreuse.Index([self._card()]))
         self.assertEqual(stats, {"total": 1, "matched": 0, "reusable": 0,
-                                 "timeline_reused": 0, "enriched": 0, "searched": 1,
-                                 "knowledge_error": ""})
+                                 "timeline_reused": 0, "enriched": 0, "aligned_only": 0,
+                                 "searched": 1, "knowledge_error": ""})
         self.assertNotIn("kb_reuse", node)
 
     def test_two_nodes_resolving_to_one_card_both_get_reused(self):
@@ -927,7 +935,7 @@ class PlanNodesContractTest(IsolatedCase):
         seen = []
         forbidden_seen = []
 
-        def fake_judge(rest, index, call, forbidden=None):
+        def fake_judge(rest, index, call, forbidden=None, dropped=None):
             seen.append(list(rest))
             forbidden_seen.append(set(forbidden or ()))
             return {}
@@ -950,7 +958,7 @@ class PlanNodesContractTest(IsolatedCase):
         node = self._node()
         seen = []
 
-        def fake_judge(rest, index, call, forbidden=None):
+        def fake_judge(rest, index, call, forbidden=None, dropped=None):
             seen.append(list(rest))
             return {}
 
@@ -995,9 +1003,14 @@ class CrossBoundaryTest(IsolatedCase):
 
     # ---------------- 闸门 1 + 3：确定性已占用的卡不许再落到判定命中那条
     def test_an_exact_hit_and_a_judged_hit_never_share_one_card(self):
-        """一条精确名节点 + 一条被模型判成同卡的节点 → **只有一个**被复用。
+        """一条精确名节点 + 一条被模型判成同卡的节点 → 库里的内容**只填进一条**。
 
-        另一条必须原样不动（内容一个字都不许改、也不许被改名）—— 它去联网。
+        另一条**一个字节的内容都不许改**（definition / sources / timeline / confidence
+        全是本次的）—— 它去联网。但它的 `term` **必须被对齐**成库里的规范名
+        （必修②：不对齐的话写回 `kb.absorb` 会新建一张重复卡）。
+
+        ⚠️ 这条改动的可见后果：报告里会出现**两条同名节点**（一条复用、一条本次生成），
+        这是**可接受的**（写回并进同一张卡），别当成 bug。
         """
         exact, judged = self._node("语音识别"), self._node("ASR")
         idx = kbreuse.Index([self._card()])
@@ -1006,11 +1019,19 @@ class CrossBoundaryTest(IsolatedCase):
         self.assertIn("kb_reuse", exact, "夹具前提：精确名那条确实命中了")
         self.assertEqual(exact["kb_reuse"]["matched_by"], "exact")
         self.assertEqual(exact["definition"], "库里的定义")
-        self.assertNotIn("kb_reuse", judged, "同一张卡不许同时落到两条节点上（I-1）")
+        r = judged["kb_reuse"]
+        self.assertTrue(r["aligned_only"], "被判回的那条只能对齐身份")
+        self.assertFalse(r["reusable"], "内容没从库里拿 → 不许说自己复用了")
+        self.assertEqual(judged["term"], "语音识别", "身份必须对齐（否则写回新建重复卡）")
+        self.assertEqual(r["term_original"], "ASR", "改名确实发生过 → 记下 JD 原本的写法")
         self.assertEqual(judged["definition"], "本次写的定义", "没被认领的那条内容一个字都不许动")
-        self.assertEqual(judged["term"], "ASR", "也不许被改名成库里的规范名")
-        self.assertEqual(stats["matched"], 1)
+        self.assertEqual(judged["sources"], [], "本次的来源是本次的（它照旧要联网）")
+        self.assertEqual(judged["confidence"], "ai-generated")
+        self.assertEqual(stats["matched"], 2,
+                         "matched = 拿到 kb_reuse 标记的节点数（含只对齐身份那条），"
+                         "报告里 reused + enriched + aligned_only 才能对上它")
         self.assertEqual(stats["reusable"], 1)
+        self.assertEqual(stats["aligned_only"], 1)
         self.assertEqual(stats["searched"], 1, "被判回的那条照旧联网")
 
     def test_the_plan_gate_drops_a_judged_card_that_the_exact_hit_already_took(self):
@@ -1018,28 +1039,67 @@ class CrossBoundaryTest(IsolatedCase):
 
         这条把 `judge` 换成"不认 forbidden 的坏判定"（模拟判定层自己漏了），
         所以它红的唯一原因就是 `plan_nodes` 那道收口被拿掉了。
+        **拦下的含义是"不拿它的内容"**（`aligned_only` + 内容原样），不是"什么都不做"：
+        身份对齐照样要做（必修②），否则写回新建重复卡。
         """
         exact, judged = self._node("语音识别"), self._node("ASR")
         idx = kbreuse.Index([self._card()])
 
-        def bad_judge(rest, index, call, forbidden=None):
+        def bad_judge(rest, index, call, forbidden=None, dropped=None):
             return {"ASR": "语音识别"}          # 明知已被占用照报（禁选集合形同虚设）
 
         with mock.patch.object(kbreuse, "judge", bad_judge):
             kbreuse.plan_nodes([exact, judged], idx, call=lambda m: "{}")
         self.assertIn("kb_reuse", exact)
-        self.assertNotIn("kb_reuse", judged, "填充前那道收口没拦住已被确定性占用的卡")
-        self.assertEqual(judged["definition"], "本次写的定义")
+        self.assertEqual(exact["definition"], "库里的定义")
+        self.assertTrue(judged["kb_reuse"]["aligned_only"],
+                        "填充前那道收口没拦住已被确定性占用的卡（内容被抢走了）")
+        self.assertEqual(judged["definition"], "本次写的定义", "内容一个字都不许动")
+        self.assertEqual(judged["term"], "语音识别", "但身份要对齐")
 
     def test_the_judge_itself_drops_a_forbidden_card_and_keeps_the_legal_one(self):
-        """闸门 1 的**独立**牙（判定层的单元测试）：禁选卡丢弃，同一条回复里合法的照活。"""
+        """闸门 1 的**独立**牙（判定层的单元测试）：禁选卡丢弃，同一条回复里合法的照活。
+
+        同时钉住**必修②**的那个出参：丢掉的配对**不是凭空消失**，它必须出现在 `dropped`
+        里（否则调用方失去身份对齐的机会 → 写回新建重复卡）。
+        """
         idx = kbreuse.Index([self._card(), self._card(term="词错率（WER）")])
+        dropped = {}
         out = kbreuse.judge(self._nodes_for_judge("ASR", "词错率别名"), idx,
                             self._reply({"pairs": [
                                 {"node": "ASR", "card_id": "语音识别"},          # 禁选 → 丢
                                 {"node": "词错率别名", "card_id": "词错率wer"}]}),  # 合法 → 活
-                            forbidden={"语音识别"})
+                            forbidden={"语音识别"}, dropped=dropped)
         self.assertEqual(out, {"词错率别名": "词错率wer"}, "禁选卡必须丢，合法的必须活")
+        self.assertEqual(dropped, {"ASR": "语音识别"},
+                         "被禁选丢掉的配对要如实报给调用方（它靠这个做身份对齐）")
+
+    def test_the_judge_reports_the_loser_when_two_nodes_claim_one_card(self):
+        """必修②的另一半：**一卡一条**的内层去重（两条节点认领同一张卡，先出现的赢）。
+
+        输的那条同样要进 `dropped` —— 否则它写回时会新建一张重复卡
+        （终审实测：`泛化能力` + `模型泛化` 这类"同一张卡被两条节点认领"）。
+        """
+        idx = kbreuse.Index([self._card()])
+        dropped = {}
+        out = kbreuse.judge(self._nodes_for_judge("ASR", "语音识别的别名"), idx,
+                            self._reply({"pairs": [
+                                {"node": "ASR", "card_id": "语音识别"},
+                                {"node": "语音识别的别名", "card_id": "语音识别"}]}),
+                            dropped=dropped)
+        self.assertEqual(out, {"ASR": "语音识别"}, "一卡一条：先出现的赢")
+        self.assertEqual(dropped, {"语音识别的别名": "语音识别"}, "输的那条也要报出来（用来对齐身份）")
+
+    def test_a_card_id_from_another_chunk_never_lands_in_dropped(self):
+        """**不在这一块**的 `card_id` 连 `dropped` 都不进：模型在发明概念/记错了块，
+        拿它对齐等于按幻觉改名（比"少对齐一次"危险得多）。"""
+        idx = kbreuse.Index([{"id": "甲", "term": "甲概念", "definition": "d"},
+                             {"id": "乙", "term": "乙概念", "definition": "d"}])
+        dropped = {}
+        out = kbreuse.judge([{"id": "n", "term": "别人", "definition": "d"}], idx,
+                            self._reply({"pairs": [{"node": "别人", "card_id": "不存在的卡"}]}),
+                            dropped=dropped)
+        self.assertEqual((out, dropped), ({}, {}))
 
     @staticmethod
     def _nodes_for_judge(*terms):
@@ -1997,6 +2057,91 @@ class IncompleteHitIdentityTest(_WriteBackCase):
         self.assertEqual(node["sources"], [], "本次的来源是本次的（不够格 = 没有来源可复用）")
         self.assertEqual(node["confidence"], "ai-generated",
                          "不够格没有整条复用 → 不许标 verified（那是够格那支的事）")
+
+    def test_a_node_the_exact_hit_already_took_is_aligned_and_does_not_duplicate(self):
+        """★ 必修②：**被禁选挡掉**的那条也要做身份对齐（内容一个字节不动）。
+
+        终审实测（`语音识别` + `asr`）：库里那张卡被**同名命中**的节点占上之后，判定层
+        把 `asr` 判给同一张卡的配对**丢掉了**（一卡一条）；旧行为下那条节点既不采纳也
+        **不改名** → `kb.absorb` 按归一化名找不到那张卡 → **新建一张重复卡**。
+        """
+        self._seed("语音识别")                     # 满卡（够格）→ 同名那条整条复用
+        before = copy.deepcopy(store.load_knowledge()["nodes"][0])
+        exact, judged = self._node("语音识别"), self._node("ASR")
+        stats = kbreuse.plan_nodes([exact, judged], kbreuse.Index(store.load_knowledge()["nodes"]),
+                                   call=self._judge_call([{"node": "ASR", "card_id": "语音识别"}]))
+        self.assertEqual((stats["reusable"], stats["aligned_only"]), (1, 1), "夹具前提")
+        r = judged["kb_reuse"]
+        self.assertTrue(r["aligned_only"], "被禁选挡掉的那条没被标记成'只对齐身份'")
+        self.assertFalse(r["reusable"], "它没从库里拿内容 → 不许说复用")
+        self.assertEqual(judged["term"], "语音识别", "身份必须对齐（否则写回新建重复卡）")
+        self.assertEqual(r["term_original"], "ASR", "改名确实发生过 → 记下 JD 原本的写法")
+        self.assertEqual(r["matched_by"], "assisted")
+        # 内容**仍是本次生成的**（③④ 的活）：一个字节都没从库里抄
+        self.assertEqual(judged["definition"], "本次写的定义")
+        self.assertEqual(judged["plain_explanation"], "本次写的通俗解释")
+        self.assertEqual(judged["sources"], [])
+        self.assertEqual(judged["timeline"], [])
+        self.assertEqual(judged["confidence"], "ai-generated")
+
+        added, merged = kb.absorb([exact, judged], self.JD_NEW)     # ← 真的 kb.absorb
+        self.assertEqual(added, 0, "新建了重复卡（旧行为：added=1 且卡片数 1 → 2）")
+        self.assertEqual(merged, 2, "两条节点都并进同一张卡")
+        cards = store.load_knowledge()["nodes"]
+        self.assertEqual(len(cards), 1, "卡片数不变（1 → 2 就是新建了一张重复卡）")
+        self.assertEqual(cards[0]["id"], before["id"], "还是原来那张卡")
+        self.assertEqual([j["id"] for j in cards[0]["from_jds"]],
+                         [self.JD_OLD["id"], self.JD_NEW["id"]], "只多了一条 from_jds")
+
+    def test_two_nodes_judged_to_one_card_still_land_on_one_card(self):
+        """★ 必修②的另一半：两条节点被判成**同一张卡**（一卡一条，先出现的赢）。
+
+        输的那条也要只对齐身份 —— 终审实测的 `泛化能力` + `模型泛化` 正是这个形态。
+        这里让那张卡**不够格**（缺来源），因为这是最坏的一种组合：两条都要联网、都要写回。
+        """
+        self._seed("语音识别", sources=[], timeline=[])
+        first, second = self._node("ASR"), self._node("语音识别的说法")
+        stats = kbreuse.plan_nodes([first, second], kbreuse.Index(store.load_knowledge()["nodes"]),
+                                   call=self._judge_call([
+                                       {"node": "ASR", "card_id": "语音识别"},
+                                       {"node": "语音识别的说法", "card_id": "语音识别"}]))
+        self.assertEqual((stats["enriched"], stats["aligned_only"]), (1, 1), "夹具前提")
+        self.assertEqual([first["term"], second["term"]], ["语音识别", "语音识别"],
+                         "两条都要对齐到规范名")
+        self.assertEqual((first["kb_reuse"].get("aligned_only"),
+                          second["kb_reuse"].get("aligned_only")),
+                         (None, True), "先出现的那个是正常命中，后一个是'只对齐身份'")
+        self.assertEqual(second["kb_reuse"]["term_original"], "语音识别的说法")
+
+        added, merged = kb.absorb([first, second], self.JD_NEW)
+        self.assertEqual(added, 0, "写回新建了重复卡")
+        self.assertEqual(len(store.load_knowledge()["nodes"]), 1, "卡片数不变")
+
+    def test_identity_alignment_is_logged_for_later_audit(self):
+        """★ 必修③留痕：改名必须落一条**可查**的事件。
+
+        为什么非要留痕：卡内容**没有版本历史** —— 判定认错（模型说 A 就是 B）时
+        `kb._merge_into` 的"更长者胜"会把 definition 换成另一个概念的文本，而用户事后
+        只能靠这条日志回答"库里那张卡为什么是这个写法"。
+        """
+        self._seed("语音识别", sources=[], timeline=[])
+        node = self._node("ASR")
+        kbreuse.plan_nodes([node], kbreuse.Index(store.load_knowledge()["nodes"]),
+                           call=self._judge_call([{"node": "ASR", "card_id": "语音识别"}]))
+        ev = [r for r in log.read_logs(200)[0] if r.get("event") == "kbreuse.term_aligned"]
+        self.assertTrue(ev, "身份对齐没留下任何日志（库里那张卡的写法以后查不到）")
+        d = ev[-1]["data"]
+        self.assertEqual((d.get("card_id"), d.get("from"), d.get("to")),
+                         ("语音识别", "ASR", "语音识别"))
+        self.assertEqual(d.get("matched_by"), "assisted", "要说清是靠哪条线索认出来的")
+        self.assertEqual(d.get("reason"), "incomplete", "也要说清是哪条支路改的名")
+
+        # 反向：**同名命中**（名字没变）不许留痕 —— 否则日志会被每一次命中刷满，
+        # 真出问题时反而查不到（"没改名却留痕"这条要靠它钉住）。
+        same = self._node("语音识别")
+        kbreuse.plan_nodes([same], kbreuse.Index(store.load_knowledge()["nodes"]))
+        again = [r for r in log.read_logs(200)[0] if r.get("event") == "kbreuse.term_aligned"]
+        self.assertEqual(len(again), len(ev), "没改名却留了痕（日志会被刷满）")
 
     def test_the_reusable_branch_still_renames_and_copies_wholesale(self):
         """回归：**够格**那一支的 `term_original` / 内容覆盖口径**一字不变**（别改坏了）。
