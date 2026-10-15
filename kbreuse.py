@@ -261,17 +261,44 @@ def build_index(cards=None):
 # 从卡片整条复制到节点上的字段。**刻意不含 `related`**：
 # 它的 `{id}` 指向**上一次分析**的节点（`store.slug`），复制到本次报告里就是断链
 # （本次节点的 related 由模型为这个 JD 头脑风暴产生，指向的 id 都在本次报告里）。
+#
+# ⚠️ **契约：这几个字段在本次运行内是"只读"的。**
+# 它们一旦落到报告节点上，本次运行就**绝不再原地改它们**（下游全是重绑定新对象：
+# ③ 会重写 `definition` / `plain_explanation`，④ 会重写 `timeline`，`kb.absorb` 也是整条重算）。
+# 为什么要有这条契约：复制出来的东西与卡片**不能共享同一个可变对象** —— 就地把共享的
+# dict 改脏再 `kb.absorb`，**盘上那张库卡真的会被改脏**（复查反证过）。所以下面所有形状类
+# 字段都走 `kb` 自己的清洗函数（它们每次都返回**全新的** dict/str，见 `_CLEAN_FIELDS`），
+# 深拷贝那一层因此是多余的（不另写一套）。
+# 但它挡不到另一头：**脏值本来就在节点上**、随后被 `kb.absorb` 抄进库 —— 那条只能靠这条契约。
 _COPY_FIELDS = ("definition", "plain_explanation", "category", "sources", "timeline",
                 "interview_questions", "state")
-# `term` 单独处理（取规范名 + 记原写法），`layer` 取 min，`confidence` 按有无来源重算。
+# 形状类字段 → 复用 `kb` 已有的清洗函数（**不另写一套**，M-6）：
+#   * `clean_sources`：只留 `dict` 且 `url` 非空，补齐 title/date/accessed/snippet（新 dict）；
+#   * `clean_timeline`：只留带 `text` 的 dict，收成 `{year,text}`（新 dict）；
+#   * `clean_questions`：只留非空字符串、去重、按 `kb.MAX_QUESTIONS` 截断。
+# 于是 `definition=5` / `timeline={"a": 1}` / `interview_questions="abc"` 这类手改出来的
+# 奇形值不会原样塞进报告节点（旧代码只有 list 被拷贝，其余原样赋值）。
+# 剩下没列在这里的字段是**文本类**，一律走 `str(...).strip()`（与 `kb._new_card` 同一口径）。
+_CLEAN_FIELDS = {"sources": kb.clean_sources,
+                 "timeline": kb.clean_timeline,
+                 "interview_questions": kb.clean_questions}
+# `term` 单独处理（取规范名 + 记原写法），`layer` 取 min，`confidence` 直接写 verified。
 
 
 def _origin_of(card):
-    """这张卡**最早**的 `from_jds` 条目 → `{"job_title","date"}`（报告标注用）。"""
+    """这张卡**最早**的 `from_jds` 条目 → `{"job_title","date"}`（报告标注用）。
+
+    **先过滤掉空 date 再取最早**：`min` 比的是字符串，手改出来的 `date: ""` 是最小的字符串，
+    会**抢赢所有真日期**，于是 origin 变成空的（M-7 —— 报告里那句「最早来自《…》· 日期」
+    会整个丢掉，还看不出来）。
+    一条真日期都没有时（全是 `""` / 空白）：没有"最早"可比 → **保序退回第一条** ——
+    `from_jds` 是按加入顺序追加的，所以第一条就是最早入库的那一次；`date` 留空，不编造日期。
+    """
     rows = [x for x in ((card or {}).get("from_jds") or []) if isinstance(x, dict)]
     if not rows:
         return {"job_title": "", "date": ""}
-    first = min(rows, key=lambda x: str(x.get("date") or ""))
+    dated = [x for x in rows if str(x.get("date") or "").strip()]
+    first = min(dated, key=lambda x: str(x.get("date") or "")) if dated else rows[0]
     return {"job_title": str(first.get("job_title") or ""), "date": str(first.get("date") or "")}
 
 
@@ -285,27 +312,61 @@ def _fill_from_card(node, card):
     """
     original = str(node.get("term") or "")
     for k in _COPY_FIELDS:
-        if k in card:
-            v = card[k]
-            node[k] = list(v) if isinstance(v, list) else v
-    node["layer"] = min(int(node.get("layer") or 0), int(card.get("layer") or 0))
-    node["confidence"] = "verified" if card.get("sources") else "ai-generated"
+        if k not in card:
+            continue                        # 卡里没有的字段保持节点自己的值
+        v = card[k]
+        clean = _CLEAN_FIELDS.get(k)
+        if clean is not None:
+            node[k] = clean(v)              # 形状类：kb 自己的尺子 + 全新对象
+        else:
+            node[k] = str(v or "").strip()  # 文本类：奇形值（5 / [1] / None）收口成字符串
+    # `layer` 走 `kb._as_int` 兜底（I-1）：`knowledge.json` 是用户可手改的，
+    # 一张 `layer: "abc"` / `[1]` 的卡会让 `int(...)` 抛出去 —— 那不是"悄悄认错"，
+    # 而是**整步崩**：Task 5 接上后整次分析的知识地图退化成 `knowledge_error`，
+    # 其余几十个节点的复用机会一起丢。下界夹 0 与 `kb._new_card` / `kb._merge_into` 同一口径
+    # （min 是单调的：一旦让 -3 落盘，之后再来合法值也永远回不来）。
+    node["layer"] = min(max(0, kb._as_int(node.get("layer"))),
+                        max(0, kb._as_int(card.get("layer"))))
+    # `"ai-generated"` 那条支路**不可达**：本函数只在够格时被调用，而"够格"的定义里
+    # 就要求「至少一条带 url 的 dict 来源」（`_card_completeness`）—— 直接写死 `verified`。
+    # 刻意不写 `"verified" if card.get("sources") else ...`：那是死分支，而且它用的是
+    # truthy，不是 completeness 那把"有 url 的 dict"的尺子，两把尺子迟早会漂移。
+    node["confidence"] = "verified"
     node["term"] = str(card.get("term") or original)
     return original
 
 
-def plan_nodes(nodes, index, call=None):
+def plan_nodes(nodes, index, call=None, error=""):
     """就地做"库优先"：确定性匹配 →（可选）模型判定 → 填充 → 统计。
 
     返回统计（报告标注与日志都用它），并把 `kb_reuse` 写在每个**命中**的节点上。
     `call` 是**已经绑好 cfg 的模型调用函数**（`call(messages) -> reply 文本`）；
     `call=None` = 只做确定性匹配（不花模型调用），这也是模型判定不可用时的降级形态。
+
+    `index=None` = **调用方没给库**（不是"库是空的"）：两者在行为上都退化成"全部走联网"，
+    但语义完全不同 —— 所以调用方必须把 `build_index` 那条 `err` 通过 `error=` 如实传进来。
+    不传的话报告里那个 `knowledge_error` 就是空串，读报告的人分不清「库里暂时没有这条」
+    与「库读不出来（这次的复用全都白瞎了）」—— 那是一行 ⚠ 的差别（M-4）。
+    `error` 非空时**不阻止**分析：能命中的照样复用，它只是如实转达进 `stats`。
+
+    **同一个节点对象**在 `nodes` 里出现两次时按 `id(n)` 只算一次（M-5）：否则
+    `matched` / `reusable` / `timeline_reused` 各 +2，而且第二遍会把第一遍写好的
+    `term_original` **抹成 `""`**（改名记录丢失）。注意去重按**对象身份**，
+    不是按名字 —— 两个内容相同的真节点是两条，都要处理。
     """
     nodes = list(nodes or [])
+    uniq, seen = [], set()
+    for n in nodes:
+        if id(n) in seen:
+            continue
+        seen.add(id(n))
+        uniq.append(n)
+    nodes = uniq
     stats = {"total": len(nodes), "matched": 0, "reusable": 0, "timeline_reused": 0,
-             "enriched": 0, "searched": len(nodes), "knowledge_error": ""}
+             "enriched": 0, "searched": len(nodes), "knowledge_error": str(error or "")}
     idx = index if index is not None else Index([])
     if len(idx) == 0:
+        # 空库直接早退：省掉那次模型判定（本来也没什么可判的）。
         return stats
     found = {}      # id(node) -> (card, matched_by)
     for n in nodes:
@@ -337,9 +398,12 @@ def plan_nodes(nodes, index, call=None):
         n["kb_reuse"] = {
             "card_id": kb.normalize_id(card.get("term")),
             "card_term": str(card.get("term") or ""),
-            # ⚠️ **只在名字真的不同时**才记原写法：同名时留空串。
-            # 不能直接写 `original if reusable else ""` —— 那样同名也会把原名塞进去，
-            # 报告里就会冒出一句多余的「JD 里写作 语音识别」。
+            # ⚠️ **只在真的改名时才记**（M-8）：
+            #   * 名字与规范名相同时留空串 —— 否则报告里会冒出一句多余的
+            #     「JD 里写作 语音识别」；
+            #   * `reusable` 也为假时留空串 —— **不够格就不改名**（内容一个字都不动，
+            #     名字也不是"被改成了规范名"，记下来是编的）。所以这里的 `reusable and`
+            #     不是多余条件，而是"改名确实发生过"的一部分。
             "term_original": (original if (reusable and original
                                            and original != str(card.get("term") or "")) else ""),
             "matched_by": how,

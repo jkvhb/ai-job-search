@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """阶段 E：知识库优先复用 —— 纯函数测试（匹配 / 够格 / 判定校验 / 填充）。"""
-import json
 import unittest
+from unittest import mock
 
 import kb
 import kbreuse
@@ -491,8 +491,11 @@ class PlanNodesTest(IsolatedCase):
         self.assertEqual(stats["reusable"], 1)
         self.assertEqual(node["definition"], "库里的定义", "整条用库里那份（spec 决策 5）")
         self.assertEqual(node["plain_explanation"], "库里的通俗解释")
-        self.assertEqual(node["sources"], card["sources"])
-        self.assertEqual(node["timeline"], card["timeline"])
+        # 形状类字段走 **kb 自己的清洗函数**（M-6）：`clean_sources` 会把缺失的
+        # date/accessed/snippet 补成空串、丢掉没 url 的项 —— 所以这里比的是**清洗后**的形状，
+        # 而不是卡片里那份原样。口径只有一套（kb），报告里读到的与写回库里的因此一致。
+        self.assertEqual(node["sources"], kb.clean_sources(card["sources"]))
+        self.assertEqual(node["timeline"], kb.clean_timeline(card["timeline"]))
         self.assertEqual(node["state"], "已掌握")
         self.assertEqual(node["confidence"], "verified")
         r = node["kb_reuse"]
@@ -519,6 +522,8 @@ class PlanNodesTest(IsolatedCase):
         self.assertEqual(stats["enriched"], 1, "命中但不够格 → 联网并把结果写回那张卡")
         self.assertFalse(node["kb_reuse"]["reusable"])
         self.assertIn("sources", node["kb_reuse"]["missing"])
+        self.assertEqual(node["kb_reuse"]["got"], "",
+                         "不够格 ⇒ 什么都没拿到，③④ 全部照旧要跑（M-9 补的牙）")
         self.assertEqual(node["definition"], "本次写的定义", "不够格时**不许改内容**，让 ③④ 去跑")
         self.assertEqual(node["sources"], [])
 
@@ -587,3 +592,327 @@ class PlanNodesTest(IsolatedCase):
         self.assertEqual(stats["searched"], 1)
         self.assertNotIn("kb_reuse", node)
         self.assertEqual(node["definition"], "本次写的定义")
+
+
+class BrokenShapeTest(IsolatedCase):
+    """`knowledge.json` **是用户可手改的** —— 手改坏的一张卡不许让整次分析的知识地图崩掉（I-1）。
+
+    崩的代价不是"悄悄认错"，而是**整步崩**：Task 5 接上后，一张 `layer: "abc"` 的卡会让
+    `plan_nodes` 抛出去、整次分析退化成 `knowledge_error`，**其余几十个节点的复用机会一起丢**。
+    项目自己就把这个形状当真：`kb._as_int`（`kb.py:83-88`）就是为它写的，
+    `tests/test_kb.py:300-309` 明确把 `"layer": "abc"` 当"不许抛"的形状。
+    """
+
+    def _node(self, term="语音识别", **kw):
+        n = {"id": store.slug(term), "term": term, "definition": "本次写的定义",
+             "plain_explanation": "本次写的通俗解释", "category": "核心概念", "layer": 4,
+             "sources": [], "timeline": [], "related": [], "interview_questions": [],
+             "confidence": "ai-generated", "state": "待学习"}
+        n.update(kw)
+        return n
+
+    def _card(self, **kw):
+        c = {"id": "语音识别", "term": "语音识别", "definition": "库里的定义",
+             "plain_explanation": "库里的通俗解释", "category": "核心概念", "layer": 0,
+             "sources": [{"url": "https://w"}], "timeline": [{"year": "2010", "text": "t"}],
+             "from_jds": [{"id": "j1", "job_title": "岗位一", "date": "2025-01-02"}]}
+        c.update(kw)
+        return c
+
+    def test_a_broken_layer_never_throws_and_is_floored_at_zero(self):
+        """`layer` 走 `kb._as_int` 兜底 —— `int("abc")` / `int([1])` 都会把整步炸掉。"""
+        for bad in ("abc", [1], None, {}, "3.7", float("nan"), -9):
+            node = self._node()
+            card = self._card(layer=bad)
+            stats = kbreuse.plan_nodes([node], kbreuse.Index([card]))     # 不许抛
+            self.assertEqual(stats["reusable"], 1)
+            self.assertEqual(node["layer"], 0,
+                             "坏 layer 按 kb._as_int 兜底成 0（下界也夹 0）：%r" % (bad,))
+
+    def test_a_missing_layer_behaves_like_zero(self):
+        node = self._node()
+        card = self._card()
+        del card["layer"]
+        kbreuse.plan_nodes([node], kbreuse.Index([card]))
+        self.assertEqual(node["layer"], 0, "字段缺失 = 0，与 kb 的口径一致")
+
+    def test_a_broken_layer_on_the_node_side_also_never_throws(self):
+        for bad in ("abc", [1], None, {}):
+            node = self._node(layer=bad)
+            card = self._card(layer=3)
+            kbreuse.plan_nodes([node], kbreuse.Index([card]))             # 不许抛
+            self.assertEqual(node["layer"], 0, "节点侧的坏 layer 同样兜底成 0：%r" % (bad,))
+
+    def test_the_layer_is_the_minimum_of_the_node_and_the_card(self):
+        """取 **min**（与 `kb._merge_into` 同一条规则）：把库里那条并到本次节点上时，
+        层级取两者更靠前的那一个 —— 取 max 会把已经学会的知识点重新推回"深层"。
+        两边各让一次（1/3 与 3/1），否则"谁小谁赢"这件事测不到（M-9 补的承重牙）。
+        """
+        for node_layer, card_layer, want in ((1, 3, 1), (3, 1, 1), (0, 2, 0), (2, 0, 0),
+                                             (-5, 2, 0), (5, -9, 0)):
+            node = self._node(layer=node_layer)
+            kbreuse.plan_nodes([node], kbreuse.Index([self._card(layer=card_layer)]))
+            self.assertEqual(node["layer"], want,
+                             "节点 layer=%r、卡 layer=%r 时该是 %r"
+                             % (node_layer, card_layer, want))
+
+    def test_a_float_layer_is_truncated_like_kb_as_int(self):
+        node = self._node(layer=5)
+        kbreuse.plan_nodes([node], kbreuse.Index([self._card(layer=3.7)]))
+        self.assertEqual(node["layer"], 3, "`kb._as_int(3.7)` == 3（截断，不四舍五入）")
+
+
+class CopyContractTest(IsolatedCase):
+    """M-2/M-6：复制到报告节点上的那几个字段**在本次运行内只读**，且形状要按 kb 的口径收口。"""
+
+    def _node(self, term="语音识别", **kw):
+        n = {"id": store.slug(term), "term": term, "definition": "本次写的定义",
+             "plain_explanation": "本次写的通俗解释", "category": "核心概念", "layer": 0,
+             "sources": [], "timeline": [], "related": [], "interview_questions": [],
+             "confidence": "ai-generated", "state": "待学习"}
+        n.update(kw)
+        return n
+
+    def _card(self, term="语音识别", **kw):
+        c = {"id": kb.normalize_id(term), "term": term,
+             "definition": "库里的定义", "plain_explanation": "库里的通俗解释",
+             "category": "核心概念", "layer": 0,
+             "sources": [{"title": "维基", "url": "https://w"}],
+             "timeline": [{"year": "2010", "text": "库里的时间线"}],
+             "interview_questions": ["会怎么问"], "state": "已掌握",
+             "from_jds": [{"id": "j1", "job_title": "岗位一", "date": "2025-01-02"}]}
+        c.update(kw)
+        return c
+
+    def test_the_copied_items_are_fresh_objects_not_shared_with_the_card(self):
+        """**里面的 dict 不许与卡片共享**（M-2）。
+
+        `list(v)` 只隔开列表本身，元素还是同一批 dict —— 今天不会真出事（下游都是重绑定），
+        但那是"碰巧成立"：复查反证过，就地把共享的那个 dict 改脏、再 `kb.absorb`，
+        **盘上那张卡真的会被改脏**。所以这里就地改节点、断言卡片一字不动。
+        """
+        node = self._node()
+        card = self._card()
+        kbreuse.plan_nodes([node], kbreuse.Index([card]))
+        self.assertIsNot(node["sources"], card["sources"], "列表本身是新对象")
+        self.assertIsNot(node["sources"][0], card["sources"][0],
+                         "里面的 dict 也必须是新对象（M-2 的牙就在这一行）")
+        self.assertIsNot(node["timeline"][0], card["timeline"][0])
+        self.assertIsNot(node["interview_questions"], card["interview_questions"])
+        node["sources"][0]["title"] = "就地把节点改脏"
+        node["timeline"][0]["text"] = "就地把节点改脏"
+        node["interview_questions"].append("就地把节点改脏")
+        self.assertEqual(card["sources"][0]["title"], "维基", "就地改节点不许污染库里那张卡")
+        self.assertEqual(card["timeline"][0]["text"], "库里的时间线")
+        self.assertEqual(card["interview_questions"], ["会怎么问"])
+
+    def test_odd_shaped_card_fields_are_cleaned_not_copied_raw(self):
+        """`definition=5` / `timeline={"a": 1}` / `interview_questions="abc"` 这类**奇形值**不许
+        原样落进报告节点（M-6）—— 形状类复用 `kb.clean_*`，文本类走 `str()`，**不另写一套**。
+        """
+        card = self._card(definition=5, plain_explanation={"a": 1}, category=[1],
+                          state=None, timeline={"a": 1}, interview_questions="abc")
+        node = self._node()
+        kbreuse.plan_nodes([node], kbreuse.Index([card]))
+        self.assertTrue(node["kb_reuse"]["reusable"], "夹具前提：这张卡够格（有真 url）")
+        self.assertEqual(node["definition"], "5", "文本类走 str()")
+        self.assertIsInstance(node["plain_explanation"], str)
+        self.assertIsInstance(node["category"], str)
+        self.assertIsInstance(node["state"], str)
+        self.assertEqual(node["timeline"], [], "形状类复用 kb.clean_timeline：dict 不是时间线")
+        self.assertEqual(node["interview_questions"], [],
+                         "形状类复用 kb.clean_questions：字符串不是问题列表")
+        self.assertIsInstance(node["sources"], list)
+
+    def test_a_card_with_a_bad_source_shape_is_cleaned_by_the_kb_rule(self):
+        """`sources` 走 `kb.clean_sources`：没 url 的项被丢掉，留下的补齐固定形状。"""
+        card = self._card(sources=[{"url": "https://w", "title": "标题"},
+                                   {"title": "没有 url"}, "不是 dict", None])
+        node = self._node()
+        kbreuse.plan_nodes([node], kbreuse.Index([card]))
+        self.assertEqual(node["sources"], [{"title": "标题", "url": "https://w",
+                                            "date": "", "accessed": "", "snippet": ""}])
+
+    def test_a_reused_hit_is_always_verified(self):
+        """M-3：`confidence` 的 `ai-generated` 支路**不可达** —— `_fill_from_card` 只在
+        `reusable` 为真时被调用，而够格的定义里本来就要求「≥1 条带 url 的来源」。
+        旧代码 `"verified" if card.get("sources") else "ai-generated"` 是**死分支**，
+        而且它用的是 truthy，不是 completeness 那把"有 url 的 dict"的尺子（两把尺子会漂移）。
+        所以直接写 `"verified"` 并在这里钉住：需要留意的只是**反过来**那一半 ——
+        命中但不够格时**一个字都不许动**（③④ 跑完由 `absorb` 重算）。
+        """
+        node = self._node()
+        kbreuse.plan_nodes([node], kbreuse.Index([self._card()]))
+        self.assertTrue(node["kb_reuse"]["reusable"], "夹具前提")
+        self.assertEqual(node["confidence"], "verified")
+        node2 = self._node()
+        kbreuse.plan_nodes([node2], kbreuse.Index([self._card(sources=[])]))
+        self.assertFalse(node2["kb_reuse"]["reusable"], "夹具前提")
+        self.assertEqual(node2["confidence"], "ai-generated", "不够格时不许动 confidence")
+
+
+class OriginTest(IsolatedCase):
+    """`origin` = 这张卡**最早**来自哪个岗位（M-7 + M-9 的承重牙）。"""
+
+    def _node(self, term="语音识别"):
+        return {"id": store.slug(term), "term": term, "definition": "本次写的定义",
+                "plain_explanation": "本次写的通俗解释", "category": "核心概念", "layer": 0,
+                "sources": [], "timeline": [], "related": [], "interview_questions": [],
+                "confidence": "ai-generated", "state": "待学习"}
+
+    def _card(self, from_jds):
+        return {"id": "语音识别", "term": "语音识别", "definition": "库里的定义",
+                "plain_explanation": "库里的通俗解释", "category": "核心概念", "layer": 0,
+                "sources": [{"url": "https://w"}], "timeline": [], "from_jds": from_jds}
+
+    def _origin(self, from_jds):
+        node = self._node()
+        kbreuse.plan_nodes([node], kbreuse.Index([self._card(from_jds)]))
+        return node["kb_reuse"]["origin"]
+
+    def test_the_earliest_jd_wins(self):
+        """取**最早**那条 —— 夹具必须有 2–3 条 `from_jds`，否则"early"根本测不到（M-9 的承重牙）。
+
+        真库每张卡都攒着好几个岗位（`from_jds` 按加入顺序追加），只给一条时
+        `min` 与 `max` 的变异**都会绿** —— 上一轮就是这么漏掉的。
+        """
+        self.assertEqual(self._origin([
+            {"id": "j3", "job_title": "最近的岗位", "date": "2026-10-03"},
+            {"id": "j2", "job_title": "中间的岗位", "date": "2025-05-05"},
+            {"id": "j1", "job_title": "最早的岗位", "date": "2024-01-02"},
+        ]), {"job_title": "最早的岗位", "date": "2024-01-02"})
+
+    def test_an_empty_date_never_beats_a_real_one(self):
+        """手改出 `date: ""` 时，它**抢赢所有真日期**（空串是最小的字符串）→ origin 变空（M-7）。"""
+        self.assertEqual(self._origin([
+            {"id": "j3", "job_title": "最近的岗位", "date": "2026-10-03"},
+            {"id": "j1", "job_title": "手改出来的空日期", "date": ""},
+            {"id": "j2", "job_title": "最早的岗位", "date": "2024-01-02"},
+        ]), {"job_title": "最早的岗位", "date": "2024-01-02"})
+        self.assertEqual(self._origin([
+            {"id": "j1", "job_title": "手改出来的空日期", "date": ""},
+            {"id": "j2", "job_title": "全是空白日期", "date": "   "},
+            {"id": "j3", "job_title": "有真日期", "date": "2024-01-02"},
+        ]), {"job_title": "有真日期", "date": "2024-01-02"})
+
+    def test_no_date_at_all_falls_back_to_the_first_row(self):
+        """一条真日期都没有时：没有"最早"可比 → **保序退回第一条**（`from_jds` 是按加入顺序追加的，
+        所以第一条就是最早入库的那次），`date` 留空 —— 不编造任何日期。
+        """
+        self.assertEqual(self._origin([
+            {"id": "j1", "job_title": "第一条", "date": ""},
+            {"id": "j2", "job_title": "第二条", "date": "   "},
+        ]), {"job_title": "第一条", "date": ""})
+
+    def test_missing_or_broken_from_jds_is_an_empty_origin(self):
+        self.assertEqual(self._origin([]), {"job_title": "", "date": ""})
+        self.assertEqual(self._origin([None, 5, "不是 dict"]), {"job_title": "", "date": ""})
+        self.assertEqual(self._origin([{"id": "j1"}]), {"job_title": "", "date": ""})
+
+
+class PlanNodesContractTest(IsolatedCase):
+    """M-4 / M-5 / M-9：库读不出来要**说出来**；同一个节点对象不许被算两遍；空库不花模型调用。"""
+
+    def _node(self, term="语音识别", **kw):
+        n = {"id": store.slug(term), "term": term, "definition": "本次写的定义",
+             "plain_explanation": "本次写的通俗解释", "category": "核心概念", "layer": 0,
+             "sources": [], "timeline": [], "related": [], "interview_questions": [],
+             "confidence": "ai-generated", "state": "待学习"}
+        n.update(kw)
+        return n
+
+    def _card(self, term="语音识别", **kw):
+        c = {"id": kb.normalize_id(term), "term": term,
+             "definition": "库里的定义", "plain_explanation": "库里的通俗解释",
+             "category": "核心概念", "layer": 0,
+             "sources": [{"url": "https://w"}], "timeline": [{"year": "2010", "text": "t"}],
+             "from_jds": [{"id": "j1", "job_title": "岗位一", "date": "2025-01-02"}]}
+        c.update(kw)
+        return c
+
+    def test_a_knowledge_error_is_carried_into_the_stats(self):
+        """`knowledge_error` 以前是**死字段**（恒 `""`），调用方分不清"库是空的"与"库读不出来"（M-4）。"""
+        node = self._node()
+        stats = kbreuse.plan_nodes([node], kbreuse.Index([]), error="读不出来：坏文件")
+        self.assertEqual(stats["knowledge_error"], "读不出来：坏文件")
+        self.assertNotIn("kb_reuse", node)
+
+    def test_the_error_reaches_the_stats_even_when_cards_were_planned(self):
+        node = self._node()
+        stats = kbreuse.plan_nodes([node], kbreuse.Index([self._card()]),
+                                   error="读不出来：坏文件")
+        self.assertEqual(stats["knowledge_error"], "读不出来：坏文件")
+        self.assertEqual(stats["reusable"], 1, "带着 err 也照样把能复用的复用掉")
+
+    def test_no_error_means_the_empty_string(self):
+        stats = kbreuse.plan_nodes([self._node()], kbreuse.Index([]))
+        self.assertEqual(stats["knowledge_error"], "")
+
+    def test_index_none_is_not_dressed_up_as_a_healthy_empty_base(self):
+        """`index=None` 不许被静默当成"库是空的" —— 那条 `err` 是**唯一**的区分依据（M-4）。"""
+        node = self._node()
+        stats = kbreuse.plan_nodes([node], None, error="读不出来：坏文件")
+        self.assertEqual(stats["knowledge_error"], "读不出来：坏文件",
+                         "调用方必须能区分『库是空的』与『库读不出来』")
+        self.assertEqual(stats["searched"], 1)
+        self.assertNotIn("kb_reuse", node)
+
+    def test_the_same_node_object_listed_twice_is_counted_once(self):
+        """同一个节点对象出现两次时：统计各 +2、第二遍还把 `term_original` 抹成 `""`（M-5）。"""
+        node = self._node("ASR")
+        card = self._card(term="语音识别", aliases=["ASR"])
+        stats = kbreuse.plan_nodes([node, node], kbreuse.Index([card]))
+        self.assertEqual(stats["total"], 1, "同一个对象就是一个节点")
+        self.assertEqual(stats["matched"], 1)
+        self.assertEqual(stats["reusable"], 1)
+        self.assertEqual(stats["timeline_reused"], 1)
+        self.assertEqual(stats["searched"], 0)
+        self.assertEqual(node["kb_reuse"]["term_original"], "ASR",
+                         "第二遍不许把第一遍写好的改名记录抹掉")
+
+    def test_two_distinct_nodes_with_the_same_term_are_still_two(self):
+        """去重按 **`id(n)`（是不是同一个对象）**，不是按名字 —— 两个真节点都要算。"""
+        a, b = self._node(), self._node()
+        self.assertIsNot(a, b)
+        stats = kbreuse.plan_nodes([a, b], kbreuse.Index([self._card()]))
+        self.assertEqual(stats["total"], 2)
+        self.assertEqual(stats["reusable"], 2)
+
+    def test_an_empty_index_never_calls_the_judge(self):
+        """**空库直接早退，一次模型调用都不花**（M-9 的承重牙）。
+
+        这是"省一次模型调用"的闸门，而且空库时本来也没什么可判的。上一轮的变异
+        （去掉早退）全量绿 —— 因为当时只用假 `call` 计数，而 `call` 要经 `judge` 才被用到；
+        这里直接盯 `judge` 自己被没被叫到，两个方向都钉住（叫了 / 没叫）。
+        """
+        node = self._node()
+        seen = []
+
+        def fake_judge(rest, index, call):
+            seen.append(list(rest))
+            return {}
+
+        with mock.patch.object(kbreuse, "judge", fake_judge):
+            stats = kbreuse.plan_nodes([node], kbreuse.Index([]), call=lambda m: "{}")
+        self.assertEqual(seen, [], "空库不许调判定（那次模型调用必须省掉）")
+        self.assertEqual(stats["searched"], 1)
+
+        # 反向：非空库 + 有未命中的节点 + 给了 call → 必须走判定，否则上面那条会假绿
+        with mock.patch.object(kbreuse, "judge", fake_judge):
+            kbreuse.plan_nodes([node], kbreuse.Index([self._card(term="别的概念")]),
+                               call=lambda m: "{}")
+        self.assertEqual(len(seen), 1, "有未命中节点时必须走判定")
+        self.assertEqual([len(r) for r in seen], [1], "只把**没命中的**那些交给判定")
+
+    def test_a_call_without_any_unmatched_node_does_not_reach_the_judge(self):
+        """全都确定性命中了 → 也没有可判的东西，同样省掉那次调用。"""
+        node = self._node()
+        seen = []
+
+        def fake_judge(rest, index, call):
+            seen.append(list(rest))
+            return {}
+
+        with mock.patch.object(kbreuse, "judge", fake_judge):
+            kbreuse.plan_nodes([node], kbreuse.Index([self._card()]), call=lambda m: "{}")
+        self.assertEqual(seen, [])
