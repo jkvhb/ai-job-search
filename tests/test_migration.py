@@ -14,7 +14,10 @@ import importlib
 import io
 import json
 import os
+import re
+import shutil
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -66,7 +69,24 @@ def _report_data(title, salary, category, location, education, score, company=""
                                               "outcome_at": ""}}
 
 
-class MigrationTestBase(IsolatedCase):
+class CliTestMixin:
+    """跑 CLI / 读结果的小工具（几套夹具共用，**不自己建夹具**）。"""
+
+    def run_cli(self, argv):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(sys, "argv", ["身份迁移.py"] + argv):
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = CLI.main()
+        return code, out.getvalue()
+
+    def jobs_by_id(self):
+        return {j["id"]: j for j in store.load_jobs()}
+
+    def jds_by_id(self):
+        return {j["id"]: j for j in jdid.load_jds()["jds"]}
+
+
+class MigrationTestBase(CliTestMixin, IsolatedCase):
     """三份同一 JD（A/B/C）+ 一份不同（D）+ 一份无原文（E）；外加知识库与一条面试记录。"""
 
     def setUp(self):
@@ -128,20 +148,6 @@ class MigrationTestBase(IsolatedCase):
 
         # 面试记录：job_id 现在指向分析 id
         store.save_interview_json("iv1", "status.json", {"state": "done", "job_id": "分析A"})
-
-    # ---- 小工具 ----
-    def run_cli(self, argv):
-        out, err = io.StringIO(), io.StringIO()
-        with mock.patch.object(sys, "argv", ["身份迁移.py"] + argv):
-            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-                code = CLI.main()
-        return code, out.getvalue()
-
-    def jobs_by_id(self):
-        return {j["id"]: j for j in store.load_jobs()}
-
-    def jds_by_id(self):
-        return {j["id"]: j for j in jdid.load_jds()["jds"]}
 
 
 class DryRunTest(MigrationTestBase):
@@ -218,6 +224,57 @@ class DryRunTest(MigrationTestBase):
         if cur is not None:
             blocks.append("\n".join(cur))
         return blocks
+
+
+class DryRunAfterColumnTest(MigrationTestBase):
+    """P1-2：试跑表的 `after` 列必须量的是**计划执行后的真实结果**。
+
+    这张表是用户决定「要不要执行」的**唯一依据**。旧实现有两个毛病：
+      ① `render_table` 自己再读一次盘取 before 值 ⇒ 计划与表可能量的是**两个时刻**的文件
+         （另一个进程刚执行完 / 用户手改过），before 那一列于是与计划无关；
+      ② 真实数据里那两行打「知识库引用 2 → 2」「multi_jd 5 → 5」（distinct id 数恰好不变），
+         看不出这次会改指 **97 个知识点** —— 表格等于没说这次迁移会做什么。
+    """
+
+    @staticmethod
+    def _row(text, label):
+        for line in text.splitlines():
+            if line.strip().startswith(label):
+                return line.strip()
+        raise AssertionError("对照表里没有 %s 这一行：\n%s" % (label, text))
+
+    def test_the_before_values_come_from_the_plan_not_from_a_fresh_read_of_disk(self):
+        """计划算好之后盘上再被动过（另一次执行 / 另一个进程 / 用户手改）也不许影响这一行。"""
+        plan = CLI.plan_migration()
+        data = store.load_knowledge()
+        for node in data["nodes"]:
+            for item in node.get("from_jds") or []:
+                item["id"] = "本科_别处改过_数据标注质检_文本_北京_13-26K_0001"
+        store.save_knowledge(data)
+
+        text = CLI.render_table(plan)
+
+        # 前值必须是**计划那一份**（4 条旧 id / 1 个 multi_jd），不是盘上那份被改过的
+        self.assertIn("知识库引用（distinct 来源 id）4 → 2", text)
+        self.assertIn("multi_jd 1 → 0", text)
+
+    def test_the_after_column_equals_what_executing_really_produces(self):
+        """`after` 唯一的意义：它必须等于**真执行之后实测出来**的值。"""
+        _code, table = self.run_cli(["--试跑"])
+        table_after_kb = int(re.search(r"→\s*(\d+)", self._row(table, "知识库引用")).group(1))
+        table_after_multi = int(re.search(r"→\s*(\d+)", self._row(table, "multi_jd")).group(1))
+
+        code, _text = self.run_cli(["--执行"])
+        self.assertEqual(code, 0)
+
+        data = store.load_knowledge()
+        self.assertEqual(table_after_kb, CLI._from_jds_ids(data))
+        self.assertEqual(table_after_multi, kb.stats(data)["multi_jd"])
+
+    def test_the_table_says_how_many_knowledge_nodes_this_run_repoints(self):
+        """distinct id 数可能是 2 → 2（真实数据就是这样），必须另说**改指了多少个知识点**。"""
+        _code, table = self.run_cli(["--试跑"])
+        self.assertIn("本次改指 2 个知识点的引用", self._row(table, "知识库引用"))
 
 
 class ExecuteTest(MigrationTestBase):
@@ -385,6 +442,35 @@ class ExecuteTest(MigrationTestBase):
         self.assertTrue(os.path.isdir(old))
         self.assertEqual(store.read_text(os.path.join(old, "jobs.json")), "旧备份，不该被拷进新备份")
 
+    def test_backup_does_not_carry_store_backup_files_away(self):
+        """`store` 会给 `jobs.json` / `knowledge.json` 留 `<文件>.bak-<时间戳>`（真实 profile 里就有）。
+
+        整目录备份**不该把留档的留档再拷一份**：每跑一次迁移就多一份，profile 无上限增长。
+        `简历迁移.py` 的同名闸门加了这一条，两处必须同一口径（骨架抄两遍已经漏出一次差异）。
+        """
+        keep = os.path.join(store.profile_dir(),
+                            "jobs.json" + store.BACKUP_SUFFIX + "20200101_000000")
+        store.write_text(keep, "旧留档，不该被拷进新备份")
+        # 反假绿：先证明夹具里**真的有**留档可挡（否则这条测试什么也没钉住）
+        self.assertTrue(glob.glob(os.path.join(store.profile_dir(), "*.bak-*")))
+
+        code, _text, _reports = self._execute()
+
+        self.assertEqual(code, 0)
+        backups = glob.glob(os.path.join(store.profiles_root(), "迁移备份_*"))
+        self.assertEqual(len(backups), 1)
+        new = backups[0]
+        copied = [os.path.relpath(os.path.join(d, n), new)
+                  for d, _dn, fns in os.walk(new) for n in fns]
+        self.assertEqual([p for p in copied if store.BACKUP_SUFFIX in p], [],
+                         "新备份里套了 store 的留档：%s" % copied)
+        # 闸门只挡留档：正常内容一个都不能少（别做成「什么都不拷」的假绿）
+        self.assertIn("jobs.json", copied)
+        self.assertIn("knowledge.json", copied)
+        self.assertIn(os.path.join("reports", "分析A.html"), copied)
+        # 留档原地不动、一个字节没动（**绝不删除**）
+        self.assertEqual(store.read_text(keep), "旧留档，不该被拷进新备份")
+
 
 class IdempotenceTest(MigrationTestBase):
     """④ 跑两次，第二次一个字节都不改（jds.json / jobs.json / knowledge.json 字节级相同）。"""
@@ -504,6 +590,154 @@ class RestoreTest(MigrationTestBase):
         with mock.patch.object(store, "write_json", side_effect=OSError("disk full (注入)")):
             self.run_cli(["--执行"])
         self.assertEqual(glob.glob(os.path.join(store.DATA_ROOT, ".迁移临时*")), [])
+
+
+class ExistingJdIdClaimTest(CliTestMixin, IsolatedCase):
+    """P0-11：job 记录上**已经写好**的 `jd_id` 必须被认领（真实数据就是这个形状）。
+
+    真实数据（`data/profiles/default/`）：`jobs.json` 里
+    `20261014_大模型标注项目团队管理（ASRTTS方向）_75分` 的 `jd_id` 已经是
+    `本科_泰盈科技集团_标注管理_多模态_成都_12-20K_0001`，而 `jds.json` 里**已经有**这条 JD
+    （它的 `jd_text_file` 也是按 JD id 命名的，所以按 `jd/<分析 id>.txt` 找不到原文）。
+    旧实现只用 `migrated_from` / 派生 id / 旧 id 认领 ⇒ 这一组被判成「缺 JD 原文」自成一组、
+    另造一张 `…_000N`：同一个岗位在台账/知识库/报告里出现**两种身份**
+    （审计 §2 P0-11 在真实数据副本上实跑确认）。
+    """
+
+    JD_ID = "本科_泰盈科技集团_标注管理_多模态_成都_12-20K_0001"
+    JOB = "20261014_大模型标注项目团队管理（ASRTTS方向）_75分"
+
+    def setUp(self):
+        IsolatedCase.setUp(self)
+        for sub in ("reports", "jd"):
+            os.makedirs(store.p_path(sub), exist_ok=True)
+        # JD 库里已经有这条 JD（程序自建 / 上一轮迁移建的），JD 级字段齐全
+        jdid.save_jds({"version": 1, "seq": 1, "jds": [{
+            "id": self.JD_ID, "seq": 1, "created_at": "2026-10-14 15:03",
+            "updated_at": "2026-10-14 15:03", "id_history": [], "jd_facts": {},
+            "job_title": "大模型标注项目团队管理（ASR/TTS方向）", "job_category": "标注管理",
+            "location": "成都", "salary": "12-20K", "company": "泰盈科技集团股份有限公司",
+            "status": "未投递", "verdict": "建议投递",
+            "jd_text_file": self.JD_ID + ".txt", "jd_image": self.JD_ID + ".jpg"}]})
+        store.write_text(store.p_path("jd", self.JD_ID + ".txt"), LONG_JD)
+        store.write_text(store.p_path("jd", self.JD_ID + ".jpg"), "假截图（只需要文件存在）")
+        # job 记录就是「迁移后」的形状：只有分析级字段 + jd_id（真实数据里就是这样）
+        store.upsert_job({"id": self.JOB, "jd_id": self.JD_ID, "report": self.JOB + ".html",
+                          "created_at": "2026-10-14 15:03", "score": 75.0,
+                          "resume": "周汉钦-母版", "resume_id": "rv_0001"})
+        # 报告里的写法与 JD 记录**不同**（JD 记录才是身份：报告那份不许反过来覆盖它）
+        write_report(os.path.join(store.p_path("reports"), self.JOB + ".html"),
+                     _report_data("大模型标注（报告侧写法）", "12-20K（含绩效）", "标注管理",
+                                  "成都", "本科", 75.0, company="泰盈科技集团股份有限公司"))
+        # 知识库的两半（真实形状）：一部分引用指向 JD id，另一部分还指向报告文件名 id
+        kb.absorb([{"term": "ASR语音标注", "layer": 0, "sources": [], "timeline": [],
+                    "related": [], "interview_questions": []}],
+                  {"id": self.JD_ID, "job_title": "大模型标注项目团队管理（ASR/TTS方向）",
+                   "company": "泰盈科技集团股份有限公司", "date": "2026-10-14"})
+        kb.absorb([{"term": "大模型标注", "layer": 0, "sources": [], "timeline": [],
+                    "related": [], "interview_questions": []}],
+                  {"id": self.JOB, "job_title": "大模型标注项目团队管理（ASRTTS方向）",
+                   "date": "2026-10-14"})
+
+    def knowledge_ref_ids(self):
+        return {x["id"] for n in store.load_knowledge()["nodes"]
+                for x in (n.get("from_jds") or [])}
+
+    def test_execute_claims_the_existing_jd_id_and_creates_no_second_card(self):
+        before = fingerprint(store.DATA_ROOT)
+        code, text = self.run_cli(["--试跑"])
+        self.assertEqual(code, 0)
+        self.assertEqual(fingerprint(store.DATA_ROOT), before)        # 试跑仍然严格只读
+        self.assertIn("JD 数 1 → 1（已迁移过，无新增）", text)
+        self.assertIn("这个 JD 已存在（沿用原 id/原编号）", text)
+
+        code, _text = self.run_cli(["--执行"])
+        self.assertEqual(code, 0)
+
+        jds = jdid.load_jds()
+        # ① JD 条数不变（旧实现会变成 2：另一张 `…_0002`）
+        self.assertEqual([r["id"] for r in jds["jds"]], [self.JD_ID], jds["jds"])
+        self.assertEqual(jds["seq"], 1)
+        # ② 那条 job 的 `jd_id` 仍指向原 id
+        self.assertEqual(self.jobs_by_id()[self.JOB]["jd_id"], self.JD_ID)
+        # ③ 知识库 `from_jds` 指向的 id 仍在 `jds.json` 里（无悬空引用）
+        self.assertEqual(self.knowledge_ref_ids(), {self.JD_ID})
+
+    def test_the_existing_jd_fields_win_over_the_report_side_ones(self):
+        """已有 JD 记录里的字段优先——「只补不覆盖」必须在**认领**这条路上也生效。"""
+        self.run_cli(["--执行"])
+
+        jds = jdid.load_jds()["jds"]
+        self.assertEqual([r["id"] for r in jds], [self.JD_ID], "旧实现会另造一张 `…_0002`")
+        jd = self.jds_by_id()[self.JD_ID]
+        # JD 记录里已有的值不许被报告侧那份覆盖（真实数据里两处写法本来就不同）
+        self.assertEqual(jd["job_title"], "大模型标注项目团队管理（ASR/TTS方向）")
+        self.assertEqual(jd["salary"], "12-20K")
+        self.assertEqual(jd["jd_text_file"], self.JD_ID + ".txt")
+        self.assertEqual(jd["jd_image"], self.JD_ID + ".jpg")
+        self.assertEqual(jd["created_at"], "2026-10-14 15:03")
+        # 已有 JD 缺的字段照旧从报告/台账补齐（别做成「整个 JD 都不动」的假绿）
+        self.assertEqual(jd["source_type"], "粘贴文本")
+        # 认领的出处要记下来（幂等的依据）
+        self.assertEqual(jd["migrated_from"], [self.JOB])
+
+    def test_the_table_shows_the_fields_that_will_actually_be_written(self):
+        """试跑表里「JD 级字段（原始值，进 jds.json 用）」这一行也必须是**已有 JD 那份**。"""
+        _code, text = self.run_cli(["--试跑"])
+        self.assertIn("标题=大模型标注项目团队管理（ASR/TTS方向）", text)
+        self.assertNotIn("标题=大模型标注（报告侧写法）", text)
+
+
+class RestoreKeepsProfileRootTest(IsolatedCase):
+    """P0-14：回滚**只许删掉自己新建的东西**，用户原来的形状（含空目录、含 profile 根）必须留着。
+
+    `简历迁移.py` 的同一段多两道：`if dirpath == root: continue` 与「备份里就有的空目录不删」。
+    `身份迁移.py` 的收尾那圈把**所有**空目录都删掉（除了根）⇒ 一次失败的 `--执行` 会把用户
+    profile 里原本就有的空目录（`jd/` 这种）抹掉 —— 而此刻脚本**正在返回错误码**，
+    用户下一步就是重试，属于「失败路径上再丢一次」。
+    """
+
+    def _tear_profile_subdirs(self):
+        """把 profile 根下的自动建出来的子目录清掉（造「空目录树」这个最极端的形状）。"""
+        for sub in ("resumes", "reports", "jd", "logs"):
+            shutil.rmtree(store.p_path(sub), ignore_errors=True)
+
+    def _execute_with_write_failure(self):
+        """注入「写盘立刻失败」→ 走备份恢复那条路（必须真的失败了，否则这条测试是空跑）。"""
+        with mock.patch.object(store, "write_json", side_effect=OSError("disk full (注入)")), \
+                mock.patch.object(sys, "argv", ["身份迁移.py", "--执行"]), \
+                contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            code = CLI.main()
+        self.assertEqual(code, 1)
+        self.assertTrue(glob.glob(os.path.join(store.profiles_root(), "迁移备份_*")))
+
+    def test_a_failed_execute_keeps_the_root_and_the_empty_directories_it_found(self):
+        """端到端走一次失败：profile 根与它原来的空目录 `jd/` 都必须在。"""
+        self.assertTrue(os.path.isdir(store.p_path("jd")), "夹具前提：profile 里本来就有空目录 jd/")
+        self.assertEqual(os.listdir(store.p_path("jd")), [], "夹具前提：它是空的")
+
+        self._execute_with_write_failure()
+
+        self.assertTrue(os.path.isdir(store.profile_dir()),
+                        "回滚把 profile 根目录删掉了：%s" % store.profile_dir())
+        self.assertTrue(os.path.isdir(store.p_path("jd")),
+                        "用户原来的空目录 jd/ 被回滚删掉了")
+
+    def test_restore_keeps_the_profile_root_when_the_tree_is_empty(self):
+        """最极端的形状：备份是空的、profile 树也是空的 → profile 根不许被 `rmdir` 掉。
+
+        这一步必须直接调 `_restore_profile`：走 `--执行` 的话备份里总带着
+        `set_current_profile()` 建出来的那几个子目录，根就永远是"非空"的，
+        根目录保护去掉也测不出来（假绿）。
+        """
+        self._tear_profile_subdirs()
+        empty_backup = tempfile.mkdtemp()
+
+        CLI._restore_profile(empty_backup, set())
+
+        self.assertTrue(os.path.isdir(store.profile_dir()),
+                        "回滚把 profile 根目录删掉了：%s" % store.profile_dir())
 
 
 class MergedRecordTest(IsolatedCase):

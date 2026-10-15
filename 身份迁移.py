@@ -206,7 +206,7 @@ def _groups_of(active):
 
 
 # ---------------------------------------------------------------- JD 记录（原始值 + 归一化 ID）
-def _jd_fields_for(records, report, extra_reports=()):
+def _jd_fields_for(records, report, extra_reports=(), existing=None):
     """一组的 JD 级字段：**原始值**（报告优先，台账补齐），一个空值都不主动写进去。
 
     `records` 已按 `created_at` 升序；`report` 是**权威那份**（身份字段从它派生）。
@@ -214,6 +214,14 @@ def _jd_fields_for(records, report, extra_reports=()):
     顺序在**同组其它分析**的报告里找，最后才退到台账记录 —— 同一份 JD 的几次分析
     在字段上是互补的，只认一份会平白丢信息（真实数据里 JD 1 的标题就是这样）。
     多份分析的原始表述不一致时取**最早那份**，结果与排序无关地可复现。
+
+    `existing`（本组认领到的已有 JD 记录）里的 JD 级字段**最优先**：上一轮迁移已经把
+    JD 级字段整体搬到 `jds.json`（`jobs.json` 里只剩分析级字段），所以对认领的组来说，
+    报告/台账那份是**副本**、`jds.json` 那份才是身份 —— 用户手改过的值必须原样带出，
+    不能让重跑从报告里再派生一份（与 `_merge_jd_record` 的「只补不覆盖」同一条口径）。
+    真实数据里报告侧写的是 `大模型标注（报告侧写法） / 12-20K（含绩效）`，
+    而 JD 记录里是 `大模型标注项目团队管理（ASR/TTS方向） / 12-20K` —— 混起来就是
+    「试跑表说一套、`jds.json` 里是另一套」。
     """
     out = {}
     for key in _REPORT_FIRST:
@@ -250,7 +258,42 @@ def _jd_fields_for(records, report, extra_reports=()):
             if key == "outcome_ai" and isinstance(v, dict) and v:
                 out[key] = v
                 break
+    if isinstance(existing, dict):
+        # 已有 JD 的值覆盖上面那份派生结果（见 docstring：`jds.json` 才是身份）
+        for key in JD_FIELDS:
+            v = existing.get(key)
+            if isinstance(v, str) and v.strip():
+                out[key] = v.strip()
+            elif isinstance(v, dict) and v:
+                out[key] = v                      # `outcome_ai` 本来就是对象
     return out
+
+
+def _claim_by_jd_id(existing, members):
+    """组内任一记录上**已经写好**的 `jd_id`（且那条 JD 真的在库里）→ 直接认领它。
+
+    为什么必须有这条（审计 §2 P0-11）：`jdid` / `jobdup` 接线之后新产生的分析记录**本来就带
+    `jd_id`**，真实数据里 `20261014_大模型标注项目团队管理（ASRTTS方向）_75分` 就是这种：
+    它的 `jd_id` 已经是 `本科_泰盈科技集团_标注管理_多模态_成都_12-20K_0001`，而 `jds.json` 里
+    **已经有**这条 JD。只按 `migrated_from` / 派生 id / 旧 id 认领会漏掉它（那条 JD 的
+    `migrated_from` 是空的、id 末段是 `_0001` 而不是派生出来的 `_0000`）→ 这一组被判成
+    「缺 JD 原文」自成一组、另造一张 `…_0004`，于是**同一个岗位在台账/知识库/报告里出现两种身份**
+    （真实数据副本上实跑确认：`_0001` 与 `_0004` 并存、job 被改指 `_0004`、
+    知识库里 53 条仍指向 `_0001` 的引用从此与台账对不上）。
+
+    记录上的 `jd_id` 是**最直接的既有身份证据**，所以它排在其它判据之前。
+    `existing` 就是 `jdid.load_jds()` 那一份（与 `jdid.find_jd(jd_id)` 命中同一批记录，
+    不再多读一次盘）。多条记录各带不同 `jd_id`（数据已经不一致）时取**组内最早那条**
+    命中的：顺序确定、可复现，而且**绝不删任何已有 JD**。
+    """
+    for rec in members:
+        jd_id = str(rec.get("jd_id") or "").strip()
+        if not jd_id:
+            continue
+        for jd_rec in existing:
+            if jd_rec.get("id") == jd_id:
+                return jd_rec
+    return None
 
 
 def _find_group_jd(existing, record):
@@ -319,7 +362,10 @@ def plan_migration():
             "kb_touched": kb_touched, "kb_unreadable": failed, "interviews": interviews,
             "groups": records, "merged": merged, "skipped": skipped,
             "active": len(active), "before_jds": len(existing),
-            "before_kb": _from_jds_ids(store.load_knowledge()),
+            # 这两行量的必须是**计划这一份快照**（`_build_knowledge` 里量的），
+            # 否则 `render_table` 会自己再读一次盘 → 表与计划量的不是同一次输入（P1-2）
+            "before_kb": kb_out["before_kb"], "after_kb": kb_out["after_kb"],
+            "before_multi": kb_out["before_multi"], "after_multi": kb_out["after_multi"],
             "seq": max([r["seq"] or 0 for r in records]
                        + [jdid._as_int(jds_data.get("seq"), 0)] + [0]),   # noqa: SLF001
         }
@@ -328,8 +374,8 @@ def plan_migration():
 def _plan_groups(jds_data, existing, active):
     """把活跃分析归成 JD 组、算出每组的新 id 与编号（**只读**）。
 
-    编号从现有 `seq` 之后顺延：**已经建过的组按 `migrated_from` 认领原 id/原编号**，
-    所以重跑既不新建 JD、也不涨 seq。返回 `(records, {旧分析id: JD id}, 未改指的旧 id)`。
+    编号从现有 `seq` 之后顺延：**已经建过的组按「记录上的 `jd_id` → `migrated_from`」认领
+    原 id/原编号**，所以重跑既不新建 JD、也不涨 seq。返回 `(records, {旧分析id: JD id}, 未改指的旧 id)`。
     """
     groups, no_text, too_short = _groups_of(active)
     bundle = [(g, "指纹") for g in groups]
@@ -356,7 +402,8 @@ def _plan_groups(jds_data, existing, active):
         record["fields"] = (jdid.derive_fields(record["report"]) if record["report"]
                             else jdid.derive_fields(record["canonical"]))
         record["derived_id"] = jdid.build_id(record["fields"], 0)
-        old = _find_group_jd(existing, record)
+        # ① 记录上**已经写好**的 `jd_id` 最优先（P0-11）② 才是上次迁移留下的认领线索
+        old = _claim_by_jd_id(existing, members) or _find_group_jd(existing, record)
         if old is not None:
             record["existing"] = old
             record["jd_id"] = str(old.get("id") or "")
@@ -409,8 +456,9 @@ def _build_jds(jds_data, records):
 
 
 def _jd_text_file_of(record):
-    """这一组的 JD 原文文件名：优先取记录/报告里的值，否则挑一个**真的存在**的 `<id>.txt`。"""
-    fields = _jd_fields_for(record["members"], record["report"], record.get("other_reports") or ())
+    """这一组的 JD 原文文件名：优先取记录/报告/已有 JD 里的值，否则挑一个**真的存在**的 `<id>.txt`。"""
+    fields = _jd_fields_for(record["members"], record["report"], record.get("other_reports") or (),
+                            record.get("existing"))
     text_file = store.safe_name(fields.get("jd_text_file")) or ""
     if text_file and os.path.isfile(store.p_path("jd", text_file)):
         return text_file
@@ -427,7 +475,8 @@ def _merge_jd_record(record):
 
     已存在的 JD（上次迁移建过）**只补不覆盖**：用户手改过的 id / 状态 / 笔记绝不能被重跑冲掉。
     """
-    fields = _jd_fields_for(record["members"], record["report"], record.get("other_reports") or ())
+    fields = _jd_fields_for(record["members"], record["report"], record.get("other_reports") or (),
+                            record.get("existing"))
     text_file = _jd_text_file_of(record)
     if text_file:
         fields["jd_text_file"] = text_file
@@ -520,12 +569,20 @@ def _build_knowledge(new_ids, jd_by_id):
     - 改写时**原位保留** `job_title` / `company` / `date`（用户看到的还是原来的岗位信息），
       缺了才从 JD 记录补
     - 「有内容但解析失败」→ 抛错中止，绝不用空库顶掉（同 `jobdup._repoint_kb`）
+
+    返回的字典里额外带**迁移前 / 计划后两项度量**（`before_kb` / `after_kb` /
+    `before_multi` / `after_multi`）：它们必须在**同一份快照**上量。以前是
+    `render_table` 自己再读一次盘取 before 值 —— 计划与表于是可能量的是**两个时刻**的文件
+    （另一次执行刚跑完、另一个进程、用户手改过），`before` 那一列与计划无关，
+    而这张表是用户决定「要不要执行」的唯一依据（审计 §3 P1-2）。
     """
     ok, reason = store.knowledge_safe_to_write()
     if not ok:
         raise RuntimeError("knowledge.json 读不出来（有内容但读不出来）："
                            "已放弃本次迁移，绝不写成空库。原因：%s" % reason)
     data = store.load_knowledge()
+    before_kb = _from_jds_ids(data)                 # 必须在改写**之前**量
+    before_multi = kb.stats(data)["multi_jd"]
     touched = 0
     for node in data.get("nodes") or []:
         if not isinstance(node, dict):
@@ -562,7 +619,8 @@ def _build_knowledge(new_ids, jd_by_id):
         if changed:
             node["from_jds"] = out
             touched += 1
-    return {"data": data}, touched
+    return {"data": data, "before_kb": before_kb, "after_kb": _from_jds_ids(data),
+            "before_multi": before_multi, "after_multi": kb.stats(data)["multi_jd"]}, touched
 
 
 def _canonical_text(record, key):
@@ -634,10 +692,11 @@ def render_table(plan):
     lines = []
     skipped = plan["skipped"]
     n_jd = len(plan["groups"])
-    before_kb = _from_jds_ids(store.load_knowledge())
-    after_kb = _from_jds_ids(plan["knowledge"])
-    before_multi = kb.stats(store.load_knowledge())["multi_jd"]
-    after_multi = kb.stats(plan["knowledge"])["multi_jd"]
+    # 这几行**全部取自计划自己那份快照**（`plan_migration` 算的），绝不在这里重新读盘：
+    # 计划与表若各读一次文件，量到的就可能是两个时刻的数据，而这张表是用户决定
+    # 「要不要执行」的**唯一依据**（审计 §3 P1-2）。
+    before_kb, after_kb = plan["before_kb"], plan["after_kb"]
+    before_multi, after_multi = plan["before_multi"], plan["after_multi"]
     # JD 数这一行必须是**真话**：`after` 取迁移后 jds.json 的**实际条数**，不靠算术猜。
     # 之前写成 `before + groups`，于是二次执行时表头谎报 `3 → 6`（实际 3、且确实是幂等的）
     # —— 这张表是用户决定「要不要执行」的唯一依据。
@@ -658,14 +717,19 @@ def render_table(plan):
     lines.append("  JD 数 %d → %d%s" % (before_jds, after_jds,
                                       "（已迁移过，无新增）" if new_jds == 0
                                       else ("（新增 %d 个）" % new_jds if new_jds > 0 else "")))
-    lines.append("  知识库引用（distinct 来源 id）%d → %d" % (before_kb, after_kb))
+    # 「distinct 来源 id」这个尺子**可能前后一样**（真实数据实测 `2 → 2`：这次迁移把 97 条
+    # 引用从旧报告 id 改指到新 JD id，两边各是 2 个 id；`multi_jd` 同理 `5 → 5`）—— 那样这
+    # 一行就什么都没说。所以同一条里再报**这次真的会改指多少个知识点**（审计 §3 P1-2）。
+    lines.append("  知识库引用（distinct 来源 id）%d → %d%s" % (
+        before_kb, after_kb,
+        "；本次改指 %d 个知识点的引用" % plan["kb_touched"] if plan["kb_touched"] else ""))
     lines.append("  multi_jd %d → %d" % (before_multi, after_multi))
     lines.append("")
     for i, record in enumerate(plan["groups"], 1):
         lines.append("JD %d  →  %s" % (i, record["jd_id"]))
         lines.append("  六段（归一化，进 ID 用）: %s" % _segs(record))
         shown = _jd_fields_for(record["members"], record["report"],
-                              record.get("other_reports") or ())
+                              record.get("other_reports") or (), record.get("existing"))
         lines.append("  JD 级字段（原始值，进 jds.json 用）: 标题=%s | 类别=%s | 城市=%s | 薪资=%s | 单位=%s"
                      % (shown.get("job_title") or "—", shown.get("job_category") or "—",
                         shown.get("location") or "—", shown.get("salary") or "—",
@@ -737,8 +801,22 @@ def _ignore_previous_backups(_dirpath, names):
     （已用隔离副本实测：新备份顶层没有 `迁移备份_*`）。这道闸门钉的是**不变量**：
     只要备份根将来挪进 profile 目录（或用户手工把旧备份搬进来），也不会滚雪球。
     `save_jds` / `_restore_profile` 都不依赖被跳过的那些目录。
+
+    注意 还要挡住 `store.snapshot_before_overwrite` / `jobdup._snapshot` 留在 profile 里的
+    `<文件>.bak-<时间戳>` **文件**：只认**目录**前缀的话这些文件照拷不误 → 每备份一次就把
+    上一次的留档再拷一份（`.bak-` 被备份再备份），profile 无上限增长。真实 profile 里
+    现在就有 `jobs.json.bak-*` / `knowledge.json.bak-*`，这不是假设。
+    它们不是用户的数据（只是覆盖前的留档），备份里不需要第二份；留档自身的上限由
+    `store._prune_backups` 轮转（每个目标文件只留最新 3 份）。
+    **与 `简历迁移.py` 的同名闸门逐字同口径**（骨架抄两遍已经漏出过一次差异）。
     """
-    return [n for n in names if n.startswith(BACKUP_PREFIX)]
+    out = []
+    for n in names:
+        if n.startswith(BACKUP_PREFIX):
+            out.append(n)
+        elif store.BACKUP_SUFFIX in n and not os.path.isdir(os.path.join(_dirpath, n)):
+            out.append(n)
+    return out
 
 
 def _backup_profile():
@@ -769,11 +847,25 @@ def _restore_profile(backup, had_files):
 
     `had_files` 是迁移前该目录的全部文件（相对路径）。恢复后凡是不在 `had_files` 里的
     文件都被删掉 —— 这正是「失败 → 从备份恢复」的严格含义（不留半改的东西、不留新造的文件）。
+
+    **空目录也要还原**（与 `简历迁移.py` 同一口径，两处骨架抄过两遍、已经漏出过差异）：
+    `os.walk` 会把空目录也走一遍，所以上面那圈会把 `copytree` 拷过来、却一个文件都没有的
+    目录重建出来；收尾那圈只删**备份里没有**的空目录（"备份里有的空目录"是用户原来的形状，
+    普通文件复制表达不出来，只能这样补）。
+
+    注意 **profile 根目录永远不删**（`if dirpath == root: continue`）：恢复成空目录树时，
+    收尾那圈会把根目录 `rmdir` 掉，而此刻脚本**正在返回错误码**、用户下一步就是重试
+    —— 那是「失败路径上再丢一次」（审计 §2 P0-14）。
+    另外**只删自己新建的**空目录：用户 profile 里原本就有的空目录（`jd/` 这种）不是本次迁移
+    造出来的东西，删掉就是丢用户原来的形状。
     """
     root = os.path.abspath(store.profile_dir())
+    backup_dirs = set()
     for dirpath, _dirnames, filenames in os.walk(backup):
         rel = os.path.relpath(dirpath, backup)
-        dest_dir = root if rel == "." else os.path.join(root, rel)
+        rel = "" if rel == "." else rel
+        backup_dirs.add(rel)
+        dest_dir = root if not rel else os.path.join(root, rel)
         if not os.path.isdir(dest_dir):
             os.makedirs(dest_dir, exist_ok=True)
         for fn in filenames:
@@ -784,7 +876,10 @@ def _restore_profile(backup, had_files):
         except OSError:
             pass
     for dirpath, dirnames, filenames in os.walk(root, topdown=False):
-        if dirpath != root and not dirnames and not filenames:
+        if dirpath == root:
+            continue                           # 根目录永远不删（P0-14）
+        rel = os.path.relpath(dirpath, root)
+        if rel not in backup_dirs and not dirnames and not filenames:
             try:
                 os.rmdir(dirpath)
             except OSError:
