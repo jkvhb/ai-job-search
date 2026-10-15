@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
+import json
 import unittest
 
 import knowledge
+import kbreuse
 import log
 import store
 
@@ -331,6 +333,127 @@ class SearchQualityTest(IsolatedCase):
         knowledge.attach_sources(nodes, [{"name": "t", "base_url": "u", "api_key": "k"}],
                                  search=counting)
         self.assertEqual(seen.get("max_results"), 5)
+
+
+class _FakeReuse:
+    """只实现 `knowledge.py` 需要的那个接口：`plan(nodes) -> stats`。
+
+    刻意**不用真的 `kbreuse.Reuse`**（那是 Task 7 才写的）：`knowledge.py` 与
+    `kbreuse` 之间**只该有"一个带 `.plan()` 的对象"**这个鸭子接口，
+    这条替身就是把这条边界钉住。
+    """
+
+    def __init__(self, cards):
+        self.cards = cards
+
+    def plan(self, nodes):
+        return kbreuse.plan_nodes(nodes, kbreuse.Index(self.cards), call=None)
+
+
+class ReuseSeamTest(IsolatedCase):
+    """`build_for_jd(reuse=…)` 的注入点：命中且够格的节点**真的不搜、不跑时间线**。
+
+    断言用 spy 计数器，而不是"看结果像不像" —— 这个功能的**全部价值**就是"省下那次搜索"，
+    所以必须断言"搜索调用次数"本身（spec §10.3）。
+    """
+
+    def _cfg(self):
+        return {"text_model": {"base_url": "b", "api_key": "k", "model": "m",
+                               "temperature": 0.3},
+                "search_providers": [{"name": "t", "base_url": "u", "api_key": "k"}],
+                "max_searches": 40}
+
+    def _dispatcher(self, calls):
+        """假模型：按系统提示词**分派** ①拆解 / ②头脑风暴 / ④时间线 / 知识库判定。
+
+        为什么必须按提示词分派：这四步走的是同一个 `chat` 入口，
+        返回错形状会让被测的那一步静默降级 —— 那样断言就变成"什么也没测"。
+        """
+        def fake_chat(base_url, api_key, model, messages, **kw):
+            calls["chat"] += 1
+            sys_prompt = messages[0]["content"]
+            if "从岗位 JD 中抽出" in sys_prompt:
+                return json.dumps({"nodes": [
+                    {"id": "a", "term": "语音识别", "definition": "本次定义",
+                     "plain_explanation": "本次通俗", "category": "核心概念"},
+                    {"id": "b", "term": "完全没见过的概念", "definition": "x",
+                     "plain_explanation": "y", "category": "核心概念"}]}, ensure_ascii=False)
+            if "知识网络构建专家" in sys_prompt:
+                return json.dumps({"related": []}, ensure_ascii=False)
+            if "技术史专家" in sys_prompt:
+                return json.dumps({"timeline": [{"year": "2020", "text": "补算的时间线"}]},
+                                  ensure_ascii=False)
+            if "知识库管理员" in sys_prompt:
+                return json.dumps({"pairs": []}, ensure_ascii=False)
+            raise AssertionError("假模型收到了认不出的提示词：%s" % sys_prompt[:60])
+        return fake_chat
+
+    def _card(self):
+        return {"id": "语音识别", "term": "语音识别", "definition": "库里的定义",
+                "plain_explanation": "库里的通俗", "category": "核心概念", "layer": 0,
+                "sources": [{"title": "维基", "url": "https://w"}],
+                "timeline": [{"year": "2010", "text": "库里的时间线"}],
+                "from_jds": [{"id": "old", "job_title": "老岗位", "date": "2026-10-03"}]}
+
+    def test_a_reusable_hit_is_neither_searched_nor_timed(self):
+        calls = {"chat": 0, "searches": []}
+
+        def fake_search(query, providers=None, **kw):
+            calls["searches"].append(query)
+            return [{"title": "T", "url": "https://x", "snippet": "s"}]
+
+        reuse = _FakeReuse([self._card()])
+        nodes = knowledge.build_for_jd("JD 原文", self._cfg(), reuse=reuse,
+                                       search=fake_search, chat=self._dispatcher(calls))
+        by_term = {n["term"]: n for n in nodes}
+        self.assertIn("语音识别", by_term)
+        self.assertEqual(by_term["语音识别"]["definition"], "库里的定义", "整条用库里那份")
+        self.assertNotIn("语音识别 是什么",
+                         calls["searches"], "够格复用就不该再联网搜（本功能的全部意义）")
+        self.assertTrue(any("完全没见过的概念" in q for q in calls["searches"]),
+                        "没命中的那条**必须**照旧联网：%r" % (calls["searches"],))
+        # ④ 也必须被跳过：库里有时间线 → 不许再调模型，否则模型的输出会**覆盖**库里那份。
+        # （没有这条断言时，"不跳过 ④"这个变异**不会红** —— 那就等于没测。）
+        self.assertEqual(by_term["语音识别"]["timeline"], self._card()["timeline"],
+                         "库里有时间线 → ④ 不许跑（否则会被模型输出覆盖）")
+        # 日志也要如实：`searched` 必须等于**真的搜了几次**，不许把"复用跳过"的算进去。
+        # （日志是本项目的取证材料；多报就是说了不真的话。）
+        ev = [r for r in log.read_logs(200)[0] if r.get("event") == "knowledge.sources_done"]
+        self.assertTrue(ev, "没有 knowledge.sources_done 事件")
+        # log_event 的 kwargs 落在 `rec["data"]` 里（见 log.log_event）——所以是 `["data"]["searched"]`，
+        # 不是顶层 `.get("searched")`（顶层永远是 None，那条断言就会"恒红"、变得测不出任何东西）。
+        self.assertEqual(ev[-1]["data"].get("searched"), len(calls["searches"]),
+                         "日志的 searched 与实际搜索次数不一致（跳过的被多报了）")
+
+    def test_a_hit_without_a_timeline_gets_it_computed_and_does_not_search(self):
+        calls = {"chat": 0, "searches": []}
+
+        def fake_search(query, providers=None, **kw):
+            calls["searches"].append(query)
+            return [{"title": "T", "url": "https://x", "snippet": "s"}]
+
+        card = self._card()
+        card["timeline"] = []
+        reuse = _FakeReuse([card])
+        nodes = knowledge.build_for_jd("JD 原文", self._cfg(), reuse=reuse,
+                                       search=fake_search, chat=self._dispatcher(calls))
+        hit = [n for n in nodes if n["term"] == "语音识别"][0]
+        self.assertNotIn("语音识别 是什么", calls["searches"], "来源是复用的 → 不搜")
+        self.assertEqual(hit["timeline"], [{"year": "2020", "text": "补算的时间线"}],
+                         "库里缺时间线 → ④ 照跑补上")
+
+    def test_reuse_none_behaves_exactly_like_today(self):
+        """**默认关闭**：不传 `reuse` → 每个节点都照旧联网搜（这条防的是"新能力偷偷默认开"）。"""
+        calls = {"chat": 0, "searches": []}
+
+        def fake_search(query, providers=None, **kw):
+            calls["searches"].append(query)
+            return [{"title": "T", "url": "https://x", "snippet": "s"}]
+
+        nodes = knowledge.build_for_jd("JD 原文", self._cfg(),
+                                       search=fake_search, chat=self._dispatcher(calls))
+        self.assertEqual(len(calls["searches"]), len(nodes), "不传 reuse 时每个节点都该搜")
+        self.assertFalse(any("kb_reuse" in n for n in nodes))
 
 
 if __name__ == "__main__":

@@ -138,6 +138,23 @@ def _map_nodes(nodes, worker, max_workers=1):
             worker(n)
 
 
+def _kb_reuse(n):
+    """节点的 `kb_reuse` 标记（没有就回空 dict）。**一律当成不可信数据**：用户可手改。"""
+    r = (n or {}).get("kb_reuse")
+    return r if isinstance(r, dict) else {}
+
+
+def _already_reused(n):
+    """这个节点已经从知识库"够格复用"了 → ③ 该跳过它。"""
+    return bool(_kb_reuse(n).get("reusable"))
+
+
+def _timeline_already_reused(n):
+    """时间线也是从库里拿的（`got == "all"`）→ ④ 该跳过它。"""
+    r = _kb_reuse(n)
+    return bool(r.get("reusable")) and r.get("got") == "all"
+
+
 EXTRACT_SYSTEM = """你是资深 AI 领域技术面试官 + 知识拆解专家。
 从岗位 JD 中抽出候选人**必须掌握**的核心知识点，供其学习备考。
 
@@ -285,6 +302,10 @@ def attach_sources(nodes, providers, search=None, max_results=5, max_workers=1,
     keep_ids = {id(n) for n in selected}
 
     def one(n):
+        if _already_reused(n):
+            # 已从知识库整条复用（来源链接来自库、本次没联网）→ **绝不**再搜一次。
+            # 置信度已在复用那一步按"有没有来源"定好，这里不动。
+            return
         if id(n) not in keep_ids:
             n["sources"] = []
             n["confidence"] = "ai-generated"
@@ -303,11 +324,14 @@ def attach_sources(nodes, providers, search=None, max_results=5, max_workers=1,
             log.log_event("knowledge.source_filtered", level="warn",
                           term=n.get("term"), dropped=len(raw))
 
+    # 复用节点虽也在 selected 里、却**根本没搜** → 先数出来，否则日志的 searched 会多报
+    # （日志是本项目的取证材料，多报就是说了不真的话）。确定性计算，不需要锁。
+    skipped = sum(1 for n in selected if _already_reused(n))
     _map_nodes(nodes, one, max_workers)
     log.log_event("knowledge.sources_done",
                   verified=sum(1 for n in nodes if n["confidence"] == "verified"),
-                  total=len(nodes), searched=len(selected),
-                  capped=max(0, len(nodes) - len(selected)))
+                  total=len(nodes), searched=len(selected) - skipped,
+                  capped=max(0, len(nodes) - len(selected)), kb_skipped=skipped)
     return nodes
 
 
@@ -324,6 +348,9 @@ def attach_timeline(nodes, cfg, chat=None, max_workers=1, max_timelines=MAX_TIME
     capped = len(sourced) - len(selected)
 
     def one(n):
+        if _timeline_already_reused(n):
+            # 时间线也是复用的 → 不再调模型（这是复用省下的第二笔）
+            return
         if not n.get("sources"):
             return
         try:
@@ -354,15 +381,22 @@ def attach_timeline(nodes, cfg, chat=None, max_workers=1, max_timelines=MAX_TIME
     return nodes
 
 
-def build_for_jd(jd_text, cfg, core_limit=MAX_CORE):
-    """编排：① 拆解 → ② 头脑风暴 → ③ 搜索 → ④ 时间线"""
-    core = extract_nodes(jd_text, cfg)[:core_limit]
-    expanded = brainstorm(core, cfg)
+def build_for_jd(jd_text, cfg, core_limit=MAX_CORE, reuse=None, search=None, chat=None):
+    """编排：① 拆解 → ② 头脑风暴 →（新增）库优先复用 → ③ 搜索 → ④ 时间线
+
+    `reuse`（可选）是一个带 `.plan(nodes) -> stats` 的对象（生产里是 `kbreuse.Reuse`）。
+    **不传 = 今天的行为**（纯联网）—— 刻意如此：新能力默认关闭，由 `app.do_analyze` 显式打开。
+    """
+    core = extract_nodes(jd_text, cfg, chat=chat)[:core_limit]
+    expanded = brainstorm(core, cfg, chat=chat)
     all_nodes = core + expanded
+    stats = reuse.plan(all_nodes) if reuse is not None else None
     attach_sources(all_nodes, cfg.get("search_providers") or [],
-                   max_results=5, max_workers=6,
+                   search=search, max_results=5, max_workers=6,
                    max_searches=int(cfg.get("max_searches") or MAX_SEARCHES))
-    attach_timeline(all_nodes, cfg, max_workers=6)
+    attach_timeline(all_nodes, cfg, chat=chat, max_workers=6)
     log.log_event("knowledge.build_done", core=len(core), expanded=len(expanded),
-                  verified=sum(1 for n in all_nodes if n["confidence"] == "verified"))
+                  verified=sum(1 for n in all_nodes if n["confidence"] == "verified"),
+                  kb_reused=(stats or {}).get("reusable", 0),
+                  kb_matched=(stats or {}).get("matched", 0))
     return all_nodes
