@@ -1638,11 +1638,26 @@ class ReportStateRouteTest(IsolatedCase):
         self.assertEqual(code, 400)
 
     def test_write_rejects_bad_know_state(self):
-        # 前端把状态拼错时不能静默吞掉：400 且不建卡
+        """**契约更新（P1-12：消灭假 ok）**：这一项没落盘时，路由**不许**回 `ok: True`。
+
+        旧断言钉的是**要消灭的那个旧契约**：`/api/report_state/write` 以前在
+        `kb.upsert_check` 返回 `ok=False` 时只把它**不计入 `saved`**、随后**无条件**回
+        `{"ok": True}` —— 前端（web/report_template.html:292 的 `if(!r || r.ok !== true)`）
+        于是显示「已保存 ✓」并 keep 住勾选框，而用户那一项**根本没落盘**（关掉程序就没了）。
+        现在路由改成「**有失败就绝不回 `ok: True`**」（见 app.py 里该分支的注释与
+        tests/test_app.py 的 `ReportStateWriteOkTest`），所以这里改钉新契约：
+        `ok is False` + 能看出**是哪一项、什么原因**，而不是一句笼统的失败。
+
+        （前端把状态拼错时不能静默吞掉：这一项不建卡、`saved` 为 0。）
+        """
         code, body = self._post_raw("/api/report_state/write",
                                     {"report_id": "r1", "know": {"新概念": {"state": "已精通"}}})
         self.assertEqual(code, 200, "整条写请求本身成功，只是这一项没写进去")
-        self.assertEqual(body["ok"], True)
+        # 有失败就不许回假 ok：旧契约在这里回 True，用户以为存上了
+        self.assertIs(body["ok"], False, "这一项真的没落盘，不许回 ok: True")
+        self.assertEqual(body["failed"], 1, "要如实报出有几项没存上")
+        self.assertIn("已精通", body["error"], "错误里要能看出是哪一项、什么原因")
+        self.assertIn("新概念", body["error"], "错误里要能看出是哪一项、什么原因")
         self.assertEqual(body["saved"], 0)                # checks 为空、know 的 state 非法 → 一个都没存
         self.assertEqual(store.load_knowledge()["nodes"], [])
 
