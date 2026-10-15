@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """阶段 E：知识库优先复用 —— 纯函数测试（匹配 / 够格 / 判定校验 / 填充）。"""
+import json
 import unittest
 from unittest import mock
 
@@ -593,6 +594,23 @@ class PlanNodesTest(IsolatedCase):
         self.assertNotIn("kb_reuse", node)
         self.assertEqual(node["definition"], "本次写的定义")
 
+    def test_an_assisted_match_fills_the_node_and_marks_the_method(self):
+        """模型判定出来的命中，走的是与确定性命中**同一条**填充路径，只是 `matched_by` 不同。
+
+        这条同时是 `plan_nodes` 里 `call` 支路的**唯一**覆盖（上一个复查点名的缺口）。
+        """
+        node = self._node("ASR")
+        idx = kbreuse.Index([self._card()])
+
+        def call(messages):
+            return json.dumps({"pairs": [{"node": "ASR", "card_id": "语音识别"}]})
+
+        stats = kbreuse.plan_nodes([node], idx, call=call)
+        self.assertEqual(node["kb_reuse"]["matched_by"], "assisted")
+        self.assertEqual(node["term"], "语音识别", "assisted 也要做身份对齐")
+        self.assertEqual(node["definition"], "库里的定义")
+        self.assertEqual(stats["reusable"], 1)
+
 
 class BrokenShapeTest(IsolatedCase):
     """`knowledge.json` **是用户可手改的** —— 手改坏的一张卡不许让整次分析的知识地图崩掉（I-1）。
@@ -916,3 +934,96 @@ class PlanNodesContractTest(IsolatedCase):
         with mock.patch.object(kbreuse, "judge", fake_judge):
             kbreuse.plan_nodes([node], kbreuse.Index([self._card()]), call=lambda m: "{}")
         self.assertEqual(seen, [])
+
+
+class JudgeTest(IsolatedCase):
+    """模型判定的输入校验：**只允许在库里已有项里选**，其余一律丢弃（spec §6）。"""
+
+    def _cards(self):
+        return [{"id": "语音识别", "term": "语音识别", "definition": "把语音转文字"},
+                {"id": "词错率wer", "term": "词错率（WER）", "definition": "错字比例"}]
+
+    def _nodes(self, *terms):
+        return [{"id": store.slug(t), "term": t, "definition": "d"} for t in terms]
+
+    def _reply(self, obj):
+        return lambda messages: json.dumps(obj, ensure_ascii=False)
+
+    def test_a_valid_pair_is_accepted(self):
+        idx = kbreuse.Index(self._cards())
+        out = kbreuse.judge(self._nodes("ASR"), idx, self._reply(
+            {"pairs": [{"node": "ASR", "card_id": "语音识别"}]}))
+        self.assertEqual(out, {"ASR": "语音识别"})
+
+    def test_a_card_id_that_is_not_in_the_index_is_dropped(self):
+        """模型**不许发明概念**：库里没有的 card_id 直接丢弃。"""
+        idx = kbreuse.Index(self._cards())
+        out = kbreuse.judge(self._nodes("ASR"), idx, self._reply(
+            {"pairs": [{"node": "ASR", "card_id": "库里根本没有这个概念"}]}))
+        self.assertEqual(out, {}, "凭空造出来的概念必须被丢掉")
+
+    def test_a_node_term_that_was_not_asked_about_is_dropped(self):
+        idx = kbreuse.Index(self._cards())
+        out = kbreuse.judge(self._nodes("ASR"), idx, self._reply(
+            {"pairs": [{"node": "我没问过的节点", "card_id": "语音识别"}]}))
+        self.assertEqual(out, {})
+
+    def test_malformed_json_yields_nothing_at_all(self):
+        idx = kbreuse.Index(self._cards())
+        out = kbreuse.judge(self._nodes("ASR"), idx, lambda messages: "这不是 JSON")
+        self.assertEqual(out, {}, "判不出来就当没命中，绝不猜")
+
+    def test_a_wrong_shape_yields_nothing(self):
+        idx = kbreuse.Index(self._cards())
+        nodes = self._nodes("ASR")
+        for bad in ({"pairs": "x"}, {"pairs": [1, 2]}, {"没有-pairs": []}, [], None):
+            with self.subTest(bad=bad):
+                self.assertEqual(kbreuse.judge(nodes, idx, self._reply(bad)), {})
+
+    def test_two_nodes_claiming_one_card_keeps_only_the_first(self):
+        """模型说"两个**不同**名字的节点都等于同一张卡"，多半是它认错了一个（spec §6）。"""
+        idx = kbreuse.Index(self._cards())
+        out = kbreuse.judge(self._nodes("ASR", "语音转写"), idx, self._reply({"pairs": [
+            {"node": "ASR", "card_id": "语音识别"},
+            {"node": "语音转写", "card_id": "语音识别"}]}))
+        self.assertEqual(out, {"ASR": "语音识别"}, "只认第一个，其余去联网")
+
+    def test_a_raising_call_is_swallowed_and_logged(self):
+        """模型不可用 → 等于"没命中"，绝不因此让分析做不出来（spec §9）。"""
+        idx = kbreuse.Index(self._cards())
+
+        def boom(messages):
+            raise RuntimeError("模型炸了")
+
+        self.assertEqual(kbreuse.judge(self._nodes("ASR"), idx, boom), {})
+
+    def test_a_reply_that_is_not_even_a_string_is_handled(self):
+        idx = kbreuse.Index(self._cards())
+        self.assertEqual(kbreuse.judge(self._nodes("ASR"), idx, lambda messages: None), {})
+        self.assertEqual(kbreuse.judge(self._nodes("ASR"), idx, lambda messages: 5), {})
+
+    def test_a_huge_library_is_chunked_and_still_judged(self):
+        """超过 `MAX_JUDGE_TERMS` 时分块；分块后仍能判定（spec §6 规模守卫）。"""
+        cards = [{"id": "c%d" % i, "term": "概念%d" % i, "definition": "d"}
+                 for i in range(kbreuse.MAX_JUDGE_TERMS + 5)]
+        cards.append({"id": "语音识别", "term": "语音识别", "definition": "d"})
+        idx = kbreuse.Index(cards)
+        seen = {"chunks": 0}
+
+        def call(messages):
+            seen["chunks"] += 1
+            if "语音识别" in messages[-1]["content"]:
+                return json.dumps({"pairs": [{"node": "ASR", "card_id": "语音识别"}]})
+            return json.dumps({"pairs": []})
+
+        out = kbreuse.judge(self._nodes("ASR"), idx, call)
+        self.assertGreater(seen["chunks"], 1, "超限必须分块，不许悄悄截断")
+        self.assertEqual(out, {"ASR": "语音识别"})
+
+    def test_no_candidate_library_means_no_call(self):
+        """库里没有条目时**一次模型都不调**（省额度）。"""
+
+        def must_not_call(messages):
+            raise AssertionError("空库不该发起模型调用")
+
+        self.assertEqual(kbreuse.judge(self._nodes("ASR"), kbreuse.Index([]), must_not_call), {})

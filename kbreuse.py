@@ -20,11 +20,24 @@ import kb
 import log
 import store
 
-# 一次模型判定最多带多少条库内条目；超了分块，分块后仍超 → 退回确定性匹配
-# （少命中，但**绝不**悄悄截断清单然后假装判过）。
-# ⚠️ **当前全仓没有任何地方引用它**（Task 5 的 judge 才会用）—— 如实记在这里，
-# 免得后人以为"已经有一道闸门在生效"。
+# 一次模型判定最多带多少条库内条目；超了**分块**（`_chunks`），每块单独判一次。
+# 「分块」而不是「截断」是**故意**的：截断会让清单尾部那些概念**永远判不到**
+# （少命中且看不出来），而分块的代价只是多花几次模型调用。
 MAX_JUDGE_TERMS = 400
+
+JUDGE_SYSTEM = """你是知识库管理员。下面给你两份清单：
+A. 我的知识库里**已有**的条目（card_id + 术语 + 一行定义）
+B. 新岗位需要、但名字没能直接对上的一些知识点（node + 术语 + 一行定义）
+
+请判断：B 里每一条，是不是**就是** A 里的某一条（同一个概念的不同叫法）。
+
+只输出 JSON：{"pairs":[{"node":"<B 里的 node 原文>","card_id":"<A 里的 card_id>"}]}
+
+硬性要求：
+- `card_id` **必须是 A 里出现过的原样字符串**；不确定就**不要输出这一对**
+- **只输出你确信是同一个概念的**；宁可少配对，也不要猜
+- 一个 `card_id` 最多被一条 `node` 认领
+- 全部中文，字符串内部禁止英文双引号与裸换行"""
 
 # ASCII 括号内容（`词错率（WER）` / `评测标准(Rubric)`）。判据在**括号内容**上，
 # 与括号本身是不是中文括号无关：`语音端点检测（VAD）` 用中文括号，照样建 `vad` 键。
@@ -417,6 +430,53 @@ def plan_nodes(nodes, index, call=None, error=""):
     return stats
 
 
+def _chunks(seq, size):
+    for i in range(0, len(seq), size):
+        yield seq[i:i + size]
+
+
 def judge(nodes, index, call):
-    """（Task 5 实现）模型判定。当前是占位版：返回空 = 只做确定性匹配。"""
-    return {}
+    """让模型判一次"这些知识点是不是库里已有的某个概念"。
+
+    返回 `{节点 term 原文: card_id}`。**逐条校验**，任何可疑的一律丢弃：
+      * `card_id` 必须真实存在于**这一批**库里（**不许发明概念**）；
+      * `node` 必须是这次问过的节点；
+      * **一张卡只认一条**（模型说两个不同名字都等于同一张卡时，多半认错了一个）；
+      * 返回畸形 / 调用抛异常 → **一条都不用**（等同"没命中"），记日志。
+    """
+    nodes = list(nodes or [])
+    terms = index.terms_for_judge() if index is not None else []
+    if not terms or not nodes:
+        return {}
+    wanted = {}
+    for n in nodes:
+        wanted.setdefault(str(n.get("term") or ""), n)
+    out = {}
+    for chunk in _chunks(terms, MAX_JUDGE_TERMS):
+        payload = {"A": chunk,
+                   "B": [{"node": t, "term": t,
+                          "definition": str((n.get("definition") or ""))[:40]}
+                         for t, n in wanted.items()]}
+        try:
+            reply = call([{"role": "system", "content": JUDGE_SYSTEM},
+                          {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}])
+            data = json.loads(reply) if isinstance(reply, str) else None
+        except Exception as e:
+            log.log_exc("kbreuse.judge_error", e)
+            continue
+        pairs = data.get("pairs") if isinstance(data, dict) else None
+        if not isinstance(pairs, list):
+            log.log_event("kbreuse.judge_bad_shape", level="warn", got=type(pairs).__name__)
+            continue
+        allowed = {c["card_id"] for c in chunk}
+        for p in pairs:
+            if not isinstance(p, dict):
+                continue
+            node_term = str(p.get("node") or "")
+            cid = str(p.get("card_id") or "")
+            if node_term not in wanted or cid not in allowed:
+                continue
+            if cid in out.values():
+                continue          # 一张卡只认一条
+            out[node_term] = cid
+    return out
