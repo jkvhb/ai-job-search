@@ -83,7 +83,7 @@ def _profile_unreadable_message(exc):
             "    为什么不能继续：宁可不启动，也不把你的数据写进另一个档。继续跑的话，"
             "之后的每一次写入（分析、报告、配置、知识、日志）都会落进 default，"
             "界面上看不出来，事后也分不清哪些是串过去的。\n"
-            "    怎么修：把它改成一行 UTF-8 的档名（例如 周汉钦），"
+            "    怎么修：把它改成一行 UTF-8 的档名（例如 示例-姓名），"
             "或者删掉它（删掉 = 回到 default）。\n"
             % (store.current_profile_file(), cause))
 
@@ -111,6 +111,28 @@ OUTCOME_TEMPLATE_PATH = os.path.join(WEB, "outcome_template.html")       # 结�
 DEMO_PATH = os.path.join(WEB, "demo_data.json")
 DEMO_ID = "示例_语音文本评测_80分"   # 示例报告固定文件名，避免重复点击产生 (2)(3) 副本
 SOP_FILES = ["00-求职SOP总纲.md", "02-预筛与打分.md", "03-JD拆解.md", "04-简历大纲.md", "05-面试准备.md"]
+
+# JSON 请求体的上限（P1-13）。理由：本工具**唯一**的 POST body 是分析参数（JD 原文 / base64
+# 截图 / 简历名），实测最大也就几百 KB；`_json_body` 会把整个 body 读进内存，所以没有一个上限
+# 的话，一个坏请求（或本机服务被别的网页打）就能把内存吃满、让服务卡死。
+# 口径与 `interview.MAX_UPLOAD_BYTES`（音频上传 500MB）一致：**先看 Content-Length，超限一个
+# 字节都不读**。2MB 对正常请求是 10 倍以上的余量，对恶意请求足够小。
+MAX_JSON_BODY_BYTES = 2 * 1024 * 1024
+
+# `Handler._json_body()` 的返回值之一：**已经自己回过 400/413** 了（body 读不出来 / 太大）。
+# 用哨兵而不是"抛异常"或"返回 None"：路由里那条 `body.get(...)` 必须**不可能**被误当成
+# "没有参数"（P1-13 的病根就是"读不出来"与"没有参数"共用一个 `{}`）。
+_NO_BODY_SENTINEL = object()
+
+
+class TemplateUnreadable(RuntimeError):
+    """模板文件**在**、却读不出来（非 UTF-8 / 权限 / 被独占）。
+
+    ⚠️ 单独一个类型是必须的（P1-9）：旧实现把"读不出来"和"没有模板"混成同一句
+    「缺少报告模板」—— 用户会去**新建一个已经存在的**文件，而真正的原因（编码/权限）
+    一个字都没说。上游（`/reports/*`）据此决定「退回原文件原样发送」。
+    """
+
 
 PORT = 8000
 for _i, _a in enumerate(sys.argv):
@@ -171,13 +193,60 @@ SCHEMA_HINT = """
 
 
 def build_system_prompt():
-    parts = []
+    """把 5 份 SOP 拼成 system prompt。返回 `(prompt, warnings)`。
+
+    ⚠️ **返回值为什么是二元组（P1-10）**：旧实现对"文件在、但读不出来"（非 UTF-8 / 被独占 /
+    权限）静默 `append("")` —— system prompt 少一整段 SOP，报告照出，用户永远不知道。
+    现在把每一处读不出来的**如实写进 prompt 本体**（模型也知道这段 SOP 缺失），
+    **并且**收集到 `warnings` 里带回调用方（`do_analyze` 会把它们落到日志与响应上）。
+
+    两条分支绝不混："**文件不在**（真的没有这份 SOP）" 与 "**文件在、读不出来**" 是两回事：
+    前者只提一句"未找到"，后者必须说出文件名与原因。绝不说成同一句假话。
+    """
+    parts, warnings = [], []
     for fn in SOP_FILES:
         p = os.path.join(ROOT, fn)
-        if os.path.exists(p):
-            parts.append("===== %s =====\n%s" % (fn, store.read_text(p)))
+        if not os.path.exists(p):
+            parts.append("===== %s（未找到该文件）=====" % fn)
+            continue
+        text = store.read_text(p, None)
+        if text is not None:
+            parts.append("===== %s =====\n%s" % (fn, text))
+            continue
+        # 文件**在**却读不出来：这是"本次分析没有 SOP"级别的降级，必须响亮
+        why = _unreadable_reason(p)
+        warn = "本次分析没能加载 SOP《%s》：%s" % (fn, why)
+        warnings.append(warn)
+        parts.append("===== %s（读不出来：%s）=====\n【这段 SOP 本次没有加载成功，"
+                     "你的分析是在缺少这一段规范的情况下做出的 —— 请在结论里如实提醒用户。】"
+                     % (fn, why))
+        try:
+            log.log_event("sop.unreadable", level="warn", file=fn, path=p, reason=why,
+                          analysis_sop_warnings=warnings)
+        except Exception:
+            pass
     return ("你是一名资深 AI 领域求职顾问，专精数据标注、AI 数据运营、标注管理、AI 产品经理岗位。\n"
-            "下面是你必须遵循的求职 SOP：\n\n" + "\n\n".join(parts) + "\n\n" + SCHEMA_HINT)
+            "下面是你必须遵循的求职 SOP：\n\n" + "\n\n".join(parts) + "\n\n" + SCHEMA_HINT,
+            warnings)
+
+
+def _unreadable_reason(path):
+    """文件**在**却读不出来时，说清是哪一种读不出来（给用户看的一句话）。
+
+    `store.read_text` 把一切都兜成默认值，这里必须自己再读一遍才能拿到原因 ——
+    拿不到原因就说"读不出来"，**绝不编一个**。
+    """
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except OSError as e:
+        return "打不开这个文件（%s）" % e
+    try:
+        raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return "文件不是 UTF-8 编码（请把它另存为 UTF-8 后重试）"
+    return "文件读不出内容（请检查它的权限或被别的程序占用）"
+
 
 
 def normalize(data, resume_name, source):
@@ -260,6 +329,36 @@ def _attach_transcript(data):
         data["transcript_text"] = text
 
 
+def read_report_template(path):
+    """读一份报告模板（按 UTF-8）。**"没有模板"与"模板读不出来"必须分得开**（P1-9）。
+
+    - 文件不存在 → 返回 None（调用方说"缺少报告模板"）；
+    - 文件在、却读不出来（非 UTF-8 / 权限 / 被独占）→ 抛 `TemplateUnreadable`，
+      消息里带**哪个文件 + 什么原因**，并记一条日志。**绝不说成"缺少"**；
+    - 文件在、也是 UTF-8、但是空内容 → 返回空串（调用方当"没有可用模板"处理，
+      这不是读失败，是文件真的空）。
+
+    为什么不直接用 `store.read_text`：它把一切异常兜成默认值 —— 那正是这条 bug 的来源
+    （解码失败 → 空串 → 上游报"缺少报告模板"）。
+    """
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+    except UnicodeDecodeError as e:
+        why = ("不是合法的 UTF-8 文本（第 %d 字节起解不出来：%s）。"
+               "请把它另存为 UTF-8 编码后重试（另存时别选 GBK/ANSI）" % (e.start + 1, e.reason))
+    except OSError as e:
+        why = "打不开/读不出这个文件（%s）。请检查它的权限，或它是否正被别的程序占用" % e
+    try:
+        log.log_event("report.template_unreadable", level="warn",
+                      file=os.path.basename(path), path=path, reason=why)
+    except Exception:
+        pass
+    raise TemplateUnreadable("报告模板读不出来：%s\n    %s" % (path, why))
+
+
 def _render_report_page(path):
     """用**当前模板** + 报告里的 REPORT_DATA 渲染。kind 决定用哪个模板（report_template_for）。
 
@@ -273,7 +372,9 @@ def _render_report_page(path):
     if not isinstance(data, dict):
         return None
     tpl_path = report_template_for(data)
-    tpl = store.read_text(tpl_path)
+    # 读不出来会抛 TemplateUnreadable（不在这里吞）：调用方 `/reports/*` 的兜底
+    # 会退回"原样发送磁盘上那份"，报告照样打得开，而日志里已经留下"模板读不出来"。
+    tpl = read_report_template(tpl_path)
     if not tpl:
         return None
     if tpl_path == INTERVIEW_TEMPLATE_PATH:
@@ -287,9 +388,16 @@ def _render_report_page(path):
 def render_report(d, fixed_id=None):
     # 写盘与 serve 共用同一份 kind 判定：否则磁盘上那份会是与用户看到的不同的骨架
     tpl_path = report_template_for(d)
-    tpl = store.read_text(tpl_path)
-    if not tpl:
+    try:
+        tpl = read_report_template(tpl_path)
+    except TemplateUnreadable as e:
+        # 读不出来**不能**报成"缺少模板"（P1-9）：这里必须是**同一个异常类型**往下传，
+        # 由调用方（路由/CLI）原样印给用户。
+        raise RuntimeError(str(e))
+    if tpl is None:
         raise RuntimeError("缺少报告模板：%s" % os.path.basename(tpl_path))
+    if not tpl:
+        raise RuntimeError("报告模板是空文件：%s" % tpl_path)
     job = store.slug(d.get("job_title") or "岗位")
     score_disp = "%g" % d["score"]
     if fixed_id:
@@ -1338,8 +1446,21 @@ def do_analyze(jd_text, image_data_url, resume_name, link="", overwrite_id="", a
         resume_display = os.path.splitext(store.safe_name(resume_name))[0]
 
         tm = cfg["text_model"]
+        # ⚠️ SOP 读不出来**不许静默**（P1-10）：`build_system_prompt` 会把每一处读不出来
+        # 收进第二个返回值。这里立刻记一条日志（路由层不用再记），并把列表挂到
+        # `do_analyze` 的属性上 —— 路由据此把它放进 `/api/analyze` 的响应体，
+        # 用户才看得见"这次分析少了 SOP"。属性而不是返回值：返回值是报告文件名，动它会
+        # 影响一堆老调用方（CLI / 测试）。
+        system_prompt, sop_warnings = build_system_prompt()
+        do_analyze.last_sop_warnings = list(sop_warnings)
+        if sop_warnings:
+            # 这里只补一条"汇总"日志（每条读不出来的明细由 build_system_prompt 自己记）。
+            log.log_event("analyze.sop_missing", level="warn",
+                          analysis_sop_warnings=sop_warnings,
+                          count=len(sop_warnings),
+                          note="本次分析的 system prompt 少了这些 SOP 段，报告质量会受影响")
         messages = [
-            {"role": "system", "content": build_system_prompt()},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": "【候选人简历】\n%s\n\n【岗位 JD】\n%s\n\n"
                                         "请按 SOP 分析并输出 JSON。注意：联系信息（公司/HR/电话/地址）原文没有就留空，不要编造。"
                                         % (resume, jd_text)},
@@ -1770,11 +1891,56 @@ class Handler(BaseHTTPRequestHandler):
         self._after(code)
 
     def _json_body(self):
+        """读 POST 的 JSON body。**"没有 body"与"body 不是合法 JSON"必须分开**（P1-13）。
+
+        旧实现 `except Exception: return {}` 把两者混成同一个 `{}`：`POST /api/config` 于是
+        会"当成没改任何东西"照常保存并回 `ok:true` —— 一次假成功，用户以为设置存上了。
+
+        返回 `_NO_BODY_SENTINEL` = 已经自己回过 400/413（调用方必须直接 return，别再往下跑）。
+
+        - 没有 Content-Length / Content-Length 为 0 → `{}`（合法：很多 POST 不带参数）；
+        - Content-Length 超过 `MAX_JSON_BODY_BYTES` → 413，**一个字节都不读**（防吃满内存）；
+        - 读得出来但不是 UTF-8 / 不是合法 JSON → 400 + 一句人话 + 一条日志。
+        """
+        raw_length = self.headers.get("Content-Length")
+        has_length = raw_length is not None and str(raw_length).strip() != ""
         try:
-            n = int(self.headers.get("Content-Length") or 0)
-            return json.loads(self.rfile.read(n).decode("utf-8")) if n else {}
-        except Exception:
-            return {}
+            n = int(raw_length) if has_length else 0
+        except (TypeError, ValueError):
+            n = 0
+        if n <= 0:
+            return {}                       # 没有 body（合法），不是"读不出来"
+        if n > MAX_JSON_BODY_BYTES:
+            log.log_event("http.json_body_too_large", level="warn",
+                          declared_bytes=n, limit=MAX_JSON_BODY_BYTES,
+                          path=urlparse(self.path).path)
+            self._send(413, {"ok": False, "error":
+                             "请求体太大（声明 %d 字节，上限 %d MB）：没有执行任何操作。"
+                             "请检查是不是发错了内容。"
+                             % (n, MAX_JSON_BODY_BYTES // 1024 // 1024)})
+            return _NO_BODY_SENTINEL
+        raw = self.rfile.read(n)
+        if not raw:
+            return {}                       # 声明了长度却一个字节都没到：当"没有参数"（对照组）
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError as e:
+            return self._bad_json_body("请求体不是合法的 UTF-8 文本（第 %d 字节起解不出来：%s）"
+                                       % (e.start + 1, e.reason), n)
+        try:
+            return json.loads(text)
+        except ValueError as e:
+            return self._bad_json_body("请求体不是合法 JSON：%s" % e, n)
+
+    def _bad_json_body(self, why, n):
+        """body 读不出来时的统一出口：记一条日志 + 回 400 + 一句人话，返回哨兵。"""
+        log.log_event("http.bad_json_body", level="warn", reason=why, bytes=n,
+                      path=urlparse(self.path).path)
+        self._send(400, {"ok": False, "error":
+                         "%s。这次没有执行任何操作 —— 请检查请求内容后重试"
+                         "（常见原因：JSON 有尾随逗号或用了单引号、内容被截断、编码不是 UTF-8）。" % why})
+        return _NO_BODY_SENTINEL
+
 
     def _send_file(self, path, ctype):
         if not os.path.exists(path) or not os.path.isfile(path):
@@ -2276,6 +2442,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def _handle_post(self, p):
         body = self._json_body()
+        if body is _NO_BODY_SENTINEL:
+            return None            # `_json_body` 已经回过 400/413，绝不继续往下跑
 
         if p == "/api/log":
             ev = str(body.get("event") or "unknown")
@@ -2292,10 +2460,15 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(200, {"ok": False, "error": str(e)})
 
         if p == "/api/logs/clear":
+            # P1-11：清空失败**不许**回 ok:true（前端只看 ok，会 toast「日志已清空」，
+            # 而取证线索其实还在/或压根没清掉 —— 两种情况都必须如实说）。
             try:
                 open(log.LOG_FILE, "w", encoding="utf-8").close()
-            except Exception:
-                pass
+            except Exception as e:
+                log.log_event("logs.clear_failed", level="error", error=str(e), file=log.LOG_FILE)
+                return self._send(200, {"ok": False,
+                                        "error": "清空日志失败：%s（日志文件：%s）—— 日志没有被清空，"
+                                                 "请检查这个文件是否被占用或没有写权限" % (e, log.LOG_FILE)})
             log.log_event("logs.cleared")
             return self._send(200, {"ok": True})
 
@@ -2673,7 +2846,10 @@ class Handler(BaseHTTPRequestHandler):
                                    # 这次用的是哪一版简历（`resumelib` 的版本 id，如 rv_0001）：
                                    # 查重的另一半粒度 + 落进分析记录（阶段 4C）。老前端不传 → 空串。
                                    resume_id=body.get("resume_id") or "")
-                return self._send(200, {"ok": True, "report": fname})
+                return self._send(200, {"ok": True, "report": fname,
+                                        # SOP 少了一段就把这件事**带回前端**（P1-10）：
+                                        # 只躺在日志里等于用户永远不知道。
+                                        "sop_warnings": list(getattr(do_analyze, "last_sop_warnings", []) or [])})
             except DuplicateSubmission as e:
                 # 命中的凭据是 (JD × 简历版本)，日志里也带上版本号：事后才查得出"为什么判了重复"
                 log.log_event("analyze.duplicate", level="warn", job=e.duplicate.get("job_id"),

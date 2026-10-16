@@ -502,21 +502,29 @@ $('#img').addEventListener('change', e=>{
 */
 const JID_SEGS = ['学历','单位','职责','领域','城市','薪资','编号'];
 let JD_OPEN = {};                       // 展开状态：搜索 / 排序重渲染后不莫名收起
+// 台账**读失败**的原因（空串 = 这次读成功了）。P1-14：读失败绝不当成「你没有岗位」——
+// 那两件事必须分得开，所以失败时把原因留在这里，计数与列表都据此显示明确的错误。
+let LEDGER_ERR = '';
 
 async function loadJobs(){
   let r = null;
+  LEDGER_ERR = '';
   try{
-    r = await fetch('/api/jds').then(x=>x.json());
+    const resp = await fetch('/api/jds');
+    if(!resp || resp.ok !== true) throw new Error('接口返回 HTTP ' + ((resp && resp.status) || '?'));
+    r = await resp.json();
     if(!r || r.ok === false || !Array.isArray(r.jds)) throw new Error((r && r.error) || '返回里没有 jds 列表');
   }catch(e){
     // 读失败绝不当成「你没有岗位」空着：明说读失败、日志留证据（否则用户以为台账被清空了）
-    logUI('jobs.load_failed', {error: e.message}, 'error');
-    toast('台账读取失败：' + e.message);
+    LEDGER_ERR = (e && e.message) || String(e);
+    logUI('jobs.load_failed', {error: LEDGER_ERR}, 'error');
+    toast('台账读取失败：' + LEDGER_ERR);
     r = null;
   }
   JOBS = (r && r.jds) || []; CATS = (r && r.categories) || []; STATS = (r && r.statuses) || [];
   ivCacheClear();                       // 台账重载 = 面试记录也可能变了，缓存作废重取
-  $('#jobCount').textContent = JOBS.length;
+  // 读失败时不写 0：0 是「你有 0 个岗位」，那是另一句假话。
+  $('#jobCount').textContent = LEDGER_ERR ? '—' : JOBS.length;
   const fc = $('#fCat'), fs = $('#fStatus');
   if(fc.options.length<=1) CATS.forEach(c=>fc.add(new Option(c,c)));
   if(fs.options.length<=1) STATS.forEach(s=>fs.add(new Option(s,s)));
@@ -726,8 +734,13 @@ function renderJobs(){
   else if(sort==='status') list.sort((a,b)=>String(a.status||'').localeCompare(String(b.status||'')));
   else list.sort((a,b)=>String(b.created_at||'').localeCompare(String(a.created_at||'')));
 
-  $('#jobCntTip').textContent = (list.length===JOBS.length) ? ('共 '+JOBS.length+' 个岗位') : (list.length+' / '+JOBS.length+' 个岗位');
+  // 读失败时**绝不说 0**（P1-14）：明说这是"没读到"，并和"真的是空的"分开说。
+  $('#jobCntTip').textContent = LEDGER_ERR
+    ? ('台账读取失败（' + LEDGER_ERR + '）—— 这不是「你没有岗位」，是没读到，请点「刷新」重试')
+    : ((list.length===JOBS.length) ? ('共 '+JOBS.length+' 个岗位') : (list.length+' / '+JOBS.length+' 个岗位'));
   const box = $('#jobList');
+  if(LEDGER_ERR){ box.innerHTML = '<div class="empty">岗位台账读取失败：'+esc(LEDGER_ERR)
+      +'<br>这不是「你没有岗位」，是没读到 —— 原来的数据可能还在，请刷新重试。</div>'; return; }
   if(!list.length){ box.innerHTML = '<div class="empty">'+(JOBS.length?'没有匹配的岗位，换个关键词试试':'台账还是空的，去「① 分析岗位」生成第一份报告')+'</div>'; return; }
 
   box.innerHTML = list.map(j=>{
@@ -2692,11 +2705,26 @@ $('#spAddBtn').addEventListener('click', ()=>{
 
 /* ---------------- 配置 ---------------- */
 async function loadConfig(){
-  const c = await fetch('/api/config').then(x=>x.json());
-  $('#tBase').value=c.text_model.base_url; $('#tModel').value=c.text_model.model; $('#tKey').value=c.text_model.api_key||'';
-  $('#vBase').value=c.vision_model.base_url; $('#vModel').value=c.vision_model.model; $('#vKey').value=c.vision_model.api_key||'';
-  SP = Array.isArray(c.search_providers) ? c.search_providers : [];
-  renderSP();
+  // P1-15：读失败**必须说出来**。旧实现没有 try/catch，接口一失败就抛在外面：
+  // 设置页一片空白，与"从没配过"完全分不开（用户会以为自己填的 Key 丢了）。
+  try{
+    const resp = await fetch('/api/config');
+    if(!resp || resp.ok !== true) throw new Error('接口返回 HTTP ' + ((resp && resp.status) || '?'));
+    const c = await resp.json();
+    if(!c || c.ok === false) throw new Error((c && c.error) || '返回里没有配置内容');
+    if(!c.text_model || !c.vision_model) throw new Error('返回的配置里没有模型设置');
+    $('#tBase').value=c.text_model.base_url; $('#tModel').value=c.text_model.model; $('#tKey').value=c.text_model.api_key||'';
+    $('#vBase').value=c.vision_model.base_url; $('#vModel').value=c.vision_model.model; $('#vKey').value=c.vision_model.api_key||'';
+    SP = Array.isArray(c.search_providers) ? c.search_providers : [];
+    renderSP();
+  }catch(e){
+    const why = (e && e.message) || String(e);
+    logUI('config.load_failed', {error: why}, 'error');
+    // 说清两件事：① 这次没读到；② 这**不代表**你没配过（下面的框本来就是空的）
+    show($('#cfgSt'), 'err', '设置读取失败：' + why
+      + '。这不是「你从没配过」—— 盘上的设置可能还在，只是这次没读到，请刷新页面重试；'
+      + '在读到之前，别在这里保存（会把空白值当成新设置写进去）。');
+  }
 }
 $('#saveCfgBtn').addEventListener('click', async ()=>{
   const body = {text_model:{label:'DeepSeek（文本分析 / 跑 SOP）',base_url:$('#tBase').value.trim(),model:$('#tModel').value.trim(),api_key:$('#tKey').value.trim()},
@@ -3035,11 +3063,25 @@ function initKnowTab(){
 function switchTab(tab){ const b = document.querySelector('nav button[data-tab="'+tab+'"]'); if(b) b.click(); }
 function showResult(report){
   const el = $('#result');
-  const url = '/reports/' + encodeURIComponent(report);
+  // P1-18：报告名为空时**绝不**渲染 /reports/undefined 那种"看起来能点"的真链接
+  // （点下去是 404，用户会以为报告坏了）。没有报告就如实说没有，并告诉他去哪找。
+  const name = String(report == null ? '' : report).trim();
+  if(!name || name === 'undefined' || name === 'null'){
+    // 刻意**不用 `show()`**：那个函数写的是 `textContent`，而这里是结果区（.result 的绿底样式
+    // 也会把一条错误显示成"成功"。直接写 innerHTML + 红色边框，一眼看出是错误。
+    el.className = 'result on';
+    el.innerHTML = '<div class="rt" style="color:var(--red)">⚠️ 报告没有生成</div>'
+      + '<div class="rn">服务端没有返回报告文件名（可能生成时出错了）。'
+      + '请到「🗂 岗位台账」看这一条岗位，或重跑一次分析；'
+      + '如果反复出现，请在「🧾 日志」里打包发给 AI 排查。</div>';
+    logUI('result.missing_report_name', {report: String(report)}, 'error');
+    return;
+  }
+  const url = '/reports/' + encodeURIComponent(name);
   el.className = 'result on';
   el.innerHTML =
     '<div class="rt">✅ 报告已生成，已存入岗位台账</div>' +
-    '<div class="rn">' + esc(report) + '</div>' +
+    '<div class="rn">' + esc(name) + '</div>' +
     '<div class="row">' +
       '<a class="btn" href="' + url + '" target="_blank" rel="noopener">📊 打开报告 ↗</a>' +
       '<button class="btn gray" data-goto="jobs">🗂 去岗位台账</button>' +
@@ -3197,13 +3239,54 @@ $('#demoBtn').addEventListener('click', async ()=>{
 });
 
 /* ---------------- 日志面板 ---------------- */
+/* 清空日志。抽成**具名函数**是为了能被探针直接调用（原来只挂在按钮的匿名监听器里，
+   前端测试根本碰不到它 —— 而 P1-16 正是"失败了也 toast 成功"这句假话）。
+   ⚠️ 判 `r.ok`：服务端失败时回 `ok:false`，这里绝不许再说「日志已清空」。 */
+async function clearLogs(){
+  const el = $('#logSt');
+  try{
+    const resp = await fetch('/api/logs/clear', {method:'POST'});
+    if(!resp || resp.ok !== true) throw new Error('接口返回 HTTP ' + ((resp && resp.status) || '?'));
+    const r = await resp.json();
+    if(!r || r.ok !== true){
+      const why = (r && r.error) || '服务端没有说明原因';
+      logUI('logs.clear_failed', {error: why}, 'error');
+      show(el, 'err', '清空日志失败：' + why);
+      toast('清空日志失败：' + why);                 // 绝不 toast「日志已清空」
+      return false;
+    }
+    loadLogs(); toast('日志已清空');
+    return true;
+  }catch(e){
+    const why = (e && e.message) || String(e);
+    logUI('logs.clear_failed', {error: why}, 'error');
+    show(el, 'err', '清空日志失败：' + why);
+    toast('清空日志失败：' + why);
+    return false;
+  }
+}
+
 async function loadLogs(){
   let r;
-  try{ r = await fetch('/api/logs?limit=150').then(x=>x.json()); }
-  catch(e){ $('#logList').innerHTML = '<div class="empty">日志接口读取失败：'+esc(e.message)+'</div>'; return; }
+  try{
+    const resp = await fetch('/api/logs?limit=150');
+    if(!resp || resp.ok !== true) throw new Error('接口返回 HTTP ' + ((resp && resp.status) || '?'));
+    r = await resp.json();
+    // 服务端已经能如实回 ok:false（读不出来 / 路径没解析出来）—— 必须判它（P1-17），
+    // 否则下面会把 undefined / NaN 当数据渲染出来（"共 undefined 条 / NaN KB"）。
+    if(!r || r.ok === false) throw new Error((r && r.error) || '日志接口没有返回内容');
+  }catch(e){
+    const why = (e && e.message) || String(e);
+    logUI('logs.load_failed', {error: why}, 'error');
+    $('#logTotal').textContent = '—';                 // 不是 0 条：是没读到
+    $('#logMeta').innerHTML = '<span style="color:var(--red)">日志读不出来：'+esc(why)+'</span>';
+    $('#logList').innerHTML = '<div class="empty">日志读取失败：'+esc(why)
+      + '<br>这不是「你没有日志」，是没读到 —— 请点「刷新」重试。</div>';
+    return;
+  }
   $('#logTotal').textContent = r.total;
   $('#logMeta').innerHTML = '版本 <code>'+esc(r.version)+'</code> ｜ 会话 <code>'+esc(r.session)+'</code><br>'+
-    '日志文件 <code>'+esc(r.file)+'</code> ｜ 大小 '+(r.size/1024).toFixed(1)+' KB';
+    '日志文件 <code>'+esc(r.file)+'</code> ｜ 大小 '+(Number(r.size)/1024).toFixed(1)+' KB';
   const list = $('#logList');
   if(!r.recent || !r.recent.length){ list.innerHTML = '<div class="empty">还没有日志</div>'; return; }
   list.innerHTML = '<div class="lgbox">' + r.recent.slice().reverse().map(x=>{
@@ -3221,8 +3304,7 @@ async function loadLogs(){
 $('#logRefreshBtn').addEventListener('click', ()=>{ loadLogs(); toast('已刷新'); });
 $('#logClearBtn').addEventListener('click', async ()=>{
   if(!confirm('确定清空所有日志？不可恢复。')) return;
-  await fetch('/api/logs/clear', {method:'POST'});
-  loadLogs(); toast('日志已清空');
+  await clearLogs();
 });
 $('#logBundleBtn').addEventListener('click', async ()=>{
   const el = $('#logSt');

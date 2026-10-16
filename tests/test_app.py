@@ -5782,5 +5782,347 @@ class ForeignRequestGuardTest(IsolatedCase):
         self.assertEqual(hf.headers_out.get("X-Content-Type-Options"), "nosniff")
 
 
+# ============================================================ 批 4「说假话」（报告 §3）
+# P1-13 / P1-9 / P1-10 / P1-11 四条：服务端把"读不出来"说成"没有"或"成功"。
+# 这一批的共同判据只有一句：**读失败必须与"没有"分得开，且必须有一句真话 + 一条日志**。
+class LyingReportBatchTest(IsolatedCase):
+    """批 4 服务端四条。沙箱 handler 一律**不带 Host**（缺 Host 放行是既定口径，见 P2-1）。"""
+
+    def _sandbox(self, method, path, body: bytes, headers=None):
+        h = _sandbox_handler(method, path, body, headers)
+        return h
+
+    # ---------------- P1-13：请求体不是合法 JSON ≠ 没有参数
+    def test_bad_json_body_is_400_not_silently_empty(self):
+        """坏 JSON 必须 400 + 说清"请求体不是合法 JSON" + 留一条日志；**绝不**回 ok:true。
+
+        旧实现 `_json_body` 把 json.loads 的异常吞成 `{}` ⇒ POST /api/config 会“当成没改
+        任何东西”照常保存并回 ok:true —— 用户以为设置存上了，其实一个字段都没动。
+        """
+        raw = b'{"text_model": {"base_url": "https://x/v1",}}'      # 尾随逗号 = 非法 JSON
+        log.log_event("canary.before_bad_body")
+        h = self._sandbox("POST", "/api/config", raw,
+                          {"Content-Length": str(len(raw)), "Content-Type": "application/json"})
+
+        self.assertEqual(h._status, 400, "坏 JSON 没回 400（body=%r）" % (h._body,))
+        self.assertFalse(h._body.get("ok"), "坏 JSON 还回了 ok:true：%r" % (h._body,))
+        msg = h._body.get("error") or ""
+        self.assertIn("请求体", msg)                 # 说清是**请求体**的问题，别让用户去查配置
+        self.assertIn("JSON", msg)
+        raw_log = _disk_bytes(log.LOG_FILE).decode("utf-8")
+        self.assertIn("canary.before_bad_body", raw_log)   # 反证：日志真的写进去了
+        self.assertIn("http.bad_json_body", raw_log)       # 留一条取证线索
+
+    def test_non_utf8_body_is_400_too_not_silently_empty(self):
+        """非 UTF-8 的 body 也必须 400（`decode` 与 `json.loads` 是两个不同的失败点，各钉一条）。"""
+        raw = b"\xff\xfe\x00\x81"                    # 在 UTF-8 里非法
+        h = self._sandbox("POST", "/api/config", raw, {"Content-Length": str(len(raw))})
+
+        self.assertEqual(h._status, 400, "非 UTF-8 body 没回 400（body=%r）" % (h._body,))
+        self.assertIn("UTF-8", h._body.get("error") or "")
+
+    def test_oversized_json_body_is_rejected_without_reading_it(self):
+        """超大 body 要有上限（与 interview.MAX_UPLOAD_BYTES 同一口径：先看 Content-Length，
+        超限**一个字节都不读**，否则一个坏请求就能把内存吃满）。"""
+        declared = app.MAX_JSON_BODY_BYTES + 1
+        h = self._sandbox("POST", "/api/config", b"", {"Content-Length": str(declared)})
+
+        self.assertEqual(h._status, 413, "超限 body 没被拒（body=%r）" % (h._body,))
+        self.assertFalse(h._body.get("ok"))
+        self.assertEqual(h.rfile.tell(), 0, "超限请求还是把 body 读了 —— 内存会被吃满")
+
+    def test_empty_body_still_means_no_parameters(self):
+        """对照组：没有 body 是**合法**的（很多 POST 不带参数）—— 必须照旧当 `{}` 处理。"""
+        log.log_event("canary.before_empty_body")
+        h = self._sandbox("POST", "/api/logs/clear", b"", {"Content-Length": "0"})
+
+        self.assertEqual(h._status, 200, "空 body 被误伤了（body=%r）" % (h._body,))
+        self.assertTrue(h._body.get("ok"), "空 body 的对照组不该失败：%r" % (h._body,))
+
+    # ---------------- P1-9：模板"存在但读不出来"≠"缺少模板"
+    def test_non_utf8_template_says_read_failure_not_missing(self):
+        """模板存在但不是 UTF-8 → 文案必须说出**哪个文件 + 读不出来的原因**，绝不说"缺少"。"""
+        path = os.path.join(store.p_path("reports"), "坏模板.html")
+        with open(path, "wb") as f:
+            # ⚠️ 这一串字节**必须真的解不成 UTF-8**（0xFF/0xFE 在 UTF-8 里非法）。
+            # 别用 GBK 的中文糊弄：那种字节往往仍是合法 UTF-8，测试会**假绿**。
+            f.write(b"<!doctype html><title>\xff\xfe\x00\x81</title>")
+        err = self._render_error(path)
+
+        self.assertNotIn("缺少报告模板", err,
+                         '把"读不出来"继续报成"缺少"：用户会去建一个已经存在的文件')
+        self.assertIn("坏模板.html", err)                 # 说清是哪个文件
+        self.assertNotIn("Traceback", err)                # 人话，不是 traceback
+        raw_log = _disk_bytes(log.LOG_FILE).decode("utf-8")
+        self.assertIn("report.template_unreadable", raw_log)   # 必须有日志
+
+    def test_missing_template_still_says_missing(self):
+        """对照组：模板**真不存在**时，那句话必须照旧（两条分支不许混成一句）。"""
+        err = self._render_error(os.path.join(store.p_path("reports"), "根本不存在.html"))
+        self.assertIn("缺少报告模板", err)
+        self.assertIn("根本不存在.html", err)
+
+    def _render_error(self, tpl_path):
+        """把模板路径指到 `tpl_path` 后跑一次真 `render_report`，回它抛出的那句话。"""
+        real = app.TEMPLATE_PATH
+        self.addCleanup(setattr, app, "TEMPLATE_PATH", real)
+        app.TEMPLATE_PATH = tpl_path
+        with self.assertRaises(RuntimeError) as cm:
+            app.render_report({"job_title": "测试岗位", "score": 80.0})
+        return str(cm.exception)
+
+    # ---------------- P1-10：SOP 读不出来 ≠ 没有 SOP
+    def test_unreadable_sop_is_not_silently_dropped(self):
+        """SOP 存在但读不出来 → 必须有一条 warn 日志，且**结果里带着**"本次没加载 SOP"。"""
+        fn = _first_readable_sop()
+        real_read_text = store.read_text
+
+        def fake(path, default="", *a, **kw):
+            if os.path.basename(str(path)) == fn:
+                return default
+            return real_read_text(path, default, *a, **kw)
+
+        with mock.patch.object(store, "read_text", side_effect=fake):
+            prompt, warnings = app.build_system_prompt()
+
+        self.assertTrue(warnings, "SOP 读不出来却一条警告都没有（报告照样出）")
+        self.assertTrue(any(fn in w for w in warnings),
+                        "警告里没说是哪个 SOP：%r" % (warnings,))
+        self.assertIn(fn, prompt)                       # 文件**在**（不是"没有"）
+        self.assertIn("读不出来", prompt)
+        raw_log = _disk_bytes(log.LOG_FILE).decode("utf-8")
+        self.assertIn("sop.unreadable", raw_log)
+
+    def test_sop_warning_reaches_the_analysis_result(self):
+        """修 1：警告不能只躺在日志里 —— 这次分析的结果必须带着它（否则用户永远不知道）。"""
+        fn = _first_readable_sop()
+        real_read_text = store.read_text
+
+        def fake(path, default="", *a, **kw):
+            if os.path.basename(str(path)) == fn:
+                return default
+            return real_read_text(path, default, *a, **kw)
+
+        with mock.patch.object(store, "read_text", side_effect=fake), \
+             mock.patch.object(llm, "call_openai_compatible",
+                               return_value=json.dumps({"job_title": "x", "score": 80.0})), \
+             mock.patch.object(log, "log_event") as fake_log:
+            store.write_text(os.path.join(store.p_path("resumes"), "母版.md"), "候选人的简历正文")
+            app.do_analyze("岗位职责：标注质检。", None, "母版.md")
+            events = [c[0][0] for c in fake_log.call_args_list]
+            self.assertIn("sop.unreadable", events)
+            kw = [c[1] for c in fake_log.call_args_list if c[0][0] == "sop.unreadable"][0]
+            self.assertIn("analysis_sop_warnings", kw)
+            self.assertTrue(kw["analysis_sop_warnings"])   # 调用方要能拿到，才能回给前端
+
+    def test_analyze_route_reports_the_sop_warning(self):
+        """/api/analyze 的响应体里带着 sop_warnings（用户看得见的那个出口）。"""
+        res = self._analyze_with_broken_sop()
+        self.assertEqual(res._status, 200, res._body)
+        self.assertTrue(res._body.get("ok"), res._body)
+        self.assertTrue(res._body.get("sop_warnings"),
+                        "响应里没有 sop_warnings：SOP 少了一段，用户永远不知道")
+
+    def _analyze_with_broken_sop(self):
+        """让一份 SOP 读不出来，跑一次 /api/analyze（模型/搜索/知识地图全部打桩，不花钱）。"""
+        store.write_text(os.path.join(store.p_path("resumes"), "母版.md"), "候选人的简历正文")
+        fn = _first_readable_sop()
+        real_read_text = store.read_text
+
+        def fake(path, default="", *a, **kw):
+            if os.path.basename(str(path)) == fn:
+                return default
+            return real_read_text(path, default, *a, **kw)
+
+        reply = json.dumps({"job_title": "语音质检", "score": 80.0}, ensure_ascii=False)
+        body = json.dumps({"jd_text": "岗位职责：语音数据质检。", "resume_name": "母版.md"},
+                          ensure_ascii=False).encode("utf-8")
+        with mock.patch.object(store, "read_text", side_effect=fake), \
+             mock.patch.object(llm, "call_openai_compatible", return_value=reply), \
+             mock.patch.object(app.search_mod, "fetch_link", return_value=""), \
+             mock.patch.object(kbreuse, "Reuse", _FakeReuse), \
+             mock.patch.object(jdfacts, "resolve", return_value=([], "computed")):
+            return self._sandbox("POST", "/api/analyze", body,
+                                 {"Content-Length": str(len(body)),
+                                  "Content-Type": "application/json"})
+
+    # ---------------- P1-11：/api/logs/clear 失败不许说成功
+    def test_logs_clear_failure_is_not_ok_true(self):
+        """清空日志失败必须如实（ok:false + error + 一条日志），绝不回 ok:true。"""
+        log.log_event("canary.before_failed_clear")
+        with mock.patch.object(log, "LOG_FILE", os.path.join(self.tmp, "不存在的目录", "events.jsonl")):
+            h = self._sandbox("POST", "/api/logs/clear", b"", {"Content-Length": "0"})
+
+        self.assertFalse(h._body.get("ok"),
+                         "清空日志失败了还回 ok:true —— 前端会 toast「日志已清空」，线索白销：%r"
+                         % (h._body,))
+        self.assertTrue(h._body.get("error"), "失败却连一句 error 都没有：%r" % (h._body,))
+
+
+class _FakeReuse(object):
+    """`kbreuse.Reuse` 的替身：这次分析里它只被用来统计"跑没跑库优先"。"""
+
+    def __init__(self, cfg):
+        self.used = False
+        self.stats = {}
+
+
+def _first_readable_sop():
+    """挑一份**真的在盘上、真读得出来**的 SOP 当"读不出来"的靶子。
+
+    不硬编码文件名：SOP 清单万一改名，这条测试不该跟着烂。找不到就**响亮失败**
+    （静默跳过等于把这条不变量删掉）。
+    """
+    for fn in app.SOP_FILES:
+        p = os.path.join(app.ROOT, fn)
+        if os.path.exists(p) and store.read_text(p).strip():
+            return fn
+    raise AssertionError("盘上一份可读的 SOP 都没有（vault 不完整？）：%r" % (app.SOP_FILES,))
+
+
+# ============================================================ 批 4「说假话」· 前端（P1-14~P1-18）
+# 前端这四条的病根是同一个：**读失败被当成"你没有数据"**。用户看到的每一句话都必须是真话：
+#   · 台账读失败 → 绝不显示"共 0 个岗位 / 台账还是空的"，要明说读不到；
+#   · 设置读失败 → 绝不留一片空白（那与"从没配过"分不开）；
+#   · 清空日志失败 → 绝不 toast「日志已清空」（那是把取证线索说没了）；
+#   · 日志读失败 → 绝不显示 undefined / NaN KB；
+#   · 报告名为空 → 绝不渲染指向 /reports/undefined 的"真链接"。
+#
+# 全部**真跑页面 JS**（tests/web_probe 的 Node 垫片）：断言的是**渲染出来的**文字/链接，
+# 不是"源码里有那句话" —— 后者在本项目出过假绿（见 web_probe 的说明）。
+_FETCH_OK_JS = (
+    "fetch = function(){ return Promise.resolve({ok:true, json:function(){"
+    "return Promise.resolve(__fixture.resp || {});}}); };\n")
+
+
+class FrontendReadFailureTest(IsolatedCase):
+    """四条前端"读失败"用例。每条都先反证"旧行为的那句假话"真的会出现，再断言它不出现。"""
+
+    # ---------------- P1-14：台账读失败 ≠ 你没有岗位
+    def test_ledger_read_failure_is_loud_and_never_says_zero(self):
+        _need_node()
+        out = web_probe.run_index(
+            "fetch = function(){ return Promise.reject(new Error('接口 500')); };\n"
+            "await loadJobs();\n"
+            "out.count = String($('#jobCount').textContent);\n"
+            "out.tip = String($('#jobCntTip').textContent);\n"
+            "out.list = String($('#jobList').innerHTML);\n")
+
+        self.assertNotIn("共 0 个岗位", out["tip"],
+                         "台账读失败却显示「共 0 个岗位」—— 用户会以为岗位没了")
+        self.assertNotIn("台账还是空的", out["list"],
+                         "台账读失败却显示「台账还是空的」—— 这是那句假话本身")
+        self.assertNotEqual(out["count"].strip(), "0",
+                            '读失败还把计数写成 0（与"真的是空的"分不开）')
+        blob = out["tip"] + out["list"]
+        self.assertIn("接口 500", blob)                 # 如实说出读不出来的原因
+        self.assertTrue(("读取失败" in blob) or ("读不到" in blob),
+                        "读失败没有一句明确的错误说明：%r" % (blob,))
+
+    def test_an_empty_ledger_is_still_reported_as_empty_not_as_error(self):
+        """对照组：**真的是空的**（接口正常回了空列表）必须照旧说"台账还是空的"。
+
+        没有这条，修法很容易变成"一律报错" —— 那又是另一种假话。
+        """
+        _need_node()
+        out = web_probe.run_index(
+            _FETCH_OK_JS +
+            "await loadJobs();\n"
+            "out.count = String($('#jobCount').textContent);\n"
+            "out.tip = String($('#jobCntTip').textContent);\n"
+            "out.list = String($('#jobList').innerHTML);\n",
+            {"resp": {"jds": [], "categories": [], "statuses": []}})
+
+        self.assertIn("台账还是空的", out["list"], "空台账被误报成读失败：%r" % (out,))
+        self.assertIn("共 0 个岗位", out["tip"])
+        self.assertNotIn("读取失败", out["list"])
+
+    # ---------------- P1-15：设置读失败 ≠ 从没配过
+    def test_config_read_failure_says_so_instead_of_blank_page(self):
+        _need_node()
+        out = web_probe.run_index(
+            "fetch = function(){ return Promise.resolve({ok:true, json:function(){"
+            "return Promise.resolve({ok:false, error:'配置读不出来（权限）'}); }}); };\n"
+            "await loadConfig();\n"
+            "out.st = String($('#cfgSt').textContent);\n"
+            "out.base = String($('#tBase').value);\n")
+
+        self.assertIn("配置读不出来（权限）", out["st"],
+                      '设置页读失败却什么都没说（一片空白 = 与"从没配过"分不开）：%r' % (out,))
+        self.assertTrue(out["st"].strip(), "设置页读失败后没有任何提示")
+
+    # ---------------- P1-16：清空日志失败 ≠ 日志已清空
+    def test_clear_logs_failure_does_not_claim_success(self):
+        _need_node()
+        out = web_probe.run_index(
+            "fetch = function(){ return Promise.resolve({ok:true, json:function(){"
+            "return Promise.resolve({ok:false, error:'日志文件被占用'}); }}); };\n"
+            "confirm = function(){ return true; };\n"
+            "await clearLogs();\n"
+            "out.toast = String($('#toast').textContent);\n"
+            "out.list = String($('#logList').innerHTML);\n")
+
+        self.assertNotIn("日志已清空", out["toast"],
+                         "清空失败了还 toast「日志已清空」—— 取证线索被一句假话销掉")
+        self.assertIn("日志文件被占用", out["toast"] + out["list"])   # 如实说出失败原因
+
+    # ---------------- P1-17：日志读失败 ≠ undefined / NaN KB
+    def test_logs_read_failure_shows_no_undefined_or_nan(self):
+        _need_node()
+        out = web_probe.run_index(
+            "fetch = function(){ return Promise.resolve({ok:true, json:function(){"
+            "return Promise.resolve({ok:false, error:'日志读不出来'}); }}); };\n"
+            "await loadLogs();\n"
+            "out.total = String($('#logTotal').textContent);\n"
+            "out.meta = String($('#logMeta').innerHTML);\n"
+            "out.list = String($('#logList').innerHTML);\n")
+
+        blob = out["total"] + out["meta"] + out["list"]
+        self.assertNotIn("undefined", blob, "日志读失败却渲染出 undefined：%r" % (out,))
+        self.assertNotIn("NaN", blob, "日志读失败却渲染出 NaN KB：%r" % (out,))
+        self.assertIn("日志读不出来", blob)            # 如实说出原因
+
+    # ---------------- P1-18：没有报告名 ≠ 可以点开的报告
+    def test_missing_report_name_renders_no_undefined_link(self):
+        _need_node()
+        out = web_probe.run_index(
+            "showResult(__fixture.report);\n"
+            "out.html = String($('#result').innerHTML);\n",
+            {"report": ""})
+
+        self.assertNotIn("/reports/undefined", out["html"],
+                         "报告名为空却渲染了指向 /reports/undefined 的真链接")
+        self.assertNotIn("href=\"/reports/\"", out["html"], "渲染了一个空的报告链接")
+        self.assertNotIn("✅", out["html"], "没有报告却仍然说「报告已生成」")
+        self.assertTrue(out["html"].strip(), "没有报告却什么都没说（用户不知道该干什么）")
+
+
+# ============================================================ P0-15：提示文案里不许有真实姓名
+# `_profile_unreadable_message` 是**给用户看的一段人话**，里面举的"档名"例子曾经写着一个**真名**
+# （这台机器上的 profile 名）。分享包在别人机器上会直接把这个名字带出去：`打包分享` 的 PII 扫描
+# 依赖一个被 gitignore 的 `.leak-keywords.txt`，干净检出时它不存在 ⇒ 扫描根本拦不住。
+# 修法是：例子必须**一眼看出是占位**（`示例-姓名`）。本测试钉住"占位串在、真名不在"。
+# ⚠️ 真名只能从 `data/` **只读**出来做比较，**绝不落进这个测试文件**。
+class ProfileMessagePlaceholderTest(IsolatedCase):
+    PLACEHOLDER = "示例-姓名"
+
+    def test_the_example_profile_name_is_a_placeholder_not_a_real_name(self):
+        store.DATA_ROOT = self._real_data_root          # 需要看真实档名文件（只读）
+        try:
+            real_name = store.current_profile()
+        except Exception:
+            real_name = ""                              # 读不出来（干净检出）→ 只钉占位串
+
+        msg = app._profile_unreadable_message(RuntimeError("坏掉的档名文件"))
+
+        self.assertIn(self.PLACEHOLDER, msg,
+                      "给用户看的档名例子不是一个明显的占位串")
+        if real_name and real_name != "default" and real_name != self.PLACEHOLDER:
+            self.assertNotIn(real_name, msg,
+                             "这段提示里出现了**真实的**档名（= 用户真名）：分享到别人机器上"
+                             "会把真名带出去（打包分享的 PII 扫描依赖被 gitignore 的关键词文件，"
+                             "干净检出时拦不住）")
+
+
 if __name__ == "__main__":
     unittest.main()
