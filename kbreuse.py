@@ -150,7 +150,9 @@ class Index:
     """知识库的"名字 → 卡片"目录。一次分析建一次，之后**只读**。
 
     **分两层**（I-1 —— 这是"能不能真正复用"的关键）：
-      1. `by_name`：卡片的**精确名** = `kb.normalize_id(term)`。查这一层命中一律算 `exact`。
+      1. `cards` ：卡片的**精确名** = `kb.normalize_id(term)`。查这一层命中一律算 `exact`。
+         （它与 id 索引**是同一张表**：卡片 id 本来就是 `normalize_id(term)` 算出来的，
+         所以以前另存的 `by_name` 是同键同值的第二份 —— 只会"改一处漏一处"，已并入。）
       2. `by_key` ：**派生键** = term 里的 ASCII 括号缩写 / 头名（去括号后的全名）/ 卡片
          记录过的 `aliases`。查这一层按**键的真实来源**判 `abbrev` / `head` / `alias`。
 
@@ -166,8 +168,10 @@ class Index:
     """
 
     def __init__(self, cards=None):
-        self.cards = {}       # card_id -> card
-        self.by_name = {}     # kb.normalize_id(term) -> card（**精确名**，第一层）
+        # 第一层（精确名）与 id 索引**是同一张表**：卡片 id 就是 `kb.normalize_id(term)`，
+        # 于是这张表的键**既是 id 也是精确名**。原来另存一份 `by_name`（同键、同值、
+        # 同先到先得）是纯粹重复（P5 §7.2）—— 两份表唯一的区别只可能是"改一处漏一处"。
+        self.cards = {}       # card_id(== kb.normalize_id(term)) -> card（第一层）
         self.by_key = {}      # 其余派生键（ASCII 括号 / 头名 / aliases），第二层（先到先得）
         # 派生键 -> "abbrev" | "head" | "alias"（M-3：归属按**键的真实来源**判）
         self.key_source = {}
@@ -175,11 +179,11 @@ class Index:
             if not isinstance(c, dict):
                 continue
             cid = kb.normalize_id(c.get("term"))
+            # 同一个 id 只进第一张（先到先得）：下面那个赋值因此**从不覆盖** ——
+            # 第一层的"先到先得"就是由这一行挡出来的，不是靠 `setdefault`。
             if not cid or cid in self.cards:
                 continue
             self.cards[cid] = c
-            # 第一层内部：先到先得（同 id 的第二张在上面就被去重挡掉了）
-            self.by_name.setdefault(cid, c)
             # 第二层：**不含 cid 自己**（精确名不参与派生层的争抢）。
             # 键的**来源**同时记下来 —— `abbrev` / `alias` 的区分判据是键从哪来，
             # 不是"两边看起来像不像"（M-3：卡侧 aliases 贡献的键必须报 alias，
@@ -246,17 +250,17 @@ class Index:
         **先查精确名那一层**（命中即 `exact`），未中再过派生键那一层 —— 顺序由
         `__init__` 的两层结构保证，与"谁先落盘"无关（I-1）。
 
-        ⚠️ 第二层**也要回查 `by_name`**，这不是走回头路：节点 `语音识别（ASR）` 的
+        ⚠️ 第二层**也要回查第一层的 `cards`**，这不是走回头路：节点 `语音识别（ASR）` 的
         **括号键** `asr` 正好就是库里那张卡的**精确名**（`card.term == "ASR"`）。
         只查 `by_key` 会让"节点带括号、库里用缩写当全名"这个方向整个 miss
         （库里那边 `asr` 是第一层，压根不在第二层）—— spec §5 要的"**双向**命中"就断了。
         回查到的仍是**那张卡自己的名字**，所以只可能更准，不可能认错。
         """
         full = kb.normalize_id(term)
-        # 第一层：精确名。节点叫 `WER`、库里也有一张就叫 `WER` 的卡 → 命中就是它，
-        # 哪怕另一张更早的卡里有 `（WER）` 这样的括号（那只是**派生**键）。
+        # 第一层：精确名（就是 `cards` 的键）。节点叫 `WER`、库里也有一张就叫 `WER` 的卡 →
+        # 命中就是它，哪怕另一张更早的卡里有 `（WER）` 这样的括号（那只是**派生**键）。
         if full:
-            card = self.by_name.get(full)
+            card = self.cards.get(full)
             if card is not None:
                 return card, "exact"
         # 第二层：派生键（括号 / 头名 / aliases）；归属按建索引时记下的**键来源**判。
@@ -265,7 +269,7 @@ class Index:
             if card is not None:
                 return card, self.key_source.get(k, "alias")
             if k != full:
-                card = self.by_name.get(k)      # 节点的括号键 == 库里那张卡的精确名
+                card = self.cards.get(k)        # 节点的括号键 == 库里那张卡的精确名
                 if card is not None:
                     # 这里如实报 `abbrev`：能走到这一行的 `k` 只可能来自 `_keys_of_term`
                     # 的**括号键**（`_head_key(节点)` 不在那张清单里），所以线索确实是
@@ -398,6 +402,7 @@ def _fill_from_card(node, card, matched_by=""):
     # 就要求「至少一条带 url 的 dict 来源」（`_card_completeness`）—— 直接写死 `verified`。
     # 刻意不写 `"verified" if card.get("sources") else ...`：那是死分支，而且它用的是
     # truthy，不是 completeness 那把"有 url 的 dict"的尺子，两把尺子迟早会漂移。
+    # ⚠️ 保留这段说明本身（别为这条不可达支路补代码、也**别为它写测试** —— 那会把死路径锁死）。
     node["confidence"] = "verified"
     # 身份对齐与"不够格"那一支**同一处实现**（I-1）：两条支路各写一遍迟早就漂移，
     # 而这里漂移的代价正是本轮修掉的那条真缺陷（写回新建重复卡）。
@@ -484,7 +489,9 @@ def plan_nodes(nodes, index, call=None, error=""):
                 continue
             card = idx.cards.get(cid)
             if card is None:
-                continue            # 判定层已经校验过，这里是"别处的 bug 也别炸"的一层
+                # **不可达**（防御性）：`judge` 只回本块清单里出现过的 `card_id`，而那些 id
+                # 都取自 `idx.cards`。保留它只为"别处的 bug 也别炸"—— 不为它写测试。
+                continue
             if cid in occupied:
                 # 这张卡已经归别人了 → **只对齐身份**，内容一个字不动（见下面的长注释）
                 align_only[id(n)] = (card, "assisted", "card_taken")
@@ -507,38 +514,44 @@ def plan_nodes(nodes, index, call=None, error=""):
             cid = dropped.get(str(n.get("term") or ""))
             card = idx.cards.get(cid) if cid else None
             if card is None:
-                continue                     # 判定层已经校验过卡在库里，这里是兜底
+                # **不可达**（防御性）：`cid` 一律来自 `judge` 写的 `dropped`，而它写进去的
+                # 只可能是 `idx.cards` 里取到的 id。保留它只为"别处的 bug 也别炸"—— 不写测试。
+                continue
             align_only[id(n)] = (card, "assisted", "card_taken")
     for n in nodes:
-        only = align_only.get(id(n))
+        # 三条支路（够格 / 不够格 / 只对齐身份）**共用下面这一段**（P5 §7.2）：它们的差别
+        # 只有"要不要拿库里的内容"这一件事，而另外两件（够格判定 + `_mark_reuse` 留痕）
+        # 逐字相同 —— 各写一遍的代价是报告说假话（报告逐字读 `kb_reuse` 那几个字段）。
+        only = align_only.get(id(n))         # 只对齐身份那条
+        hit = found.get(id(n))               # 真拿到了库内容那条
+        if only is None and hit is None:
+            continue
+        card, how = (only[0], only[1]) if only is not None else hit
+        eligible, missing = _card_completeness(card)
+        # 只对齐身份那条：内容一个字不动 ⇒ 复用资格一律 False
+        # （③④ 照旧要跑，`_already_reused` 也是读它）。
+        reusable = eligible and only is None
         if only is not None:
-            card, how, why = only
-            original = _align_term(n, card, matched_by=how, reason=why)
-            stats["matched"] += 1
-            stats["aligned_only"] += 1
-            # 内容一个字不动 ⇒ 复用资格一律 False（③④ 照旧要跑，`_already_reused` 也是读它）
-            _reusable, missing = _card_completeness(card)
-            _mark_reuse(n, card, how, False, missing, original, aligned_only=True)
-            continue
-        hit = found.get(id(n))
-        if hit is None:
-            continue
-        card, how = hit
-        reusable, missing = _card_completeness(card)
-        stats["matched"] += 1
-        original = ""
-        if reusable:
+            # 改名 + 内容一个字不动；`reason` 由判定层给（`card_taken`）
+            original = _align_term(n, card, matched_by=how, reason=only[2])
+        elif eligible:
             original = _fill_from_card(n, card, how)
+        else:
+            # **不够格也要做身份对齐**（I-1，真缺陷）：改名不是内容覆盖，只要命中就该做。
+            # 不做的话写回会新建一张重复卡（`kb.absorb` 按 `normalize_id(term)` 找卡）。
+            # 内容（definition / sources / timeline / …）一个字都不动 —— 那是 ③④ 的事。
+            original = _align_term(n, card, matched_by=how, reason="incomplete")
+        stats["matched"] += 1
+        if only is not None:
+            stats["aligned_only"] += 1
+        elif eligible:
             stats["reusable"] += 1
             if card.get("timeline"):
                 stats["timeline_reused"] += 1
         else:
             stats["enriched"] += 1
-            # **不够格也要做身份对齐**（I-1，真缺陷）：改名不是内容覆盖，只要命中就该做。
-            # 不做的话写回会新建一张重复卡（`kb.absorb` 按 `normalize_id(term)` 找卡）。
-            # 内容（definition / sources / timeline / …）一个字都不动 —— 那是 ③④ 的事。
-            original = _align_term(n, card, matched_by=how, reason="incomplete")
-        _mark_reuse(n, card, how, reusable, missing, original)
+        _mark_reuse(n, card, how, reusable, missing, original,
+                    aligned_only=(only is not None))
     stats["searched"] = stats["total"] - stats["reusable"]
     return stats
 
@@ -584,14 +597,17 @@ def _mark_reuse(node, card, how, reusable, missing, original, aligned_only=False
 
 
 def _chunks(seq, size):
-    """按 `size` 切块。**`size <= 0` 一律兜底成 1**（M-6）。
+    """按 `size` 切块。**`size <= 0` 一律兜底成 1**（M-6）—— 这是**防御性兜底**。
 
-    为什么非要兜这一下：`size=0` 时 `range(0, n, 0)` 抛 `ValueError`，而这个函数**不在**
-    `judge` 那个 `try` 里（try 罩的是模型调用）—— 它会一路掀掉整步知识地图：
-    Task 5 接上之后，整次分析的知识地图退化成 `knowledge_error`，几十个节点的复用机会
-    一起丢。负数更坏：一个 chunk 都不产出，看起来"判过了"其实**一条都没问**。
-    当前唯一的 `size` 来源是模块常量 `MAX_JUDGE_TERMS`（硬编码、没有配置入口），
-    所以这是**预防性**的兜底 —— 但代价极低，而漏掉的代价是整步崩。
+    ⚠️ 它在**生产里不可达**：唯一的 `size` 来源是模块常量 `MAX_JUDGE_TERMS`（硬编码 400、
+    没有配置入口），所以正常路径上永远 > 0。留着它的理由是**删掉的代价不是零**：
+    `size=0` 时 `range(0, n, 0)` 抛 `ValueError`，而这个函数**不在** `judge` 那个 `try` 里
+    （try 罩的是模型调用）—— 它会一路掀掉整步知识地图（Task 5 接上之后，整次分析的知识地图
+    退化成 `knowledge_error`，几十个节点的复用机会一起丢）；负数更坏：一个 chunk 都不产出，
+    看起来"判过了"其实**一条都没问**。
+    一行 `max()` 换掉一整类"整步崩"，这就是留它的理由 —— 但请把它读成**防御**，
+    不是"某条业务路径要 `size=0`"（`tests/test_kbreuse.py` 里那条用 `mock.patch` 把常量压到 0
+    的测试，是**人工注入**才走到这条兜底的，不是业务场景）。
     """
     size = max(1, int(size))
     for i in range(0, len(seq), size):

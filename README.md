@@ -62,6 +62,8 @@
 | `outcome.py` | 结果与复盘：记录结果状态与「你写的原因」、AI 归因（终态门槛 / 证据过滤 / 可控性三态）、渲染复盘报告（`oc_<岗位id>.html`） |
 | `migrate_to_profiles.py` | 一次性迁移：把旧的扁平数据**复制**进 `data/profiles/default/`（非破坏性） |
 | `报告体检.py` | 报告维护：体检 / 清理非本领域来源 / 用新模板重渲染（都先备份，零 API 成本） |
+| `打包分享.py` | 打包分享：把项目打成发给朋友的干净 zip（剔除 API Key 与个人数据，打完反向扫描确认没泄漏、依赖不缺） |
+| `岗位去重.py` | 岗位维护：体检疑似「同一份 JD 被分析了两次」的岗位 + 确认后合并（不带参数严格只读；`--合并` 先备份，只标 `merged_into`，不删任何东西） |
 | `web/` | 前端界面 `index.html` + 报告模板 `report_template.html` + 面试复盘模板 `interview_template.html` + 结果复盘模板 `outcome_template.html` + 示例数据 `demo_data.json` |
 | `assets/` | 应用图标（桌面快捷方式使用） |
 | `templates/` | 空模板，可直接填 |

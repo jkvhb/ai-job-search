@@ -326,10 +326,38 @@ class ExamplePlaceholderTest(unittest.TestCase):
             self.assertNotIn(kw, text, "%s 里还留着真实 PII（关键词长度 %d）" % (where, len(kw)))
 
     def test_readme_resume_example_is_placeholder(self):
-        for n in (271, 272):
-            line = _line_of(os.path.join(REPO, "README.md"), n)
-            self.assertIn("示例", line, "README.md:%d 必须写明这是占位示例：%r" % (n, line))
-            self._assert_no_real_pii(line, "README.md:%d" % n)
+        """README 里那处简历版本示例必须是**明显占位**、且一个真名都不含（P0-15）。
+
+        ⚠️ **按内容定位，不再硬编码行号**：2026-10-16 在脚本表里补两行 ⇒ 示例块从 271/272
+        位移到 273/274 ⇒ 硬编码行号的那条断言直接转红（那次改动本身是对的，脆的是断言）。
+        现在的判据：**围栏（``` 代码块）内凡是带 `rv_` 版本号的那一块** ——
+          * 块里**每一行**都不许出现 profile 真名（原来只扫两行，现在扫整块：更严）；
+          * 出现 `rv_` 的那几行必须写明「示例」（占位一眼可辨）；
+          * 一块都找不到 ⇒ 直接红（示例块被删了也逃不掉）。
+        行号再位移、块增删几行都不再误报；往块里塞真名照样红。
+        """
+        path = os.path.join(REPO, "README.md")
+        with open(path, encoding="utf-8") as f:
+            lines = f.read().splitlines()
+        blocks, inside, cur = [], False, []      # cur = 当前围栏块的行号列表
+        for i, ln in enumerate(lines, 1):
+            if ln.strip().startswith("```"):
+                if inside:
+                    blocks.append(cur)
+                inside, cur = not inside, []
+                continue
+            if inside:
+                cur.append(i)
+        if inside:                                # 围栏没闭合（README 坏了）也当一块看
+            blocks.append(cur)
+        marked = [b for b in blocks if any("rv_" in _line_of(path, n) for n in b)]
+        self.assertTrue(marked, "README 里找不到任何带 `rv_` 版本号的示例块（示例块被删了？）")
+        for block in marked:
+            for n in block:
+                line = _line_of(path, n)
+                self._assert_no_real_pii(line, "README.md:%d" % n)
+                if "rv_" in line:
+                    self.assertIn("示例", line, "README.md:%d 必须写明这是占位示例：%r" % (n, line))
 
 
 if __name__ == "__main__":

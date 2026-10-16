@@ -281,7 +281,7 @@ class IndexTest(IsolatedCase):
         """不变量：`by_key` 里**没有任何 len < 2 的键**（构造库）。
 
         构造库里故意放最坏的形状：单字符 term 的卡（`{"term": "A"}` 的 id 就是 `a`）、
-        单字符别名。精确名可以短（它在 `by_name` 里，是**用户自己的卡**，短名无害 ——
+        单字符别名。精确名可以短（它在第一层 `cards` 里，是**用户自己的卡**，短名无害 ——
         查 `a` 只会查到那张卡自己），但**派生键**一旦短了就是泛化键。
         """
         idx = kbreuse.Index([
@@ -291,7 +291,7 @@ class IndexTest(IsolatedCase):
             {"id": "响应延迟首字延迟", "term": "响应延迟（首字延迟）", "definition": "d"},
         ])
         self.assertEqual([k for k in idx.by_key if len(k) < 2], [])
-        self.assertIn("a", idx.by_name, "精确名（哪怕 1 个字符）仍在第一层")
+        self.assertIn("a", idx.cards, "精确名（哪怕 1 个字符）仍在第一层")
 
     def test_lookup_misses_cleanly(self):
         idx = kbreuse.Index([{"id": "语音识别", "term": "语音识别", "definition": "d"}])

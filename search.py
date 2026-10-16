@@ -8,30 +8,31 @@ import urllib.request
 DEFAULT_MAX = 5
 
 
-def _http_tavily(base_url, payload, api_key, timeout):
-    url = base_url.rstrip("/") + "/search"
-    req = urllib.request.Request(
-        url, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers={"Content-Type": "application/json", "Authorization": "Bearer " + api_key},
-        method="POST")
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+def _http_json_sender(path):
+    """造一个搜索源实现：向 `base_url + path` 发 JSON POST，返回解析后的 JSON。
+
+    `tavily` / `bocha` 的调用协议**逐字相同**（同一份 payload、同一个 `Bearer` 头、
+    同样 `json.loads` 应答），只有路径后缀不同 —— 所以只有这一份实现（原来 18 行同构
+    抄了两遍，是"改一处漏一处"的温床）。后缀由 `REGISTRY` 各自钉住，
+    `tests/test_search.py` 里那条 `REGISTRY` 测试盯着它（既有测试全注入假 `http`，
+    真实现一行都没被走过，后缀写错也发现不了）。
+    """
+    def send(base_url, payload, api_key, timeout):
+        url = base_url.rstrip("/") + path
+        req = urllib.request.Request(
+            url, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Authorization": "Bearer " + api_key},
+            method="POST")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    return send
 
 
-def _http_bocha(base_url, payload, api_key, timeout):
-    url = base_url.rstrip("/") + "/v1/web-search"
-    req = urllib.request.Request(
-        url, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers={"Content-Type": "application/json", "Authorization": "Bearer " + api_key},
-        method="POST")
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+REGISTRY = {"tavily": _http_json_sender("/search"),
+            "bocha": _http_json_sender("/v1/web-search")}
 
 
-REGISTRY = {"tavily": _http_tavily, "bocha": _http_bocha}
-
-
-def _normalize(raw, provider_name):
+def _normalize(raw):
     """把不同厂商的返回统一成 [{title, url, snippet, date}]"""
     out = []
     if not isinstance(raw, dict):
@@ -65,7 +66,7 @@ def search(query, providers=None, max_results=DEFAULT_MAX, timeout=20, http=None
         payload = {"query": query, "max_results": max_results, "count": max_results}
         try:
             raw = fn(p.get("base_url") or "", payload, p.get("api_key") or "", timeout)
-            items = _normalize(raw, name)
+            items = _normalize(raw)
             if items:
                 return items[:max_results]
             last_err = "%s 返回空结果" % name
