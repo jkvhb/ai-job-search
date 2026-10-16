@@ -431,6 +431,24 @@ def config_safe_to_write(path=None):
     return False, err
 
 
+# ---------- 元素级形状（**读路径**专用）----------
+def first_non_object_index(items):
+    """列表里**第一个不是对象**的元素是第几条（1 基，给人看的）？全是对象回 0。
+
+    ⚠️ 这是**读路径**的另一把尺子，刻意与 `read_*_strict` 分开：
+    `read_*_strict` 只查**容器**形状，而它们同时是 `*_safe_to_write` 的判据 ——
+    在那里收紧"元素"，写路径的既有语义就变了（"能写"会翻成"拒绝写"）。
+    而**读**的时候元素不是对象会被上层静默丢掉（`app._ledger_rows()` 的 `continue` /
+    `kb.list_nodes()` 的过滤）：`[1, 2, 3]` 于是变成「共 0 个岗位」、
+    `[{好记录}, 1]` 只显示 1 条 —— 坏的那部分**没人看得见**（又一个假话）。
+    用法见 `read_jobs_strict_deep` / `read_jds_strict_deep` / `read_knowledge_strict_deep`。
+    """
+    for i, x in enumerate(items or [], 1):
+        if not isinstance(x, dict):
+            return i
+    return 0
+
+
 # ---------- jobs（岗位台账）----------
 def jobs_path(key=None):
     return p_path("jobs.json", key=key)
@@ -465,6 +483,30 @@ def read_jobs_strict(path=None):
         return [], "台账 `%s` 读不出来：%s" % (os.path.basename(p), e)
     if not isinstance(data, list):
         return [], "台账 `%s` 的结构不对（应当是一个列表）" % (os.path.basename(p),)
+    return data, ""
+
+
+def read_jobs_strict_deep(path=None):
+    """`read_jobs_strict` + **元素级**校验：列表里每一项都必须是对象。
+
+    **为什么另起一个函数**（而不是把校验塞进 `read_jobs_strict`）：那个同时是
+    `jobs_safe_to_write` 的判据（写路径）—— 在它里面收紧会让"能写"翻成"拒绝写"，
+    写路径的既有语义**一个字都不许动**。而元素坏这件事**读侧必须报**：
+    `app._ledger_rows()` 对不是对象的记录是 `continue` ⇒ `[1, 2, 3]` 回「共 0 个岗位」、
+    `[{好记录}, 1]` 只显示 1 条（坏的那条**静默消失**，比整份读不出来更难发现）。
+
+    出口与"容器坏"**同一把尺子**：原因非空、点明**哪个文件**与**第几条**不是对象。
+    对照组照旧：不存在 / 真 0 字节 / 合法的空列表 `[]` ⇒ `([], "")`。
+    """
+    data, err = read_jobs_strict(path)
+    if err:
+        return data, err
+    bad = first_non_object_index(data)
+    if bad:
+        p = path or jobs_path()
+        return [], ("台账 `%s` 读不出来：第 %d 条不是对象"
+                    "（列表里每一项都应当是含 `id` 等字段的对象）"
+                    % (os.path.basename(p), bad))
     return data, ""
 
 
@@ -587,6 +629,24 @@ def read_jds_strict(path=None):
     return data, ""
 
 
+def read_jds_strict_deep(path=None):
+    """`read_jds_strict` + **元素级**校验：`jds` 列表里每一项都必须是对象。
+
+    与 `read_jobs_strict_deep` 逐字同一个理由（写路径用的是浅的那一个，语义不许动；
+    读侧丢元素就是"JD 从台账里静默消失"）。出口同一把尺子：点明文件与第几条不是对象。
+    """
+    data, err = read_jds_strict(path)
+    if err:
+        return data, err
+    bad = first_non_object_index(data.get("jds"))
+    if bad:
+        p = path or p_path("jds.json")
+        return _empty_jd_library(), ("JD 库 `%s` 读不出来：第 %d 条不是对象"
+                                     "（`jds` 列表里每一项都应当是对象）"
+                                     % (os.path.basename(p), bad))
+    return data, ""
+
+
 def jds_safe_to_write(path=None):
     """`jds.json` 当前是否可以**安全写盘**？返回 `(可写, 原因)`。
 
@@ -645,6 +705,25 @@ def read_knowledge_strict(path=None):
         return {"nodes": []}, "知识库 `%s` 读不出来：%s" % (os.path.basename(p), e)
     if not isinstance(data, dict) or not isinstance(data.get("nodes"), list):
         return {"nodes": []}, "知识库 `%s` 的结构不对（应当是含 `nodes` 列表的对象）" % (os.path.basename(p),)
+    return data, ""
+
+
+def read_knowledge_strict_deep(path=None):
+    """`read_knowledge_strict` + **元素级**校验：`nodes` 列表里每一项都必须是对象。
+
+    理由与 `read_jobs_strict_deep` 逐字相同（写路径用的仍是浅的那一个）。
+    读侧丢元素的后果在知识库这里是最"响"的：`{"nodes": [1, 2]}` 会被
+    `kb.list_nodes()` 过滤成空列表 ⇒ 「共 0 个知识点」/「今天没有要复习的」。
+    """
+    data, err = read_knowledge_strict(path)
+    if err:
+        return data, err
+    bad = first_non_object_index(data.get("nodes"))
+    if bad:
+        p = path or knowledge_path()
+        return {"nodes": []}, ("知识库 `%s` 读不出来：第 %d 条不是对象"
+                               "（`nodes` 列表里每一项都应当是对象）"
+                               % (os.path.basename(p), bad))
     return data, ""
 
 

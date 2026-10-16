@@ -6710,6 +6710,12 @@ class JsonBodySizeLimitTest(IsolatedCase):
                          "把正常用户当坏人：旧文案让他去检查自己发错了什么")
         self.assertIn("本次", msg)                 # 说清这次是多大
         self.assertIn("上限", msg)
+        # ⚠️ 两个数必须是**真实字节数**：旧断言只断 "8.0 MB"（一位小数），
+        # 超限 1 字节时本次 8388609 与上限 8388608 都印成 "8.0 MB" ⇒ 抹平了也照样绿（假绿）。
+        self.assertIn(str(declared), msg,
+                      "本次的**真实字节数**没写出来（一位小数把两个数抹平了）")
+        self.assertIn(str(app.MAX_JSON_BODY_BYTES), msg, "上限的真实字节数没写出来")
+        self.assertIn("字节", msg)
         self.assertIn("8.0 MB", msg)               # 上限如实写出来（8 MiB）
         self.assertIn("压缩", msg)                 # 能指导下一步该干什么
 
@@ -6881,6 +6887,179 @@ class KnowledgeReviewUnreadableRouteTest(IsolatedCase):
         self.assertEqual(sorted(body.keys()), ["ok", "queue", "stats"])
         self.assertEqual([n["term"] for n in body["queue"]], ["RLHF"])
         self.assertEqual(sorted(body["stats"].keys()), ["due", "mastered", "reviewed_today"])
+
+
+# ============================================================ 追加五：元素级形状（复查整改）
+# 复查实测（真 HTTP + 隔离根）：`jobs.json = [1,2,3]` /`[null]` / `[{好记录}, 1]`、
+# `knowledge.json = {"nodes":[1,2]}` **容器形状都没问题** ⇒ 读得出来 ⇒ 上层（`_ledger_rows` /
+# `kb.list_nodes`）把不是对象的元素**静默丢掉**：
+#   * `[{好记录}, 1]`   ⇒ 只显示 1 条，坏的那条**无声消失**（最难发现的那种假话）
+#   * `[1,2,3]` / `[null]` ⇒ 回 200 + `{"jobs": []}` + 无 error + 无日志 ⇒「共 0 个岗位」
+#   * `{"nodes":[1,2]}` ⇒ `total:0` ⇒「共 0 个知识点」/「今天没有要复习的」
+# 判据与出口**逐字同源**（`app._unreadable` + **500** + `ok:false` + 人话 + 日志事件）；
+# 多出来的只有 store 那一层**元素级**校验（`read_*_strict_deep`），人话点明"**第几条**不是对象"。
+class ElementShapeRouteTest(IsolatedCase):
+    """元素不是对象 ⇒ 与"容器坏"同一个出口（500 + `ok:false` + 人话 + 日志）。"""
+
+    def _write_json(self, path, obj):
+        folder = os.path.dirname(path)
+        if folder:
+            os.makedirs(folder, exist_ok=True)
+        store.write_text(path, json.dumps(obj, ensure_ascii=False))
+
+    def test_a_bare_list_of_non_objects_is_not_an_empty_ledger(self):
+        """`[1, 2, 3]`：整份台账没有一个对象 ⇒ 绝不许说「共 0 个岗位」。"""
+        self._write_json(store.jobs_path(), [1, 2, 3])
+        for route in ("/api/jobs", "/api/jds"):
+            with self.subTest(route=route):
+                h = _get(route)
+                body = h.json_body()
+                self.assertEqual(h.code, 500,
+                                 "元素坏却回了 %r：界面会说「共 0 个岗位」" % (h.code,))
+                self.assertFalse(body.get("ok"))
+                self.assertIn("jobs.json", str(body.get("error")))
+                self.assertIn("第 1 条不是对象", str(body.get("error")), "没说是第几条坏")
+        self.assertIn("jobs.read_failed", _log_events(), "读不出来必须留一条日志（取证）")
+
+    def test_a_null_job_record_is_not_an_empty_ledger(self):
+        """`[null]`：JSON 合法、容器也对，但那条记录不是一个对象。"""
+        self._write_json(store.jobs_path(), [None])
+        h = _get("/api/jobs")
+        self.assertEqual(h.code, 500, "元素坏却回了 %r" % (h.code,))
+        self.assertIn("第 1 条不是对象", str(h.json_body().get("error")))
+
+    def test_a_half_broken_ledger_is_reported_not_partially_shown(self):
+        """⚠️ 半坏：`[{好记录}, 1]` ⇒ **报错**，不许只显示好的那条（那是"静默消失"）。"""
+        self._write_json(store.jobs_path(), [{"id": "本科_示例_0001", "title": "好记录"}, 1])
+        h = _get("/api/jobs")
+        body = h.json_body()
+        self.assertEqual(h.code, 500,
+                         "半坏却回了 %r（旧行为：200 + 只显示好的那条）" % (h.code,))
+        self.assertFalse(body.get("ok"))
+        self.assertIn("第 2 条不是对象", str(body.get("error")))
+
+    def test_a_non_object_jd_record_is_not_an_empty_ledger(self):
+        self._write_json(store.p_path("jds.json"),
+                         {"version": 1, "seq": 2, "jds": [{"id": "a"}, 1]})
+        h = _get("/api/jds")
+        body = h.json_body()
+        self.assertEqual(h.code, 500, "元素坏却回了 %r" % (h.code,))
+        self.assertIn("jds.json", str(body.get("error")))
+        self.assertIn("第 2 条不是对象", str(body.get("error")))
+
+    def test_a_non_object_knowledge_node_is_not_an_empty_kb(self):
+        self._write_json(store.knowledge_path(), {"nodes": [1, 2]})
+        h = _get("/api/knowledge")
+        body = h.json_body()
+        self.assertEqual(h.code, 500,
+                         "元素坏却回了 %r：界面会说「共 0 个知识点」" % (h.code,))
+        self.assertFalse(body.get("ok"))
+        self.assertIn("knowledge.json", str(body.get("error")))
+        self.assertIn("第 1 条不是对象", str(body.get("error")))
+        self.assertIn("kb.read_failed", _log_events(), "读不出来必须留一条日志（取证）")
+
+    def test_a_non_object_knowledge_node_is_not_an_empty_review_queue(self):
+        self._write_json(store.knowledge_path(), {"nodes": [1, 2]})
+        h = _get("/api/knowledge/review")
+        body = h.json_body()
+        self.assertEqual(h.code, 500,
+                         "元素坏却回了 %r：界面会说「今天没有要复习的」" % (h.code,))
+        self.assertIn("第 1 条不是对象", str(body.get("error")))
+        self.assertIn("kb.review_read_failed", _log_events())
+
+    def test_control_group_records_that_are_all_objects_still_show(self):
+        """对照组：每一项都是对象（哪怕只有一条）⇒ 四条路由照旧 200。"""
+        self._write_json(store.jobs_path(), [{"id": "本科_示例_0001", "title": "好记录"}])
+        self._write_json(store.p_path("jds.json"),
+                         {"version": 1, "seq": 1, "jds": [{"id": "本科_示例_0001"}]})
+        self._write_json(store.knowledge_path(), {"nodes": [{"id": "rlhf", "term": "RLHF"}]})
+        for route in ("/api/jobs", "/api/jds", "/api/knowledge", "/api/knowledge/review"):
+            with self.subTest(route=route):
+                self.assertEqual(_get(route).code, 200, "全是对象却被报成读不出来")
+        self.assertNotIn("jobs.read_failed", _log_events())
+        self.assertNotIn("kb.read_failed", _log_events())
+
+    def test_control_group_legally_empty_lists_are_still_empty(self):
+        """对照组：合法的空列表 `[]` / `{"nodes": []}` ⇒ 照旧空（不是"读不出来"）。"""
+        self._write_json(store.jobs_path(), [])
+        self._write_json(store.p_path("jds.json"), {"version": 1, "seq": 0, "jds": []})
+        self._write_json(store.knowledge_path(), {"nodes": []})
+        for route in ("/api/jobs", "/api/jds", "/api/knowledge", "/api/knowledge/review"):
+            with self.subTest(route=route):
+                self.assertEqual(_get(route).code, 200, "空列表被误报成读不出来")
+        self.assertNotIn("jobs.read_failed", _log_events())
+        self.assertNotIn("kb.read_failed", _log_events())
+
+
+class ConfigSaveRefusedOnUnreadableFileTest(IsolatedCase):
+    """问题 4：同一份坏 `config.json`，`POST /api/config` 必须说**同一件事**。
+
+    旧行为（复查实测）：GET 走定制 500「配置 `config.json` 读不出来：…」+ `config.read_failed`；
+    POST 却让 `save_config` 的 `RuntimeError` 掉进 `do_POST` 的兜底 ⇒ 回
+    「服务器内部错误：配置 `config.json` 读不出来：<内部异常原文>。**拒绝保存设置**：…」——
+    ① 把**用户文件的状态**说成"服务器内部错误"；② 把内部异常原文当用户话术。
+    与 `/api/jd_text` 那条论证逐字同源：读不出来的是**他的文件**，不是程序坏了。
+    """
+
+    def _post(self, body):
+        raw = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        return _sandbox_handler("POST", "/api/config", raw,
+                                {"Content-Length": str(len(raw)),
+                                 "Content-Type": "application/json"})
+
+    def test_saving_on_an_unreadable_config_is_not_a_server_internal_error(self):
+        path = store.config_path()
+        raw = _write_unreadable(path, "我的配置：中文内容")
+        self.assertGreater(os.path.getsize(path), 0, "反证：盘上确实有内容")
+        self.assertRaises(UnicodeDecodeError, raw.decode, "utf-8")
+        before = _disk_bytes(path)
+
+        h = self._post({"text_model": {"model": "新模型"}})
+        msg = str(h._body.get("error") or "")
+
+        self.assertEqual(h._status, 500, "读不出来却回了 %r：%r" % (h._status, h._body))
+        self.assertFalse(h._body.get("ok"))
+        self.assertNotIn("服务器内部错误", msg, "把用户配置文件的状态说成了服务器内部错误")
+        self.assertNotIn("codec can't decode", msg, "内部异常原文当成了用户话术")
+        self.assertIn("config.json", msg, "没点名是哪个文件")
+        self.assertIn("没有保存", msg, "没说清这次没有保存")
+        self.assertEqual(_disk_bytes(path), before,
+                         "被拒绝的保存**还是动了盘**：磁盘必须一个字节都不动")
+        self.assertIn("config.save_rejected", _log_events(), "拒绝必须留一条日志（取证）")
+
+    def test_the_log_keeps_the_internal_detail(self):
+        """用户话术与取证线索**分开**：日志里必须留着内部细节（`error` 字段）。"""
+        _write_unreadable(store.config_path(), "我的配置：中文内容")
+        self._post({"text_model": {"model": "新模型"}})
+        try:
+            with open(log.LOG_FILE, "r", encoding="utf-8") as f:
+                lines = [json.loads(x) for x in f if x.strip()]
+        except Exception:
+            lines = []
+        ev = [x for x in lines if x.get("event") == "config.save_rejected"]
+        self.assertTrue(ev, "拒绝没有留日志")
+        blob = json.dumps(ev, ensure_ascii=False)
+        self.assertIn("读不出来", blob, "日志里没有留下内部细节：%r" % (ev,))
+        self.assertIn("codec", blob,
+                      "日志里没有留下**内部异常原文**（用户话术与取证线索必须分开）：%r" % (ev,))
+
+    def test_a_zero_byte_config_still_saves(self):
+        """对照组：0 字节是合法的"第一次"（与 `config_safe_to_write` 同一把尺子）⇒ 照旧保存。"""
+        open(store.config_path(), "wb").close()
+        h = self._post({"text_model": {"model": "只有模型名"}})
+        self.assertEqual(h._status, 200, h._body)
+        self.assertEqual(h._body, {"ok": True})
+        self.assertEqual(store.load_config()["text_model"]["model"], "只有模型名")
+        self.assertNotIn("config.save_rejected", _log_events())
+
+    def test_a_readable_config_still_saves(self):
+        """对照组：读得出来的配置照旧保存（这次改动不许碰成功路径）。"""
+        store.save_config(json.loads(json.dumps(store.DEFAULT_CONFIG)))
+        h = self._post({"text_model": {"model": "正常路径"}})
+        self.assertEqual(h._status, 200, h._body)
+        self.assertEqual(h._body, {"ok": True})
+        self.assertEqual(store.load_config()["text_model"]["model"], "正常路径")
+        self.assertNotIn("config.save_rejected", _log_events())
 
 
 class JobOutcomeUnreadableRouteTest(_OutcomeRouteCase):

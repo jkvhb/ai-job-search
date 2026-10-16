@@ -49,7 +49,8 @@
      **绝不 import `app.py`**（那是服务，脚本不能拖起 Web 依赖）。
   2. 写 `knowledge.json` 必须持 `kb._KB_LOCK`（本项目真实丢过 97 张卡）；
      锁顺序恒为 `jdid._JD_LOCK` → `kb._KB_LOCK`（反向会死锁）。
-  3. `knowledge.json` 「有内容但解析失败」→ **立刻中止**，绝不用空库顶掉（同 `jobdup._repoint_kb`）。
+  3. `knowledge.json` 「有内容但解析失败」→ **立刻中止**，绝不用空库顶掉
+     （与 `kb.merge_jd_refs` 同一口径：读-改-写知识库的坏库拒绝只有 kb 那一份实现）。
   4. 一次性原子写：先在内存里把三份新内容全算出来，再逐文件落盘；
      落盘失败用备份恢复（绝不半改）。
 """
@@ -593,7 +594,7 @@ def _build_knowledge(new_ids, jd_by_id):
     - 同一 JD 的重复引用**并成一条**（A/B/C 三份分析挂在同一张卡上时，`multi_jd` 不能再被数成 3）
     - 改写时**原位保留** `job_title` / `company` / `date`（用户看到的还是原来的岗位信息），
       缺了才从 JD 记录补
-    - 「有内容但解析失败」→ 抛错中止，绝不用空库顶掉（同 `jobdup._repoint_kb`）
+    - 「有内容但解析失败」→ 抛错中止，绝不用空库顶掉（与 `kb.merge_jd_refs` 同一口径）
 
     返回的字典里额外带**迁移前 / 计划后两项度量**（`before_kb` / `after_kb` /
     `before_multi` / `after_multi`）：它们必须在**同一份快照**上量。以前是
@@ -848,10 +849,12 @@ def _report_count():
 # ---------------------------------------------------------------- 备份 / 恢复
 # 批 5 §7.2：这一段原先在本脚本与 `简历迁移.py` 里**各抄一遍**（`_dir_stats` / `_human_size`
 # / `_backup_note` / `_profile_files` / `_ignore_previous_backups` / `_backup_profile` /
-# `_restore_profile`）。两边唯一的差别是 `_restore_profile` 收尾那圈少一句
-# `if dirpath == root: continue` —— 而那句正是体检 §2 P0-14 的真缺陷（回滚时把 profile 根目录
-# `rmdir` 掉，用户下一步就是重试，等于「失败路径上再丢一次」）。抄两遍的真正代价是
-# **下一次改一处、漏一处**，所以现在**唯一一份实现**在 `迁移脚手架.py`，这里只剩绑定：
+# `_restore_profile`）。【订正】旧说法（原先写着"两边唯一的差别是本脚本少一句
+# `if dirpath == root: continue`"——**这是假的**）：重构前两份脚本**都已有**那道根保护与
+# `.bak-` 闸门，两份 `_restore_profile` **代码逐行一致**（AST 归一化后只差 docstring/注释）；
+# 那颗雷（体检 §2 P0-14：回滚把 profile 根目录 `rmdir` 掉）是**更早的一次修复**里拆掉的。
+# 这次重构统一的是**实现**，抄两遍的真正代价是**下一次改一处、漏一处**，
+# 所以现在**唯一一份实现**在 `迁移脚手架.py`，这里只剩绑定：
 # `functools.partial` 把本脚本的备份前缀绑成第一个位置参数，于是调用形状一个字没变
 # （`_backup_profile()` / `_restore_profile(backup, had_files)`，以及 `copytree(ignore=...)`
 # 按 `(dirpath, names)` 两参调用）—— `execute_migration`、`mock.patch.object(CLI, ...)` 与

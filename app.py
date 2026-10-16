@@ -712,6 +712,22 @@ def _unreadable(err, path):
     return bool(err) and store.file_has_bytes_to_lose(path)
 
 
+# `POST /api/config` 在**配置读不出来**时给用户的那句话（问题 4：GET 与 POST 不许两套话术）。
+# 三件事必须说清：① 这是**这个文件现在的状态**，不是"服务器的错"（读不出来的是用户自己的
+# `config.json` —— 与 `/api/jd_text` 那条论证同源：**500 会是句假话**）；② 这次**没有保存
+# 任何设置**、盘上一个字节都没动；③ 为什么不"照样保存"：`load_config()` 读不出来时回的是
+# 默认配置（`api_key` 为空、`search_providers` 为空），它与「你从没配过」长得一模一样，
+# 写下去就是真的 API Key 与搜索来源永久消失（盘上没有任何副本）。
+# ⚠️ 内部异常原文（`Expecting value…` / `codec can't decode…`）**只进日志**，绝不进这句。
+_CONFIG_UNREADABLE_SAVE_SAY = (
+    "配置 `config.json` 读不出来（这是这个文件当前的状态，不是服务器的错）："
+    "**这次没有保存任何设置**，盘上那份文件一个字节都没动。"
+    "为什么不能照样保存：读不出来时 `load_config()` 回的是默认配置"
+    "（`api_key` 为空、`search_providers` 为空）—— 它与「你从没配过」一模一样，"
+    "写下去就是真的 API Key 与搜索来源永久消失，而盘上没有任何副本。"
+    "请先把 `config.json` 修好（或从别处恢复、把它移开）再保存。")
+
+
 def _ledger_store_error():
     """台账那一行**读不出来**的原因（都读得出来回空串）。
 
@@ -719,11 +735,16 @@ def _ledger_store_error():
     这里不另写一套。为什么两条数据文件都要问：`_ledger_rows()` 的每一行是 `jobs.json`
     （分析记录）与 `jds.json`（JD 级真相，经 `jdid.find_jd`）**拼**出来的 ——
     任何一半读不出来，界面拿到的都是一份**残缺却看起来完整**的台账。
+
+    ⚠️ 用的是 `read_*_strict_deep`（= 既有 strict 读 + **元素级**校验）：`[{好记录}, 1]`
+    这种**半坏**的台账若只报"读得出来"，`_ledger_rows()` 会把坏的那条静默 `continue` 掉
+    （用户少看见一条，却不知道少了）；`[1, 2, 3]` 更是整份回「共 0 个岗位」。
+    浅的那两个函数**没有**被收紧（它们是 `*_safe_to_write` 等写路径的判据，语义不许动）。
     """
-    _jobs, jobs_err = store.read_jobs_strict()
+    _jobs, jobs_err = store.read_jobs_strict_deep()
     if _unreadable(jobs_err, store.jobs_path()):
         return jobs_err
-    _jds, jds_err = store.read_jds_strict()
+    _jds, jds_err = store.read_jds_strict_deep()
     if _unreadable(jds_err, store.p_path("jds.json")):
         return jds_err
     return ""
@@ -2021,10 +2042,14 @@ class Handler(BaseHTTPRequestHandler):
                           declared_bytes=n, limit=MAX_JSON_BODY_BYTES,
                           path=urlparse(self.path).path)
             self._send(413, {"ok": False, "error":
-                             "请求体太大（本次 %s，上限 %s）：没有执行任何操作。"
+                             "请求体太大（本次 %d 字节（%s），上限 %d 字节（%s））：没有执行任何操作。"
                              "若是上传的 JD 截图，请先压缩或裁剪小一点再传"
                              "（图片以 base64 进请求体会比原图大约 1/3）。"
-                             % (_size_text(n), _size_text(MAX_JSON_BODY_BYTES))})
+                             # ⚠️ **真实字节数必须是整数**：只写 `_size_text()` 时，超限 1 字节
+                             # （8388609 vs 8388608）两个数都被抹成 "8.0 MB" —— 同一句话里
+                             # 「本次」与「上限」看起来一样大，用户根本不知道超了多少。
+                             % (n, _size_text(n), MAX_JSON_BODY_BYTES,
+                                _size_text(MAX_JSON_BODY_BYTES))})
             return _NO_BODY_SENTINEL
         raw = self.rfile.read(n)
         if not raw:
@@ -2312,8 +2337,10 @@ class Handler(BaseHTTPRequestHandler):
             # （话术见 `_GET_ERROR_SAYS`），前端才能显示「知识库读取失败」而不是静默白屏。
             # ⚠️ 但"**读出来是空库**"是另一件事（P1-14 的第 2 处）：`load_knowledge()` 在
             # 读/解析失败时也回 `{"nodes": []}` ⇒ 界面说「共 0 个知识点」。判据用 store 的
-            # strict 读（**500**：服务端读不出自己的知识库）。
-            _kb, kb_err = store.read_knowledge_strict()
+            # strict 读（**500**：服务端读不出自己的知识库）；⚠️ 用 `*_strict_deep` ——
+            # `{"nodes": [1, 2]}`（元素不是对象）同样必须报，不许被 `kb.list_nodes()` 过滤成空。
+            _kb, kb_err = store.read_knowledge_strict_deep()
+
             if _unreadable(kb_err, store.knowledge_path()):
                 log.log_event("kb.read_failed", level="warn", error=kb_err)
                 return self._send(500, {"ok": False, "error": kb_err})
@@ -2342,7 +2369,10 @@ class Handler(BaseHTTPRequestHandler):
             # 判据与 `/api/knowledge` **逐字同源**（store 的 strict 读 + `_unreadable` 那把尺子）：
             # **500**（服务端读不出自己的知识库）；**对照组**照旧 —— 真的空库 / 新档案（文件不存在、
             # 或真的是 0 字节）走 `_unreadable` 的假分支 ⇒ 200 + 空队列，别把它做成一律报错。
-            _kb, kb_err = store.read_knowledge_strict()
+            # ⚠️ 与 `/api/knowledge` 一样用 `*_strict_deep`：`{"nodes": [1, 2]}` 必须报，
+            # 否则 `kb.review_queue()` 过滤掉坏元素 ⇒ 队列空 + 全 0 ⇒「今天没有要复习的」。
+            _kb, kb_err = store.read_knowledge_strict_deep()
+
             if _unreadable(kb_err, store.knowledge_path()):
                 log.log_event("kb.review_read_failed", level="warn", error=kb_err)
                 return self._send(500, {"ok": False, "error": kb_err})
@@ -2693,6 +2723,20 @@ class Handler(BaseHTTPRequestHandler):
             if type_err:
                 log.log_event("config.save_rejected", level="warn", error=type_err)
                 return self._send(400, {"ok": False, "error": type_err})
+            # ⚠️ **同一份坏 `config.json`，GET 与 POST 不许两套话术**（问题 4）：
+            # 旧写法直接 `load_config()` → `save_config()`，让它的 `RuntimeError` 掉进
+            # `do_POST` 的兜底 ⇒ 用户看到「服务器内部错误：配置 `config.json` 读不出来：
+            # <内部异常原文>。**拒绝保存设置**：…」——① 把**他自己文件**的状态说成
+            # "服务器内部错误"（与 `/api/jd_text` 那条论证同源：500 会是句假话）；
+            # ② 把内部异常原文当用户话术（细节该进日志，不该进界面）。
+            # 现在提前问**同一把尺子**（`_unreadable` = store 的 strict 读 + 盘上真有字节吗），
+            # 出口与 GET /api/config 同源：**500 + ok:false + 一句人话 + 一条日志**；
+            # 磁盘**一个字节都不动**（这一步只是读一次，不写盘）。
+            _cfg_now, cfg_err = store.read_config_strict()
+            if _unreadable(cfg_err, store.config_path()):
+                log.log_event("config.save_rejected", level="warn", error=cfg_err,
+                              reason="配置读不出来，拒绝保存（盘上没动）")
+                return self._send(500, {"ok": False, "error": _CONFIG_UNREADABLE_SAVE_SAY})
             cfg = store.load_config()
             changed = []
             for k in ("text_model", "vision_model"):
@@ -2704,7 +2748,15 @@ class Handler(BaseHTTPRequestHandler):
             if isinstance(body.get("search_providers"), list):
                 cfg["search_providers"] = body["search_providers"]
                 changed.append("search_providers")
-            store.save_config(cfg)
+            try:
+                store.save_config(cfg)
+            except RuntimeError as e:
+                # 兜底：上面那次判据与这次写盘之间文件又坏了（别的进程 / 杀毒软件锁住 / 手改）
+                # —— `save_config` 的前置检查（同一把尺子）会拒绝写盘。用户看到的仍是**那句
+                # 定制话术**（不带内部原文），内部原文只进日志。
+                log.log_event("config.save_rejected", level="warn", error=str(e),
+                              reason="save_config 的前置检查没通过（判据与写盘之间的竞态）")
+                return self._send(500, {"ok": False, "error": _CONFIG_UNREADABLE_SAVE_SAY})
             log.log_event("config.save", changed=changed, text_model=cfg["text_model"]["model"],
                           vision_model=cfg["vision_model"]["model"],
                           text_key_set=bool(cfg["text_model"]["api_key"]),

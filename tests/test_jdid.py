@@ -645,7 +645,7 @@ class RenameJdTest(IsolatedCase):
         self.assertEqual(frm[0]["job_title"], "新")   # 保留本来就在的那一条
 
 
-    # ---------- P0-8：知识库**读不出来**时拒绝整次改名（判据与 `jobdup._repoint_kb` 同一份） ----------
+    # ---------- P0-8：知识库**读不出来**时拒绝整次改名（判据与 `kb.repoint_jd_refs` 同一份） ----------
     def _break_knowledge_base_non_utf8(self):
         """把 `knowledge.json` 写成一个**真的非 UTF-8**（GBK，含中文）的坏文件，返回那串字节。
 
@@ -670,7 +670,7 @@ class RenameJdTest(IsolatedCase):
     def test_an_unreadable_knowledge_base_refuses_the_rename_and_changes_nothing(self):
         """P0-8：知识库**有内容但读不出来** → 拒绝整次改名，别处的引用一个字节都不许动。
 
-        老行为：`load_knowledge()` 把坏文件静默归成 `{"nodes": []}` → `_repoint_kb` 命中 0 →
+        老行为：`load_knowledge()` 把坏文件静默归成 `{"nodes": []}` → `kb.repoint_jd_refs` 命中 0 →
         `if kb_touched:` 为假 → **一字不写**，而 `rename_jd` 照样成功返回。
         于是"没有卡引用它"与"库读不出来"**不可区分**：jds.json / 台账 / 面试记录都改指了新 ID，
         知识库里那些卡的 `from_jds` 仍指向旧 ID —— 用户把库修好的那一刻，同一个岗位成了两种身份。

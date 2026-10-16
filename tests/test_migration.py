@@ -870,11 +870,14 @@ class ExistingJdIdClaimTest(CliTestMixin, IsolatedCase):
 class RestoreKeepsProfileRootTest(IsolatedCase):
     """P0-14：回滚**只许删掉自己新建的东西**，用户原来的形状（含空目录、含 profile 根）必须留着。
 
-    **历史形状**（批 5 §7.2 收成一份实现之前）：`简历迁移.py` 的那一段多两道 ——
-    `if dirpath == root: continue` 与「备份里就有的空目录不删」；`身份迁移.py` 少了它们
-    ⇒ 一次失败的 `--执行` 会把用户 profile 里原本就有的空目录（`jd/` 这种）抹掉 ——
-    而此刻脚本**正在返回错误码**，用户下一步就是重试，属于「失败路径上再丢一次」。
-    现在这四件套只剩**一份**实现（`迁移脚手架.py`），且两边跑**同一套差分测试**：
+    **这次重构统一的是实现**（批 5 §7.2）：【订正】一处旧说法 —— 原先这里写着"`简历迁移.py`
+    的那一段多两道（`if dirpath == root: continue` 与「备份里就有的空目录不删」）、
+    `身份迁移.py` 少了它们"，**那是假的**：重构前两份脚本**都有** `if dirpath == root: continue`
+    与 `.bak-` 闸门，两份 `_restore_profile` 代码逐行一致（AST 归一化后只差 docstring/注释）。
+    那颗雷（失败回滚时把 profile 里原本就有的空目录 / 根目录抹掉，而此刻脚本**正在返回错误码**，
+    用户下一步就是重试 = 「失败路径上再丢一次」）是**更早的一次修复**里拆掉的。
+    真正成立的理由是另一半：靠人眼对出"两份一样"保不住下一次改动，所以收成**一份实现**，
+    且两边跑**同一套差分测试**：
     `tests/test_resume_migration.py::SharedScaffoldDifferentialTest`（改一边、漏一边就红）。
     """
 

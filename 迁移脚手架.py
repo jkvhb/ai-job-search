@@ -3,10 +3,14 @@
 
 为什么有它（体检报告批 5 §7.2）：`简历迁移.py` 与 `身份迁移.py` 的这套骨架
 （`_dir_stats` / `_human_size` / `_backup_note` / `_profile_files` / `_ignore_previous_backups` /
-`_backup_profile` / `_restore_profile`）原先**一处一处抄了两遍**，两边唯一的差别是
-`_restore_profile` 收尾那圈多一句 `if dirpath == root: continue` —— 而那句正是体检 §2 P0-14 的
-真缺陷（失败回滚时把 profile 根目录 `rmdir` 掉，用户下一步就是重试，等于"失败路径上再丢一次"）。
-抄两遍的代价不是"代码丑"，是**下一次改一处、漏一处**：这次靠人眼对出来的差异，下次不会。
+`_backup_profile` / `_restore_profile`）原先**一处一处抄了两遍**。
+【订正】一句旧说法（原先这里写着"两边唯一的差别是 `_restore_profile` 收尾那圈多一句
+`if dirpath == root: continue`、`身份迁移.py` 少了它"——**这是假的**）：重构前两份脚本**都已有**
+`if dirpath == root: continue` 与 `.bak-` 闸门，两份 `_restore_profile` **代码逐行一致**
+（AST 归一化后只差 docstring/注释）。那颗雷（失败回滚时把 profile 根目录 `rmdir` 掉）是
+**更早的一次修复**里拆掉的，不是这次重构补上的差值。
+这次重构统一的是**实现**：一份骨架 + 两边跑同一套差分测试。抄两遍的代价不是"代码丑"，
+是**下一次改一处、漏一处** —— 靠人眼对出来的"两份一样"保不住下一次改动。
 所以：**一份实现 + 两边跑同一套差分测试**（`tests/test_resume_migration.py` 的
 `SharedScaffoldDifferentialTest`）。**改这里的任何一行，都同时改两个脚本的行为。**
 
@@ -152,6 +156,7 @@ def restore_profile(backup, had_files):
     ⚠️ **profile 根目录永远不删**（`if dirpath == root: continue`）：恢复成空目录树时，收尾那圈
     会把根目录 `rmdir` 掉，而此刻脚本**正在返回错误码**、用户下一步就是重试 ——
     那是「失败路径上再丢一次」（体检 §2 P0-14）。
+    （这道保护**两份脚本此前就都有**，这次重构只是把它收进唯一一份实现，不是"补上少的那句"。）
     ⚠️ 另外**只删自己新建的**空目录：用户 profile 里原本就有的空目录（`jd/` 这种）不是本次迁移
     造出来的东西，删掉就是丢用户原来的形状（`backup_dirs` 那条判据挡的就是它）。
     """

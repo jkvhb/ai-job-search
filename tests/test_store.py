@@ -1396,5 +1396,152 @@ class SaveStreamAtomicTest(IsolatedCase):
         self.assertEqual(os.path.dirname(dsts[0][0]), os.path.dirname(path))
 
 
+class ElementShapeStrictDeepTest(IsolatedCase):
+    """元素级形状：`read_*_strict_deep()` = 既有容器校验 **+ 每一项都必须是对象**。
+
+    **为什么另起一层**（而不是把校验塞进 `read_*_strict`）：那三个函数还被
+    `jobs_safe_to_write` / `jds_safe_to_write` / `knowledge_safe_to_write` 等**写路径**当判据用着
+    —— 在里面收紧会让"能写"翻成"拒绝写"，而写路径的既有语义**一个字都不许动**
+    （本类最后两条用例就是这条守卫的钉子）。读路径上则是另一件必须修的事实：
+    元素不是对象时上层会**静默丢掉**它 —— `[{好记录}, 1]` 只显示 1 条、`[1,2,3]` 显示 0 条，
+    坏的那部分**没人看得见**（又是一句"共 0 个岗位"级别的假话）。
+
+    人话与"容器坏"同一把尺子：`<文件> \`x.json\` 读不出来：第 N 条不是对象`。
+    """
+
+    def _write(self, path, blob):
+        folder = os.path.dirname(path)
+        if folder:
+            os.makedirs(folder, exist_ok=True)
+        data = blob if isinstance(blob, bytes) else blob.encode("utf-8")
+        with open(path, "wb") as f:
+            f.write(data)
+        return path
+
+    # ---------- jobs ----------
+    def test_a_non_object_job_record_is_reported_with_its_position(self):
+        self._write(store.jobs_path(), json.dumps([{"id": "a"}, {"id": "b"}, 3],
+                                                  ensure_ascii=False))
+        data, err = store.read_jobs_strict_deep()
+        self.assertEqual(data, [], "读不出来时给的是空列表占位")
+        self.assertIn("jobs.json", err)
+        self.assertIn("读不出来", err)
+        self.assertIn("第 3 条不是对象", err)
+
+    def test_a_half_broken_ledger_is_reported_not_partially_readable(self):
+        """半坏（`[{好记录}, 1]`）也要报 —— 只说"好的那部分读得出来"就是让坏的那条静默消失。"""
+        self._write(store.jobs_path(), '[{"id": "g"}, 1]')
+        data, err = store.read_jobs_strict_deep()
+        self.assertTrue(err, "半坏被当成读得出来（上层会静默丢掉坏的那条）")
+        self.assertEqual(data, [])
+        self.assertIn("第 2 条不是对象", err)
+
+    def test_every_non_object_shape_is_caught(self):
+        for blob, pos in (("[1, 2, 3]", 1), ("[null]", 1), ('[{"id": "a"}, "x"]', 2),
+                          ("[[], {}]", 1), ('[true]', 1)):
+            with self.subTest(blob=blob):
+                self._write(store.jobs_path(), blob)
+                _, err = store.read_jobs_strict_deep()
+                self.assertIn("第 %d 条不是对象" % pos, err)
+
+    def test_jobs_control_group_is_still_empty(self):
+        """对照组：不存在 / **合法的空列表** / 全是对象 ⇒ 照旧"没有"，不是"读不出来"。
+
+        ⚠️ 真 0 字节这一格**两边都不回空**（`json.load` 对空文件的报错是既有的浅读语义）——
+        所以这里钉的是"深读与浅读逐字一致"，"0 字节 = 合法的第一次"那条判据在
+        `file_has_bytes_to_lose` / 路由的 `_unreadable` 那一层（`test_app` 的对照组钉着它）。
+        """
+        self.assertEqual(store.read_jobs_strict_deep(), ([], ""))
+        self._write(store.jobs_path(), b"")
+        self.assertEqual(store.read_jobs_strict_deep(), store.read_jobs_strict(),
+                         "深读改变了 0 字节这一侧的判定（写路径判据用的是浅读，语义不许动）")
+        self._write(store.jobs_path(), "[]")
+        self.assertEqual(store.read_jobs_strict_deep(), ([], ""))
+        self._write(store.jobs_path(), '[{"id": "a"}]')
+        self.assertEqual(store.read_jobs_strict_deep(), ([{"id": "a"}], ""))
+
+    # ---------- jds ----------
+    def test_a_non_object_jd_record_is_reported(self):
+        self._write(store.p_path("jds.json"),
+                    json.dumps({"version": 1, "seq": 2, "jds": [{"id": "a"}, 1]},
+                               ensure_ascii=False))
+        data, err = store.read_jds_strict_deep()
+        self.assertEqual(data, {"version": 1, "seq": 0, "jds": []}, "读不出来时给的是空库占位")
+        self.assertIn("jds.json", err)
+        self.assertIn("第 2 条不是对象", err)
+
+    def test_jds_control_group_is_still_empty(self):
+        self.assertEqual(store.read_jds_strict_deep(), ({"version": 1, "seq": 0, "jds": []}, ""))
+        self._write(store.p_path("jds.json"), b"")
+        self.assertEqual(store.read_jds_strict_deep(), store.read_jds_strict(),
+                         "深读改变了 0 字节这一侧的判定")
+        self._write(store.p_path("jds.json"), '{"version": 1, "seq": 0, "jds": []}')
+        self.assertEqual(store.read_jds_strict_deep()[1], "")
+        self._write(store.p_path("jds.json"), '{"version": 1, "seq": 0, "jds": [{"id": "a"}]}')
+        self.assertEqual(store.read_jds_strict_deep()[1], "")
+
+    # ---------- knowledge ----------
+    def test_a_non_object_knowledge_node_is_reported(self):
+        self._write(store.knowledge_path(), '{"nodes": [1, 2]}')
+        data, err = store.read_knowledge_strict_deep()
+        self.assertEqual(data, {"nodes": []}, "读不出来时给的是空库占位")
+        self.assertIn("knowledge.json", err)
+        self.assertIn("第 1 条不是对象", err)
+
+    def test_knowledge_control_group_is_still_empty(self):
+        self.assertEqual(store.read_knowledge_strict_deep(), ({"nodes": []}, ""))
+        self._write(store.knowledge_path(), b"")
+        self.assertEqual(store.read_knowledge_strict_deep(), store.read_knowledge_strict(),
+                         "深读改变了 0 字节这一侧的判定")
+        self._write(store.knowledge_path(), '{"nodes": []}')
+        self.assertEqual(store.read_knowledge_strict_deep()[1], "")
+        self._write(store.knowledge_path(), '{"nodes": [{"id": "a"}]}')
+        self.assertEqual(store.read_knowledge_strict_deep()[1], "")
+
+    def test_the_reason_names_the_file_that_was_actually_read(self):
+        """元素坏那一侧同样要插值文件名（与容器坏那一侧同一把尺子）。"""
+        other = os.path.join(self.tmp, "别处的库.json")
+        self._write(other, '{"nodes": [1]}')
+        _, err = store.read_knowledge_strict_deep(other)
+        self.assertIn("别处的库.json", err)
+        self.assertNotIn("knowledge.json", err)
+        self._write(other, '{"nodes": "不是列表"}')          # 容器坏：照旧由既有那层报
+        self.assertIn("别处的库.json", store.read_knowledge_strict_deep(other)[1])
+
+    def test_it_does_not_write_anything(self):
+        bad = b'{"nodes": [1]}'
+        path = self._write(store.knowledge_path(), bad)
+        folder = os.path.dirname(path)
+        before = sorted(os.listdir(folder))
+        store.read_knowledge_strict_deep()
+        with open(path, "rb") as f:
+            self.assertEqual(f.read(), bad, "只读：元素坏的文件原样留原路径")
+        self.assertEqual(sorted(os.listdir(folder)), before, "只读：不许多写/改名任何文件")
+
+    # ---------- 写路径守卫（问题 1 的 3.）：既有语义一个字都不许改 ----------
+    def test_the_shallow_strict_reads_were_not_tightened(self):
+        """⚠️ 守卫：`read_*_strict` 对**元素坏**照旧说"读得出来"（它们是写路径的判据）。"""
+        self._write(store.jobs_path(), '[{"id": "a"}, 1]')
+        self._write(store.p_path("jds.json"), '{"version": 1, "seq": 0, "jds": [1]}')
+        self._write(store.knowledge_path(), '{"nodes": [1]}')
+        self.assertEqual(store.read_jobs_strict(), ([{"id": "a"}, 1], ""))
+        self.assertEqual(store.read_jds_strict()[0]["jds"], [1])
+        self.assertEqual(store.read_jds_strict()[1], "")
+        self.assertEqual(store.read_knowledge_strict(), ({"nodes": [1]}, ""))
+
+    def test_the_write_path_rulers_still_say_writable(self):
+        """⚠️ 守卫：元素坏**不是**写盘判据的事 —— 三个 `*_safe_to_write` 仍回可写。
+
+        谁把元素校验塞进 `read_*_strict`（或 `*_safe_to_write`），这两条就红 ——
+        "写路径的既有行为一字不变"就是这么钉住的。
+        """
+        self._write(store.jobs_path(), '[{"id": "a"}, 1]')
+        self._write(store.p_path("jds.json"), '{"version": 1, "seq": 0, "jds": [1]}')
+        self._write(store.knowledge_path(), '{"nodes": [1]}')
+        self.assertEqual(store.jobs_safe_to_write(), (True, ""))
+        self.assertEqual(store.jds_safe_to_write(), (True, ""))
+        self.assertEqual(store.knowledge_safe_to_write(), (True, ""))
+
+
 if __name__ == "__main__":
     unittest.main()
