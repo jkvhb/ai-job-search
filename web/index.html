@@ -247,6 +247,8 @@
         <button class="btn ghost" id="demoBtn">看看示例效果（免 API Key）</button>
       </div>
       <div class="status" id="st"></div>
+      <!-- 本次分析没能加载的 SOP 段（P1-10 的界面出口）：空的时候**一个字都不显示** -->
+      <div class="status" id="sopWarn"></div>
       <div class="result" id="result"></div>
     </div>
   </section>
@@ -3061,6 +3063,29 @@ function initKnowTab(){
 
 /* ---------------- 分析 ---------------- */
 function switchTab(tab){ const b = document.querySelector('nav button[data-tab="'+tab+'"]'); if(b) b.click(); }
+
+/* 本次分析没能加载的 SOP 段（P1-10 的界面出口）。
+   服务端 `/api/analyze` 成功时会带上 `sop_warnings: [...]`（每一条都是"**这次分析**没能加载
+   SOP《文件名》：原因"）。两条纪律：
+     ① `sop_warnings` 为空 / 缺失 / 不是数组 → **一个字都不加**（不许出现"无警告"这种噪音）；
+     ② 文案必须说清是「**本次分析**没能加载」—— 笼统说成「缺少 SOP」是另一件事（文件真的不在），
+        那种假话正是这一批要根除的。原因里已经带着文件名与读不出来的原因，原样转给用户。
+   返回显示出来的那段文字（空串 = 什么都没显示），便于调用方/测试直接看口径。 */
+function showSopWarnings(warnings){
+  const el = $('#sopWarn');
+  const list = Array.isArray(warnings) ? warnings.filter(w => String(w == null ? '' : w).trim()) : [];
+  if(!list.length){
+    el.className = 'status';       // 去掉 on：连占位都不留
+    el.textContent = '';
+    return '';
+  }
+  const text = '⚠ 本次分析没能加载求职 SOP：' + list.join('；')
+    + ' —— 这份报告可能少了 SOP 里那几条要求（SOP 文件本身可能还在，只是这次没读出来；'
+    + '修好后重跑一次即可）。';
+  el.className = 'status on err';
+  el.textContent = text;
+  return text;
+}
 function showResult(report){
   const el = $('#result');
   // P1-18：报告名为空时**绝不**渲染 /reports/undefined 那种"看起来能点"的真链接
@@ -3203,6 +3228,7 @@ async function analyzeSubmit(){
   if(!jd && !imageB64 && !link){ logUI('analyze.blocked', {reason:'no_jd'}, 'warn'); return show($('#st'),'err','请粘贴 JD 文字、上传截图，或填分享链接'); }
   if(!resume){ logUI('analyze.blocked', {reason:'no_resume'}, 'warn'); return show($('#st'),'err','请先选择一份简历'); }
   clearResult();
+  showSopWarnings([]);              // 上一次分析的 SOP 警告绝不能留到这一次
   logUI('analyze.click', {resume: resume, resume_id: payload.resume_id || '', has_text: !!jd, has_image: !!imageB64, has_link: !!link});
   $('#goBtn').disabled = true;
   show($('#st'),'info','正在分析……（识图 + 跑 SOP + 生成报告，约需 20–60 秒，请勿关闭本页）');
@@ -3215,9 +3241,12 @@ async function analyzeSubmit(){
       show($('#st'),'warn','这一版在这个岗位上已经分析过 —— 选「覆盖」或「仍然新建」');
     } else if(r.ok){
       show($('#st'),'ok','分析完成 ✓');
+      // SOP 少了一段就把这件事**显示给用户**（P1-10）：报告照出，但必须让人知道它少了什么。
+      // 没有警告时 `showSopWarnings` 一个字都不写（不留噪音）。
+      showSopWarnings(r.sop_warnings);
       showResult(r.report);
       loadJobs();
-      logUI('analyze.done', {report: r.report});
+      logUI('analyze.done', {report: r.report, sop_warnings: (r.sop_warnings || []).length});
     } else {
       show($('#st'),'err','失败：'+(r.error||'未知错误'));
       logUI('analyze.fail', {error: r.error||''}, 'error');
@@ -3231,6 +3260,7 @@ async function analyzeSubmit(){
 $('#goBtn').addEventListener('click', analyzeSubmit);
 $('#demoBtn').addEventListener('click', async ()=>{
   clearResult();
+  showSopWarnings([]);              // 示例报告与 SOP 无关：别把上一次分析的警告留在屏幕上
   logUI('demo.click');
   show($('#st'),'info','正在生成示例报告……');
   const r = await fetch('/api/demo', {method:'POST'}).then(x=>x.json());

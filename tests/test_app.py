@@ -6096,6 +6096,52 @@ class FrontendReadFailureTest(IsolatedCase):
         self.assertNotIn("✅", out["html"], "没有报告却仍然说「报告已生成」")
         self.assertTrue(out["html"].strip(), "没有报告却什么都没说（用户不知道该干什么）")
 
+    # ---------------- P1-10 的界面出口：SOP 没加载要**显示给用户**
+    # 真跑 `analyzeSubmit()`（不是单独调渲染函数）：要钉的正是"分析成功那条分支**接上了**这个显示"。
+    # fetch 按路径分发：`/api/jds` 给空台账（成功后前端会 loadJobs），其余给伪造的分析响应。
+    _ANALYZE_JS = (
+        "RESUME_PICKS = [{key:'k1', name:'母版.md', version:'rv_0001'}];\n"
+        "$('#resumeSel').value = 'k1';\n"
+        "$('#jd').value = '岗位职责：语音数据质检';\n"
+        "fetch = function(url){\n"
+        "  var isJds = String(url).indexOf('/api/jds') >= 0;\n"
+        "  var body = isJds ? {ok:true, jds:[], categories:[], statuses:[]}\n"
+        "                   : {ok:true, report:'r.html', sop_warnings: __fixture.w};\n"
+        "  return Promise.resolve({ok:true, status:200, json:function(){ return Promise.resolve(body); }});\n"
+        "};\n"
+        "await analyzeSubmit();\n"
+        "out.warn = String($('#sopWarn').textContent);\n"
+        "out.warnOn = String($('#sopWarn').className);\n"
+        "out.st = String($('#st').textContent);\n")
+
+    def test_analyze_shows_the_sop_warning_to_the_user(self):
+        _need_node()
+        reason = ("本次分析没能加载 SOP《00-求职SOP总纲.md》：文件不是 UTF-8 编码"
+                  "（请把它另存为 UTF-8 后重试）")
+        out = web_probe.run_index(self._ANALYZE_JS, {"w": [reason]})
+
+        self.assertEqual(out["st"], "分析完成 ✓")            # 反证：走的确实是**成功**那条分支
+        warn = out["warn"]
+        self.assertIn("没能加载求职 SOP", warn, "SOP 没加载却一个字都没显示给用户：%r" % (out,))
+        self.assertIn("本次分析", warn, "文案没说清是「**本次分析**没加载」（笼统的「缺少 SOP」是假话）")
+        self.assertIn("00-求职SOP总纲.md", warn)             # 说清是哪一份
+        self.assertIn("UTF-8", warn)                        # 说清读不出来的原因
+        self.assertIn("on", out["warnOn"])                  # 真的显示了（不是被 CSS 藏起来的元素）
+
+    def test_analyze_without_sop_warnings_shows_nothing(self):
+        """对照组：没有警告时**一个字都不加**（不许出现「无警告」这种噪音）。
+
+        ⚠️ 如实说明：这一条在改动**之前**也是绿的 —— 它是对照组（旧实现同样什么都不显示），
+        用来钉住"别把空列表也渲染成一句话"。真正变红的是上一条。
+        """
+        _need_node()
+        for fixture in ({"w": []}, {}, {"w": None}, {"w": "不是数组"}):
+            out = web_probe.run_index(self._ANALYZE_JS, fixture)
+            self.assertEqual(out["st"], "分析完成 ✓")        # 成功分支确实走到了
+            self.assertEqual(out["warn"].strip(), "",
+                             "没有 SOP 警告却往页面上写了一句话（噪音）：%r / %r"
+                             % (fixture, out["warn"]))
+
 
 # ============================================================ P0-15：提示文案里不许有真实姓名
 # `_profile_unreadable_message` 是**给用户看的一段人话**，里面举的"档名"例子曾经写着一个**真名**
