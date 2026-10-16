@@ -11,7 +11,10 @@
   2. **不做字面相似度匹配**（`difflib` / 编辑距离一律不引入）：实测错例明确
      （「风险识别」会被认成「语音识别」），而认错的形态是"报告里塞进另一个概念的内容
      且看不出来"——那正是本项目最不能出的错（spec §2、§5）。
-  3. 读知识库**只读**，且必须区分"读不出来"与"没有"（`store.read_knowledge_strict`）。
+  3. 读知识库**只读**，且必须区分"读不出来"与"没有"（`store.read_knowledge_strict`）；
+     而且**读盘那一下要持 `kb._KB_LOCK`**（批 2 · 2.3）：写者 `kb.absorb` 是在同一把锁里
+     整份 `os.replace` 重写 knowledge.json 的，无锁读者会让它在 Windows 上抛 `WinError 5`
+     —— 用户刚沉淀的卡静默丢失。理由与锁序核查见 `build_index` 的 docstring。
 """
 import json
 import re
@@ -283,10 +286,41 @@ def build_index(cards=None):
 
     返回 `(Index, 原因)`：原因非空 = 知识库读不出来。这时**不阻止分析**，
     只是这次全部走联网，并由调用方把原因如实带进报告标注（spec §9）。
+
+    **读盘那一下必须持 `kb._KB_LOCK`**（批 2 · 2.3，体检 §5 P3-2）：本函数是**新加的无锁读者**，
+    而 `kb.absorb` 是持同一把锁**整份重写** knowledge.json 的写者（`store.write_json` 走
+    "写临时文件 → `os.replace`"）。Windows 上 `os.replace` 撞上别人正打开着的同名文件会抛
+    `WinError 5`（CPython 的 `open` 不带 `FILE_SHARE_DELETE`），而 `kb.absorb` 只在边界记一条
+    日志 ⇒ **用户刚沉淀的卡静默丢失**（本模块的并发用例实测复现：absorb 线程抛
+    `PermissionError(13, '拒绝访问。')`，那一轮沉淀的卡只留在没被改名过去的临时文件里）。
+
+    **为什么选 (a)「持锁读」，不是 (b)「走 store 的重试语义」**：
+      1. 仓库里**没有**现成的重试口径 —— `store.read_knowledge_strict` 是**一次**读、
+         读不出来就回 `(空, 原因)`（"读不出来 ≠ 没有"的唯一实现）；写那条路上也没有
+         `os.replace` 的重试（`store._atomic_write_bytes` 失败就把临时文件删掉再抛）。
+         照 (b) 做就得**自己发明**一套"试几次 / 隔多久 / 什么时候放弃"的口径，
+         而它立刻带来一个更坏的问题：重试到放弃之间要不要把 `err` 报上去？
+         报了与"读一次"没区别（(a) 已经保证读得到），不报就是**把"读不出来"吞成空库** ——
+         正是本模块铁律 3 禁止的那件事（本项目最恨的假话）。
+      2. 锁序**不会**反转（结论来自逐个调用点的核查，见下），于是 (a) 的全部代价只是
+         "读者等写者写完那几毫秒"，而写者本来就在毫秒级（读窗口也只有那几毫秒）。
+      3. `kb._KB_LOCK` 是 `RLock`：将来若有人在持它时调本函数，也只是**重入**，不是死锁。
+
+    ⚠️ **锁序核查（生产只有 1 条链，逐段看过）**：`build_index` 只被 `Reuse.plan`（本模块）
+    调用，而 `Reuse.plan` 的生产调用点是 `knowledge.build_for_jd` 里的 `reuse.plan(all_nodes)`；
+    它由 `app.do_analyze` 经 `_builder_with_reuse` 闭包注入 `jdfacts`。关键是 `jdfacts` 把
+    `builder(...)` 当**实参**求值 —— 它在 `_store` 取 `_JD_LOCK` **之前**就算完了
+    （`jdfacts._compute` 的注释明写："真算要 206 秒，抱着 `_JD_LOCK` 去算就等于让所有 JD 的
+    写入一起停 206 秒"），`_INFLIGHT_LOCK` 也不跨 `builder`（`_enter_flight` 用完即放）。
+    所以读盘那一刻**一把外层锁都没被持着** ⇒ 这里取 `_KB_LOCK` 是从外到内的正常顺序，
+    不可能与 `_JD_LOCK` / `_MERGE_LOCK` / `_JOBS_LOCK` 形成环。
     """
     if cards is not None:
         return Index(cards), ""
-    data, err = store.read_knowledge_strict()
+    # 临界区**只罩住读盘那一下**（短、只读）：`Index` 的构造是纯内存的，不进锁。
+    # ⚠️ **不许**把 `if err` 这段挪进锁里 —— 日志是文件写，锁里只该有那一次读盘。
+    with kb._KB_LOCK:                                     # noqa: SLF001 —— 见上面那段锁序核查
+        data, err = store.read_knowledge_strict()
     if err:
         log.log_event("kbreuse.kb_unreadable", level="warn", error=err)
         return Index([]), err

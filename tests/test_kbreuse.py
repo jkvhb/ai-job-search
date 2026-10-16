@@ -2,6 +2,8 @@
 """阶段 E：知识库优先复用 —— 测试（匹配 / 够格 / 判定校验 / 填充 / 写回安全的强不变量）。"""
 import copy
 import json
+import os
+import threading
 import unittest
 from unittest import mock
 
@@ -408,6 +410,178 @@ class IndexTest(IsolatedCase):
         idx, err = kbreuse.build_index(cards=[])
         self.assertEqual(err, "")
         self.assertEqual(len(idx), 0, "显式空列表就是空目录")
+
+
+class BuildIndexLockTest(IsolatedCase):
+    """批 2 · 2.3（体检 §5 P3-2）：`build_index` 是**新加的无锁读者**。
+
+    为什么它不是"只读所以无所谓"：`kb.absorb` 持 `kb._KB_LOCK` **整份重写** knowledge.json
+    （`store.write_json` → 写临时文件 → `os.replace`）。Windows 上 `os.replace` 撞上
+    别人打开着的同名文件会抛 `WinError 5`（CPython 的 `open` 不带 `FILE_SHARE_DELETE`），
+    而 `kb.absorb` 只在边界记一条日志 ⇒ **用户刚沉淀的卡静默丢失**（本项目最恨的假话）。
+
+    选 **(a) 读取时持 `kb._KB_LOCK`**，理由见 `kbreuse.build_index` 的 docstring。
+    """
+
+    def test_reading_the_knowledge_base_holds_the_kb_lock_and_releases_it(self):
+        """读盘必须**在 `kb._KB_LOCK` 里**发生（判据与 `test_jdid.py` 那条同源：`_is_owned()`）。
+
+        ⚠️ 断言的是"**读盘那一刻**"锁被持着，而不是"函数外面碰过锁"：变异成
+        `with kb._KB_LOCK: pass` 之后再去读盘，这条照样红（`seen` 里是 `False`）。
+        """
+        store.save_knowledge({"nodes": [{"id": "语音识别", "term": "语音识别", "definition": "d"}]})
+        seen = []
+        real = store.read_knowledge_strict
+
+        def spy(*a, **kw):
+            seen.append(kb._KB_LOCK._is_owned())      # noqa: SLF001 —— 与 test_jdid 同一判据
+            return real(*a, **kw)
+
+        with mock.patch.object(store, "read_knowledge_strict", spy):
+            idx, err = kbreuse.build_index()
+        self.assertEqual(err, "")
+        self.assertEqual(len(idx), 1)
+        self.assertEqual(seen, [True],
+                         "读 knowledge.json 时没有持 `kb._KB_LOCK`：写者的 `os.replace` 会与它"
+                         "并发，Windows 上抛 WinError 5，用户的沉淀静默丢失")
+        self.assertFalse(kb._KB_LOCK._is_owned(), "只读临界区必须退出去，别把锁留在手里")  # noqa: SLF001
+
+    def test_explicit_cards_never_take_the_lock(self):
+        """`cards=[...]` 那条路**不碰盘、也不碰锁**：它不该为一个内存对象去挡住写者。
+
+        （"不读盘"由 `test_explicit_cards_never_touch_the_disk` 钉着；这条钉"不取锁"。）
+        """
+        seen = []
+        real = store.read_knowledge_strict
+        with mock.patch.object(store, "read_knowledge_strict",
+                               lambda *a, **kw: (seen.append(1), real(*a, **kw))[1]):
+            idx, err = kbreuse.build_index(cards=[{"id": "a", "term": "A", "definition": "d"}])
+        self.assertEqual((err, len(idx), seen), ("", 1, []))
+
+    def test_an_unreadable_knowledge_base_is_reported_and_never_pretends_to_be_empty(self):
+        """「读不出来」**不许**当成「空库」 —— 那是本项目最恨的假话。
+
+        变异取证（本批第 2 条）：把 `build_index` 里那句 `return Index([]), err` 改成
+        `return Index([]), ""`（"读不出来"当成"没有"），**这条必须红**。它逐条钉住四条出口：
+          ① 返回的原因非空（调用方要把它写进报告的 ⚠）；
+          ② 原因里点得出是哪个文件（用户照着这句话才知道去修哪个）；
+          ③ 落一条 `kbreuse.kb_unreadable` 的 warn 日志（事后查得到）；
+          ④ 经 `Reuse.plan` 之后 `stats["knowledge_error"]` 仍带着那句话 —— 报告里那句
+             「库读不出来」的**唯一**来源就是它；
+        另外钉住"只读"：坏文件一个字节都不许动（读者绝不隔离/改名/写盘）。
+        """
+        store.ensure_profile()
+        path = store.knowledge_path()
+        with open(path, "wb") as f:
+            f.write(b'{"nodes": [ <<<CORRUPT>>>')
+        before = store.read_bytes(path)
+
+        idx, err = kbreuse.build_index()               # cards=None → 真的去读盘
+        self.assertEqual(len(idx), 0, "坏库拿不出可复用的卡（这次全部走联网）")
+        self.assertTrue(err, "读不出来必须如实给出原因，**不许**静默成空库")
+        self.assertIn("knowledge.json", err, "原因要点出文件，否则用户不知道去修哪个")
+
+        evs = [r for r in log.read_logs(200)[0] if r.get("event") == "kbreuse.kb_unreadable"]
+        self.assertEqual(len(evs), 1, "库读不出来必须留一条日志：%r" % (evs,))
+        self.assertEqual(str(evs[0].get("level") or "").lower(), "warn")
+
+        stats = kbreuse.Reuse({}).plan([])             # 真跑一次"库优先"
+        self.assertEqual(stats["knowledge_error"], err, "原因必须一路带到报告统计里")
+        self.assertEqual(store.read_bytes(path), before, "只读：坏文件一个字节都不许动")
+
+    # ---- 并发（这一条才是"不再丢数据"的牙）----
+    #: 种进库里的卡数。**库文件够大是关键**：读一次要在几毫秒里一直握着那个文件句柄，
+    #: 无锁读者才有可命中的窗口（小库的窗口窄到几乎撞不上，测试会变成假绿）。
+    SEED_CARDS = 150
+    ROUNDS = 40
+
+    def _seed_a_big_kb(self):
+        nodes = [{"id": "种子%04d" % i, "term": "种子概念%04d" % i,
+                  "definition": "定义" * 100, "plain_explanation": "解释" * 100,
+                  "sources": [{"url": "https://example.invalid/%d" % i}]}
+                 for i in range(self.SEED_CARDS)]
+        store.save_knowledge({"version": kb.KB_VERSION, "nodes": nodes})
+        size = os.path.getsize(store.knowledge_path())
+        self.assertGreater(size, 100000, "夹具前提：库文件太小，读窗口窄到测不出竞态（%d 字节）" % size)
+
+    def test_a_concurrent_absorb_never_loses_a_card_and_never_raises(self):
+        """一个线程反复 `kb.absorb`、另一个线程反复 `build_index` ⇒ **零异常 + 零丢失**。
+
+        交错用 `threading.Event` 真制造（不是 `sleep` 赌）：两个线程都卡在同一个发令 `Event`
+        上，一放行就同时开跑；写者跑完 N 轮后置 `done`，读者**自由循环**到那一刻为止。
+
+        ⚠️ 读者**故意不逐轮对齐**（不用 `Barrier`）—— 这不是风格问题，是**这条测试有没有牙**的问题。
+        `Barrier` 会把两条线程的相位锁死（每轮都从同一时刻起步、跑同样的工作量），于是写者的
+        `os.replace` 每一轮都落在读窗口**之外**。**实测**（探针：与这里完全同构，只是把读者换成
+        无锁替身，`SEED_CARDS=150` / `ROUNDS=40`）：
+
+            无锁 + Event    errors=1（writer:PermissionError(13, '拒绝访问。')） missing=40  ← 旧实现红
+            无锁 + Barrier  errors=0                                      missing=0   ← 旧实现**绿**！
+            持锁 + Event    errors=0                                      missing=0
+
+        读者单次耗时 2.04 ms（文件句柄在整个 `json` 解析期间都开着）。也就是说：用 `Barrier` 写
+        这条用例，**旧实现会全绿地通过** —— 那正是本项目最怕的"测试看起来有牙、其实没有"。
+        自由循环让相位自然漂移，读者在整个跑动期间有相当比例的时间"文件开着"。
+
+        ⚠️ **旧实现（无锁读）的红色形态是异常，不是丢数据**：`kb.absorb` 里
+        `store.write_json` 的 `os.replace` 撞上读者打开着的 knowledge.json →
+        `PermissionError: [WinError 5]` → `_with_kb_write` 不吞（这是对的：吞掉就是骗用户
+        "已沉淀"）→ absorb 抛出；而**那张刚沉淀的卡只在没被改名过去的临时文件里** ⇒ 一起丢。
+        于是下面的 `errors` 与 `missing` 会**同时**红（谁先红看时序）。
+        """
+        store.ensure_profile()
+        self._seed_a_big_kb()
+        self.assertIn(self.tmp, store.knowledge_path(), "探针必须落在临时根里")
+
+        errors = []
+        reads = []                        # 读者每次看到的卡数（钉"永远不是空库/残库"）
+        start = threading.Event()         # 发令枪：两条线程同一刻起跑
+        done = threading.Event()          # 写者跑完 N 轮 → 读者收工
+
+        def writer():
+            try:
+                start.wait(30)
+                for i in range(self.ROUNDS):
+                    kb.absorb([{"term": "并发概念-%d" % i, "definition": "本次沉淀",
+                                "plain_explanation": "并发写入", "layer": 2,
+                                "sources": [{"url": "https://example.invalid/c%d" % i}]}],
+                              {"id": "jd-conc", "job_title": "并发岗"})
+            except Exception as e:            # 异常必须带回主线程，否则会被 unittest 吞掉
+                errors.append("absorb 线程抛异常：%r" % (e,))
+            finally:
+                done.set()                    # 写者即使是异常退出，读者也必须能收工
+
+        def reader():
+            try:
+                start.wait(30)
+                while not done.is_set():
+                    idx, err = kbreuse.build_index()
+                    if err:
+                        errors.append("build_index 报读不出来：%r" % (err,))
+                        return
+                    reads.append(len(idx))
+            except Exception as e:
+                errors.append("build_index 线程抛异常：%r" % (e,))
+
+        tw = threading.Thread(target=writer, name="kbreuse-conc-absorb", daemon=True)
+        tr = threading.Thread(target=reader, name="kbreuse-conc-read", daemon=True)
+        tw.start()
+        tr.start()
+        start.set()
+        tw.join(180)
+        tr.join(180)
+        self.assertEqual([t.name for t in (tw, tr) if t.is_alive()], [],
+                         "并发用例没跑完（挂住了）—— 很可能是锁序/死锁")
+        self.assertGreaterEqual(len(reads), 1, "夹具前提：读者至少真读过一次")
+        self.assertEqual(errors, [],
+                         "并发读写抛异常了（旧实现的形态就是 WinError 5，"
+                         "而它把用户刚沉淀的卡一起带走）")
+        have = {n.get("term") for n in store.load_knowledge()["nodes"]}
+        missing = sorted({"并发概念-%d" % i for i in range(self.ROUNDS)} - have)
+        self.assertEqual(missing, [], "absorb 沉淀的卡片丢了：%r" % (missing,))
+        self.assertGreaterEqual(min(reads), self.SEED_CARDS,
+                                "读者读到过一次空库/残库（把「读不出来」当成「没有」？）："
+                                "最少的一次只有 %d 张" % min(reads))
 
 
 class JudgeTermsTest(IsolatedCase):
