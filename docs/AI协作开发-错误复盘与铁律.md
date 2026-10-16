@@ -347,6 +347,26 @@ git commit -F <消息文件>                # ← 【commit 这一行漏了 -- �
    归属/消息错了就**如实记下来**，不要重写历史（尤其已经 push 的）。
 4. 更彻底的解法：**一个实现者一个 worktree**（`git worktree add`），index 与 HEAD 就不再共享。
 
+### 5.2b 提交消息**用 `write` 工具写成文件**，绝不经 shell/python 字面量（本项目栽了 3 次）
+**案例**：本项目约定"提交消息用 python 写（无 BOM）"，于是我一直这么干：
+```powershell
+$py = @'
+msg = ("fix(x): 说明里带【"引号"】的这一段…")   # ← 中文引号没事，英文双引号会把字符串截断
+'@
+$py | python - $m ; git commit -F $m
+```
+**结果**：`SyntaxError` ⇒ **消息文件根本没生成** ⇒ `git commit -F` 报
+`fatal: could not read log file ...`（exit 128），而**同一批命令里的 `git add` 已经执行了** ⇒
+留下"暂存了但没提交"的中间态（更糟的是：人容易把 `git show HEAD` 的旧输出误读成"提交成功"）。
+**一天之内犯了 3 次**（内容不同、形状相同）。
+**做法**：**用 `write` 工具直接写消息文件**（它不经过任何 shell/字面量转义）：
+```
+write  →  C:\...\Temp\cm-xxx.txt   内容就是最终消息（无引号嵌套风险、无 BOM）
+pwsh   →  git add -- <路径> ; git commit -F <那个文件> -- <路径>
+```
+并在提交后**立刻核对**：`git show --stat --format= --name-only HEAD` 里应当**只有**你的路径。
+（同理适用于一切"把多行文本交给命令行"的场合：**先写文件，再让命令读文件**。）
+
 ### 5.3 不要 amend 共享历史（R14）
 **案例**：一个实现者 `--amend` 时，把主控刚提的提交折进了它自己的提交（因为共享同一个工作树/HEAD）。
 **做法**：子代理**永远不许** `--amend`、`push`、`checkout/restore/stash`；
