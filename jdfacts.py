@@ -33,7 +33,10 @@ JD 文本，所以「同一个 JD 只算一次、换简历直接复用」是白�
      返回的节点列表也不会污染缓存。
   6. **同一个 JD 的并发请求只许真算一次**（单飞）：真算是 206 秒 + ~53 次搜索额度，而服务是
      `ThreadingHTTPServer` —— 双击 / 双标签页 / 重试都会让两个线程同时看到「没有缓存」。
-     等待者**绝不各算一遍**，也不许死等：领导者失败时它自己再算一次。
+     等待者**绝不各算一遍**，也不许死等：领导者失败时它自己再算一次；
+     领导者**卡死**（超过 `INFLIGHT_WAIT_SECONDS` 还没回来）时等待者**如实抛错**
+     （`InflightTimeout`，由 app.py 变成报告里的 `knowledge_error`）并摘掉那份死掉的登记 ——
+     **绝不**静默返回一份「没算出来」的结果冒充算完了（体检 §5 P3-4）。
      单飞登记表由 `_INFLIGHT_LOCK` 护着，**绝不用 `_JD_LOCK` 跨 `builder`**
      （那会让所有 JD 的写入一起停 206 秒）。等待者拿到领导者的结果后按 **`cache`** 报
      （它没有重新搜索），日志里用 `analyze.knowledge_joined` 分辨「这是等待者」。
@@ -59,6 +62,13 @@ SEEDED_PREFIX = "seeded:"           # 播种：`seeded:<报告id>`
 
 EVENT_JOINED = "analyze.knowledge_joined"        # 等待者加入了别人「在飞」的那次真算
 EVENT_SEED_SKIPPED = "analyze.knowledge_seed_skipped"   # 临界区里发现已有可用缓存 → 放弃播种写
+EVENT_JOIN_TIMEOUT = "analyze.knowledge_join_timeout"   # 等待者等超时（领导者卡死）→ 如实报错
+
+# 等同一个 JD 上「在飞」的那次真算的**上限**（秒）。取值依据：用户真实日志里一次知识地图真算是
+# `analyze.knowledge_done {"ms": 206206}`（206 秒 / 53 次搜索），这里按最坏耗时留近 3 倍余量。
+# ⚠️ **必须明显大于一次正常真算**：把一次正常的慢真算误判成「卡死」= 给用户报一个**假的失败**。
+# ⚠️ **必须是模块级常量**（不许把字面量写死在 `wait()` 里）：测试要把它压到 0.5 秒才跑得动。
+INFLIGHT_WAIT_SECONDS = 600
 
 
 # ---------------------------------------------------------------- 单飞（同一个 JD 只算一次）
@@ -66,33 +76,57 @@ _INFLIGHT_LOCK = threading.Lock()   # 只护着下面这张登记表；**绝不*
 _INFLIGHT = {}                      # jd_id -> _Flight：这个 JD 上正在「真算」的那一次
 
 
+class InflightTimeout(RuntimeError):
+    """等同一个 JD 上「在飞」的那次真算**超时**（领导者卡死，超过 `INFLIGHT_WAIT_SECONDS`）。
+
+    继承 `RuntimeError`：调用方（app.py 的 `except Exception`）按普通失败处理 —— 记
+    `analyze.knowledge_error`，把原因写进报告的 `knowledge_error`，用户看到的是
+    「知识地图生成失败：…」，**不是**一份空地图冒充「算完了」。
+    """
+
+
 class _Flight(object):
     """一次「真算」的登记。`done` 给等待者发信号；`nodes` / `error` 是那次的结果。
 
     第二个线程**等它算完直接拿结果**，绝不各算一遍。领导者失败（builder 抛异常）时
     `error` 会被填上、`done` **照样**会被置上：等待者醒来发现没有结果就自己再去算一次 ——
-    **绝不死等**。
+    **绝不死等**。领导者**卡死**（`builder` 永不返回、连 `done` 都不置）时等待者按
+    `INFLIGHT_WAIT_SECONDS` 放弃并抛 `InflightTimeout`（同样**绝不死等**）。
 
     这里**没有** `source`：等待者一律按「复用」（`SOURCE_CACHE`）报，不读领导者的来源
     —— 理由见 `_compute_once` 里那段产品裁定（报了 `computed` 用户会以为又烧了一遍额度）。
     """
-    __slots__ = ("done", "nodes", "error")
+    __slots__ = ("done", "nodes", "error", "started")
 
     def __init__(self):
         self.done = threading.Event()
         self.nodes = None
         self.error = None
+        # 等待者的期限从**这次在飞的那一次**起算（不是每个等待者各发一个满额）。
+        self.started = time.monotonic()
 
 
 def _join_inflight(flight):
-    """等同一个 JD 上正在真算的那个线程；返回等了多久（秒）。
+    """等同一个 JD 上正在真算的那个线程；返回 `(等了多久秒, 有没有等到)`。
 
     **单独一个函数是给测试留的同步缝**：替换它，测试就能确定性地知道「等待者已经进入了
     等待」，不必靠 sleep 去猜（sleep 型的并发测试既可能假绿也可能假红）。
+
+    ⚠️ **必须带超时**（体检 §5 P3-4）：服务是 `ThreadingHTTPServer`（每请求一线程），
+    `Event.wait()` 不封顶时，一个卡死的领导者会让**所有**等待者无限占住线程 —— 一次卡死
+    慢慢把线程耗光。超时后由调用方**如实报错**（`InflightTimeout`），绝不返回空结果。
+    期限按登记的 `started` 起算：来得越晚的等待者等得越短，上限才是真的上限（每个等待者
+    各发一个满额的话，一个卡死的登记能把「上限」无限续下去）。
     """
     t0 = time.monotonic()
-    flight.done.wait()
-    return time.monotonic() - t0
+    left = (flight.started + INFLIGHT_WAIT_SECONDS) - t0
+    ok = False
+    if left > 0:
+        ok = flight.done.wait(left)
+        if not ok and flight.done.is_set():
+            # 竞态兜底：`wait` 刚超时、领导者恰好放行 —— 结果就在手边，别错杀成一次失败。
+            ok = True
+    return time.monotonic() - t0, ok
 
 
 def _enter_flight(jd_id):
@@ -104,6 +138,18 @@ def _enter_flight(jd_id):
             _INFLIGHT[jd_id] = flight
             return flight, None
         return None, flight
+
+
+def _abandon_flight(jd_id, flight):
+    """摘掉一份**已经指望不上**的登记（领导者失败 / 等它超时）。
+
+    ⚠️ 只有**还是同一份**登记时才删：否则会把后来者刚建的那份（正在算的）误删，同一个 JD
+    就会同时算出两份。反过来，该删而不删更坏：后来者会永远去等一个不会再有结果的信号
+    （那份登记再也不会有人注销 —— 领导者就是卡死在那里）。
+    """
+    with _INFLIGHT_LOCK:
+        if _INFLIGHT.get(jd_id) is flight:
+            del _INFLIGHT[jd_id]
 
 
 def _leave_flight(jd_id, flight):
@@ -300,17 +346,29 @@ def _compute_once(jd_id, jd_text, cfg, builder, refresh):
 
     没有单飞的话，双击 / 双标签页 / 重试会让两个线程同时看到「没有缓存」→ 各烧一遍
     206 秒 + ~53 次搜索额度（服务是 `ThreadingHTTPServer`，全项目没有分析级锁）。
+
+    等待者是**有上限**的（`INFLIGHT_WAIT_SECONDS`）：领导者失败 → 自己再算一次；
+    领导者卡死 → 摘掉死登记 + 抛 `InflightTimeout`（绝不死等，也绝不返回一份没算出来的结果）。
     """
     while True:
         mine, other = _enter_flight(jd_id)
         if mine is None:
             # ---- 等待者：绝不各算一遍 ----
-            waited = _join_inflight(other)
+            waited, ok = _join_inflight(other)
+            if not ok:
+                # 领导者**卡死**（超过最坏耗时还没回来）→ **绝不死等、也绝不假装算完了**：
+                # 先摘掉那份死掉的登记（不摘的话后来者会永远等一个不会再有结果的信号），
+                # 再如实抛错 —— app.py 会记 `analyze.knowledge_error` 并把它写进报告，
+                # 用户看到的是「知识地图生成失败：…」，而不是一份空地图冒充成功。
+                log.log_event(EVENT_JOIN_TIMEOUT, jd=jd_id, ms=int(waited * 1000),
+                              limit=INFLIGHT_WAIT_SECONDS)
+                _abandon_flight(jd_id, other)
+                raise InflightTimeout(
+                    "等同一个岗位「在飞」的那次知识地图真算超过 %g 秒仍未返回（那一次很可能"
+                    "已经卡死）；已放弃这次等待，请重试" % INFLIGHT_WAIT_SECONDS)
             if other.error is not None:
                 # 领导者失败了 → **绝不死等**：摘掉那份失败的登记，自己再抢一次领导权去算
-                with _INFLIGHT_LOCK:
-                    if _INFLIGHT.get(jd_id) is other:
-                        del _INFLIGHT[jd_id]
+                _abandon_flight(jd_id, other)
                 continue
             nodes = knowledge_of(jd_id)      # 磁盘是唯一真相源：重新解析，不与它共享同一个列表
             if not nodes:
@@ -356,6 +414,10 @@ def resolve(jd_id, jd_text, cfg, refresh=False, builder=None):
     ③ 那一步是**单飞**的：同一个 JD 的并发请求只烧一次（206 秒 + ~53 次搜索额度），
     等待者拿的正是领导者的结果，但按**复用**报（`source="cache"`）—— 它没有重新搜索，
     报「本次新算」会让用户以为又烧了一遍额度（日志里 `analyze.knowledge_joined` 分辨得出）。
+
+    等待者**不会无限等**：领导者超过 `INFLIGHT_WAIT_SECONDS` 没回来 ⇒ 抛 `InflightTimeout`
+    （如实报错，由上层变成报告里的 `knowledge_error`），并注销那份死掉的登记 —— 既不假装
+    算完了，也不把后来的请求永远堵在一个不会再有结果的信号上。
     """
     if jdid.find_jd(jd_id) is None:
         # 身份先校验：否则「强制刷新」会在一个不存在的岗位上空烧 53 次搜索，最后才写盘失败

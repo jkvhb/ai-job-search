@@ -775,6 +775,11 @@ class SingleFlightTest(IsolatedCase):
       * 所以「两个线程同时 resolve」是被事件钉住的，不是靠时间差碰运气。
     """
 
+    # 超时类用例的**有界等待**：正确实现在 0.5 秒内就退出了，这里给 5 秒余量。
+    # ⚠️ 它的作用不是「等它回来」，而是「回来后断言它必须已经结束」—— 旧实现（无限 wait）上
+    # 等待者永远不结束，红就出在 assertFalse(is_alive) 那一行，而不会把整个套件拖死。
+    HANG_GRACE_SECONDS = 5.0
+
     def _new_jd(self, jd_id=JD_A):
         jdid.upsert_jd({"id": jd_id, "seq": 1})
         return jd_id
@@ -855,6 +860,72 @@ class SingleFlightTest(IsolatedCase):
         self.assertEqual(joined[0]["data"]["jd"], JD_A)
         self.assertEqual(joined[0]["data"]["nodes"], 2)
 
+    def test_eight_threads_on_one_jd_compute_once_and_share_one_result(self):
+        """并发 **8** 个线程请求同一个 JD ⇒ builder 只被调 **1** 次、8 个线程拿到**同一份**结果。
+
+        2 个线程那条钉的是「等待者」这一条路，这条钉的是**规模**：7 个等待者同时挂上来时，
+        登记表的「先来者当领导、后来者等它」必须仍然只算一次（真算 = 206 秒 + ~53 次搜索额度）。
+        """
+        total = 8
+        self._new_jd()
+        calls, results, errors, waits = [], {}, {}, []
+        entered, release, all_waiting = threading.Event(), threading.Event(), threading.Event()
+
+        def builder(jd_text, cfg):
+            calls.append(threading.current_thread().name)
+            entered.set()
+            self.assertTrue(release.wait(30), "测试自己没放行 builder")
+            return json.loads(json.dumps(_nodes("shared"), ensure_ascii=False))
+
+        def worker(i):
+            name = "w%d" % i
+            try:
+                results[name] = jdfacts.resolve(JD_A, "JD 原文-A", CFG, builder=builder)
+            except BaseException as e:                     # noqa: BLE001 - 异常也要能被断言看到
+                errors[name] = e
+
+        real_join = jdfacts._join_inflight
+
+        def watch_join(flight):
+            waits.append(threading.current_thread().name)
+            if len(waits) >= total - 1:
+                all_waiting.set()
+            return real_join(flight)
+
+        threads = [threading.Thread(target=worker, args=(i,), name="w%d" % i, daemon=True)
+                   for i in range(total)]
+        with mock.patch.object(jdfacts, "_join_inflight", watch_join):
+            threads[0].start()
+            self.assertTrue(entered.wait(30), "领导者没进 builder（这条测试没验证到东西）")
+            for t in threads[1:]:
+                t.start()
+            # 7 个等待者必须**都**已经等在那次在飞的真算上，才放行领导者（否则会有线程晚到、
+            # 在登记注销之后自己抢领导权 → 真算两次，测试就变成靠时间差碰运气了）。
+            self.assertTrue(all_waiting.wait(30),
+                            "只有 %d/%d 个线程进入了单飞等待" % (len(waits), total - 1))
+            release.set()
+            for t in threads:
+                t.join(30)
+        self.assertEqual([t.name for t in threads if t.is_alive()], [], "有线程没跑完（死等了）")
+        self.assertEqual(jdfacts._INFLIGHT, {}, "单飞登记没注销干净")
+        self.assertEqual(errors, {}, "有线程抛异常了")
+        self.assertEqual(sorted(results), sorted("w%d" % i for i in range(total)))
+        self.assertEqual(calls, ["w0"],
+                         "同一个 JD 被真算了 %d 次（= 烧了 %d 份 206 秒 + 搜索额度）"
+                         % (len(calls), len(calls)))
+        payloads = {}
+        for name in sorted(results):
+            nodes, source = results[name]
+            payloads[name] = _jdump(nodes)
+            self.assertEqual(source, "computed" if name == "w0" else jdfacts.SOURCE_CACHE,
+                             "%s 的来源报错了：%r" % (name, source))
+        self.assertEqual(set(payloads.values()), {_jdump(_nodes("shared"))},
+                         "8 个线程拿到的不是同一份知识地图：%r" % (payloads,))
+        self.assertEqual(len({id(nodes) for nodes, _ in results.values()}), total,
+                         "有线程共享了同一个列表对象：谁就地改一下（kb.absorb 就会）就污染别人")
+        self.assertEqual(len(_events("analyze.knowledge_joined")), total - 1)
+        self.assertEqual(len(_events("analyze.knowledge_computed")), 1)
+
     def test_a_waiting_thread_does_not_hang_when_the_leader_fails(self):
         """领导者**失败**（builder 抛异常）时，等待者**绝不死等**。
 
@@ -886,6 +957,118 @@ class SingleFlightTest(IsolatedCase):
         self.assertEqual(facts["knowledge_source"], "computed")
         # 失败那次**没有**写盘（既不写空缓存，也不留半截）
         self.assertEqual(len(_events("analyze.knowledge_computed")), 1)
+        # ⚠️ 「领导者**失败**」与「领导者**卡死**」是两条路，绝不许混：
+        # 前者等待者自己再算一次（上面钉住了 builder 被调 2 次），后者等待者**如实报错**。
+        self.assertEqual(_events(jdfacts.EVENT_JOIN_TIMEOUT), [],
+                         "失败的领导者被误判成「卡死超时」了（那是另一条路）")
+
+    # ---- 超时（体检 §5 P3-4）：领导者**卡死**时等待者绝不无限挂起 ----
+    def test_a_waiter_gives_up_with_an_error_when_the_leader_never_returns(self):
+        """`builder` 永不返回 ⇒ 等待者必须在 `INFLIGHT_WAIT_SECONDS` 内退出并**如实报错**。
+
+        ⚠️ 这是体检 §5 P3-4 的真实病：服务是 `ThreadingHTTPServer`（每请求一线程），
+        `Event.wait()` 没有上限时，一个卡死的领导者会让**所有**等待者永久占住线程 ——
+        一次卡死慢慢把线程耗光（而且它们永远等不到任何结果）。
+
+        ⚠️ 断言形状必须是「有界 join 之后线程**必须**已经结束」，**不能**写成「等它回来」：
+        旧实现上等待者会一直挂，写成等它就变成测试自己挂住（那既不是红、也拿不到证据）。
+
+        ⚠️ 选定的降级是**抛错**（`InflightTimeout`）而不是「等不到就自己再算一遍」：
+        `builder` 永不返回时「自己算」会再进一次同样不封顶的调用 —— 照样占住线程（等于没修），
+        还会再烧一遍 ~53 次搜索额度；抛错则被 app.py 如实写进报告的 `knowledge_error`。
+        """
+        self._new_jd()
+        calls, errors, results = [], {}, {}
+        entered, release = threading.Event(), threading.Event()
+
+        def builder(jd_text, cfg):
+            calls.append(threading.current_thread().name)
+            entered.set()
+            release.wait(30)                              # 断言窗口内**永不返回**
+            return json.loads(json.dumps(_nodes("never"), ensure_ascii=False))
+
+        def worker(name):
+            try:
+                results[name] = jdfacts.resolve(JD_A, "JD 原文-A", CFG, builder=builder)
+            except BaseException as e:                     # noqa: BLE001 - 异常本身就是要断言的对象
+                errors[name] = e
+
+        with mock.patch.object(jdfacts, "INFLIGHT_WAIT_SECONDS", 0.5):
+            t1 = threading.Thread(target=worker, args=("t1",), name="t1", daemon=True)
+            t2 = threading.Thread(target=worker, args=("t2",), name="t2", daemon=True)
+            try:
+                t1.start()
+                self.assertTrue(entered.wait(30), "领导者没进 builder（这条测试没验证到东西）")
+                t2.start()
+                t2.join(self.HANG_GRACE_SECONDS)
+                # ↓ 旧实现 / 变异「把 wait 的超时去掉」红在**这一行**：等待者到现在还挂着
+                self.assertFalse(t2.is_alive(),
+                                 "等待者在超时（0.5 秒）之后仍然挂住：无限 wait 会一直占着线程")
+            finally:
+                release.set()                              # 放行领导者（否则它一直卡在 builder 里）
+                t1.join(10)
+        self.assertEqual(jdfacts._INFLIGHT, {}, "超时之后留下了「永久占位」的在飞登记")
+        self.assertEqual(calls, ["t1"], "等待者没去等，而是自己另算了一遍（那会再烧 53 次搜索）")
+        self.assertNotIn("t2", results,
+                         "等待者返回了一份「结果」：那是**说假话** —— 它根本没拿到任何结果")
+        self.assertIsInstance(errors.get("t2"), jdfacts.InflightTimeout,
+                              "等待者不是「如实报错」退出的：%r" % (errors.get("t2"),))
+        self.assertIn("0.5", str(errors["t2"]), "报错里没说清等了多久就放弃了")
+        timeouts = _events(jdfacts.EVENT_JOIN_TIMEOUT)
+        self.assertEqual(len(timeouts), 1, "超时没有留下日志（真出事时没法诊断）")
+        self.assertEqual(timeouts[0]["data"]["jd"], JD_A)
+
+    def test_a_request_arriving_after_the_timeout_still_computes(self):
+        """超时之后**新来的**请求必须能正常开始算 —— 不是永远去等一个已经死掉的登记。
+
+        做法：领导者卡死 → 等待者超时退出（这一步该把死登记注销掉）→ 再来一个请求，
+        它必须**自己真算一次**并拿到结果。判据是「builder 又被调了一次」而**不是**「它很快
+        返回了」：只断言「没挂住」的话，一份永远等不到结果的死登记也能让新请求**立刻抛错**
+        通过 —— 那不是「正常开始」，那正是这条要防的病。
+        """
+        self._new_jd()
+        calls, errors = [], {}
+        entered, release = threading.Event(), threading.Event()
+
+        def hung(jd_text, cfg):
+            calls.append(threading.current_thread().name)
+            entered.set()
+            release.wait(30)                              # 领导者卡死（收尾时才放行）
+            return json.loads(json.dumps(_nodes("stale"), ensure_ascii=False))
+
+        def worker(name):
+            try:
+                jdfacts.resolve(JD_A, "JD 原文-A", CFG, builder=hung)
+            except BaseException as e:                     # noqa: BLE001 - 超时就是要断言的对象
+                errors[name] = e
+
+        fresh = _Builder(_nodes("fresh"))                  # 新来的请求注入的 builder（会计数）
+        with mock.patch.object(jdfacts, "INFLIGHT_WAIT_SECONDS", 0.5):
+            leader = threading.Thread(target=worker, args=("leader",), name="leader", daemon=True)
+            waiter = threading.Thread(target=worker, args=("waiter",), name="waiter", daemon=True)
+            try:
+                leader.start()
+                self.assertTrue(entered.wait(30), "领导者没进 builder（这条测试没验证到东西）")
+                waiter.start()
+                waiter.join(self.HANG_GRACE_SECONDS)
+                self.assertFalse(waiter.is_alive(), "等待者没在超时内退出（无限挂起）")
+                self.assertIsInstance(errors.get("waiter"), jdfacts.InflightTimeout)
+                self.assertEqual(jdfacts._INFLIGHT, {},
+                                 "超时之后留下了「永久占位」的在飞登记：后来者会永远等一个死掉的"
+                                 "领导者（那份登记再也不会有人注销）")
+                try:
+                    nodes, source = jdfacts.resolve(JD_A, "JD 原文-A", CFG, builder=fresh)
+                except BaseException as e:
+                    # ↓ 变异「超时后不清理登记」红在**这一行**：新请求还在等那个死条目
+                    self.fail("超时之后新来的请求没能开始算（还在等那个死掉的登记）：%r" % (e,))
+            finally:
+                release.set()
+                leader.join(10)
+        self.assertEqual(calls, ["leader"], "等待者不该去调 builder（它只是在等）")
+        self.assertEqual(len(fresh.calls), 1, "新来的请求没有真的开始算")
+        self.assertEqual(source, jdfacts.SOURCE_COMPUTED)
+        self.assertEqual(_jdump(nodes), _jdump(_nodes("fresh")))
+        self.assertEqual(jdfacts._INFLIGHT, {}, "收尾后还留着在飞登记")
 
     def test_the_builder_is_called_outside_the_jd_lock(self):
         """真算（206 秒）**绝不能**抱着 `_JD_LOCK`：那会让**所有 JD 的写入**一起停 206 秒。
@@ -933,6 +1116,35 @@ class ModuleHygieneTest(IsolatedCase):
         self.assertTrue(names, "一个 import 都没找到？解析方式不对")
         self.assertEqual(names - {"os", "threading", "time", "datetime",
                                   "jdid", "kb", "log", "store"}, set())
+
+    def test_the_inflight_wait_always_passes_a_timeout(self):
+        """AST 钉住：`_join_inflight` 里的等待**必须**带超时实参（体检 §5 P3-4）。
+
+        回归形态就是「把 `wait(left)` 改回 `wait()`」—— 无限等会让一个卡死的领导者把所有
+        等待者永久占住（服务是 `ThreadingHTTPServer`）。正则看不出来（`wait` 到处都是），
+        所以按 AST 找 **`_join_inflight` 函数体内**的 `.wait(` 调用，断言它带了实参。
+        """
+        tree = ast.parse(store.read_text(os.path.join(store.ROOT, "jdfacts.py")))
+        funcs = [n for n in ast.walk(tree)
+                 if isinstance(n, ast.FunctionDef) and n.name == "_join_inflight"]
+        self.assertEqual(len(funcs), 1, "找不到 _join_inflight（解析方式不对？）")
+        waits = [n for n in ast.walk(funcs[0])
+                 if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                 and n.func.attr == "wait"]
+        self.assertTrue(waits, "_join_inflight 里一个等待都没找到（这条测试没验证到东西）")
+        for call in waits:
+            self.assertTrue(call.args or call.keywords,
+                            "_join_inflight 里有不带超时的 wait()：领导者卡死会无限占住线程")
+
+    def test_the_inflight_wait_covers_a_slow_but_healthy_compute(self):
+        """超时上限必须**明显大于**一次正常真算（实测最坏 206 秒 / 53 次搜索）。
+
+        定小了 = 把一次正常的慢真算误判成「卡死」→ 给用户报一个**假的失败**（本项目最恨的
+        那类错）。这里钉住下界：至少是实测最坏耗时（`analyze.knowledge_done ms=206206`）的
+        2 倍；上限值本身可以调，但不许调到会误杀正常真算的量级。
+        """
+        self.assertIsInstance(jdfacts.INFLIGHT_WAIT_SECONDS, (int, float))
+        self.assertGreaterEqual(jdfacts.INFLIGHT_WAIT_SECONDS, 2 * 206)
 
     def test_it_takes_only_the_jd_lock(self):
         """锁顺序恒为 `_JD_LOCK` → `_KB_LOCK`：本模块**只**碰前者，绝不反向。
