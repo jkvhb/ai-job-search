@@ -305,25 +305,62 @@ _CJK_MIN = 2
 #   - README / app.py 满篇"母版 / 快照 / 版本 / 简历"，简历文件名也常带这些分类词。
 # 代价是"某人的真名恰好就是这些词"时漏检 —— 与"每个包都被删"相比，这个方向更合理。
 #
-# ⚠️ 两种匹配方式不能混：
-#   - 中文按**子串**判：`我的简历` 这种整段没被分隔符切开的名字，按整串比是比不中的
-#     （实测 `test_generic_names_are_not_used` 就是这么红的）。中文两字词当子串命中
-#     （"张三-个人简历" 里的 "个人简历"）不会误伤真名 —— 真名叫"我的简历"是不现实的。
+# ⚠️ 匹配方式（2026-10-16 改过 —— 修 P0-15 的第 4 条漏检，理由见 `_is_generic`）：
 #   - 英文只按**整串**判：`cv` / `new` / `old` 当子串会误伤真英文名
 #     （"newman" / "goldman" / "cvmaker" 全被吃掉），只认"这一段就等于这个词"。
-_GENERIC_CJK = ("简历", "母版", "版本", "快照", "我的", "副本", "终版", "定稿", "草稿",
-                "初稿", "通用", "模板", "正文", "备份", "汇总", "新版", "旧版", "示例")
+#   - 中文：整段**被通用词吃干净**才算通用；只粘着一个"版次词"的（`张三母版`）不算 ——
+#     旧实现是"任意通用词是子串就整段丢"，于是 `张三母版.md` 整段被丢、真名一起丢。
+#
+# 通用词分两桶，**退化行为不同**（这次修复的核心）：
+#   * `_GENERIC_CJK_STICKY`（版次/状态）：它们**粘在人名后面**是最常见的命名
+#     （`张三母版.md` / `李四终版.md`，真名后面连个 `-` 都不加）⇒ 只把这几个词本身挖掉，
+#     **前面粘着的名字必须留下**（旧行为整段丢 = 真名跟着进不了关键词表 = 带真名的包
+#     照样过 `verify()`，与 P0-15 要防的事一模一样）；
+#   * `_GENERIC_CJK_WHOLE`（文件是什么）：前面粘着的通常是**限定词而不是名字**
+#     （`个人简历.md` / `中文简历.md`）⇒ 保持旧行为整段丢。绝不能从 `个人简历` 里切出
+#     "个人"当关键词：分享包自己就写着"仅供个人求职使用" ⇒ 那种词会让**每个包**都被判成
+#     泄漏（另一个方向的错，同样不许）。
+# ⚠️ 两张表加起来 = 原来那 18 个词，**一个字都没删**（不许为了让粘连用例通过就放宽表）。
+_GENERIC_CJK_STICKY = ("母版", "版本", "快照", "终版", "定稿", "草稿", "初稿",
+                       "备份", "副本", "新版", "旧版")
+_GENERIC_CJK_WHOLE = ("简历", "我的", "通用", "模板", "正文", "汇总", "示例")
+_GENERIC_CJK = _GENERIC_CJK_STICKY + _GENERIC_CJK_WHOLE
 _GENERIC_ASCII = frozenset([
     "default", "resume", "cv", "final", "copy", "master", "version", "backup",
     "new", "old", "template",
 ])
 
 
+def _generic_residues(word):
+    """把片段里出现的**所有**通用词挖掉，返回剩下的碎片（挖空处拿 `\\x00` 记个坑）。
+
+    `我的简历` → `[]`（整段就是通用词的串联）；`张三母版` → `['张三']`（真名留下）；
+    `newman` → `['newman']`（英文表只认整串，`new` 不会把 `newman` 切开）。
+    """
+    out = str(word or "")
+    for g in _GENERIC_CJK:
+        if g in out:
+            out = out.replace(g, "\x00")
+    return [p for p in out.split("\x00") if p]
+
+
 def _is_generic(word):
-    """这一段只是"简历文件的分类词"，不是身份？（匹配方式的取舍见上面那条注释）"""
+    """这一段只是"简历文件的分类词"，不是身份？（匹配方式的取舍见上面那两条注释）
+
+    ⚠️ 判据 2026-10-16 换过（P0-15 第 4 条漏检）：**不再**是"任意通用词是子串即整段丢"，
+    而是「整段被通用词吃干净」或「整段里含『文件是什么』类词」：
+      - `我的简历` / `cv` / `new` ⇒ 通用（挖掉 我的+简历 后什么都不剩）⇒ **仍然要丢** ✓
+        —— 包自己就会写 `data/profiles/default/resumes/我的简历.md`，起步简历正文第一行
+        也是「# 我的简历…」，它一旦入表，**每个包都会被自己判成泄漏**；
+      - `张三母版` ⇒ **不通用**（挖掉"母版"还剩"张三"，那是真名）⇒ 不许再整段丢 ✓；
+      - `个人简历` ⇒ 通用（含"简历"这桶词）⇒ 整段丢，绝不切出"个人"。
+    """
+    word = str(word or "")
     if word.lower() in _GENERIC_ASCII:
         return True
-    return any(g in word for g in _GENERIC_CJK)
+    if any(g in word for g in _GENERIC_CJK_WHOLE):
+        return True
+    return not _generic_residues(word)
 
 
 def _usable_keyword(word):
@@ -339,13 +376,20 @@ def _name_fragments(text):
     """把一个"名字"切成可用片段：`示例-姓名-母版.md` → `示例` / `姓名` / `母版` 三段，
     其中 `示例`、`母版` 是通用词被丢掉，最后只剩 `姓名`。
 
+    ⚠️ 整段**不是**通用词、但**粘着**版次类通用词时（`张三母版`），只把通用词挖掉、把真名
+    留下（`张三`）—— 旧实现"子串命中就整段丢"会把真名一起丢掉（P0-15 第 4 条漏检，
+    这种"真名后面直接跟母版/终版、不加连字符"的命名非常常见）。
+
     ⚠️ 只对**文件名主干 / 档名**这类短标识调用，绝不对正文调用。
     """
     out = []
     for part in _SEP_RE.split(str(text or "")):
-        if not _usable_keyword(part) or _is_generic(part):
+        if _is_generic(part):
             continue
-        out.append(part)
+        for piece in _generic_residues(part):
+            if not _usable_keyword(piece) or _is_generic(piece):
+                continue
+            out.append(piece)
     return out
 
 

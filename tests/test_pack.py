@@ -13,6 +13,8 @@
 **唯一的例外**：`ExamplePlaceholderTest` 会**只读**地看一眼真实 `data/`，把"用户自己的真名"
 取出来当比较基准（P0-15：README 的示例串不许再写真名）—— 真名只用于 `assertNotIn`，
 既不写进任何文件、也不打印（失败信息里只报关键词长度）。
+⚠️ 那台机器**没有 `data/`**（干净检出）时真名推不出来 ⇒ 相关用例**显式 skip + 给理由**
+（见 `_assert_no_real_pii`），绝不退化成"看起来在断言、其实什么都没断言"的空循环。
 """
 import importlib
 import os
@@ -21,6 +23,7 @@ import shutil
 import tempfile
 import unittest
 import zipfile
+from unittest import mock
 
 PACK = importlib.import_module("打包分享")
 
@@ -313,28 +316,70 @@ class ProfilePiiTest(unittest.TestCase):
         self.assertEqual([], PACK.profile_leak_keywords(self.root))
         self.assertEqual([], PACK.verify(self.build(pii="data/profiles/default 我的简历"), root=self.root))
 
+    # ---- 需求三（P0-15 第 4 条漏检）：真名与通用词**粘连**（无分隔符）时不许整段丢 ----
+    # 复查用隔离探针实测：`张三母版.md` 在旧实现下给出 `[]` —— 中文按"通用词是子串"判，
+    # "母版"一命中 ⇒ **整个 token 被丢掉** ⇒ 真名 `张三` 一起丢 ⇒ 带真名的包照样过 `verify()`。
+    # 这个形状（真名后面直接跟"母版/终版"、不加连字符）非常常见；本机不触发只是因为
+    # 真实档名恰好写成 `真名-母版.md`（中间有连字符）⇒ 属**潜伏**缺陷。
+
+    def _reset_data(self):
+        """清掉上一个子用例造的 `data/`：每个子用例一份干净夹具，互不串味。"""
+        shutil.rmtree(os.path.join(self.root, "data"), ignore_errors=True)
+
+    def test_sticky_generic_suffix_keeps_the_name(self):
+        """`张三母版.md` / `李四终版.md` ⇒ 真名必须留在关键词表里（旧实现：`[]`）。"""
+        for resume, want in (("张三母版.md", "张三"), ("李四终版.md", "李四")):
+            with self.subTest(resume=resume):
+                self._reset_data()
+                self.make_profile(key="default", resumes=(resume,))
+                self.assertEqual([want], PACK.profile_leak_keywords(self.root),
+                                 "%s 里的真名被通用词一起吃掉了" % resume)
+
+    def test_verify_blocks_sticky_name_end_to_end(self):
+        """端到端：粘连命名的档，真名进了包也必须被 `verify()` **点名**（不只是表里有）。"""
+        self._reset_data()
+        self.make_profile(key="default", resumes=("张三母版.md",))
+        issues = PACK.verify(self.build(pii="张三"), root=self.root)
+        self.assertTrue(any("张三" in i for i in issues),
+                        "粘连命名的真名进了分享包，verify() 却没拦：%r" % (issues,))
+
+    def test_separated_name_still_works(self):
+        """对照组（本机真实档名的形状）：`张三-母版.md` 照旧给出 `张三`，修复不许碰坏它。"""
+        self._reset_data()
+        self.make_profile(key="default", resumes=("张三-母版.md",))
+        self.assertEqual(["张三"], PACK.profile_leak_keywords(self.root))
+
+    def test_whole_generic_words_are_still_dropped(self):
+        """对照组：**整段就是通用词**的仍然一个都不许入表（子串判据当初存在的理由）。
+
+        `我的简历.md` 一旦入表，**每个包都会被它自己判成泄漏**：`main()` 自己就往包里写
+        `data/profiles/default/resumes/我的简历.md`，起步简历正文第一行也是「# 我的简历…」。
+        ASCII 的 `cv` / `new` 同理（只认整串，且太短 ⇒ 入表就是灾难）。
+        """
+        self._reset_data()
+        self.make_profile(key="default", resumes=("我的简历.md", "cv.md", "new.md"))
+        self.assertEqual([], PACK.profile_leak_keywords(self.root))
+        self.assertEqual([], PACK.verify(self.build(pii="data/profiles/default 我的简历 cv new"),
+                                         root=self.root))
+
 
 class ExamplePlaceholderTest(unittest.TestCase):
     """需求二（P0-15）：README 的简历文件名示例必须是**明显占位**，不许再写真名。"""
 
     def _real_pii(self):
-        """用户自己的真名判据：**只从 data/ 只读**推导，一个字都不落盘、不打印。"""
+        """用户自己的真名判据：**只从 data/ 只读**推导，一个字都不落盘、不打印。
+
+        ⚠️ 干净检出（没有 `data/`、或名字全是通用词）时这里**正常**返回 `[]` —— 那**不等于**
+        "没有泄漏"。所以调用方必须先看空不空（见 `_assert_no_real_pii`），不许直接 `for` 循环。
+        """
         return PACK.profile_leak_keywords(REPO)
 
-    def _assert_no_real_pii(self, text, where):
-        for kw in self._real_pii():
-            self.assertNotIn(kw, text, "%s 里还留着真实 PII（关键词长度 %d）" % (where, len(kw)))
+    def _rv_example_lines(self):
+        """README 里「带 `rv_` 版本号的示例块」的每一行 → `[(行号, 行内容), …]`。
 
-    def test_readme_resume_example_is_placeholder(self):
-        """README 里那处简历版本示例必须是**明显占位**、且一个真名都不含（P0-15）。
-
-        ⚠️ **按内容定位，不再硬编码行号**：2026-10-16 在脚本表里补两行 ⇒ 示例块从 271/272
+        ⚠️ **按内容定位，不硬编码行号**：2026-10-16 在脚本表里补两行 ⇒ 示例块从 271/272
         位移到 273/274 ⇒ 硬编码行号的那条断言直接转红（那次改动本身是对的，脆的是断言）。
-        现在的判据：**围栏（``` 代码块）内凡是带 `rv_` 版本号的那一块** ——
-          * 块里**每一行**都不许出现 profile 真名（原来只扫两行，现在扫整块：更严）；
-          * 出现 `rv_` 的那几行必须写明「示例」（占位一眼可辨）；
-          * 一块都找不到 ⇒ 直接红（示例块被删了也逃不掉）。
-        行号再位移、块增删几行都不再误报；往块里塞真名照样红。
+        一块都找不到 ⇒ 直接红（示例块被删了也逃不掉）。
         """
         path = os.path.join(REPO, "README.md")
         with open(path, encoding="utf-8") as f:
@@ -352,12 +397,54 @@ class ExamplePlaceholderTest(unittest.TestCase):
             blocks.append(cur)
         marked = [b for b in blocks if any("rv_" in _line_of(path, n) for n in b)]
         self.assertTrue(marked, "README 里找不到任何带 `rv_` 版本号的示例块（示例块被删了？）")
-        for block in marked:
-            for n in block:
-                line = _line_of(path, n)
+        return [(n, _line_of(path, n)) for block in marked for n in block]
+
+    def _assert_no_real_pii(self, text, where):
+        """`text` 里不许出现任何真实 PII 关键词。
+
+        ⚠️ 关键词表为空时**显式跳过**（unittest 报 skipped + 这条理由），绝不静默通过：
+        旧写法是 `for kw in self._real_pii(): assertNotIn(…)` —— 空表时循环一次都不进，
+        「README 不许写真名」这半条**看起来在断言、其实什么都没断言**，没有 `data/` 的
+        干净检出照样全绿（独立复查 2026-10-16 点名）。口径同 `tests/test_app.py:6152`：
+        读不到真名就把回落**写明白**（跳过并给理由），不留空转的断言。
+        """
+        kws = self._real_pii()
+        if not kws:
+            self.skipTest("干净检出（没有 data/，或名字全是通用词）⇒ 推不出『用户自己的真名』，"
+                          "『%s 不许写真名』这半条无从断言：显式跳过，不是通过" % where)
+        for kw in kws:
+            self.assertNotIn(kw, text, "%s 里还留着真实 PII（关键词长度 %d）" % (where, len(kw)))
+
+    def test_readme_resume_example_is_placeholder(self):
+        """示例块里凡是带 `rv_` 的那几行必须写明「示例」（占位一眼可辨）。
+
+        这一条**不依赖 `data/`**（占位串本身就能查）⇒ 干净检出上也照跑不误。
+        """
+        for n, line in self._rv_example_lines():
+            if "rv_" in line:
+                self.assertIn("示例", line, "README.md:%d 必须写明这是占位示例：%r" % (n, line))
+
+    def test_readme_resume_example_has_no_real_pii(self):
+        """示例块里**每一行**都不许出现 profile 真名（P0-15；比原来只扫两行更严）。
+
+        ⚠️ 在干净检出（没有 `data/`）上这条会**显式 skip**（理由见 `_assert_no_real_pii`）——
+        旧写法在这种机器上是静默变空断言、全量照样绿，那正是复查点名的地方。
+        """
+        for n, line in self._rv_example_lines():
+            self._assert_no_real_pii(line, "README.md:%d" % n)
+
+    def test_the_no_real_pii_check_is_not_vacuous(self):
+        """反证：把关键词表换成 README 示例行里**一定有**的串（「示例」）⇒ 同一个判据必须报错。
+
+        钉的是「回落之后判据本体还活着」：万一它又被写成空转（空循环），这条会红。
+        用的是**假串**，不碰真名。
+        """
+        hit = next(((n, line) for n, line in self._rv_example_lines() if "示例" in line), None)
+        self.assertIsNotNone(hit, "README 的示例块里没有『示例』二字，本反证无从构造")
+        n, line = hit
+        with mock.patch.object(ExamplePlaceholderTest, "_real_pii", return_value=["示例"]):
+            with self.assertRaises(AssertionError):
                 self._assert_no_real_pii(line, "README.md:%d" % n)
-                if "rv_" in line:
-                    self.assertIn("示例", line, "README.md:%d 必须写明这是占位示例：%r" % (n, line))
 
 
 if __name__ == "__main__":
