@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
 import glob
 import importlib
+import io
 import json
 import os
+import tempfile
 import threading
 import time
 import unittest
@@ -1155,6 +1157,243 @@ class UpsertJobConcurrencyTest(IsolatedCase):
             with lock:
                 with lock:                        # 重入必须不死锁
                     pass
+
+
+class AtomicWriteTest(IsolatedCase):
+    """P3-5：`write_text` / `write_bytes` 也必须是**原子**的（同目录临时文件 + `os.replace`）。
+
+    老实现是"先 `open(path, "w"/"wb")` 把目标**截断成 0 字节**、再一段段写"：中途失败
+    （磁盘满 / 被 kill / 断电）留下的是**半截文件**，而**同一个模块**里的 `write_json`
+    早就是原子的（mkstemp + `os.replace`）—— 一个模块两套语义，调用点（报告 HTML、JD 原文、
+    报告就地改写、`jobdup` 留档快照、`jdid` 回滚）全都暴露在"把用户唯一那份写成半截"之下。
+
+    下面每条**都**在改前的实现上红，红在哪一行写在各自 docstring 里。
+    """
+
+    def _leftover_temps(self, room):
+        return sorted(n for n in os.listdir(room) if n.startswith(".tmp-"))
+
+    def test_a_failed_write_bytes_keeps_the_old_bytes_and_leaves_no_temp_file(self):
+        """写失败（mock `os.replace` 抛 OSError）→ 目标**逐字节仍是旧内容**、且不留 `.tmp-`。
+
+        改前红在第 ① 条断言：老实现先把目标截断成 0 字节、紧接着写进了 `b"NEW"`，
+        `os.replace` 压根没被调用 ⇒ 盘上是 `b"NEW"`（旧内容已经没了）。
+        """
+        path = os.path.join(self.tmp, "旧的.bin")
+        old = b"OLD-\xe4\xb8\xad\xe6\x96\x87-\r\n"
+        store.write_bytes(path, old)
+
+        with mock.patch.object(store.os, "replace", side_effect=OSError(28, "磁盘空间不足")):
+            with self.assertRaises(OSError):
+                store.write_bytes(path, b"NEW")
+
+        self.assertEqual(store.read_bytes(path), old,
+                         "写失败时旧内容必须一个字节都没变（老实现：目标已被截断后写成了半截）")
+        self.assertEqual(self._leftover_temps(self.tmp), [],
+                         "失败时不许在目标目录里留下 .tmp- 垃圾")
+
+    def test_a_failed_write_text_keeps_the_old_content_and_leaves_no_temp_file(self):
+        """同上，`write_text` 那一支（报告 HTML / JD 原文 / 就地改写走的就是它）。"""
+        path = os.path.join(self.tmp, "旧报告.html")
+        store.write_text(path, "<html>旧报告\r\n第二行</html>")
+        old = store.read_bytes(path)
+
+        with mock.patch.object(store.os, "replace", side_effect=OSError(28, "磁盘空间不足")):
+            with self.assertRaises(OSError):
+                store.write_text(path, "<html>新的</html>")
+
+        self.assertEqual(store.read_bytes(path), old, "写失败时旧报告必须一个字都没变")
+        self.assertEqual(self._leftover_temps(self.tmp), [], "失败时不许留下 .tmp- 垃圾")
+
+    def test_the_temp_file_lives_in_the_target_directory(self):
+        """临时文件必须与目标**同目录**：`os.replace` 只在同一文件系统内才是原子的。
+
+        改前红在第 ① 条断言：老实现**没有**任何 `os.replace`，`srcs` 是空列表 ⇒ `[] != [path]`。
+        """
+        path = os.path.join(self.tmp, "同一目录.txt")
+        srcs = []
+        real_replace = os.replace
+
+        def spy(src, dst):
+            srcs.append((src, dst))
+            return real_replace(src, dst)
+
+        with mock.patch.object(store.os, "replace", side_effect=spy):
+            store.write_text(path, "内容")
+
+        self.assertEqual([dst for _src, dst in srcs], [path], "写出必须靠 os.replace 换上去")
+        self.assertEqual(os.path.dirname(srcs[0][0]), os.path.dirname(path),
+                         "临时文件必须在目标**同一个目录**里（跨盘 os.replace 会退化成复制）")
+        self.assertEqual(self._leftover_temps(self.tmp), [], "成功之后临时文件不许留在盘上")
+
+    def test_a_successful_write_text_is_byte_identical_to_the_old_text_mode_write(self):
+        """写成功 → 与改前那条实现（文本模式直写）的产物**逐字节**相同。
+
+        为什么拿"文本模式直写"当参照物：改前的 `write_text` 是
+        `open(path, "w", encoding="utf-8")`，而文本模式在 Windows 上会把 `\\n` 翻成 `\\r\\n`。
+        新实现若图省事直接 `content.encode("utf-8")`，盘上每个换行都变了 —— 那是**行为变更**，
+        不是修 bug。CRLF / 裸 CR / 非 ASCII / 空文件一起钉住。
+        """
+        cases = ["", "a\nb", "a\r\nb", "a\rb", "a\r\nb\nc\rd", "中文\n结束\r\n", "x\n" * 3]
+        for i, text in enumerate(cases):
+            ref = os.path.join(self.tmp, "ref-%d.txt" % i)
+            got = os.path.join(self.tmp, "got-%d.txt" % i)
+            with open(ref, "w", encoding="utf-8") as f:        # 改前那条实现
+                f.write(text)
+            store.write_text(got, text)
+            with open(ref, "rb") as f:
+                self.assertEqual(store.read_bytes(got), f.read(),
+                                 "第 %d 个用例的产物与改前不一致：%r" % (i, text))
+
+    def test_a_successful_write_bytes_is_byte_identical_to_the_raw_bytes(self):
+        """`write_bytes` 仍按**原始字节**写（含 0 字节、非 UTF-8、空文件）。"""
+        for i, raw in enumerate([b"", b"a\r\nb", b"\x00\xff\xfe", "中文".encode("gbk")]):
+            path = os.path.join(self.tmp, "raw-%d.bin" % i)
+            store.write_bytes(path, raw)
+            self.assertEqual(store.read_bytes(path), raw, "第 %d 个用例不是逐字节相同" % i)
+
+    def test_a_write_that_cannot_be_encoded_does_not_touch_the_old_file(self):
+        """正文编不出来（孤立代理项）时，旧文件也不能被动到。
+
+        改前红在第 ① 条断言：老实现先截断、再在写的时候抛 `UnicodeEncodeError`
+        ⇒ 盘上是被清空的旧文件（用户那份唯一的报告就成这样了）。
+        """
+        path = os.path.join(self.tmp, "旧报告.html")
+        store.write_text(path, "<html>旧报告</html>")
+        with self.assertRaises(UnicodeEncodeError):
+            store.write_text(path, "孤立的代理项：\ud800")
+        self.assertEqual(store.read_bytes(path), "<html>旧报告</html>".encode("utf-8"))
+        self.assertEqual(self._leftover_temps(self.tmp), [], "编码失败也要清掉临时文件")
+
+
+class WriteJsonByteIdentityTest(IsolatedCase):
+    """P3-5/P3-6：`write_json` 的**产物**逐字节不变，但内部改成共用同一条原子写 + 加 fsync。"""
+
+    @staticmethod
+    def _legacy_write_json(path, obj):
+        """改前那份 `write_json` 的逐字复制（mkstemp + 文本模式 `json.dump`）。
+
+        它就是"改前产物长什么样"的**夹具**：下面的断言拿它与新实现的输出逐字节对比，
+        格式差一个空格都算行为变更。
+        """
+        d = os.path.dirname(path)
+        os.makedirs(d, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix=".tmp-", suffix=".json", dir=d)
+        os.close(fd)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(obj, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+
+    def test_the_output_is_byte_identical_to_the_old_implementation(self):
+        fixtures = [
+            {},
+            [],
+            {"nodes": []},
+            {"a": 1, "中文": "值\r\n带换行", "巢": {"b": [1, 2.5, None, True, "x\ny"]}},
+            [{"id": "x", "score": 80.0, "备注": "多行\n换行\r\n结束"}],
+            {"空": "", "列表": [{"深": {"更深的": ["中文", 1]}}]},
+        ]
+        for i, obj in enumerate(fixtures):
+            ref = os.path.join(self.tmp, "ref-%d.json" % i)
+            got = os.path.join(self.tmp, "got-%d.json" % i)
+            self._legacy_write_json(ref, obj)
+            store.write_json(got, obj)
+            self.assertEqual(store.read_bytes(got), store.read_bytes(ref),
+                             "第 %d 个夹具的 JSON 产物与改前不一致" % i)
+        self.assertEqual([n for n in os.listdir(self.tmp) if n.startswith(".tmp-")], [],
+                         "写完不许留临时文件")
+
+    def test_flush_and_fsync_happen_before_the_rename(self):
+        """先把字节**冲进盘**（flush + fsync）再 `os.replace` —— 这就是 P3-6 那条"断电丢最后一次写入"。
+
+        ⚠️ 说清这条钉子的**性质**：它是"调用顺序"的钉子（spy 记录 `os.fsync` / `os.replace`
+        的先后），**不是**对"断电后数据还在"的证明 —— 后者在单元测试里验不了（要真的拔电源）。
+        它的用处是：谁把 `fsync` 那两行删掉，这条会红，而不是"删了也没有一条测试发现"。
+        """
+        path = os.path.join(self.tmp, "x.json")
+        calls = []
+        real_fsync, real_replace = os.fsync, os.replace
+
+        def spy_fsync(fd):
+            calls.append("fsync")
+            return real_fsync(fd)
+
+        def spy_replace(src, dst):
+            calls.append("replace")
+            return real_replace(src, dst)
+
+        with mock.patch.object(os, "fsync", side_effect=spy_fsync), \
+                mock.patch.object(os, "replace", side_effect=spy_replace):
+            store.write_json(path, {"a": 1})
+
+        self.assertEqual(calls[-1], "replace", "os.replace 必须是最后一步（fsync 之后）")
+        self.assertIn("fsync", calls[:-1], "写临时文件之后、replace 之前必须 fsync 一次")
+        self.assertEqual(store.read_json(path, None), {"a": 1}, "加了 fsync 之后内容照旧")
+
+
+class SaveStreamAtomicTest(IsolatedCase):
+    """P3-7：`save_stream` 失败**不许删旧文件**。
+
+    老实现直接 `open(path, "wb")`（先截断同名旧文件），失败时 `os.remove(path)` 把**旧文件
+    也删了** —— 同名的重传/重试一失败，用户原来那份录音就没了。
+    """
+
+    def _leftover_temps(self, room):
+        return sorted(n for n in os.listdir(room) if n.startswith(".tmp-"))
+
+    def test_a_failed_save_stream_keeps_the_old_file(self):
+        """超限失败 → 旧文件**原封不动**、半截文件与 `.tmp-` 都不留。
+
+        改前红在第 ② 条断言：老实现 `os.remove(path)` 把旧录音一起删了 ⇒ 盘上什么都没有。
+        """
+        store.save_stream("iv1", "audio.wav", io.BytesIO(b"OLD-AUDIO-BYTES"), max_bytes=10 * 1024)
+        path = store.interview_file("iv1", "audio.wav")
+
+        with self.assertRaises(ValueError):
+            store.save_stream("iv1", "audio.wav", io.BytesIO(b"x" * 5000), max_bytes=1000)
+
+        self.assertTrue(os.path.exists(path), "失败时不许把旧录音删掉")
+        self.assertEqual(store.read_bytes(path), b"OLD-AUDIO-BYTES")
+        self.assertEqual(self._leftover_temps(os.path.dirname(path)), [],
+                         "失败时不许留下 .tmp- 垃圾")
+
+    def test_a_failed_save_stream_leaves_no_half_written_new_file(self):
+        """本来没有同名文件时（第一次上传）：失败不留半截（老行为，别改坏）。"""
+        with self.assertRaises(ValueError):
+            store.save_stream("iv1", "audio.wav", io.BytesIO(b"x" * 5000), max_bytes=1000)
+        self.assertFalse(os.path.exists(store.interview_file("iv1", "audio.wav")))
+        self.assertEqual(self._leftover_temps(store.interview_dir("iv1")), [],
+                         "失败时不许留下 .tmp- 垃圾")
+
+    def test_a_successful_save_stream_replaces_the_old_file(self):
+        """成功 → 返回写入字节数、内容逐字节正确、旧的被换掉，且不留临时文件。"""
+        store.save_stream("iv1", "audio.wav", io.BytesIO(b"OLD"), max_bytes=10 * 1024)
+        payload = "新录音".encode("utf-8") + b"\x00\x01"
+        n = store.save_stream("iv1", "audio.wav", io.BytesIO(payload), max_bytes=10 * 1024)
+        path = store.interview_file("iv1", "audio.wav")
+        self.assertEqual(n, len(payload))
+        self.assertEqual(store.read_bytes(path), payload)
+        self.assertEqual(self._leftover_temps(os.path.dirname(path)), [],
+                         "成功之后临时文件不许留在盘上")
+
+    def test_the_new_bytes_go_in_through_replace_not_a_direct_write(self):
+        """新内容必须是 `os.replace` 换上去的（而不是往目标名上直写）。
+
+        改前红在第 ① 条断言：老实现从头到尾没有 `os.replace` ⇒ 列表是空的。
+        """
+        path = store.interview_file("iv1", "audio.wav")
+        dsts = []
+        real_replace = os.replace
+
+        def spy(src, dst):
+            dsts.append((src, dst))
+            return real_replace(src, dst)
+
+        with mock.patch.object(store.os, "replace", side_effect=spy):
+            store.save_stream("iv1", "audio.wav", io.BytesIO(b"NEW"), max_bytes=10 * 1024)
+
+        self.assertEqual([d for _s, d in dsts], [path])
+        self.assertEqual(os.path.dirname(dsts[0][0]), os.path.dirname(path))
 
 
 if __name__ == "__main__":

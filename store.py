@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """路径解析（profile 隔离）+ 文本/JSON 读写 + config/jobs/knowledge 存取"""
+import io
 import json
 import os
 import re
@@ -171,10 +172,103 @@ def read_text(path, default=""):
         return default
 
 
+def _encode_text(content):
+    """把文本编成 `open(path, "w", encoding="utf-8")` 落盘时**会写下的那串字节**。
+
+    ⚠️ 不能图省事写成 `content.encode("utf-8")`：文本模式写入时 Python 会把每个 `\\n` 翻成
+    `os.linesep`（Windows 上是 `\\r\\n`），而本项目的报告 HTML / JD 原文 / 简历旁挂全是这么
+    写下去的 —— 直接 encode 会把盘上每一个换行都改掉，那是**行为变更**，不是修 bug
+    （`tests/test_store.py::AtomicWriteTest` 拿"文本模式直写"当参照物逐字节钉着这一点）。
+    非 str 的入参照老 `f.write()` 的语义抛 `TypeError`（别让 `AttributeError` 漏出去）。
+    """
+    if not isinstance(content, str):
+        raise TypeError("write() argument must be str, not %s" % type(content).__name__)
+    return content.replace("\n", os.linesep).encode("utf-8")
+
+
+def _fsync_dir(room):
+    """`os.replace` 之后把**目录**也刷一次（可选，尽力而为）。
+
+    为什么要有：`os.replace` 改的是目录项，只 fsync 文件本身并不保证"这一次改名"也已落盘
+    —— 断电后可能仍旧看到旧名字。
+
+    ⚠️ Windows 上**做不到**（本机实测 `os.open(目录, os.O_RDONLY)` 直接
+    `PermissionError: [Errno 13]`，也没有 `O_DIRECTORY`）：系统层没有这个能力，
+    就不硬做、也**不伪造**一次"已刷"。所以本函数只在 POSIX 上动作。
+    刷不动（权限 / 奇怪的 FS）也**不抛**：此刻字节已经安全地换到位了，在这里报错等于让调用方
+    以为"这次写失败了"（它会去回滚 / 重试），那比少一次目录 fsync 更糟。
+
+    ⚠️ 如实说明覆盖范围：本机是 Windows ⇒ 这段 POSIX 分支**在本机一次都不会执行**，
+    全量测试**覆盖不到它**（没有测试能证明它是对的）。留着它是因为本仓库也能在 WSL/Linux 下跑，
+    而那里 `os.replace` 的"改名"确实要目录 fsync 才抗断电；它只是一句尽力而为，不影响 Windows 上的行为。
+    """
+    if os.name == "nt":
+        return
+    try:
+        fd = os.open(room, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def _atomic_write_bytes(path, raw, sync=False):
+    """把 `raw` 字节**原子地**写到 `path`（同目录临时文件 + `os.replace`）—— store 里**唯一**一条落盘实现。
+
+    谁走它：`write_bytes`（原始字节）、`write_text`（UTF-8 + 平台换行翻译）、
+    `write_json`（UTF-8 + `indent=2`，并多要一次 `sync=True` 的 fsync）。
+    ⚠️ **别在 store 里另写第二套"临时文件 + replace"**。`resumelib._atomic_write_bytes` 是
+    **另一个模块**的实现（它要记日志、要把失败翻成 `SnapshotArchiveError`），本批不动它；
+    将来若要合并，那是"把日志钩子参数化"的一件事，不是今天顺手做的。
+
+    为什么要原子（体检 P3-5）：老的 `write_bytes` / `write_text` 是"先
+    `open(path, "wb"/"w")` 把目标**截断成 0 字节**、再一段段写" —— 中途失败（磁盘满 /
+    进程被 kill / 断电）留下的是**半截文件**。调用点（报告 HTML、JD 原文、报告就地改写、
+    `jobdup` 留档快照、`jdid` 回滚）每一个都是"用户手上唯一的那一份"；而**同一个模块**里
+    `write_json` 早就是原子的，一个模块两套语义本身就是 bug。
+
+    临时文件必须与目标**同目录**：`os.replace` 只在同一文件系统内保证原子（跨盘会退化成复制）。
+    父目录不存在则建（与老 `write_text` / `write_bytes` 的语义一致）。
+    任何失败（编码 / 写盘 / replace）都先把临时文件删掉再抛 —— 目录里不留 `.tmp-` 垃圾，
+    目标文件**一个字节都没被动过**。
+
+    `sync=True`：写临时文件时 `flush()` + `os.fsync()`，**然后**才 `os.replace`（体检 P3-6：
+    不 fsync 的话，断电时 rename 可能已经落盘而数据没有 ⇒ 目标变成空文件/半截）。
+    默认 `False` 是**刻意**的：`write_bytes` 的大调用点之一是 `snapshot_before_overwrite`
+    （每次分析 / 每次保存设置都写一份留档），给它加 fsync 只换来"每次写盘多等一次磁盘往返"；
+    而 P3-6 指的是 `write_json` 单子上的那几份（台账 / 知识库 / JD 库 / 配置）—— 那里丢一次就没了。
+    """
+    room = os.path.dirname(path)
+    os.makedirs(room, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".tmp-", suffix=".part", dir=room)
+    os.close(fd)
+    try:
+        with open(tmp, "wb") as f:
+            f.write(raw)
+            if sync:
+                f.flush()
+                os.fsync(f.fileno())
+        os.replace(tmp, path)
+        if sync:
+            _fsync_dir(room)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def write_text(path, content):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(content)
+    """文本写盘：**UTF-8**，换行按平台翻译（与老写法**逐字节**相同），走 `_atomic_write_bytes`。"""
+    _atomic_write_bytes(path, _encode_text(content))
 
 
 def read_bytes(path):
@@ -193,10 +287,13 @@ def read_bytes(path):
 
 
 def write_bytes(path, raw):
-    """按**原始字节**写（不做任何编码/换行转换）。父目录不存在则建（与 `write_text` 一致）。"""
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "wb") as f:
-        f.write(raw)
+    """按**原始字节**写（不做任何编码/换行转换）。父目录不存在则建（与 `write_text` 一致）。
+
+    ⚠️ 与 `write_text` / `write_json` 共用同一条原子写（`_atomic_write_bytes`）：老写法是
+    "截断后直写"，中途失败会留下半截 —— 而本函数的调用点里有 `jobdup` 的留档快照与
+    `jdid` 的回滚原像，那两份**没有第二个副本**。
+    """
+    _atomic_write_bytes(path, raw)
 
 
 def read_json(path, default=None):
@@ -208,7 +305,7 @@ def read_json(path, default=None):
 
 
 def write_json(path, obj):
-    """原子写 JSON：先写同目录临时文件，再 os.replace 换过去。
+    """原子写 JSON：先写同目录临时文件（**flush + fsync**），再 `os.replace` 换过去。
 
     为什么必须原子：`open(path,"w")` 会立刻把原文件截断成 0 字节，之后 json.dump 是一段一段
     往盘上写的（knowledge.json 有 27 万字节）。这中间任何一次并发读（例如用户在知识库 tab
@@ -218,21 +315,22 @@ def write_json(path, obj):
 
     临时文件必须与目标**同目录**：os.replace 只在同一文件系统内保证原子（跨盘会退化成复制）。
     序列化或写盘中途失败时删掉临时文件，绝不在目录里留垃圾。
+
+    ⚠️ 落盘实现已收归 `_atomic_write_bytes`（与 `write_text` / `write_bytes` **同一份**），
+    产物逐字节不变（同样 `ensure_ascii=False` / `indent=2` / 文本模式的平台换行翻译；
+    `tests/test_store.py::WriteJsonByteIdentityTest` 拿改前的实现当夹具逐字节钉着）。
+    ⚠️ 序列化仍走**模块级的 `json.dump`**（先写进 `io.StringIO`，再交给统一的原子写）：
+    这一点是刻意的 —— `tests/test_kb.py::AtomicWriteTest` 用 `mock.patch.object(json, "dump")`
+    注入"写到一半就挂"来钉"旧文件分毫未动 + 不留临时文件"，换成 `json.dumps` 会让那条既有断言
+    直接失去着力点（实测：`RuntimeError not raised`）。`StringIO` 写入**不做**换行翻译，
+    所以那串文本与老写法交给文本模式文件之前的那份完全相同，翻译由 `_encode_text` 一次完成。
+    ⚠️ 本函数是唯一要 `sync=True` 的调用者（体检 P3-6）：这几个 JSON 是台账 / 知识库 / JD 库 /
+    配置，丢一次就是永久丢；`write_text` / `write_bytes` 保持老的非 fsync 语义不动
+    （理由写在 `_atomic_write_bytes` 的 docstring 里）。
     """
-    d = os.path.dirname(path)
-    os.makedirs(d, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(prefix=".tmp-", suffix=".json", dir=d)
-    os.close(fd)
-    try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(obj, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, path)
-    except BaseException:
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
-        raise
+    buf = io.StringIO()
+    json.dump(obj, buf, ensure_ascii=False, indent=2)
+    _atomic_write_bytes(path, _encode_text(buf.getvalue()), sync=True)
 
 
 def safe_name(name):
@@ -788,18 +886,32 @@ def interview_file(interview_id, filename, key=None):
 
 
 def save_stream(interview_id, filename, src, max_bytes):
-    """把可读对象分块写到面试目录。超限或出错时删掉半截文件并抛异常。返回写入字节数。
+    """把可读对象分块写到面试目录。超限或出错时**只删掉临时文件**并抛异常。返回写入字节数。
 
-    分块（256KB）是为了几十 MB 的录音不吃内存；
-    写失败必须清理，否则目录里留下半截文件、下次还会被当成有效录音。
+    分块（256KB）是为了几十 MB 的录音不吃内存；所以这里不能像 `_atomic_write_bytes` 那样
+    先把整份字节攒在内存里，而是**流式**写进同目录临时文件，成功后再 `os.replace`。
+
+    ⚠️ 为什么必须"先写临时文件"（体检 P3-7）：老写法直接 `open(path, "wb")` —— 那会**先把
+    同名的旧文件截断成 0 字节**，失败时那句 `os.remove(path)` 又把**旧文件也删了**。
+    同名重传/重试是这台机器上的常态（同一场面试重传 `audio.wav`），一次超限或一次断线
+    就能把用户原来那份录音一起弄没。现在失败时旧文件**原封不动**，半截只可能落在临时文件里
+    且会被删掉（否则下次会被当成有效录音）。
+
+    `max_bytes` 上限的语义**一字不变**：还是"读到的累计字节数一超限就抛 `ValueError`"
+    （超限那一块**不写**），还是 `max_bytes // 1024 // 1024` 那个提示文案。
+    契约（返回写入字节数 / 抛 `ValueError` / 抛 `OSError`）也照旧 —— `app.py` 的上传路由
+    不用改。
     """
     path = interview_file(interview_id, filename)
     if not path:
         raise ValueError("非法的面试 id 或文件名")
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    room = os.path.dirname(path)
+    os.makedirs(room, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".tmp-", suffix=".part", dir=room)
+    os.close(fd)
     total = 0
     try:
-        with open(path, "wb") as f:
+        with open(tmp, "wb") as f:
             while True:
                 chunk = src.read(256 * 1024)
                 if not chunk:
@@ -808,9 +920,10 @@ def save_stream(interview_id, filename, src, max_bytes):
                 if total > max_bytes:
                     raise ValueError("文件超过上限 %d MB" % (max_bytes // 1024 // 1024))
                 f.write(chunk)
-    except Exception:
+        os.replace(tmp, path)
+    except BaseException:
         try:
-            os.remove(path)
+            os.remove(tmp)
         except OSError:
             pass
         raise
