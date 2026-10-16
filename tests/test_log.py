@@ -1,7 +1,12 @@
 # -*- coding: utf-8 -*-
+import contextlib
+import io
 import json
 import os
+import shutil
 import unittest
+import zipfile
+from unittest import mock
 
 import log
 import store
@@ -105,6 +110,358 @@ class LogFilePathTest(IsolatedCase):
         os.remove(store.current_profile_file())            # 删掉 = 回到 default
         self.assertEqual(log.refresh(), os.path.join(store.profile_dir(), "logs", "events.jsonl"))
         self.assertIsNone(log.LOG_PATH_ERROR)
+
+
+# ---------------------------------------------------------------- P1-8 打码口径
+class KeyMaskingTest(unittest.TestCase):
+    """`KEY_PAT` 必须覆盖本项目**真实用到**的 Key 形态（P1-8）。
+
+    本项目实际会写进日志的凭证（见 `search.py` / `llm.py` / `README.md`）：
+      - 模型调用（OpenAI 兼容，DeepSeek / Kimi）→ `sk-...`
+      - Tavily 搜索 → `tvly-...`（**旧实现漏的就是它**：说明书写着"已打码"，实际原样落盘）
+      - 博查搜索 → 同样走 `Authorization: Bearer <key>` 头，配置里可能是 `sk-` / `bsk-`
+    所以规则定为：「`sk-` / `tvly-` / `bsk-` 前缀的长 key（保留前 8 位）」+「`Bearer <16 位以上长串>`」。
+
+    ⚠️ 正例之外**必须**有反例：扩大正则最容易顺手把正常文本改坏
+    （旧实现没有词边界，`task-1234567890` 会被打成 `ta` + `sk-1234***`）。
+    """
+
+    def test_masks_sk_key_inside_string(self):
+        out = log.redact("用 sk-abcdef1234567890 调用")
+        self.assertNotIn("abcdef1234567890", out)
+        self.assertIn("***", out)
+
+    def test_masks_tavily_key_inside_string(self):
+        out = log.redact("tavily 返回 401，key tvly-dev-abcdef1234567890 已失效")
+        self.assertNotIn("abcdef1234567890", out, "tvly- 开头的 Key 必须被打码")
+        self.assertIn("***", out)
+
+    def test_masks_bsk_key_inside_string(self):
+        out = log.redact("bocha key bsk-abcdef1234567890 已过期")
+        self.assertNotIn("abcdef1234567890", out)
+
+    def test_masks_bearer_token(self):
+        out = log.redact("Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.payloadpart.sigpart")
+        self.assertNotIn("eyJhbGciOiJIUzI1NiJ9", out, "Bearer 后面的长串必须被打码")
+        self.assertIn("Bearer ***", out)
+
+    def test_masks_key_inside_nested_container(self):
+        out = log.redact({"providers": [{"note": "tvly-abcdef1234567890"}]})
+        self.assertNotIn("abcdef1234567890", json.dumps(out, ensure_ascii=False))
+
+    def test_masks_key_glued_to_chinese_text_without_a_space(self):
+        """汉字**紧邻**在 Key 前面（没隔空格）时也必须打码。
+
+        ⚠️ 这条钉的是 `\\b` 的 Unicode 语义：`str` 模式下的 `\\w` 把汉字也算**单词字符**，
+        于是 `密钥tvly-…` 里 `钥`|`t` 之间**没有**词边界 —— 只见 `\\b` 的正则会把这种
+        Key 原样放过去。日志里的提示语正是这种写法（"搜索失败：密钥tvly-…" 不隔空格），
+        所以它是 P1-8「只打码 sk-」的同一个坑再犯一次：说明书写"已自动打码"、实际漏。
+        反例（`task-…` 不许被改坏）见下面两个用例 —— 修法必须是"只挡 ASCII 字母数字"，
+        不是干脆把边界判断删掉。
+        """
+        out = log.redact("搜索失败：密钥tvly-abcdef1234567890 已失效")
+        self.assertNotIn("abcdef1234567890", out, "汉字紧邻的 tvly- Key 必须被打码")
+        self.assertIn("***", out)
+
+        out = log.redact("上一轮 sk-abcdef1234567890 已过期")
+        self.assertNotIn("abcdef1234567890", out, "汉字紧邻的 sk- Key 必须被打码")
+
+        # 同一个坑对 `Bearer` 也一样：`认证Bearer <长串>` 没有词边界
+        out = log.redact("调用返回401认证Bearer eyJhbGciOiJIUzI1NiJ9.payloadpart.sigpart")
+        self.assertNotIn("eyJhbGciOiJIUzI1NiJ9", out, "汉字紧邻的 Bearer 长串必须被打码")
+
+    # ---- 反例：不该打码的正常文本，一个字都不许动 ----
+    def test_leaves_normal_text_with_dashes_alone(self):
+        for text in ("task-1234567890 已关闭",
+                     "risk-1234567890 是风险编号",
+                     "disk-1234567890 空间不足",
+                     "职位编号 2024-1234567890",
+                     "https://example.com/job?id=1234567890123"):
+            self.assertEqual(log.redact(text), text, "正常文本被改坏了：%s" % text)
+
+    def test_leaves_too_short_or_prefix_only_strings_alone(self):
+        for text in ("Bearer token", "sk-abc", "tvly-1", "请把 sk- 换成真 key", "bearer 认证失败"):
+            self.assertEqual(log.redact(text), text, "短串/前缀本身不该被打码：%s" % text)
+
+
+# ---------------------------------------------------------------- P1-7 口径一致
+class ReadLogsTotalsTest(IsolatedCase):
+    """`total` 与 `records` 必须是**同一口径**（P1-7）。
+
+    选定的口径：**`total` = 能解析出来的记录总条数**（不受 `limit` 影响），
+    `records` = 其中最后 `limit` 条 ⇒ 恒等式 `len(records) == min(limit, total)`。
+    行数口径另给（`lines` / `blank_lines` / `bad_lines`），
+    所以"文件里有 5 行、只有 3 条能解析"这件事**本身可见**，而不是被悄悄抹平。
+    """
+
+    def _write(self, lines):
+        os.makedirs(os.path.dirname(log.LOG_FILE), exist_ok=True)
+        with open(log.LOG_FILE, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+
+    def _mixed(self):
+        """5 行：3 条好记录 + 1 行空行 + 1 行坏 JSON。"""
+        self._write([json.dumps({"event": "e1"}), "", "{这不是 JSON",
+                     json.dumps({"event": "e2"}), json.dumps({"event": "e3"})])
+
+    def test_total_counts_parsable_records_not_lines(self):
+        self._mixed()
+        page = log.read_logs(10)
+        self.assertEqual(page.lines, 5)
+        self.assertEqual(page.blank_lines, 1)
+        self.assertEqual(page.bad_lines, 1)
+        self.assertEqual(page.total, 3, "total 必须是能解析的条数，不是文件行数")
+        self.assertEqual(len(page.records), 3)
+
+    def test_line_accounting_is_an_exact_identity(self):
+        """两个数不许"看起来差不多"：必须有确定的恒等式。"""
+        self._mixed()
+        page = log.read_logs(10)
+        self.assertEqual(page.total + page.blank_lines + page.bad_lines, page.lines)
+
+    def test_total_is_independent_of_limit_and_matches_records(self):
+        self._mixed()
+        for limit in (1, 2, 3, 5, 10):
+            page = log.read_logs(limit)
+            self.assertEqual(page.total, 3, "total 不该被 limit 截断（limit=%d）" % limit)
+            self.assertEqual(len(page.records), min(limit, page.total),
+                             "len(records) 必须等于 min(limit, total)（limit=%d）" % limit)
+        self.assertEqual(log.read_logs(2).records[-1]["event"], "e3")
+        # limit<=0 视为不截断（与旧实现 limit=0 的行为一致）
+        self.assertEqual(len(log.read_logs(0).records), 3)
+
+    def test_two_value_unpacking_still_works(self):
+        self._mixed()
+        recent, total = log.read_logs(2)
+        self.assertEqual(total, 3)
+        self.assertEqual(len(recent), 2)
+
+
+# ---------------------------------------------------------------- P1-6 读不出来 ≠ 空
+class ReadLogsUnreadableTest(IsolatedCase):
+    """日志文件**存在却读不出来**时，绝不许被读成"共 0 条日志"（P1-6）。"""
+
+    def _write_bytes(self, raw):
+        os.makedirs(os.path.dirname(log.LOG_FILE), exist_ok=True)
+        with open(log.LOG_FILE, "wb") as f:
+            f.write(raw)
+
+    def _gbk_bytes(self):
+        """真实形态：记事本按 ANSI/GBK 存过的日志（非 UTF-8）。"""
+        raw = "中文日志内容".encode("gbk")
+        self.assertRaises(UnicodeDecodeError, raw.decode, "utf-8")   # 反证：这份字节真的读不出来
+        return raw
+
+    def test_missing_file_is_a_true_zero(self):
+        page = log.read_logs(10)
+        self.assertEqual(page.records, [])
+        self.assertEqual(page.total, 0)
+        self.assertIsNone(page.error, "文件不存在 = 真的没有日志，不是读不出来")
+        self.assertTrue(page.readable)
+
+    def test_empty_file_is_a_true_zero(self):
+        self._write_bytes(b"")
+        page = log.read_logs(10)
+        self.assertEqual(page.total, 0)
+        self.assertIsNone(page.error, "0 字节 = 真的没有日志，不是读不出来")
+
+    def test_existing_but_unreadable_is_distinguishable_from_a_true_zero(self):
+        self._write_bytes(self._gbk_bytes())
+        self.assertGreater(os.path.getsize(log.LOG_FILE), 0)         # 反证：盘上确实有内容
+
+        page = log.read_logs(10)
+        self.assertFalse(page.readable, "存在却读不出来，必须能与'真的是 0 条'区分")
+        self.assertIsNotNone(page.error)
+        self.assertIn(log.LOG_FILE, page.error, "原因里要指得出是哪个文件")
+        # 外形不变：仍然可解包成 (records, total)，但 error 把真相带出去了
+        records, total = page
+        self.assertEqual(records, [])
+        self.assertEqual(total, 0)
+
+    def test_unreadable_is_not_the_same_object_state_as_empty(self):
+        self._write_bytes(b"")
+        empty = log.read_logs(10)
+        self._write_bytes(self._gbk_bytes())
+        broken = log.read_logs(10)
+        self.assertNotEqual(bool(empty.error), bool(broken.error),
+                            "两者必须能被调用方区分开：一个 error 为 None，一个不为 None")
+
+    def test_unresolved_log_path_is_not_reported_as_zero(self):
+        """`LOG_FILE` 为空串占位（import 期档名文件读不出来）时，也不许说成"共 0 条"。"""
+        self.addCleanup(setattr, log, "LOG_FILE", log.LOG_FILE)
+        log.LOG_FILE = ""
+        page = log.read_logs(10)
+        self.assertFalse(page.readable)
+        self.assertIn("档名", page.error)
+
+
+# ---------------------------------------------------------------- P1-4 数不出来 ≠ 0
+class CountFilesTest(IsolatedCase):
+    """`_count_files` 的返回形状：`(计数, 原因)`；原因非空时计数是 `None`（P1-4）。"""
+
+    def test_missing_directory_is_a_true_zero(self):
+        """目录**真的不存在**（新建档案的第一天）→ 这才是唯一允许回 0 的形态。
+
+        ⚠️ 必须先把目录删掉：`IsolatedCase.setUp` 里的 `store.set_current_profile()`
+        会顺手 `ensure_profile()` 把 `resumes/` 建出来 —— 不删的话这条用例名义上在测
+        "目录不存在"，实际测的只是"空目录"，`FileNotFoundError` 那一支**一行都没走到**。
+        （变异取证：把 `except FileNotFoundError` 整支删掉，改名前这条用例照样绿；
+        它挡不住任何东西，等于没测。所以下面那条 `assertFalse(os.path.exists(p))` 是反证。
+        `test_unlistable_directory_is_not_zero` 的 mock 也**盖不住**这一支：
+        它 mock 掉的是 `os.listdir`，走的是通用 `except`。）
+        """
+        p = store.p_path("resumes")
+        if os.path.isdir(p):
+            shutil.rmtree(p)
+        self.assertFalse(os.path.exists(p), "反证：目录确实不存在，否则本用例测的还是空目录")
+        self.assertEqual(log._count_files(p, (".md", ".txt")), (0, ""))
+
+    def test_counts_only_matching_extensions(self):
+        d = store.p_path("resumes")
+        os.makedirs(d, exist_ok=True)
+        for n in ("a.md", "b.txt", "c.pdf", "d.MD"):
+            open(os.path.join(d, n), "w").close()
+        self.assertEqual(log._count_files(d, (".md", ".txt")), (3, ""))
+
+    def test_a_regular_file_in_place_of_the_directory_is_not_zero(self):
+        """报告里的实测复现：传普通文件也返回 0 —— 那个 0 会变成"用户 0 份简历"。"""
+        store.ensure_profile()
+        p = store.p_path("resumes")
+        if os.path.isdir(p):
+            shutil.rmtree(p)
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("我不是目录")
+        value, why = log._count_files(p, (".md", ".txt"))
+        self.assertIsNone(value, "存在却不是目录 = 数不出来，不许回 0")
+        self.assertIn(p, why)
+
+    def test_unlistable_directory_is_not_zero(self):
+        d = store.p_path("resumes")
+        os.makedirs(d, exist_ok=True)
+        with mock.patch("os.listdir", side_effect=PermissionError(13, "拒绝访问")):
+            value, why = log._count_files(d, (".md",))
+        self.assertIsNone(value, "存在却列不出来 = 数不出来，不许回 0")
+        self.assertTrue(why)
+
+
+class EnvCountsTest(IsolatedCase):
+    """`env.json` 里不许出现一个会被误读成"用户真的 0 份简历"的 0（P1-4）。"""
+
+    def _env(self):
+        name = log.build_log_bundle(port=1234)
+        with zipfile.ZipFile(os.path.join(os.path.dirname(log.LOG_FILE), name)) as z:
+            return json.loads(z.read("env.json").decode("utf-8"))
+
+    def test_healthy_profile_reports_real_numbers_and_no_unreadable_entries(self):
+        store.ensure_profile()
+        d = store.p_path("resumes")
+        os.makedirs(d, exist_ok=True)
+        open(os.path.join(d, "简历.md"), "w").close()
+        env = self._env()
+        self.assertEqual(env["counts"]["resumes"], 1)
+        self.assertEqual(env["counts_unreadable"], {})
+
+    def test_unreadable_resumes_directory_leaves_no_zero_behind(self):
+        store.ensure_profile()
+        p = store.p_path("resumes")
+        if os.path.isdir(p):
+            shutil.rmtree(p)
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("我不是目录")
+        env = self._env()
+        self.assertNotIn("resumes", env["counts"], "数不出来时不许写一个 0 进 counts")
+        self.assertIn("resumes", env["counts_unreadable"])
+        self.assertTrue(env["counts_unreadable"]["resumes"])
+
+    def test_unreadable_jobs_ledger_leaves_no_zero_behind(self):
+        store.ensure_profile()
+        with open(store.jobs_path(), "w", encoding="utf-8") as f:
+            f.write("{坏掉的台账")
+        env = self._env()
+        self.assertNotIn("jobs", env["counts"], "台账读不出来时不许写 0 个岗位")
+        self.assertIn("jobs", env["counts_unreadable"])
+
+
+# ---------------------------------------------------------------- P1-5 写失败必须可见
+class LogEventWriteFailureTest(IsolatedCase):
+    """写失败（含 `json.dumps` 失败、磁盘满、被占用）不许静默（P1-5）。
+
+    选定行为：**失败时返回 `None`**（成功仍返回那条 rec，形状不变）+ 进程内留痕
+    （`LOG_WRITE_FAILURES` 计数 + `LAST_LOG_WRITE_FAILURE` 最近一次原因 + stderr 一行），
+    但**绝不把异常抛回业务逻辑**。理由：`None` 是"没写进盘"的最直白说法，
+    而原来的写法回一条**看起来成功了**的 rec 才是那句假话。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.addCleanup(setattr, log, "LOG_WRITE_FAILURES", getattr(log, "LOG_WRITE_FAILURES", 0))
+        self.addCleanup(setattr, log, "LAST_LOG_WRITE_FAILURE",
+                        getattr(log, "LAST_LOG_WRITE_FAILURE", None))
+        log.LOG_WRITE_FAILURES = 0
+        log.LAST_LOG_WRITE_FAILURE = None
+
+    def _lines(self):
+        if not os.path.exists(log.LOG_FILE):
+            return []
+        with open(log.LOG_FILE, encoding="utf-8") as f:
+            return [l for l in f.read().splitlines() if l.strip()]
+
+    def test_unserializable_data_is_visible_to_the_caller(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            back = log.log_event("t.bad", bad=object())
+        self.assertIsNone(back, "写失败必须让调用方看得出来：不能回一条'看起来成功'的记录")
+        self.assertEqual(self._lines(), [], "反证：这一条确实没写进盘")
+        self.assertGreaterEqual(log.LOG_WRITE_FAILURES, 1)
+        self.assertEqual(log.LAST_LOG_WRITE_FAILURE.get("event"), "t.bad")
+        self.assertTrue(log.LAST_LOG_WRITE_FAILURE.get("error"))
+        self.assertIn("t.bad", err.getvalue(), "进程内至少要留一行痕迹")
+
+    def test_disk_write_failure_is_visible_and_does_not_raise(self):
+        err = io.StringIO()
+        with mock.patch("builtins.open", side_effect=OSError("磁盘满")):
+            with contextlib.redirect_stderr(err):
+                back = log.log_event("t.diskfull", a=1)      # 不许抛回业务逻辑
+        self.assertIsNone(back)
+        self.assertGreaterEqual(log.LOG_WRITE_FAILURES, 1)
+        self.assertIn("磁盘满", log.LAST_LOG_WRITE_FAILURE.get("error") or "")
+        self.assertIn("t.diskfull", err.getvalue())
+
+    def test_a_successful_write_is_not_counted_as_a_failure(self):
+        back = log.log_event("t.ok", a=1)
+        self.assertIsInstance(back, dict)
+        self.assertEqual(back["event"], "t.ok")
+        self.assertEqual(log.LOG_WRITE_FAILURES, 0, "没失败就不许记失败，否则计数本身是新的假话")
+        self.assertIsNone(log.LAST_LOG_WRITE_FAILURE)
+
+    def test_failure_stats_are_reported_in_env_json(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            log.log_event("t.bad", bad=object())
+        name = log.build_log_bundle()
+        with zipfile.ZipFile(os.path.join(os.path.dirname(log.LOG_FILE), name)) as z:
+            env = json.loads(z.read("env.json").decode("utf-8"))
+        self.assertGreaterEqual(env["log_write_failures"]["count"], 1)
+        self.assertTrue(env["log_write_failures"]["last_error"])
+
+    def test_empty_log_path_is_quietly_skipped_but_still_counted(self):
+        """`LOG_FILE` 是空串占位（import 期档名文件读不出来）时写日志的行为。
+
+        这里把 P1-5 与 P1-6 的接缝钉死：`_initial_log_file()` 的说明写着"空路径下它安静地不写"，
+        而"安静"**不等于**"成功"——
+          - 不许抛（那会把 `import log` 之后的所有调用打成 traceback，见上一条用例的说明）；
+          - 也不许回一条"看起来成功了"的 rec（P1-5 那句假话），要回 `None`；
+          - 更要记进 `LOG_WRITE_FAILURES`：**这段时间的日志确实一条都没落盘**，
+            反馈包里必须看得见，否则 AI 排错时会把"缺日志"读成"用户没操作过"。
+        """
+        self.addCleanup(setattr, log, "LOG_FILE", log.LOG_FILE)
+        log.LOG_FILE = ""
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            back = log.log_event("t.nopath", a=1)        # 不许抛回业务逻辑
+        self.assertIsNone(back, "没写进盘就必须回 None，不能回一条'看起来成功'的记录")
+        self.assertGreaterEqual(log.LOG_WRITE_FAILURES, 1, "空路径下没写盘也必须留痕")
+        self.assertEqual(log.LAST_LOG_WRITE_FAILURE.get("event"), "t.nopath")
+        self.assertIn("t.nopath", err.getvalue())
 
 
 if __name__ == "__main__":
