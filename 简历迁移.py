@@ -42,14 +42,18 @@
 只 import 本任务用到的模块（`resumelib` / `store` / `log`），**绝不 import `app.py`**
 （那是服务，脚本不能拖起 Web 依赖）。
 """
+import functools
 import hashlib
 import json
 import os
-import shutil
 import sys
 from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+# 备份 / 恢复四件套的**唯一一份实现**（批 5 §7.2）：`简历迁移.py` 与 `身份迁移.py` 共用，
+# 不再各抄一遍（抄漏一处就是体检 §2 P0-14）。
+import 迁移脚手架 as 脚手架  # noqa: E402
 
 import log        # noqa: E402
 import resumelib  # noqa: E402
@@ -316,6 +320,13 @@ def render_table(plan, executing=False):
     "这次什么都没改"（与 `身份迁移.py` 同一处误读）。表的内容一个字不变，只换这两句的口气。
     """
     lines = []
+    # 批 5 §7.1：本脚本是**一次性**迁移工具，本机**已经跑过了**（`rv_0001` 已登记、6 条老分析
+    # 已经指过去）。再跑一次什么也不会改，只会往 `data/profiles/` 里再堆一份整目录备份 ——
+    # 这行"开场提示"就是为了挡住"顺手再跑一次"。
+    # 这是**唯一**允许的输出变化（§7.2）。措辞里**不用** `⚠` / `✗` 之类的非 GBK 字符：
+    # cp936 控制台 print 它们就是 `UnicodeEncodeError`（本项目为此专门换掉过 `⚠` / `✗`）。
+    lines.append("【提醒】本脚本是一次性迁移工具，本机已完成迁移；重复执行只会重复备份，"
+                 "除非确有必要请勿再跑。")
     lines.append("简历迁移 · %s" % ("改动预览（下面开始执行：有改动才建备份）" if executing
                                     else "试跑（严格只读，一个字节都不写）"))
     lines.append("profile: %s" % plan["profile"])
@@ -410,118 +421,23 @@ def render_table(plan, executing=False):
 
 
 # ---------------------------------------------------------------- 备份 / 恢复
-def _dir_stats(path):
-    """目录的 `(文件数, 总字节数)`：备份体积必须**如实报给用户**（与 `身份迁移.py` 同一口径）。"""
-    files = total = 0
-    for dirpath, _dirnames, filenames in os.walk(path):
-        for fn in filenames:
-            try:
-                total += os.path.getsize(os.path.join(dirpath, fn))
-            except OSError:                    # 数不出来就不数它，别让"报体积"本身失败
-                continue
-            files += 1
-    return files, total
+# 批 5 §7.2：这一段原先在本脚本与 `身份迁移.py` 里**各抄一遍**（`_dir_stats` / `_human_size`
+# / `_backup_note` / `_profile_files` / `_ignore_previous_backups` / `_backup_profile` /
+# `_restore_profile`）。两边唯一的差别是 `_restore_profile` 收尾那圈多一句
+# `if dirpath == root: continue` —— 而那句正是体检 §2 P0-14 的真缺陷（回滚时把 profile 根目录
+# `rmdir` 掉，用户下一步就是重试，等于「失败路径上再丢一次」）。抄两遍的真正代价是
+# **下一次改一处、漏一处**，所以现在**唯一一份实现**在 `迁移脚手架.py`，这里只剩绑定：
+# `functools.partial` 把本脚本的备份前缀绑成第一个位置参数，于是调用形状一个字没变
+# （`_backup_profile()` / `_restore_profile(backup, had_files)`，以及 `copytree(ignore=...)`
+# 按 `(dirpath, names)` 两参调用）—— `execute_migration` 与既有测试都照原名调用。
+# 备份前缀仍**各脚本一份**（`简历迁移备份` / `迁移备份`：用户要能分开看哪次备份属于哪件事），
+# 但**命名规则**（`<前缀>_<YYYYmmdd_HHMMSS>`、同秒重名兜底）只有脚手架里 `backup_dir_name` 一处。
+_backup_note = 脚手架.backup_note
+_profile_files = 脚手架.profile_files
+_restore_profile = 脚手架.restore_profile
+_ignore_previous_backups = functools.partial(脚手架.ignore_previous_backups, BACKUP_PREFIX)
+_backup_profile = functools.partial(脚手架.backup_profile, BACKUP_PREFIX)
 
-
-def _human_size(n):
-    """人类可读体积（1024 进制；B 不带小数，其余一位小数）。"""
-    size = float(n)
-    for unit in ("B", "KB", "MB", "GB"):
-        if size < 1024 or unit == "GB":
-            return ("%d B" % int(size)) if unit == "B" else ("%.1f %s" % (size, unit))
-        size /= 1024.0
-
-
-def _backup_note(path):
-    """备份的「在哪、多大、可删」一句话（三个维护脚本同一口径，骨架抄三遍就得更小心）。"""
-    files, total = _dir_stats(path)
-    return ("%s（%d 个文件，%d 字节 ≈ %s；确认无误后可自行删除）"
-            % (path, files, total, _human_size(total)))
-
-
-def _profile_files(root):
-    """目录下所有文件的相对路径（含子目录）"""
-    out = set()
-    for dirpath, _dirnames, filenames in os.walk(root):
-        for fn in filenames:
-            out.add(os.path.relpath(os.path.join(dirpath, fn), root))
-    return out
-
-
-def _ignore_previous_backups(_dirpath, names):
-    """`shutil.copytree` 的 ignore：**备份里绝不套备份**（拷一次就多 MB 级、再跑就滚雪球）。
-
-    备份落在 `data/profiles/简历迁移备份_<ts>/`，是 profile 目录的**兄弟**，真布局下本来就
-    拷不进去；这道闸门钉的是**不变量**：备份根将来挪进 profile（或用户手工搬进来）也不会滚雪球。
-
-    ⚠️ 还要挡住 `store.snapshot_before_overwrite` / `jobdup._snapshot` 留在 profile 里的
-    `<文件>.bak-<时间戳>` **文件**：原来的闸门只看**目录**前缀 `简历迁移备份`，这些文件照拷不误
-    ⇒ 每备份一次就把上一次的留档再拷一份，profile 目录无上限增长（`.bak-` 被备份再备份）。
-    它们不是用户的数据（是覆盖前的留档），备份里不需要第二份；留档自身的上限由
-    `store._prune_backups` 轮转（每份目标文件只留最新 3 份）。
-    """
-    out = []
-    for n in names:
-        if n.startswith(BACKUP_PREFIX):
-            out.append(n)
-        elif store.BACKUP_SUFFIX in n and not os.path.isdir(os.path.join(_dirpath, n)):
-            out.append(n)
-    return out
-
-
-def _backup_profile():
-    """把 `data/profiles/<key>/` **整目录拷贝**到 `data/profiles/简历迁移备份_<时间戳>/`。
-
-    **拷贝而不是移动**：整目录移动会让 `profile_dir()` 在迁移过程中不存在（`store` 的任何读
-    路径都会当场坏掉），而且"备份"本来就该是"原地不动的那一份"。备份**保留不删**。
-    """
-    src = os.path.abspath(store.profile_dir())
-    if not os.path.isdir(src):
-        raise RuntimeError("profile 目录不存在：%s" % src)
-    root = store.profiles_root()
-    os.makedirs(root, exist_ok=True)
-    dest = os.path.join(root, BACKUP_PREFIX + "_" + datetime.now().strftime("%Y%m%d_%H%M%S"))
-    if os.path.exists(dest):
-        dest = os.path.join(root, BACKUP_PREFIX + "_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f"))
-    shutil.copytree(src, dest, ignore=_ignore_previous_backups)
-    return dest
-
-
-def _restore_profile(backup, had_files):
-    """从备份恢复：把备份里的文件写回，并**删掉迁移新建的东西**（备份里没有的一律不留下）。
-
-    `had_files` 是迁移前该目录的全部文件（相对路径）。恢复后凡是不在 `had_files` 里的文件
-    都被删掉 —— 这正是「失败 → 从备份恢复」的严格含义（不留半改的、不留新造的）。
-
-    **空目录也要还原**：`os.walk` 会把空目录也走一遍，所以上面那圈会把 `logs/` 这种
-    `copytree` 拷过来、却一个文件都没有的目录重建出来；收尾那圈只删**备份里没有**的空目录
-    （"备份里有的空目录"是用户原来的形状，普通文件复制表达不出来，只能这样补）。
-    """
-    root = os.path.abspath(store.profile_dir())
-    backup_dirs = set()
-    for dirpath, _dirnames, filenames in os.walk(backup):
-        rel = os.path.relpath(dirpath, backup)
-        rel = "" if rel == "." else rel
-        backup_dirs.add(rel)
-        dest_dir = root if not rel else os.path.join(root, rel)
-        if not os.path.isdir(dest_dir):
-            os.makedirs(dest_dir, exist_ok=True)
-        for fn in filenames:
-            shutil.copy2(os.path.join(dirpath, fn), os.path.join(dest_dir, fn))
-    for rel in sorted(_profile_files(root) - set(had_files), reverse=True):
-        try:
-            os.remove(os.path.join(root, rel))
-        except OSError:
-            pass
-    for dirpath, dirnames, filenames in os.walk(root, topdown=False):
-        if dirpath == root:
-            continue
-        rel = os.path.relpath(dirpath, root)
-        if rel not in backup_dirs and not dirnames and not filenames:
-            try:
-                os.rmdir(dirpath)
-            except OSError:
-                pass
 
 
 def _write_json(path, obj):

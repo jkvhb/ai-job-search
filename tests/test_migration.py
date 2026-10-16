@@ -870,10 +870,12 @@ class ExistingJdIdClaimTest(CliTestMixin, IsolatedCase):
 class RestoreKeepsProfileRootTest(IsolatedCase):
     """P0-14：回滚**只许删掉自己新建的东西**，用户原来的形状（含空目录、含 profile 根）必须留着。
 
-    `简历迁移.py` 的同一段多两道：`if dirpath == root: continue` 与「备份里就有的空目录不删」。
-    `身份迁移.py` 的收尾那圈把**所有**空目录都删掉（除了根）⇒ 一次失败的 `--执行` 会把用户
-    profile 里原本就有的空目录（`jd/` 这种）抹掉 —— 而此刻脚本**正在返回错误码**，
-    用户下一步就是重试，属于「失败路径上再丢一次」。
+    **历史形状**（批 5 §7.2 收成一份实现之前）：`简历迁移.py` 的那一段多两道 ——
+    `if dirpath == root: continue` 与「备份里就有的空目录不删」；`身份迁移.py` 少了它们
+    ⇒ 一次失败的 `--执行` 会把用户 profile 里原本就有的空目录（`jd/` 这种）抹掉 ——
+    而此刻脚本**正在返回错误码**，用户下一步就是重试，属于「失败路径上再丢一次」。
+    现在这四件套只剩**一份**实现（`迁移脚手架.py`），且两边跑**同一套差分测试**：
+    `tests/test_resume_migration.py::SharedScaffoldDifferentialTest`（改一边、漏一边就红）。
     """
 
     def _tear_profile_subdirs(self):

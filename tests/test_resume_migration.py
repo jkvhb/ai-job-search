@@ -16,7 +16,10 @@ import importlib
 import io
 import json
 import os
+import re
+import shutil
 import sys
+import tempfile
 import unittest
 from datetime import datetime
 from unittest import mock
@@ -27,6 +30,9 @@ import store
 from tests.base import IsolatedCase
 
 CLI = importlib.import_module("简历迁移")
+# 差分测试（体检批 5 §7.2）要用到**另一个**迁移脚本与共用的那份实现：
+IDENTITY_CLI = importlib.import_module("身份迁移")
+MIGRATION_SCAFFOLD = importlib.import_module("迁移脚手架")
 
 RESUME_NAME = "周汉钦-母版"
 RESUME_TEXT = ("周汉钦 · 简历（夹具）\n\n## 技能\n数据标注质检 / ASR 评测 / Bad Case 归因\n\n"
@@ -648,6 +654,236 @@ class NonUtf8ResumesDocTest(MigrationCase):
         self.assertNotEqual(code, 0, "有字节却解析不出 → 必须非零退出，不能假装成功")
         self.assertIn("有内容但解析失败", err)
         self.assertEqual(self.disk_bytes(path), raw, "中止时一个字节都不许动")
+
+
+# ================================================================ 差分测试（体检批 5 §7.2）
+# 两个脚本的「备份 / 恢复」四件套现在是**同一份实现**（`迁移脚手架.py`）。下面这个夹具与这个
+# 用例类就是"不再抄两遍"的**牙**：谁把实现抄回两份、或只改一边、或改动命名规则，这里就红。
+FIXTURE_RESUME = "周汉钦-母版"
+FIXTURE_RESUME_TEXT = "周汉钦 · 简历（差分夹具）\n\n## 技能\n数据标注质检 / ASR 评测\n"
+FIXTURE_MTIME_TS = datetime.strptime("2026-09-18 23:06:24", "%Y-%m-%d %H:%M:%S").timestamp()
+FIXTURE_BAK = "jobs.json" + store.BACKUP_SUFFIX + "20200101_000000"
+FIXTURE_OLD_BACKUPS = ("迁移备份_20200101_000000", "简历迁移备份_20200101_000000")
+FIXTURE_SNAPSHOT_REL = os.path.join("resumes", resumelib.SNAPSHOT_DIR, "rv_0009.md")
+
+
+def build_shared_migration_fixture():
+    """造一份**两个迁移脚本都认**的隔离 profile（差分用例与改前/改后对比探针共用同一份）。
+
+    形状（体检 §7.2 要求的"同一个夹具"）：
+      - **空目录** `jd/`（用户原来的形状：回滚**不许**把它删掉）与空目录 `logs/`
+      - 母版**快照目录** `resumes/快照/`（含一份 `rv_0009.md` 的档）
+      - `<文件>.bak-<ts>` **留档**（`store.snapshot_before_overwrite` 的产物：备份里不许再套）
+      - 两个脚本各自前缀的**旧备份目录**（落在 profile 里 → 闸门必须跳过自己那一份）
+      - 2 条分析：`resume` 与盘上简历名对得上（简历侧有改动）、`jd/<id>.txt` 与报告都缺
+        （JD 侧"缺原文自成 1 个 JD"→ 身份侧也有改动）
+
+    只写调用方已经隔离好的 `store.DATA_ROOT` 下面的东西；**绝不碰真实 `data/`**。
+    """
+    for sub in ("resumes", "reports", "jd", "logs", ("interviews", "iv1")):
+        os.makedirs(store.p_path(*sub) if isinstance(sub, tuple) else store.p_path(sub),
+                    exist_ok=True)
+    path = os.path.join(store.p_path("resumes"), FIXTURE_RESUME + ".md")
+    with open(path, "w", encoding="utf-8", newline="") as f:      # LF：磁盘字节 == 文本字节
+        f.write(FIXTURE_RESUME_TEXT)
+    os.utime(path, (FIXTURE_MTIME_TS, FIXTURE_MTIME_TS))
+    store.write_bytes(store.p_path("resumes", resumelib.SNAPSHOT_DIR, "rv_0009.md"),
+                      "旧版母版快照（差分夹具）".encode("utf-8"))
+    store.save_jobs([
+        {"id": jid, "report": jid + ".html", "created_at": created, "job_title": "语音/文本评测",
+         "job_category": "数据标注/质检", "location": "北京", "salary": "13-26K", "score": 70.0,
+         "verdict": "建议投递", "jd_text_file": jid + ".txt", "resume": FIXTURE_RESUME,
+         "status": "未投递", "notes": ""}
+        for jid, created in (("分析A", "2026-09-19 14:29"), ("分析B", "2026-09-19 15:06"))])
+    store.write_bytes(store.p_path(FIXTURE_BAK), "旧留档，不该被拷进新备份".encode("utf-8"))
+    for name in FIXTURE_OLD_BACKUPS:
+        d = os.path.join(store.profile_dir(), name)
+        os.makedirs(d, exist_ok=True)
+        store.write_text(os.path.join(d, "jobs.json"), "旧备份，不该被拷进新备份")
+    store.write_json(store.p_path("interviews", "iv1", "status.json"),
+                     {"state": "done", "job_id": "分析A", "created_at": "2026-09-20 10:00"})
+    return store.profile_dir()
+
+
+def tree_fingerprint(root):
+    """整棵树的形状：`({相对路径: sha256}, {相对目录})` —— **空目录也在目录集合里**（P0-14 的靶子）。"""
+    files, dirs = {}, set()
+    for dirpath, dirnames, filenames in os.walk(root):
+        for d in dirnames:
+            dirs.add(os.path.relpath(os.path.join(dirpath, d), root))
+        for fn in filenames:
+            p = os.path.join(dirpath, fn)
+            with open(p, "rb") as f:
+                files[os.path.relpath(p, root)] = hashlib.sha256(f.read()).hexdigest()
+    return files, dirs
+
+
+class SharedScaffoldDifferentialTest(IsolatedCase):
+    """批 5 §7.2 差分测试：两个迁移脚本的「备份 / 恢复」必须**逐字同行为**。
+
+    为什么必须有它：这四件套原先在 `简历迁移.py` 与 `身份迁移.py` 里**各抄一遍**，两边只差
+    `_restore_profile` 收尾那句 `if dirpath == root: continue` —— 而那句正是体检 §2 P0-14 的
+    P0 缺陷（失败回滚把 profile 根目录 `rmdir` 掉）。靠人眼对差异只能对这一次，所以现在实现
+    只剩一份，并且**同夹具、同参数、对两个脚本各跑一遍**：
+
+      - 「备份 → 故意让迁移失败 → 从备份恢复」后，目录树（**含空目录**）与备份前逐项一致
+        （文件比 sha256、目录比集合）；
+      - 备份里**不含** `.bak-*` 留档、也不含**自己前缀**的旧备份目录（备份里不套备份）；
+      - 两边的备份**命名规则一致**（同一个 `<前缀>_<YYYYmmdd_HHMMSS>` 构造函数）；
+      - profile 根目录在空树回滚时也**不许**被删（P0-14）；
+      - 四件套的名字都绑在**同一个函数对象**上（谁再抄一份就 red）。
+    """
+
+    CLIENTS = (CLI, IDENTITY_CLI)
+
+    def setUp(self):
+        IsolatedCase.setUp(self)
+        build_shared_migration_fixture()
+
+    # ---- 小工具 ----
+    def run_failing_execute(self, cli, fail_on=2):
+        """跑一次 `--执行`，在第 `fail_on` 次 `store.write_json` 上注入失败（必然走恢复那条路）。
+
+        返回 `(退出码, stdout, stderr, 真实写盘调用次数)`。`fail_on=2` 是关键：第 1 个文件
+        已经写进盘了，**恢复必须把它撤掉** —— 否则这条用例会退化成"什么都没写，所以看起来一样"。
+        """
+        calls = {"n": 0}
+        real = store.write_json
+        boom = OSError("disk full (差分注入)")
+
+        def flaky(path, obj):
+            calls["n"] += 1
+            if calls["n"] == fail_on:
+                raise boom
+            return real(path, obj)
+
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(store, "write_json", side_effect=flaky):
+            with mock.patch.object(sys, "argv", [cli.__name__ + ".py", "--执行"]):
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    code = cli.main()
+        return code, out.getvalue(), err.getvalue(), calls["n"]
+
+    def backups_of(self, cli):
+        return sorted(glob.glob(os.path.join(store.profiles_root(), cli.BACKUP_PREFIX + "_*")))
+
+    def copied_under(self, backup):
+        return sorted(os.path.relpath(os.path.join(dp, fn), backup)
+                      for dp, _dn, fns in os.walk(backup) for fn in fns)
+
+    def new_doc_of(self, cli):
+        """这个脚本在本次迁移里**新建**的那份文档（恢复后必须被撤掉）。"""
+        return "resumes.json" if cli is CLI else "jds.json"
+
+    # ---- ① 恢复：目录树（含空目录）与备份前逐项一致 ----
+    def test_restore_brings_back_every_file_and_every_empty_directory(self):
+        for cli in self.CLIENTS:
+            with self.subTest(脚本=cli.__name__):
+                before = tree_fingerprint(store.profile_dir())
+                self.assertIn("jd", before[1], "夹具前提：profile 里本来就有空目录 jd/")
+                self.assertEqual(os.listdir(store.p_path("jd")), [], "夹具前提：它是空的")
+
+                code, text, _err, writes = self.run_failing_execute(cli, fail_on=2)
+
+                self.assertEqual(writes, 2,
+                                 "注入的那次写盘没落到第 2 个文件上：这条用例会退化成空跑")
+                self.assertEqual(code, 1)
+                self.assertIn("已用备份恢复", text)
+                after = tree_fingerprint(store.profile_dir())
+                self.assertEqual(after[0], before[0], "恢复后文件与备份前对不上（逐字节）")
+                self.assertEqual(after[1], before[1],
+                                 "恢复后目录集合与备份前对不上（用户原来的空目录被删了？）")
+                # 点名两处最容易被"顺手删掉"的形状
+                self.assertTrue(os.path.isdir(store.p_path("jd")), "用户原来的空目录 jd/ 被回滚删了")
+                self.assertTrue(os.path.isdir(store.p_path("resumes", resumelib.SNAPSHOT_DIR)),
+                                "快照目录被回滚删了")
+                # 本次新建的那份文档必须被撤掉（否则"恢复"是假的）
+                self.assertFalse(os.path.exists(store.p_path(self.new_doc_of(cli))),
+                                 "%s 没把本次新建的 %s 撤掉" % (cli.__name__, self.new_doc_of(cli)))
+                # 留档与旧备份原地不动（一个字节都没动）
+                self.assertEqual(store.read_text(store.p_path(FIXTURE_BAK)), "旧留档，不该被拷进新备份")
+                for name in FIXTURE_OLD_BACKUPS:
+                    self.assertTrue(os.path.isdir(os.path.join(store.profile_dir(), name)))
+
+    # ---- ② 备份里不套备份：`.bak-` 留档与自己前缀的旧备份都不拷 ----
+    def test_the_backup_carries_no_bak_file_and_no_nested_backup(self):
+        for cli in self.CLIENTS:
+            with self.subTest(脚本=cli.__name__):
+                code, _text, _err, _n = self.run_failing_execute(cli, fail_on=1)
+                self.assertEqual(code, 1)
+
+                backups = self.backups_of(cli)
+                self.assertEqual(len(backups), 1, "没建备份（那就没有回滚能力）：%r" % backups)
+                copied = self.copied_under(backups[0])
+
+                # ① `<文件>.bak-<ts>` 留档绝不许再拷一份进备份（profile 无上限增长的根源）
+                self.assertEqual([p for p in copied if store.BACKUP_SUFFIX in p], [],
+                                 "备份里套了 .bak- 留档：%s" % copied)
+                # ② 自己前缀的旧备份目录也不许拷进去（闸门就是按 prefix 认的）
+                nested = [d for d in os.listdir(backups[0]) if d.startswith(cli.BACKUP_PREFIX)]
+                self.assertEqual(nested, [], "备份里套了自己前缀的旧备份：%s" % nested)
+                # 反假绿：该拷的一个都不能少（别把闸门做成"什么都不拷"）
+                self.assertIn("jobs.json", copied)
+                self.assertIn(os.path.join("resumes", FIXTURE_RESUME + ".md"), copied)
+                self.assertIn(FIXTURE_SNAPSHOT_REL, copied)
+                self.assertTrue(os.path.isdir(os.path.join(backups[0], "jd")),
+                                "空目录 jd/ 没被拷进备份（恢复时它就回不来了）")
+
+    # ---- ③ 命名规则：两边同一条（前缀各一份，但规则只有一处） ----
+    def test_both_sides_name_the_backup_by_the_same_rule(self):
+        when = datetime(2026, 10, 13, 19, 15, 37)
+        # 规则钉死在这里（不用实现里的常量拼期望值，否则改了实现这条断言跟着一起变 = 假绿）
+        self.assertEqual(MIGRATION_SCAFFOLD.backup_dir_name("X", when), "X_20261013_191537")
+        self.assertEqual(MIGRATION_SCAFFOLD.backup_dir_name("X", when, micro=True),
+                         "X_20261013_191537_000000")
+
+        for cli in self.CLIENTS:
+            with self.subTest(脚本=cli.__name__):
+                code, _text, _err, _n = self.run_failing_execute(cli, fail_on=1)
+                self.assertEqual(code, 1)
+                name = os.path.basename(self.backups_of(cli)[0])
+                self.assertRegex(name, r"^%s_\d{8}_\d{6}$" % re.escape(cli.BACKUP_PREFIX),
+                                 "备份目录名不符合两边同一条规则：%r" % name)
+
+        # 前缀本身**用户可见**（备份区里一眼看到的那几个目录），逐字钉住：
+        # 两边故意不同（`简历迁移备份` / `迁移备份` —— 用户要能分开看哪次备份属于哪件事），
+        # 但"改一个字符"（前缀或时间戳格式）都必须在这里变红。
+        self.assertEqual(CLI.BACKUP_PREFIX, "简历迁移备份")
+        self.assertEqual(IDENTITY_CLI.BACKUP_PREFIX, "迁移备份")
+
+    # ---- ④ P0-14：最极端的形状下，profile 根目录也不许被删 ----
+    def test_restore_keeps_the_profile_root_when_the_backup_and_the_tree_are_empty(self):
+        """备份是空的、profile 树也是空的 → 根**不许**被 `rmdir` 掉。
+
+        走 `--执行` 测不出来：备份里总带着那几个子目录，根永远"非空"（P0-14 当初漏掉这条，
+        正是因为只测了"根非空"的形状）。所以这里直接调 `_restore_profile`，两个脚本各一次。
+        """
+        empty_backup = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, empty_backup, ignore_errors=True)
+        for cli in self.CLIENTS:
+            with self.subTest(脚本=cli.__name__):
+                for sub in ("resumes", "reports", "jd", "logs", "interviews"):
+                    shutil.rmtree(store.p_path(sub), ignore_errors=True)
+                cli._restore_profile(empty_backup, set())          # noqa: SLF001 - 被测的就是它
+                self.assertTrue(os.path.isdir(store.profile_dir()),
+                                "回滚把 profile 根目录删掉了：%s" % store.profile_dir())
+
+    # ---- ⑤ 四件套只剩一份实现：名字都绑在同一个函数对象上 ----
+    def test_both_scripts_bind_the_same_implementation(self):
+        self.assertIs(CLI._restore_profile, IDENTITY_CLI._restore_profile)
+        self.assertIs(CLI._restore_profile, MIGRATION_SCAFFOLD.restore_profile)
+        for cli in self.CLIENTS:
+            self.assertIs(cli._profile_files, MIGRATION_SCAFFOLD.profile_files, cli.__name__)
+            self.assertIs(cli._backup_note, MIGRATION_SCAFFOLD.backup_note, cli.__name__)
+            for name, impl in (("_backup_profile", MIGRATION_SCAFFOLD.backup_profile),
+                               ("_ignore_previous_backups",
+                                MIGRATION_SCAFFOLD.ignore_previous_backups)):
+                bound = getattr(cli, name)
+                self.assertIs(getattr(bound, "func", None), impl,
+                              "%s 又自己抄了一份 %s（§7.2：四件套只许有一份实现）"
+                              % (cli.__name__, name))
+                self.assertEqual(bound.args, (cli.BACKUP_PREFIX,),
+                                 "%s 的 %s 没绑上本脚本的备份前缀" % (cli.__name__, name))
 
 
 if __name__ == "__main__":
