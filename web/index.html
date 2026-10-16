@@ -3296,27 +3296,36 @@ async function clearLogs(){
   }
 }
 
+// 「日志读不出来」的**唯一**出口：读没读到是两件事，说错了就是把"没读到"说成"你没有日志"。
+function renderLogsUnreadable(why){
+  logUI('logs.load_failed', {error: why}, 'error');
+  $('#logTotal').textContent = '—';                 // 不是 0 条：是没读到
+  $('#logMeta').innerHTML = '<span style="color:var(--red)">日志读不出来：'+esc(why)+'</span>';
+  $('#logList').innerHTML = '<div class="empty">日志读取失败：'+esc(why)
+    + '<br>这不是「你没有日志」，是没读到 —— 请点「刷新」重试。</div>';
+}
+
 async function loadLogs(){
   let r;
   try{
     const resp = await fetch('/api/logs?limit=150');
     if(!resp || resp.ok !== true) throw new Error('接口返回 HTTP ' + ((resp && resp.status) || '?'));
     r = await resp.json();
-    // 服务端已经能如实回 ok:false（读不出来 / 路径没解析出来）—— 必须判它（P1-17），
-    // 否则下面会把 undefined / NaN 当数据渲染出来（"共 undefined 条 / NaN KB"）。
-    if(!r || r.ok === false) throw new Error((r && r.error) || '日志接口没有返回内容');
+    if(!r) throw new Error('日志接口没有返回内容');
   }catch(e){
-    const why = (e && e.message) || String(e);
-    logUI('logs.load_failed', {error: why}, 'error');
-    $('#logTotal').textContent = '—';                 // 不是 0 条：是没读到
-    $('#logMeta').innerHTML = '<span style="color:var(--red)">日志读不出来：'+esc(why)+'</span>';
-    $('#logList').innerHTML = '<div class="empty">日志读取失败：'+esc(why)
-      + '<br>这不是「你没有日志」，是没读到 —— 请点「刷新」重试。</div>';
+    renderLogsUnreadable((e && e.message) || String(e));
+    return;
+  }
+  // 服务端如实回的"文件存在却读不出来"（P1-6）：HTTP 200 也可能带着这件事。
+  // ⚠️ 认 `error` / `readable` **本身**，不靠 `ok` 一个字段 —— 少给一个字段就又会变回
+  // 下面那句"还没有日志 / 共 0 条"（对照组：真的是 0 条时这三个字段都不会这么说）。
+  if((r.error) || r.readable === false || r.ok === false){
+    renderLogsUnreadable(r.error || '接口回了 ok:false，但没说原因');
     return;
   }
   $('#logTotal').textContent = r.total;
   $('#logMeta').innerHTML = '版本 <code>'+esc(r.version)+'</code> ｜ 会话 <code>'+esc(r.session)+'</code><br>'+
-    '日志文件 <code>'+esc(r.file)+'</code> ｜ 大小 '+(Number(r.size)/1024).toFixed(1)+' KB';
+    '日志文件 <code>'+esc(r.file)+'</code> ｜ 大小 '+(Number(r.size)/1024).toFixed(1)+' KB ｜ 共 '+r.total+' 条记录';
   const list = $('#logList');
   if(!r.recent || !r.recent.length){ list.innerHTML = '<div class="empty">还没有日志</div>'; return; }
   list.innerHTML = '<div class="lgbox">' + r.recent.slice().reverse().map(x=>{

@@ -1799,6 +1799,26 @@ FOREIGN_REQUEST_ERROR = (
     "（想改你的模型地址、或读走你的配置）—— 已经被拦下来了。"
 )
 
+# `do_GET` 路由内部**没人接住**的意外：该说哪句人话、记哪个日志事件（批 5 / 体检报告 §7.3 第 1 条）。
+#
+# 为什么是张表而不是每处自己 `_send(500, …)`：那 7 处各拼一份 500 响应（状态码 + 响应体形状 +
+# 日志），写法一样、还漏着 6 个分支。现在**唯一**构造 GET 500 的地方是 `do_GET` 的兜底，
+# 路由只负责"说清是哪件事失败"。表里这 7 句与旧实现逐字一致 —— 它们被既有测试钉着
+# （`tests/test_kb.py` 断"知识库读取失败"/"复习队列读取失败"，`tests/test_app.py` 断"读取失败"），
+# 换句话就是换一句假话，所以不许改字。
+# ⚠️ **没有登记的路由走通用那句**：兜底只接"没人接住的意外"，不是把 404 / 409 / 400 也吞进来 ——
+# 那些状态码仍由路由自己 `_send`（`test_app.GetOuterTryTest` 逐条钉着）。
+_GET_ERROR_SAYS = {
+    "/api/resumes": ("简历版本库读取失败：%s", "resume.list_error"),
+    "/api/knowledge": ("知识库读取失败：%s", "kb.api_error"),
+    "/api/knowledge/review": ("复习队列读取失败：%s", "kb.review_api_error"),
+    "/api/jd/purge_preview": ("预演失败：%s", "jd.purge_preview_error"),
+    "/api/job/outcome": ("结果读取失败：%s", "outcome.api_error"),
+    "/api/interview/status": ("面试状态读取失败：%s", "interview.status_error"),
+    "/api/interview/list": ("面试记录列表读取失败：%s", "interview.list_error"),
+}
+_GET_UNHANDLED_SAY = ("服务器内部错误：%s", "http.get_unhandled_error")
+
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "AIJobSearch/2.0"
@@ -1961,6 +1981,16 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- GET
     def do_GET(self):
+        """GET 的入口：**唯一的外层兜底**（批 5 / 体检报告 §7.3 第 1 条）。
+
+        三个动词里原先只有 GET 没有外层 try：任何一条路由里漏掉的意外（读盘 OSError、
+        被手改坏的数据 TypeError…）都会让服务器**不回任何响应就断开连接** —— 客户端只看到
+        RemoteDisconnected，连 500 都拿不到，界面只能永远转圈。这里统一兜成结构化
+        500 + 一句人话 + 一条日志（与 `do_POST` / `do_DELETE` 同一口径）。
+
+        ⚠️ **兜底只接"没人接住的意外"**：该 404 / 409 / 400 的仍由路由自己 `_send`，
+        一个状态码都没有变（见 `_GET_ERROR_SAYS` 与 `test_app.GetOuterTryTest`）。
+        """
         self._t0 = time.time()
         # 来源校验放在**所有路由之前**（含静态文件与 /reports/*、/jd/*）：域名重绑定下
         # 攻击者的页面连读都该读不到（P2-1）。do_POST / do_DELETE 走同一个函数。
@@ -1968,7 +1998,16 @@ class Handler(BaseHTTPRequestHandler):
             return
         u = urlparse(self.path)
         p, q = u.path, parse_qs(u.query)
+        try:
+            return self._handle_get(p, q)
+        except Exception as e:
+            # 未预期异常的**唯一**出口：路由自己没接住 = 没人能说清是哪件事，按路由登记的话术说
+            say, event = _GET_ERROR_SAYS.get(p, _GET_UNHANDLED_SAY)
+            log.log_exc(event, e, path=p, query=u.query[:300])
+            return self._send(500, {"ok": False, "error": say % (e,)})
 
+    # ---- GET 的各条只读路由（统一由 `do_GET` 兜底，见它的说明；这里只管路由本身）
+    def _handle_get(self, p, q):
         if p in ("/", "/index.html"):
             return self._send_file(os.path.join(WEB, "index.html"), "text/html; charset=utf-8")
 
@@ -2028,16 +2067,12 @@ class Handler(BaseHTTPRequestHandler):
             # `unregistered` 是**盘上有文件但还没有版本记录**的那些 —— 迁移（Task 5）之前它们
             # 就是用户全部的简历，界面必须看得见，绝不能因为"没有版本记录"就当成不存在。
             include_removed = _as_bool(q.get("include_removed", ["0"])[0])
-            try:
-                # 版本名集合一律取**全量（含已移出）**：`unregistered` 说的是"盘上这个文件
-                # **有没有版本记录**"，而"移出列表"只是不再显示/不能继续用 —— 记录还在。
-                # 拿过滤后的集合算，会把刚移出的简历报成"没有版本记录"（T3a 据此给"登记"
-                # 入口就是错的：用户以为自己的版本记录丢了）。列表本身仍按 include_removed 过滤。
-                all_versions = resumelib.list_versions(include_removed=True)
-            except Exception as e:
-                # do_GET 没有外层 try（见 /api/knowledge 的注释）：不兜底就是连接裸断
-                log.log_exc("resume.list_error", e)
-                return self._send(500, {"ok": False, "error": "简历版本库读取失败：%s" % e})
+            # 版本名集合一律取**全量（含已移出）**：`unregistered` 说的是"盘上这个文件
+            # **有没有版本记录**"，而"移出列表"只是不再显示/不能继续用 —— 记录还在。
+            # 拿过滤后的集合算，会把刚移出的简历报成"没有版本记录"（T3a 据此给"登记"
+            # 入口就是错的：用户以为自己的版本记录丢了）。列表本身仍按 include_removed 过滤。
+            # （这一支原先自带一份 500 包装；批 5 起由 do_GET 的外层兜底统一构造，见 `_GET_ERROR_SAYS`）
+            all_versions = resumelib.list_versions(include_removed=True)
             versions = all_versions if include_removed else [r for r in all_versions
                                                             if not r.get(resumelib.REMOVED)]
             files = _resume_files()
@@ -2135,48 +2170,39 @@ class Handler(BaseHTTPRequestHandler):
             def one(k, default=""):
                 v = q.get(k)
                 return v[0] if v else default
-            try:
-                data = store.load_knowledge()
-                return self._send(200, {
-                    "ok": True,
-                    "nodes": kb.list_nodes(data, q=one("q"), state=one("state"),
-                                           category=one("category"), jd_id=one("jd"),
-                                           sort=one("sort") or "mentions"),
-                    "stats": kb.stats(data),
-                    "duplicates": kb.find_duplicates(data),
-                    "jds": kb.all_jds(data),
-                    "categories": kb.all_categories(data),
-                    "states": list(kb.STATE_VALUES),
-                })
-            except Exception as e:
-                # do_POST 有外层 try，do_GET 没有：手改坏的 knowledge.json 曾让这里抛 TypeError，
-                # 服务器直接关连接 —— 客户端拿到的是 RemoteDisconnected，连 500 都没有。
-                # 兜底成结构化错误，前端才能显示「知识库读取失败」而不是静默白屏。
-                log.log_exc("kb.api_error", e)
-                return self._send(500, {"ok": False, "error": "知识库读取失败：%s" % e})
+            # 手改坏的 knowledge.json 曾让这里抛 TypeError，服务器直接关连接 —— 客户端拿到的是
+            # RemoteDisconnected，连 500 都没有。现在由 do_GET 的外层兜底成结构化 500
+            # （话术见 `_GET_ERROR_SAYS`），前端才能显示「知识库读取失败」而不是静默白屏。
+            data = store.load_knowledge()
+            return self._send(200, {
+                "ok": True,
+                "nodes": kb.list_nodes(data, q=one("q"), state=one("state"),
+                                       category=one("category"), jd_id=one("jd"),
+                                       sort=one("sort") or "mentions"),
+                "stats": kb.stats(data),
+                "duplicates": kb.find_duplicates(data),
+                "jds": kb.all_jds(data),
+                "categories": kb.all_categories(data),
+                "states": list(kb.STATE_VALUES),
+            })
 
         if p == "/api/knowledge/review":
             try:
-                try:
-                    limit = int(q.get("limit", ["20"])[0])
-                except Exception:
-                    limit = 20
-                limit = max(1, min(limit, 200))
-                data = store.load_knowledge()
-                queue = kb.review_queue(data, limit=limit)
-                today = datetime.now().strftime("%Y-%m-%d")
-                nodes = kb.ensure_kb(data)["nodes"]
-                return self._send(200, {
-                    "ok": True, "queue": queue,
-                    "stats": {"due": len(queue),
-                              "mastered": sum(1 for n in nodes if n.get("state") == "已掌握"),
-                              "reviewed_today": sum(1 for n in nodes
-                                                    if n.get("last_reviewed_at") == today)},
-                })
-            except Exception as e:
-                # do_GET 没有外层 try（见上面 /api/knowledge 的注释）：不兜底就会裸断连接
-                log.log_exc("kb.review_api_error", e)
-                return self._send(500, {"ok": False, "error": "复习队列读取失败：%s" % e})
+                limit = int(q.get("limit", ["20"])[0])
+            except Exception:
+                limit = 20
+            limit = max(1, min(limit, 200))
+            data = store.load_knowledge()
+            queue = kb.review_queue(data, limit=limit)
+            today = datetime.now().strftime("%Y-%m-%d")
+            nodes = kb.ensure_kb(data)["nodes"]
+            return self._send(200, {
+                "ok": True, "queue": queue,
+                "stats": {"due": len(queue),
+                          "mastered": sum(1 for n in nodes if n.get("state") == "已掌握"),
+                          "reviewed_today": sum(1 for n in nodes
+                                                if n.get("last_reviewed_at") == today)},
+            })
 
         if p == "/api/jd_text":
             # JD 原文挂在 **JD** 上（阶段 4A）：id 是 JD id（前端从 /api/jobs 拿到的就是它），
@@ -2200,11 +2226,8 @@ class Handler(BaseHTTPRequestHandler):
             jd_id = _purge_target_id(q.get("jd", q.get("id", [""]))[0])
             if not jd_id:
                 return self._send(400, {"ok": False, "error": "缺少 id（要删哪个岗位？）"})
-            try:
-                preview = jddelete.preview_purge(jd_id)
-            except Exception as e:
-                log.log_exc("jd.purge_preview_error", e, jd=jd_id)
-                return self._send(500, {"ok": False, "error": "预演失败：%s" % e})
+            # 预演炸了就由 do_GET 的外层兜底成 500「预演失败：…」（批 5，话术见 `_GET_ERROR_SAYS`）
+            preview = jddelete.preview_purge(jd_id)
             if not preview.get("found"):
                 # 200 之外唯一正确的一支：404（表里没有这个岗位，**不是**崩）
                 return self._send(404, {"ok": False, "id": jd_id,
@@ -2239,54 +2262,50 @@ class Handler(BaseHTTPRequestHandler):
                                         "statuses": store.STATUSES,
                                         "terminal": list(outcome.TERMINAL)})
             except LookupError as e:
+                # ⚠️ **这一处必须自己接**（批 5 里唯一保留的 GET 包装）：它是 **404**，不是 500 ——
+                # 兜底只负责"没人接住的意外"，把它交出去就会变成一句「服务器内部错误」的假话。
+                # 其余意外（手改坏的岗位记录 → TypeError…）由 do_GET 的外层兜底统一成 500。
                 return self._send(404, {"ok": False, "error": str(e)})
-            except Exception as e:
-                # do_GET **没有外层 try**（见 /api/knowledge 的注释）：手改坏的岗位记录会让
-                # application_of 抛出来，服务器直接关连接 —— 前端只看到 RemoteDisconnected，
-                # 连 500 都拿不到，只能永远转圈。必须在这里兜成结构化错误。
-                log.log_exc("outcome.api_error", e, job=jid)
-                return self._send(500, {"ok": False, "error": "结果读取失败：%s" % e})
 
         if p == "/api/interview/status":
             iid = store.safe_name(q.get("id", [""])[0])
             if not iid:
                 return self._send(400, {"ok": False, "error": "缺少面试记录 id"})
-            try:
-                st = interview.status(iid)
-                if not st:
-                    return self._send(404, {"ok": False, "error": "找不到该面试记录"})
-                return self._send(200, dict(st, ok=True, id=iid,
-                                            running=interview.is_running(iid)))
-            except Exception as e:
-                # do_GET **没有外层 try**（见 /api/knowledge 的注释）：不兜底的话服务器直接关连接，
-                # 前端只看到 RemoteDisconnected —— 连 500 都拿不到，只能永远转圈。
-                log.log_exc("interview.status_error", e, interview=iid)
-                return self._send(500, {"ok": False, "error": "面试状态读取失败：%s" % e})
+            st = interview.status(iid)
+            if not st:
+                return self._send(404, {"ok": False, "error": "找不到该面试记录"})
+            return self._send(200, dict(st, ok=True, id=iid,
+                                        running=interview.is_running(iid)))
 
         if p == "/api/interview/list":
             job = store.safe_name(q.get("job", [""])[0])
-            try:
-                rows = []
-                for iid in interview.list_interviews(job):
-                    st = interview.status(iid)
-                    if st:
-                        rows.append(dict(st, id=iid, running=interview.is_running(iid)))
-                return self._send(200, {"ok": True, "job": job, "interviews": rows})
-            except Exception as e:
-                # 同上：do_GET 必须自己兜底，否则连接裸断
-                log.log_exc("interview.list_error", e, job=job)
-                return self._send(500, {"ok": False, "error": "面试记录列表读取失败：%s" % e})
+            rows = []
+            for iid in interview.list_interviews(job):
+                st = interview.status(iid)
+                if st:
+                    rows.append(dict(st, id=iid, running=interview.is_running(iid)))
+            return self._send(200, {"ok": True, "job": job, "interviews": rows})
 
         if p == "/api/logs":
             try:
                 n = int(q.get("limit", ["150"])[0])
             except Exception:
                 n = 150
-            recent, total = log.read_logs(n)
+            page = log.read_logs(n)
+            # ⚠️ **"文件存在却读不出来"绝不是"共 0 条日志"**（P1-6）。`LogPage.error` 早就会说这件事，
+            # 但这里从没把它带出去 ⇒ 前端只看 `total` ⇒ 界面照旧显示"共 0 条"（那句假话）。
+            # 所以**加两个字段**如实带出去（`readable` / `error`），
+            # 同时**既有字段的语义一个字不改**（`total` = 能解析的条数、`recent` = 最后 n 条）。
+            recent, total = page
             size = os.path.getsize(log.LOG_FILE) if os.path.exists(log.LOG_FILE) else 0
-            return self._send(200, {"version": log.APP_VERSION, "session": log.SESSION_ID,
-                                    "file": log.LOG_FILE, "total": total, "size": size,
-                                    "recent": recent})
+            body = {"version": log.APP_VERSION, "session": log.SESSION_ID,
+                    "file": log.LOG_FILE, "total": total, "size": size,
+                    "recent": recent, "readable": page.readable, "error": page.error}
+            if not page.readable:
+                # 与其余路由同一口径：读不出来就说 `ok:false` + 一句人话。
+                # **不是 500**（服务器没坏，是那份文件读不出来），也不是"你没有日志"。
+                body["ok"] = False
+            return self._send(200, body)
 
         if p == "/api/logs/download":
             if not os.path.exists(log.LOG_FILE):

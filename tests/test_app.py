@@ -6170,5 +6170,187 @@ class ProfileMessagePlaceholderTest(IsolatedCase):
                              "干净检出时拦不住）")
 
 
+# ============================================================ 批 5：do_GET 外层兜底 + P1-6 的界面半边
+# 体检报告 §7.3 第 1 条：`do_GET` 是三个动词里**唯一没有外层 try** 的 —— 任何一条路由里
+# 漏掉的意外都会让服务器**不回任何响应就断开连接**（客户端只看到 RemoteDisconnected，
+# 连 500 都拿不到）。下面给它加一层兜底，并逐条核对"该 404 还 404、该 409 还 409、该 400 还 400"。
+#
+# P1-6 的另一半：`log.read_logs` 已经能说"存在却读不出来"（`LogPage.error`），但 `/api/logs`
+# 从没把它带出去 ⇒ 界面照旧显示"共 0 条日志"（那句假话）。下面的路由用例 + 前端探针成对钉住
+# 「读不出来」与「真的 0 条」必须分得开。
+def _write_gbk_log():
+    """造一份**存在但读不出来**的 logs/events.jsonl（真非 UTF-8、含中文）。"""
+    path = log.LOG_FILE
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    raw = "中文日志内容".encode("gbk")
+    with open(path, "wb") as f:
+        f.write(raw)
+    return path, raw
+
+
+class LogsRouteUnreadableTest(IsolatedCase):
+    """`/api/logs`：**存在却读不出来** ≠ 共 0 条（P1-6 的服务端出口）。"""
+
+    def test_an_unreadable_log_file_is_not_reported_as_a_true_zero(self):
+        path, raw = _write_gbk_log()
+        self.assertGreater(os.path.getsize(path), 0)                  # 反证：盘上确实有内容
+        self.assertRaises(UnicodeDecodeError, raw.decode, "utf-8")    # 反证：真的读不出来
+
+        h = _get("/api/logs")
+        self.assertEqual(h.code, 200, "读不出来不是服务器坏了：状态码照旧 200")
+        body = h.json_body()
+        self.assertFalse(body.get("readable", True),
+                         "日志存在却读不出来，响应却说 readable（旧实现连这两个字段都没有）")
+        self.assertTrue(body.get("error"),
+                        "读不出来却没把原因带出去 ⇒ 界面只能显示「共 0 条日志」")
+        self.assertIn(path, body["error"], "原因里要指得出是哪个文件")
+        self.assertEqual(body["total"], 0)          # 既有字段的语义一个字都没改
+        self.assertEqual(body["recent"], [])
+        self.assertFalse(body.get("ok", True),
+                         "读不出来却说 ok：那句「共 0 条」的假话就回来了")
+
+    def test_a_missing_log_file_is_still_a_true_zero(self):
+        """对照组：**真的没有日志**照旧 0 条 —— 不许被一律报成"读不出来"。
+
+        ⚠️ 如实说明：这一条在改动**之前**也是绿的（旧的 `/api/logs` 本来就说 0 条且没 error）。
+        它钉的是"别把修法做成一律报错"；真正变红的是上一条。
+        """
+        self.assertFalse(os.path.exists(log.LOG_FILE))
+        h = _get("/api/logs")
+        self.assertEqual(h.code, 200)
+        body = h.json_body()
+        self.assertTrue(body.get("readable", True))
+        self.assertFalse(body.get("error"))
+        self.assertEqual(body["total"], 0)
+        self.assertEqual(body["recent"], [])
+
+
+class GetOuterTryTest(IsolatedCase):
+    """`do_GET` 外层兜底：路由里没人接住的意外 → **500 + 一句人话 + 一条日志**。
+
+    6 个分支就是体检报告 §7.3 第 1 条点名"漏着"的那 6 处，逐条造一次内部异常。
+    旧实现下这些用例不是"断言失败"而是 **ERROR**：异常直接穿出 `do_GET()`（真实服务器上
+    = 不回任何响应就断开连接，客户端拿到的是 RemoteDisconnected）。
+    """
+
+    def _assert_500_with_a_human_sentence(self, h, why):
+        self.assertEqual(h.code, 500,
+                         "内部意外必须变成结构化 500，而不是裸断连接：%r" % (h.code,))
+        body = h.json_body()
+        self.assertFalse(body.get("ok"))
+        self.assertIn("服务器内部错误", str(body.get("error")))
+        self.assertIn(why, str(body.get("error")), "原因要如实带出来（不许只说「出错了」）")
+
+    def test_api_config_leaked_exception_becomes_a_500(self):
+        with mock.patch.object(store, "load_config", side_effect=RuntimeError("配置盘坏了")):
+            h = _get("/api/config")
+        self._assert_500_with_a_human_sentence(h, "配置盘坏了")
+
+    def test_api_jd_text_leaked_exception_becomes_a_500(self):
+        with mock.patch.object(app, "_jd_view", side_effect=RuntimeError("JD 记录被改坏")):
+            h = _get("/api/jd_text?id=j1")
+        self._assert_500_with_a_human_sentence(h, "JD 记录被改坏")
+
+    def test_api_logs_leaked_exception_becomes_a_500(self):
+        with mock.patch.object(log, "read_logs", side_effect=RuntimeError("日志盘坏了")):
+            h = _get("/api/logs")
+        self._assert_500_with_a_human_sentence(h, "日志盘坏了")
+
+    def test_a_file_send_whose_open_fails_becomes_a_500(self):
+        """`_send_file` 的 `open`（首页 / 报告 / JD 截图都走它）。"""
+        real_open = open
+
+        def flaky(path, *a, **kw):
+            if str(path).endswith("index.html"):
+                raise OSError("首页文件被占用")
+            return real_open(path, *a, **kw)
+
+        with mock.patch("builtins.open", side_effect=flaky):
+            h = _get("/")
+        self._assert_500_with_a_human_sentence(h, "首页文件被占用")
+
+    def test_a_report_list_whose_getmtime_fails_becomes_a_500(self):
+        _write_report("20261015_岗A_80分.html", "<html></html>")
+        with mock.patch.object(app.os.path, "getmtime", side_effect=OSError("盘坏了")):
+            h = _get("/api/reports")
+        self._assert_500_with_a_human_sentence(h, "盘坏了")
+
+    def test_a_resume_version_whose_sha256_fails_becomes_a_500(self):
+        """`/api/resumes/file` 的 `try` 只接 `ValueError` —— 算指纹炸了就漏出去了。"""
+        v1 = resumelib.create_version("母版.md", "第一版内容")
+        with mock.patch.object(resumelib, "sha256_of", side_effect=RuntimeError("指纹算不出来")):
+            h = _get("/api/resumes/file?version=" + v1["id"])
+        self._assert_500_with_a_human_sentence(h, "指纹算不出来")
+
+    def test_the_expected_4xx_codes_are_not_swallowed_by_the_new_net(self):
+        """兜底**只接没人接住的意外**：该 404 / 409 / 400 的一个都不许被兜成 500。"""
+        store.ensure_profile()
+        for path in ("/api/job/outcome?id=nope", "/api/jd_text?id=nope",
+                     "/api/interview/status?id=nope",
+                     "/api/resumes/file?version=rv_9999"):
+            with self.subTest(path=path):
+                self.assertEqual(_get(path).code, 404, path)
+        for path in ("/api/job/outcome", "/api/jd/purge_preview", "/api/resumes/file"):
+            with self.subTest(path=path):
+                self.assertEqual(_get(path).code, 400, path)
+        # 409：简历里有字节、但不是 UTF-8 文本（"读不出来"绝不是"文件是空的"）
+        path = os.path.join(store.p_path("resumes"), "读不出来.md")
+        with open(path, "wb") as f:
+            f.write("我的简历：十个项目经验".encode("gbk"))
+        h = _get("/api/resumes?name=" + quote("读不出来.md"))
+        self.assertEqual(h.code, 409, "该 409 的被兜成 500 了：%s" % h.text()[:200])
+
+
+class FrontendLogsUnreadableTest(IsolatedCase):
+    """日志面板：`error` 非空时必须说"日志读不出来（原因）"，**不许**说"共 0 条"（P1-6 的界面半边）。"""
+
+    _JS = ("await loadLogs();\n"
+           "out.total = String($('#logTotal').textContent);\n"
+           "out.meta = String($('#logMeta').innerHTML);\n"
+           "out.list = String($('#logList').innerHTML);\n")
+
+    # HTTP 200，服务端如实说"存在却读不出来"：`readable:false` + `error`（`/api/logs` 的真实回包）
+    _ERROR_RESP = {"readable": False,
+                   "error": "日志文件 events.jsonl 存在却读不出来：'utf-8' codec can't decode byte 0xd6",
+                   "total": 0, "recent": [], "size": 12,
+                   "version": "1.0", "session": "s1", "file": "logs/events.jsonl"}
+
+    def test_an_unreadable_log_file_never_renders_a_zero_count(self):
+        """两种形状都要认：① `readable:false` + `error`；② 同一件事再加 `ok:false`。
+
+        只认 ② 的话，界面就把"读不出来"绑死在 `ok` 一个字段上 —— 服务端少给一个字段，
+        页面就又变回那句「共 0 条 / 还没有日志」的假话。旧实现正是只认 ②：形状 ① 下它
+        照旧渲染成"还没有日志"（这就是本条用例**在改动前红**的原因）。
+        """
+        _need_node()
+        for with_ok_false in (False, True):
+            with self.subTest(ok_false=with_ok_false):
+                resp = dict(self._ERROR_RESP)
+                if with_ok_false:
+                    resp["ok"] = False
+                out = web_probe.run_index(_FETCH_OK_JS + self._JS, {"resp": resp})
+                blob = out["total"] + out["meta"] + out["list"]
+                self.assertIn("日志读不出来", blob,
+                              "读不出来却没在界面上说（旧实现照旧说「共 0 条」）：%r" % (out,))
+                self.assertIn("存在却读不出来", blob, "没把服务端给的原因显示出来")
+                self.assertNotIn("共 0 条", blob, "读不出来却显示「共 0 条」—— 那句假话本身")
+                self.assertNotIn("还没有日志", out["list"],
+                                 "读不出来却说「还没有日志」（与真的 0 条分不开）")
+
+    def test_a_true_zero_still_renders_as_zero_records(self):
+        """对照组：**真的 0 条**（读了、就是没有）照旧说 0 条。"""
+        _need_node()
+        out = web_probe.run_index(_FETCH_OK_JS + self._JS,
+                                  {"resp": {"ok": True, "readable": True, "error": None,
+                                            "total": 0, "recent": [], "size": 0,
+                                            "version": "1.0", "session": "s1",
+                                            "file": "logs/events.jsonl"}})
+        blob = out["total"] + out["meta"] + out["list"]
+        self.assertIn("共 0 条", out["meta"],
+                      "真的 0 条却不显示条数（旧实现也没有这句）：%r" % (out,))
+        self.assertNotIn("读不出来", blob, "真的 0 条被误报成读不出来")
+        self.assertIn("还没有日志", out["list"])
+
+
 if __name__ == "__main__":
     unittest.main()
