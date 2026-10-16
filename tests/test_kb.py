@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import datetime
 import glob
 import io
 import json
@@ -1487,6 +1488,200 @@ class ReviewQueueTest(IsolatedCase):
 
     def test_empty_kb_is_fine(self):
         self.assertEqual(kb.review_queue({"nodes": []}), [])
+
+
+def _days_ago(n):
+    """n 天前的日期串（`%Y-%m-%d`）——按**当下**算，不用写死日期。"""
+    return (datetime.date.today() - datetime.timedelta(days=n)).strftime("%Y-%m-%d")
+
+
+def _reason_card(term="甲", **kw):
+    """只为 `kb._review_reason` 造一张卡：只摆理由文案会读的字段，其余给默认值。"""
+    c = {"term": term, "state": "待学习", "from_jds": [], "asked_count": 0,
+         "review_count": 0, "last_reviewed_at": "", "last_result": "",
+         "last_outcome": "未面试"}
+    c.update(kw)
+    return c
+
+
+class ReviewReasonTest(IsolatedCase):
+    """`kb._review_reason` 的**完整映射表**（体检 **P1-3**：理由文案必须与卡上的事实一致）。
+
+    背景：老实现让 `_days_since()` 一个数同时干两件事 —— **评分**（久未复习加成封顶 30 天）
+    与**说话**。于是 `min(天, 30) >= 30` 既可能是「从没复习过」，也可能是「复习过 45 天」，
+    文案一律写成「还没复习过」：`last_reviewed_at=45 天前` + `review_count=3` 的卡会显示
+    「待学习 · 还没复习过」这句**假话**（体检报告 §3 P1-3 的实跑证据）。
+
+    这里钉的是**每一支**的**具体文案**（不是 `assertIsInstance(str)` 那种没牙的断言）：
+    从没复习 / 今天复习过 / 1~29 天 / 恰好 30 天 / 45 天 / 有次数没日期 / 日期读不出来 /
+    日期在未来 / 空 state / 非法 state / asked_count 为负 / last_outcome 各种值 / 坏数据。
+    """
+
+    def _reasons(self, *cards):
+        """卡片写进隔离库 → 走**真实读路径**（`ensure_kb` 归一 → `review_queue`）→ {术语: 理由}。
+
+        为什么不直接调 `_review_reason(card)`：那会绕开 `ensure_kb` 这道咽喉
+        （「非字符串日期一律当空」等归一都发生在那里），而线上/界面上真正跑的就是这条路径。
+        """
+        nodes = []
+        for c in cards:
+            c = dict(c)
+            n = {"id": c["term"], "term": c["term"], "sources": [], "from_jds": []}
+            n.update(c)
+            nodes.append(n)
+        store.save_knowledge({"version": 1, "nodes": nodes})
+        return {n["term"]: n["reason"]
+                for n in kb.review_queue(store.load_knowledge(), limit=0)}
+
+    # ---------- 复习时间这一支（P1-3 的被告状分支） ----------
+
+    def test_never_reviewed_says_never_reviewed(self):
+        self.assertEqual(self._reasons(_reason_card())["甲"], "待学习 · 还没复习过")
+
+    def test_reviewed_45_days_ago_is_not_never_reviewed(self):
+        """P1-3 的被告状组合：复习过 30 天以上，绝不许说成「还没复习过」。"""
+        r = self._reasons(_reason_card(review_count=3, last_reviewed_at=_days_ago(45)))["甲"]
+        self.assertEqual(r, "待学习 · 45 天没复习")
+        self.assertNotIn("还没复习过", r)
+
+    def test_29_and_30_days_ago_report_the_real_number(self):
+        """30 天是评分的**加成上限**，不是「从没复习过」的判据 —— 29/30 都要如实说天数。"""
+        got = self._reasons(_reason_card(term="甲", last_reviewed_at=_days_ago(29)),
+                            _reason_card(term="乙", last_reviewed_at=_days_ago(30)))
+        self.assertEqual(got["甲"], "待学习 · 29 天没复习")
+        self.assertEqual(got["乙"], "待学习 · 30 天没复习")
+
+    def test_reviewed_today(self):
+        self.assertEqual(self._reasons(_reason_card(last_reviewed_at=kb._today()))["甲"],
+                         "待学习 · 今天复习过")
+
+    def test_review_count_without_date_is_admitted_not_denied(self):
+        """有自测次数、日期却是空的（手改坏/旧数据）→ 说次数，别替它说「还没复习过」。
+
+        `_normalise_review_fields` 把非字符串的 `last_reviewed_at` 一律归成空串，
+        所以「review_count=3 + last_reviewed_at=5」这个**真实可达**的组合必须走这一支。
+        """
+        got = self._reasons(_reason_card(review_count=3, last_reviewed_at=5))["甲"]
+        self.assertEqual(got, "待学习 · 复习过 3 次（没记日期）")
+        self.assertNotIn("还没复习过", got)
+
+    def test_unparseable_date_is_admitted_not_guessed(self):
+        """日期串读不出来 → 如实说读不出来，绝不猜成「还没复习过」或「今天复习过」。"""
+        got = self._reasons(_reason_card(last_reviewed_at="2026-13-45"))["甲"]
+        self.assertEqual(got, "待学习 · 上次复习日期读不出来（2026-13-45）")
+
+    def test_future_date_is_not_reported_as_today(self):
+        """日期在未来（手改 / 改过系统时钟）→ 不许说「今天复习过」（那是假话）。"""
+        tomorrow = (datetime.date.today() + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+        got = self._reasons(_reason_card(last_reviewed_at=tomorrow))["甲"]
+        self.assertEqual(got, "待学习 · 上次复习日期在未来（%s）" % tomorrow)
+
+    # ---------- state 这一支 ----------
+
+    def test_bad_state_is_not_dressed_up_as_a_known_state(self):
+        """非法 state（手改出「精通」/ 5）→ 说「状态未知」，不许冒充满分权重最高的「待学习」。
+
+        `_review_score` 对非法 state 用的是 `_REVIEW_WEIGHT.get(state, 1)` → weight=1（最低），
+        文案要是写「待学习」就等于宣称它按最高权重 3 排的。
+        """
+        got = self._reasons(_reason_card(term="甲", state="精通"),
+                            _reason_card(term="乙", state=5))
+        self.assertEqual(got["甲"], "状态未知（精通） · 还没复习过")
+        self.assertEqual(got["乙"], "状态未知（5） · 还没复习过")
+
+    def test_count_zero_with_a_corrupt_date_is_still_about_the_date(self):
+        """`review_count==0` + 坏日期 → 说的是**日期读不出来**，不是「还没复习过」。
+
+        两个字段必须各按各的事实说：日期坏了就报日期坏了（那一支还能被修好），
+        不能因为「次数是 0」就把「日期读不出来」这句真话吞掉。
+        """
+        got = self._reasons(_reason_card(review_count=0, last_reviewed_at="昨天"))["甲"]
+        self.assertEqual(got, "待学习 · 上次复习日期读不出来（昨天）")
+
+    def test_negative_review_count_is_not_printed_as_a_count(self):
+        """`review_count=-3`（手改坏）→ 不许写「复习过 -3 次」（负的自测次数不存在）。
+
+        `_review_age_text` 的判据是 `count > 0`，所以负值落回同一支「还没复习过」——
+        与事实一致：没有过任何一次自测。
+        """
+        got = self._reasons(_reason_card(review_count=-3))["甲"]
+        self.assertEqual(got, "待学习 · 还没复习过")
+
+    def test_whitespace_only_date_is_treated_as_absent(self):
+        """`"   "` 经 `_normalise_review_fields` 的 `strip()` 成了空串 → 走「还没复习过」，
+        不许把它当成一个读不出来的日期印成「上次复习日期读不出来（ ）」。"""
+        got = self._reasons(_reason_card(review_count=0, last_reviewed_at="   "))["甲"]
+        self.assertEqual(got, "待学习 · 还没复习过")
+
+    def test_wording_is_not_capped_at_30_days_but_the_score_is(self):
+        """**不封顶与封顶的分工**：45 天前复习的卡，**文案**说 45 天，**评分**仍按上限 30 天算。
+
+        这正是 P1-3 的根因 —— `_days_since()` 一个数同时干两件事。修法是把它们分开：
+        说话走 `_review_age_text`（不封顶），评分继续走 `_days_since`（封顶 30，旧行为不变）。
+        所以这里同时钉两个数：文案「45 天没复习」，且 score 与「从没复习过」那张卡**完全相等**
+        （都是封顶到 30 天）。谁要是为了改文案顺手动了 `_days_since`，这条就会红。
+        """
+        store.save_knowledge({"version": 1, "nodes": [
+            {"id": "甲", "term": "甲", "sources": [], "from_jds": [],
+             "last_reviewed_at": _days_ago(45), "review_count": 3},
+            {"id": "乙", "term": "乙", "sources": [], "from_jds": []}]})
+        q = {n["term"]: n for n in kb.review_queue(store.load_knowledge(), limit=0)}
+        self.assertEqual(q["甲"]["reason"], "待学习 · 45 天没复习")
+        self.assertEqual(q["乙"]["reason"], "待学习 · 还没复习过")
+        self.assertEqual(q["甲"]["score"], q["乙"]["score"],
+                         "久未复习的加成封顶 30 天：45 天前复习过的卡与从没复习过的卡同分")
+        # 两张卡同分时按术语升序（「乙」U+4E59 < 「甲」U+7532），顺序确定
+        self.assertEqual([n["term"] for n in kb.review_queue(store.load_knowledge(), limit=0)],
+                         ["乙", "甲"])
+
+    def test_missing_state_is_said_as_the_same_ruler_the_score_uses(self):
+        """空/缺失 state 与 `_review_score` **同一把尺子**：评分按 DEFAULT_STATE=待学习 算（权重 3），
+        所以文案也说「待学习」—— 判据与文案对齐，而不是各说各的。"""
+        got = self._reasons(_reason_card(term="甲", state=""),
+                            _reason_card(term="乙", state=None))
+        self.assertEqual(got["甲"], "待学习 · 还没复习过")
+        self.assertEqual(got["乙"], "待学习 · 还没复习过")
+
+    # ---------- asked_count / last_outcome / 岗位数 ----------
+
+    def test_negative_asked_count_is_not_turned_into_a_claim(self):
+        """asked_count=-3（手改坏）→ 不许写「面试被问过 -3 次」（没人被问过负数次）。"""
+        got = self._reasons(_reason_card(term="甲", asked_count=-3),
+                            _reason_card(term="乙", asked_count=2))
+        self.assertEqual(got["甲"], "待学习 · 还没复习过")
+        self.assertEqual(got["乙"], "待学习 · 面试被问过 2 次 · 还没复习过")
+
+    def test_last_outcome_values_do_not_leak_into_review_wording(self):
+        """`last_outcome` 是**面试结果**，不是自测记录：各种取值都不许搅动复习理由。
+
+        （它与 `asked_count` 是两回事：`_record_interview_in` 里 weak/good 只写 `last_outcome`、
+        不加 `asked_count`，所以「asked_count=0 + last_outcome=没答上」是真会出现的组合；
+        反正理由里一个字都不提面试结果，就不会说假话。）
+        """
+        values = ("未面试", "答上了", "没答上", 5, None, "")
+        cards = [_reason_card(term="t%d" % i, last_outcome=v)
+                 for i, v in enumerate(values)]
+        got = self._reasons(*cards)
+        for i, v in enumerate(values):
+            self.assertEqual(got["t%d" % i], "待学习 · 还没复习过",
+                             "last_outcome=%r 不许改变复习理由" % (v,))
+
+    def test_jd_clause_only_when_really_more_than_one_valid_jd(self):
+        """「被 N 个岗位提到」与 `all_jds` 同一把尺子：只有**非空字符串 id** 才算一个岗位。"""
+        got = self._reasons(
+            _reason_card(term="甲", from_jds=[{"id": "j1"}, {"id": "j2"}]),
+            _reason_card(term="乙", from_jds=[{"id": "j1"}]),
+            _reason_card(term="丙", from_jds=[{"id": "j1"}, {"id": 5}, {"id": ""}]))
+        self.assertEqual(got["甲"], "待学习 · 被 2 个岗位提到 · 还没复习过")
+        self.assertEqual(got["乙"], "待学习 · 还没复习过")
+        self.assertEqual(got["丙"], "待学习 · 还没复习过")
+
+    def test_full_reason_matches_the_documented_example(self):
+        """README 给用户看的例子必须真的能由实现产出（四段全齐、顺序一致）。"""
+        got = self._reasons(_reason_card(
+            term="甲", from_jds=[{"id": "j1"}, {"id": "j2"}], asked_count=1,
+            review_count=2, last_reviewed_at=_days_ago(21)))["甲"]
+        self.assertEqual(got, "待学习 · 被 2 个岗位提到 · 面试被问过 1 次 · 21 天没复习")
 
 
 class RecordReviewTest(IsolatedCase):

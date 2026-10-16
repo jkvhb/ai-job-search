@@ -561,11 +561,30 @@ def _valid_jds(card):
 
 
 def _days_since(date_str):
+    """距上次复习多少天，封顶 `_REVIEW_AGE_CAP` —— **只给评分用，不许拿来说话**。
+
+    它把「从没复习过」「日期格式坏了」「日期在未来」「真的过了很久」四种情况兜成同一个数
+    （30）。对**评分**这是对的（久未复习加成要封顶，`_review_score` 的旧行为不变），
+    但拿它去写文案就必然说假话 —— 体检 **P1-3** 的「复习过 45 天却说从没复习过」就是这么来的。
+    文案走 `_parse_review_date()` + `_review_age_text()`（见 `_review_reason` 的映射表）。
+    """
     try:
         d = datetime.strptime(str(date_str), "%Y-%m-%d").date()
     except Exception:
         return _REVIEW_AGE_CAP              # 从没复习过（或格式坏了）→ 按最久算
     return max(0, (datetime.now().date() - d).days)
+
+
+def _parse_review_date(date_str):
+    """`last_reviewed_at` → `date`；解析不出来返回 **None**（不兜底、不猜）。
+
+    判据必须与 `_days_since` 分开：那个函数把「没写过 / 格式坏了 / 超过 30 天」抹平成同一个
+    数（30，评分用的封顶），说话时就必须能分辨它们，否则又回到 P1-3 那句假话。
+    """
+    try:
+        return datetime.strptime(str(date_str), "%Y-%m-%d").date()
+    except Exception:
+        return None
 
 
 def _review_score(card):
@@ -586,18 +605,72 @@ def _review_score(card):
     return weight * (1 + jd_n) * (1 + age / 7.0) * (1 + asked)
 
 
+def _review_age_text(raw, count):
+    """「多久没复习」那一句 —— 每一支都必须与事实对得上（见 `_review_reason` 的映射表）。
+
+    `raw` 是**已经过 `_normalise_review_fields` 归一**的 `last_reviewed_at`
+    （非字符串一律成了空串；非空字符串原样保留，可能是"昨天"、"2026-13-45" 这类）。
+    """
+    if not raw:
+        if count > 0:
+            # 有自测次数、没日期：两个字段打架（手改坏 / 旧版本数据），只报事实、不选边 ——
+            # 老实现这里一律说「还没复习过」，而卡上明明写着 review_count=3。
+            # **报得出的事实就报**（次数），报不出的（哪天看的）如实说没记，不给「不确定」那种
+            # 什么都不说的空话 —— 用户至少知道这张卡被自测过几次。
+            return "复习过 %d 次（没记日期）" % count
+        return "还没复习过"
+    day = _parse_review_date(raw)
+    if day is None:
+        return "上次复习日期读不出来（%s）" % raw[:20]   # 信息不足 → 如实说，别猜
+    days = (datetime.now().date() - day).days
+    if days < 0:
+        # 日期在未来（手改 / 改过系统时钟）：算不出"多久没复习"，但绝不说成「今天复习过」
+        return "上次复习日期在未来（%s）" % raw[:20]
+    if days == 0:
+        return "今天复习过"
+    # **不封顶**：`_REVIEW_AGE_CAP` 是评分的加成上限，不是说话的上限 —— 45 天就说 45 天
+    return "%d 天没复习" % days
+
+
 def _review_reason(card):
-    """给人看的排序理由 —— 黑箱排序会让人不信任它。"""
+    """给人看的排序理由 —— 黑箱排序会让人不信任它。
+
+    **每一句都必须与卡上的事实对得上**（体检 **P1-3**：老实现把「复习过 30 天以上」说成
+    「还没复习过」）。判据与文案的完整映射表：
+
+    | 卡上的事实 | 文案 |
+    |---|---|
+    | `state` 在 `STATE_VALUES` 里 | 原样印状态 |
+    | `state` 为空 / 缺失 | 「待学习」—— 与 `_review_score` 的 `or DEFAULT_STATE` **同一把尺子**（权重 3） |
+    | `state` 非空但不在枚举里（如「精通」/5） | 「状态未知（X）」—— 评分对它按 `_REVIEW_WEIGHT.get(state, 1)` ＝ 1 算，不许冒充已知状态 |
+    | `_valid_jds` 数 > 1 | 「被 N 个岗位提到」（≤1 时省略；与 `all_jds` 同一把尺子） |
+    | `asked_count` > 0 | 「面试被问过 N 次」（≤0 / 坏值一律不提，免得写出"被问过 -3 次"） |
+    | 没日期 + `review_count` == 0 | 「还没复习过」 |
+    | 没日期 + `review_count` > 0 | 「复习过 N 次（没记日期）」—— 两个字段打架，只报事实、不选边 |
+    | 日期串读不出来 | 「上次复习日期读不出来（X）」—— 信息不足，如实说 |
+    | 日期在未来 | 「上次复习日期在未来（X）」—— 算不出来，绝不说「今天复习过」 |
+    | 日期是今天 | 「今天复习过」 |
+    | 日期在 1 天前或更早 | 「N 天没复习」—— **不封顶**，45 天就说 45 天 |
+
+    为什么不复用 `_days_since()`：见它的 docstring —— 它把三种不同的情况兜成同一个封顶值，
+    适合评分、不适合说话。评分继续用它（旧行为不变），文案走 `_parse_review_date()`。
+
+    `last_outcome` / `last_result` 不参与本文案：它们分别是「面试结果」与「上次自测结果」，
+    与"多久没复习"无关，写进来只会多一句与排序无关的话（也就多一个说假话的机会）。
+    映射表钉在 `tests/test_kb.py::ReviewReasonTest`，每一支都有具体文案断言。
+    """
     state = str(card.get("state") or DEFAULT_STATE)
-    parts = [state]
+    # 合法状态原样印；非法状态评的是 weight=1（最低），所以不许印成「待学习」那种满权重的说法
+    parts = [state if state in _STATE_RANK else "状态未知（%s）" % state[:20]]
     jd_n = len(_valid_jds(card))
     if jd_n > 1:
         parts.append("被 %d 个岗位提到" % jd_n)
     asked = _as_int(card.get("asked_count"))
-    if asked:
+    if asked > 0:
         parts.append("面试被问过 %d 次" % asked)
-    age = _days_since(card.get("last_reviewed_at"))
-    parts.append("还没复习过" if age >= _REVIEW_AGE_CAP else "%d 天没复习" % age)
+    raw = card.get("last_reviewed_at")
+    raw = raw.strip() if isinstance(raw, str) else ""
+    parts.append(_review_age_text(raw, _as_int(card.get("review_count"))))
     return " · ".join(parts)
 
 
