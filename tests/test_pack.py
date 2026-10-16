@@ -362,6 +362,37 @@ class ProfilePiiTest(unittest.TestCase):
         self.assertEqual([], PACK.verify(self.build(pii="data/profiles/default 我的简历 cv new"),
                                          root=self.root))
 
+    # ---- 收紧（复查批准的那一刀）：残余若出现在**包自带的样板文本**里 ⇒ 丢弃 ----
+    # 安全论证：`STARTER_RESUME` / `SHARE_NOTE` 是本工具**自己的常量**，按构造**不含用户 PII**
+    # ⇒ 出现在它们里的词不可能是"用户的真名" ⇒ 丢掉它**不会掩盖任何真实泄漏**。
+    # 不丢的代价：`个人终版.md` 这种"限定词 + 版次词"的档名会切出 `个人`（包自带的
+    # 分享说明里就写着"仅供个人求职使用"）⇒ verify() 点名、**每个包都被删**。
+
+    def test_residues_that_are_our_own_sample_words_are_dropped(self):
+        """正例：`个人终版` / `中文母版` 切出来的 `个人` / `中文` **必须被丢弃**。
+
+        它们都在包自带的样板文本里（`分享说明.md`：仅供个人求职使用 / 中文名照抄）⇒ 留着就是
+        "每个包都被自己判成泄漏"（fail-closed 删包），是另一个方向的错。
+        """
+        for resume in ("个人终版.md", "中文母版.md"):
+            with self.subTest(resume=resume):
+                self._reset_data()
+                self.make_profile(key="default", resumes=(resume,))
+                self.assertEqual([], PACK.profile_leak_keywords(self.root),
+                                 "%s 切出了包自带样板文本里的词" % resume)
+                self.assertEqual([], PACK.verify(self.build(pii="个人 中文"), root=self.root))
+
+    def test_sticky_residue_survives_when_it_is_not_a_sample_word(self):
+        """反例（不许削弱）：不在样板文本里的假名粘连（`张三母版`）⇒ `张三` 必须仍然留下。
+
+        与上一条成对：那把刀只砍"我们自己样板文本里的词"，绝不许顺手把真名一起砍掉。
+        """
+        self.assertNotIn("张三", PACK.STARTER_RESUME + PACK.SHARE_NOTE,
+                         "夹具前提被破坏：样板文本里出现了这个假名")
+        self._reset_data()
+        self.make_profile(key="default", resumes=("张三母版.md",))
+        self.assertEqual(["张三"], PACK.profile_leak_keywords(self.root))
+
 
 class ExamplePlaceholderTest(unittest.TestCase):
     """需求二（P0-15）：README 的简历文件名示例必须是**明显占位**，不许再写真名。"""

@@ -363,6 +363,25 @@ def _is_generic(word):
     return not _generic_residues(word)
 
 
+# 包**自己一定会带上**的两段样板文本（`main()` 直接写进 zip）。只拿来当"**已知非 PII 词源**"，
+# ⚠️ **不是**把它们整段当通用词表（那会把整段文本里的每个词都误杀）。
+#
+# 安全论证（一句话）：这两段是**本工具自己的常量**，按构造**不含用户 PII** ⇒ 凡是出现在它们
+# 里的词，**不可能是"用户的真名"** ⇒ 把命中它们的残余丢掉，**不会掩盖任何真实泄漏**。
+# （唯一理论例外：用户真名恰好就是样板文本里的某个普通词 —— 那已被上面"真名恰等于通用词
+#   会漏检"这条**已知取舍**覆盖，方向与它一致。）
+#
+# 为什么非丢不可：不丢的话，`个人终版.md` / `中文母版.md` 这种"限定词 + 版次词"的档名会切出
+# `个人` / `中文` —— 而分享说明里就写着"仅供个人求职使用" / "中文名照抄" ⇒ `verify()` 点名、
+# **每一个包都被删**（fail-closed 删包），正是"另一个方向的错"。
+_SAMPLE_TEXT = STARTER_RESUME + "\n" + SHARE_NOTE
+
+
+def _in_sample_text(word):
+    """这个词出现在包自带的样板文本里？（= 已知的非 PII 词源，见上面那条安全论证）"""
+    return bool(word) and word in _SAMPLE_TEXT
+
+
 def _usable_keyword(word):
     """这个词够不够"具体"到可以当泄漏关键词？（长度判据见上面那条注释）"""
     if not word:
@@ -380,6 +399,10 @@ def _name_fragments(text):
     留下（`张三`）—— 旧实现"子串命中就整段丢"会把真名一起丢掉（P0-15 第 4 条漏检，
     这种"真名后面直接跟母版/终版、不加连字符"的命名非常常见）。
 
+    ⚠️ 但**挖出来的残余**要再用 `_in_sample_text` 过一遍：落在包自带样板文本里的（`个人终版`
+    → `个人`）是**已知的非 PII 词源**，留着只会让每个包都被自己判成泄漏（安全论证见上面
+    `_SAMPLE_TEXT` 那段）。这一刀只砍样板文本里的词，真名（`张三母版` → `张三`）照留。
+
     ⚠️ 只对**文件名主干 / 档名**这类短标识调用，绝不对正文调用。
     """
     out = []
@@ -387,7 +410,7 @@ def _name_fragments(text):
         if _is_generic(part):
             continue
         for piece in _generic_residues(part):
-            if not _usable_keyword(piece) or _is_generic(piece):
+            if not _usable_keyword(piece) or _is_generic(piece) or _in_sample_text(piece):
                 continue
             out.append(piece)
     return out
