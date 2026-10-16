@@ -635,39 +635,6 @@ def analyses_of(jd_id, key=None):
 
 
 # ---------- 改 ID ----------
-def _repoint_kb(data, old_id, new_id):
-    """把知识库引用从 old 改成 new。**返回 (新数据, 命中数)**，不落盘。
-
-    与 `jobdup._repoint_kb` 同一套语义：卡上**本来就有** new_id 的项时保留它、去掉 old 那一项
-    （否则同一个 JD 会被数两次 —— 正是本块要修的根因的另一种形态）；否则把 old 项**原位改 id**
-    （保留它的 job_title / company / date）。
-    """
-    nodes = data.get("nodes") if isinstance(data, dict) else None
-    touched = 0
-    for node in (nodes if isinstance(nodes, list) else []):
-        if not isinstance(node, dict):
-            continue
-        frm = node.get("from_jds")
-        if not isinstance(frm, list):
-            continue
-        has_new = any(isinstance(x, dict) and x.get("id") == new_id for x in frm)
-        out, changed = [], False
-        for x in frm:
-            if isinstance(x, dict) and x.get("id") == old_id:
-                if has_new:
-                    changed = True        # 已有 new 项 → 去掉这个重复项
-                    continue
-                x = dict(x)               # 只改一份副本，不动传进来的那些 dict
-                x["id"] = new_id
-                has_new = True
-                changed = True
-            out.append(x)
-        if changed:
-            node["from_jds"] = out
-            touched += 1
-    return data, touched
-
-
 def _interview_status_paths(old_id):
     """扫 `interviews/<面试id>/status.json`，返回 `(job_id == old_id 的文件路径, 原因)`。
 
@@ -713,7 +680,7 @@ def rename_jd(old_id, new_id, key=None):
     把已写的文件回滚（先 jds.json 后知识库），绝不留「jds 改了、引用没改」的半改状态。
 
     **知识库读不出来时拒绝整次改名**（`RuntimeError`）：判据是 `store.knowledge_safe_to_write()`
-    —— 与 `jobdup._repoint_kb` 用的是**同一份**（"读不出来 ≠ 空"只有一个实现）。为什么必须拒绝：
+    —— 与 `kb.repoint_jd_refs` 用的是**同一份**（"读不出来 ≠ 空"只有一个实现）。为什么必须拒绝：
     `load_knowledge()` 会把坏文件静默归成 `{"nodes": []}`，于是"没有卡引用它"与"库读不出来"
     **不可区分**，照改就会留下「jds.json 指向新 ID、知识库里的引用仍指向旧 ID」的两种身份
     （回归测试 `tests/test_jdid.py::RenameJdTest::test_an_unreadable_knowledge_base_refuses_the_rename_and_changes_nothing`）。
@@ -775,14 +742,17 @@ def rename_jd(old_id, new_id, key=None):
 
         # 锁顺序恒为 _JD_LOCK → _KB_LOCK（见文件头铁律 3）
         with kb._KB_LOCK:
-            # ---- P0-8：动手之前先确认知识库**读得出来**（闸门与 `jobdup._repoint_kb` 同一判据）----
+            # ---- P0-8：动手之前先确认知识库**读得出来**（判据只准有一份）----
             # 不装这道闸门的后果（本块修的就是它）：`load_knowledge()` 把坏文件静默归成
-            # `{"nodes": []}` → `_repoint_kb` 命中 0 → `if kb_touched:` 为假 → **一字不写**，
-            # 而本函数照样成功返回 —— 于是 jds.json / 台账 / 面试记录都改指新 ID，
-            # 知识库里那些卡的 `from_jds` 仍指向旧 ID（同一个岗位两种身份，用户修好库的那一刻就看得见）。
+            # `{"nodes": []}` → 重指命中 0 → **一字不写**，而本函数照样成功返回 ——
+            # 于是 jds.json / 台账 / 面试记录都改指新 ID，知识库里那些卡的 `from_jds`
+            # 仍指向旧 ID（同一个岗位两种身份，用户修好库的那一刻就看得见）。
             # 这是"会串档"里最隐蔽的一条：**"没有卡引用它"与"库读不出来"不可区分**。
             # 判据只准有一份（`store.knowledge_safe_to_write`）：读得出来 **或** 真的没有一个字节
             # 才放行；0 字节 / 不存在是合法的"第一次"，不算读不出来。
+            #
+            # 这道闸门**不删**（虽然 `kb.repoint_jd_refs` 自己也会拒绝坏库）：它要在**任何**
+            # 落盘之前就拒绝整次改名，而且那句话是给用户看的（说清"这次改名一个字节都没动"）。
             kb_ok, kb_reason = store.knowledge_safe_to_write(store.knowledge_path(key))
             if not kb_ok:
                 msg = ("%s。**已拒绝这次改 ID**：读不出来就无法确认哪些卡引用了 %s，"
@@ -791,7 +761,6 @@ def rename_jd(old_id, new_id, key=None):
                        % (kb_reason, old))
                 log.log_event("jdid.rename_rejected", level="warn", reason=msg, old=old, new=new)
                 raise RuntimeError(msg)
-            kb_data = store.load_knowledge(key)
             jobs = store.load_jobs(key)
 
             # ---- 需求二②：有面试 status.json 读不出来 → 拒绝整次改名（"读不出来"就是"不知道"）----
@@ -814,7 +783,8 @@ def rename_jd(old_id, new_id, key=None):
             updated_jds = dict(data)
             updated_jds["jds"] = [new_target if r is target else r for r in data["jds"]]
 
-            kb_new, kb_touched = _repoint_kb(kb_data, old, new)
+            # 知识库那一段**不在这里算**：它的读-改-写整段收归 `kb.repoint_jd_refs`
+            # （P3-3），在下面第 7 步按"落盘顺序"（jds → 知识库 → 面试 → 台账）真正执行。
             iv_new = []
             for path in paths:
                 st = store.read_json(path, None)
@@ -839,13 +809,24 @@ def rename_jd(old_id, new_id, key=None):
             # 用户的 JD 库被清空、连备份里也没有原文。回归测试：
             # `tests/test_jdid.py::RenameJdTest::test_a_read_failure_at_snapshot_time_leaves_the_bytes_untouched`。
             written = []      # [(path, 原始字节 或 None)]
+            kb_touched = 0
             try:
                 written.append((_jds_path(key), store.read_bytes(_jds_path(key))))
                 save_jds(updated_jds, key)
+                # 知识库引用：走 kb 的窄接口 —— 读-改-写整段在 `_KB_LOCK` 里完成
+                # （这里只是**重入**取它；外面那把 `_KB_LOCK` 是本函数从第 744 行起持着的）。
+                # 原像必须在接口**之前**取：此刻没有并发写者能挤进来，所以那份字节就是
+                # 「本次改动的原像」，失败回滚写回去 = 逐字节还原。
+                kb_path = store.knowledge_path(key)
+                kb_before = store.read_bytes(kb_path)
+                kb_touched, kb_ref_err = kb.repoint_jd_refs(old, new, key)
+                if kb_ref_err:
+                    # 外层这道闸门与这次调用之间库变成了读不出来（外部程序锁/改坏了它）：
+                    # 接口**一个字都没写**。这里**响亮失败**而不是静默跳过 —— 静默跳过
+                    # 正好就是 P0-8 要修的那件事（jds 改了、引用没改）。
+                    raise RuntimeError("知识库在改名过程中变得读不出来了：%s" % kb_ref_err)
                 if kb_touched:
-                    written.append((store.knowledge_path(key),
-                                    store.read_bytes(store.knowledge_path(key))))
-                    store.save_knowledge(kb_new, key)
+                    written.append((kb_path, kb_before))
                 for path, st in iv_new:
                     written.append((path, store.read_bytes(path)))
                     store.write_json(path, st)

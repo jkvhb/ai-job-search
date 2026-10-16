@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import ast
 import datetime
 import glob
 import io
@@ -8,10 +9,12 @@ import os
 import shutil
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 
 import app
+import jdid
 import kb
 import store
 
@@ -2572,3 +2575,462 @@ class KbSetStateCorruptLibraryHonestyTest(IsolatedCase):
         self.assertIn("读", msg, "没如实说清原因是'库读不出来' " + kv)
         self.assertIsNotNone(after, "坏库被弄没了（连隔离备份都不是）" + kv)
         self.assertEqual(after, raw, "坏库被动过 " + kv)
+
+
+# ======================================================================
+# 批 2 · 2.1：`_KB_LOCK` 跨模块缺口（体检 §5 P3-3）
+#
+# 三个调用方（`jddelete` / `jdid` / `jobdup`）原先**各自**在 kb 之外做
+# 「load_knowledge → 改 from_jds → save_knowledge」，并各自解析 `kb._KB_LOCK`
+# （= 三份重复的 `_repoint_kb`）。现在这段读-改-写收进 kb 的三个窄接口，
+# 保护它的锁与它同处一个模块（都以 `_with_kb_write` 为准）。
+#
+# 这一段钉三件事：
+#   ① 三个接口的对外行为（含坏库时"拒绝写入、一个字节都不动"）；
+#   ② **并发不丢更新** —— 分析（absorb）与"删岗位 / 改 ID"同时发生，一条沉淀都不许丢；
+#   ③ **不出现互相等待** —— 新接口只许取内层锁 `_KB_LOCK`，绝不回头去取
+#      `_JD_LOCK` / `_MERGE_LOCK`（锁序铁律：外层 → `_KB_LOCK` → 文件写）。
+# ======================================================================
+
+
+def _ref_card(cid, term, refs):
+    """一张带 `from_jds` 的卡：三个接口只改这个字段，**卡片本身必须留着**。"""
+    return {"id": cid, "term": term, "from_jds": [dict(r) for r in refs]}
+
+
+def _ref_ids(card):
+    """一张卡引用的岗位 id（原样，不去空白 —— 正是为了看清接口动了哪一条）。"""
+    return [x.get("id") for x in (card.get("from_jds") or [])]
+
+
+def _read_raw(path):
+    if not os.path.exists(path):
+        return None
+    with open(path, "rb") as f:
+        return f.read()
+
+
+def _corrupt_backups(path):
+    folder = os.path.dirname(path)
+    return sorted(f for f in os.listdir(folder) if ".corrupt-" in f)
+
+
+class PurgeJdRefsTest(IsolatedCase):
+    """`kb.purge_jd_refs(jd_id)` = 删岗位时清引用：**只清 `from_jds` 条目、卡片留着**。
+
+    这是 `jddelete._strip_references` 里知识库那一半的唯一实现（原来那一份已删）。
+    判据与它**逐字同一把尺子**：条目 id 去首尾空白后相等（用户手改出的 `" jd-a "`
+    也算同一条引用）。
+    """
+
+    def setUp(self):
+        super().setUp()
+        store.ensure_profile()
+        store.save_knowledge({"version": kb.KB_VERSION, "nodes": [
+            _ref_card("rlhf", "RLHF", [{"id": "jd-a", "job_title": "甲岗"},
+                                       {"id": "jd-b", "job_title": "乙岗"}]),
+            _ref_card("asr", "ASR", [{"id": "jd-a", "job_title": "甲岗"}]),
+            _ref_card("tts", "TTS", [{"id": "jd-b", "job_title": "乙岗"}]),
+        ]})
+        self.path = store.knowledge_path()
+        self.assertIn(self.tmp, self.path, "探针必须落在临时根里")
+
+    def _card(self, cid):
+        return [n for n in store.load_knowledge()["nodes"] if n.get("id") == cid][0]
+
+    def test_only_the_matching_entries_go_away_and_every_card_stays(self):
+        changed, err = kb.purge_jd_refs("jd-a")
+        self.assertEqual(err, "")
+        self.assertEqual(changed, 2, "命中的卡片数应当是 2（rlhf / asr）")
+        self.assertEqual(_ref_ids(self._card("rlhf")), ["jd-b"])
+        self.assertEqual(_ref_ids(self._card("asr")), [])
+        self.assertEqual(len(store.load_knowledge()["nodes"]), 3, "卡片一张都不许少")
+        # 没提到 jd-a 的卡：连它那条引用的 job_title 都原样留着
+        self.assertEqual(self._card("tts")["from_jds"], [{"id": "jd-b", "job_title": "乙岗"}])
+
+    def test_a_library_that_never_mentions_the_id_is_not_rewritten(self):
+        before = _read_raw(self.path)
+        self.assertEqual(kb.purge_jd_refs("jd-none"), (0, ""))
+        self.assertEqual(_read_raw(self.path), before, "没有可清的引用时不该白重写整份库")
+
+    def test_a_whitespace_padded_id_is_the_same_reference(self):
+        """`" jd-a "` 与 `jd-a` 是同一条引用（照 `jddelete._text()` 的既有尺子）。"""
+        store.save_knowledge({"version": kb.KB_VERSION, "nodes": [
+            _ref_card("padded", "P", [{"id": " jd-a "}])]})
+        changed, err = kb.purge_jd_refs("jd-a")
+        self.assertEqual((changed, err), (1, ""))
+        self.assertEqual(_ref_ids(self._card("padded")), [])
+
+    def test_an_empty_id_touches_nothing(self):
+        before = _read_raw(self.path)
+        self.assertEqual(kb.purge_jd_refs(""), (0, ""))
+        self.assertEqual(kb.purge_jd_refs(None), (0, ""))
+        self.assertEqual(_read_raw(self.path), before)
+
+
+class RepointJdRefsTest(IsolatedCase):
+    """`kb.repoint_jd_refs(old, new)` = 改 ID 时把引用重指过去（`jdid.rename_jd` 用）。
+
+    计数口径照 `jdid._repoint_kb`：返回**被改动的卡片数**（`jdid` 记的 `kb_nodes`）。
+    判据也照它：**逐字比较**条目 id（不去空白 —— 去空白是 `purge_jd_refs` 那一半的尺子，
+    收口时把三处的差异参数化、不顺手统一口径）。
+    """
+
+    def setUp(self):
+        super().setUp()
+        store.ensure_profile()
+        store.save_knowledge({"version": kb.KB_VERSION, "nodes": [
+            _ref_card("a1", "A1", [{"id": "old", "job_title": "旧岗", "date": "2026-10-01"}]),
+            _ref_card("a2", "A2", [{"id": "old"}, {"id": "new", "job_title": "新岗"}]),
+            _ref_card("a3", "A3", [{"id": "other"}]),
+        ]})
+        self.path = store.knowledge_path()
+        self.assertIn(self.tmp, self.path, "探针必须落在临时根里")
+
+    def _card(self, cid):
+        return [n for n in store.load_knowledge()["nodes"] if n.get("id") == cid][0]
+
+    def test_the_old_entry_is_repointed_in_place_and_keeps_its_own_fields(self):
+        changed, err = kb.repoint_jd_refs("old", "new")
+        self.assertEqual(err, "")
+        self.assertEqual(changed, 2, "两张卡提到 old（a1 / a2）")        # 原位改 id：这条引用自己的 job_title / date 是它自己的身份，不许丢
+        self.assertEqual(self._card("a1")["from_jds"],
+                         [{"id": "new", "job_title": "旧岗", "date": "2026-10-01"}])
+        # 卡上本来就有 new 的项时：保留它、去掉 old 那一条（否则同一个岗位被数两次）
+        self.assertEqual(_ref_ids(self._card("a2")), ["new"])
+        self.assertNotIn("old", _ref_ids(self._card("a3")))
+
+    def test_two_old_entries_without_a_new_one_become_a_single_one(self):
+        store.save_knowledge({"version": kb.KB_VERSION, "nodes": [
+            _ref_card("dup", "D", [{"id": "old"}, {"id": "old"}])]})
+        self.assertEqual(kb.repoint_jd_refs("old", "new"), (1, ""))
+        self.assertEqual(_ref_ids(self._card("dup")), ["new"])
+
+    def test_a_library_that_never_mentions_the_old_id_is_not_rewritten(self):
+        before = _read_raw(self.path)
+        self.assertEqual(kb.repoint_jd_refs("nobody", "new"), (0, ""))
+        self.assertEqual(_read_raw(self.path), before, "没有命中的引用时不该白重写整份库")
+
+    def test_the_id_comparison_is_verbatim_like_jdid_used_to_be(self):
+        """`" old "` **不是** `old`：这一半的判据与 `jobdup` / `jdid` 原来逐字一致。"""
+        store.save_knowledge({"version": kb.KB_VERSION, "nodes": [
+            _ref_card("padded", "P", [{"id": " old "}])]})
+        self.assertEqual(kb.repoint_jd_refs("old", "new"), (0, ""))
+        self.assertEqual(_ref_ids(self._card("padded")), [" old "])
+
+
+class MergeJdRefsTest(IsolatedCase):
+    """`kb.merge_jd_refs(drop, keep)` = 合并时把被并掉的 id 重指到保留 id（`jobdup` 用）。
+
+    变换与 `repoint_jd_refs` **同一份核心遍历**（只留一份实现），差别只在**计数口径**：
+    `jobdup` 的对外字段是 `kb_repointed` / `kb_deduplicated`，数的是 `from_jds`
+    **条目**（不是卡片）—— 那是既有日志与 `merge_jobs` 返回值的形状，收口时不许改。
+    """
+
+    def setUp(self):
+        super().setUp()
+        store.ensure_profile()
+        store.save_knowledge({"version": kb.KB_VERSION, "nodes": [
+            _ref_card("m1", "M1", [{"id": "drop", "job_title": "被并岗"}]),
+            _ref_card("m2", "M2", [{"id": "drop"}, {"id": "keep", "job_title": "保留岗"}]),
+            _ref_card("m3", "M3", [{"id": "keep"}]),
+        ]})
+        self.assertIn(self.tmp, store.knowledge_path(), "探针必须落在临时根里")
+
+    def test_the_two_counters_are_item_level_like_the_old_jobdup_one(self):
+        repointed, deduped, err = kb.merge_jd_refs("drop", "keep")
+        self.assertEqual(err, "")
+        self.assertEqual((repointed, deduped), (1, 1),
+                         "m1 的 drop 条目被重指、m2 的 drop 条目被去重")
+        card = [n for n in store.load_knowledge()["nodes"] if n.get("id") == "m1"][0]
+        self.assertEqual(_ref_ids(card), ["keep"])
+
+    def test_a_library_that_never_mentions_the_drop_id_is_not_rewritten(self):
+        before = _read_raw(store.knowledge_path())
+        self.assertEqual(kb.merge_jd_refs("nobody", "keep"), (0, 0, ""))
+        self.assertEqual(_read_raw(store.knowledge_path()), before)
+
+
+class KbRefInterfacesCorruptLibraryTest(IsolatedCase):
+    """坏库（有内容却读不出来）→ 三个接口**都拒绝写入、连留档都不做**。
+
+    口径照 `_with_kb_write(..., write_when_unreadable=False)` —— 也正是三处调用方本来的行为：
+    `jddelete` 靠"坏库读成空库 → `kb_touched` 保持 0"恰好不写（回归断言见
+    `test_jddelete.JdPurgeRollbackTest.test_an_unreadable_knowledge_base_is_reported_but_does_not_block`）；
+    `jdid` / `jobdup` 各自在调用前用 `store.knowledge_safe_to_write()` 拒绝整次操作。
+    现在这句话由 kb 自己保证，调用方不必再解析私有锁、也不必各自装一遍闸门。
+    """
+
+    ENTRIES = (("purge_jd_refs", lambda: kb.purge_jd_refs("jd-a")),
+               ("repoint_jd_refs", lambda: kb.repoint_jd_refs("jd-a", "jd-b")),
+               ("merge_jd_refs", lambda: kb.merge_jd_refs("jd-a", "jd-b")))
+
+    def setUp(self):
+        super().setUp()
+        store.ensure_profile()
+        self.path = store.knowledge_path()
+        self.assertIn(self.tmp, self.path, "探针必须落在临时根里")
+        # GBK 字节：非 UTF-8 ⇒ `read_knowledge_strict` 读不出来、`file_has_bytes_to_lose` 为真
+        self.raw = json.dumps({"version": 1, "nodes": [{"id": "语音识别", "term": "语音识别"}]},
+                              ensure_ascii=False).encode("gbk")
+        with self.assertRaises(UnicodeDecodeError):
+            self.raw.decode("utf-8")
+
+    def test_every_ref_interface_refuses_and_keeps_the_corrupt_bytes(self):
+        for name, call in self.ENTRIES:
+            with self.subTest(entry=name):
+                with open(self.path, "wb") as f:
+                    f.write(self.raw)
+                result = call()
+                after = _read_raw(self.path)
+                kv = "entry=%s before=%d after=%s result=%r" % (
+                    name, len(self.raw), "文件不在了" if after is None else len(after), result)
+                self.assertIsNotNone(after, "坏库被弄没了 " + kv)
+                self.assertEqual(after, self.raw, "坏库被动过 " + kv)
+                self.assertEqual(_corrupt_backups(self.path), [],
+                                 "拒绝写入的入口不该隔离用户文件 " + kv)
+                self.assertEqual(result[0], 0, "坏库时却报告改动了东西 " + kv)
+                err = result[-1]
+                self.assertTrue(err, "坏库时没给出可分辨的'没写'信号 " + kv)
+                self.assertIn("读", str(err), "没如实说清原因是'库读不出来' " + kv)
+
+
+class KbRefConcurrencyTest(IsolatedCase):
+    """P3-3 的牙：分析写库（`absorb`）与"清引用 / 重指引用"**同时发生**时，一条都不许丢。
+
+    失败形态（就是本块要修的）：两边各自 `load → 改 → save`，后写的整份**盖掉**先写的
+    —— absorb 刚沉淀的卡片凭空消失，而两边都报成功（用户看不到任何提示）。
+
+    **交错怎么造**（不靠 sleep 赌运气，见 `LOAD_DELAY_SECONDS`）：`threading.Barrier` 保证
+    两条线程每一轮**同一瞬间**进入各自的读-改-写；`store.load_knowledge` 上的延迟保证
+    "先读的拿到旧快照、另一条的写落在它的读与写之间"这件事**必然发生**一次。
+    """
+
+    ROUNDS = 40
+
+    #: 把 **B 那一条线程**的「读 → 写」窗口人为拉宽（`store.load_knowledge` 返回前睡一下）。
+    #: 为什么必须"只放慢 B"：`Barrier` 让两条线程同一瞬间起步，**后读的那个必然后写** ——
+    #: 两边都放慢的话，后写的永远是 absorb（B 先读先写），丢更新反而被掩盖掉。
+    #: 只放慢 B 之后，B 的读远早于它的写，而 A 的整段读-改-写就夹在这个窗口里 ⇒
+    #: "A 写成功、B 拿旧快照后写并盖掉它"这件事**必然发生**一次。
+    #: 加了锁的实现里这个 sleep 在临界区**里面**（`_with_kb_write` 持着 `_KB_LOCK` 调 fn）
+    #: ⇒ A 根本进不来，照样全绿；把锁去掉（变异 #1"回到各自读改写"）就立刻变成静默丢数据。
+    LOAD_DELAY_SECONDS = 0.008
+
+    def _seed(self):
+        store.ensure_profile()
+        store.save_knowledge({"version": kb.KB_VERSION, "nodes": [
+            _ref_card("seed", "种子", [{"id": "jd-old", "job_title": "旧岗"}])]})
+        self.path = store.knowledge_path()
+        self.assertIn(self.tmp, self.path, "探针必须落在临时根里")
+
+    def _run(self, worker_b, name):
+        """跑一轮并发：线程 A 反复 absorb（每轮新建一张卡、带 jd-old 引用），
+        线程 B 反复做 `worker_b`。返回 (errors, 卡住的线程名)。"""
+        errors = []
+        barrier = threading.Barrier(2)
+        real_load = store.load_knowledge
+        real_save = store.save_knowledge
+        slow_here = threading.local()       # 只在 B 线程里放慢（见 LOAD_DELAY_SECONDS）
+        #: 只把**写盘这一步**串行。理由：Windows 上并发 `os.replace` 同一份文件会直接抛
+        #: `PermissionError(13, '拒绝访问。')`（一条**响**的失败），而本用例要抓的是**静默**的
+        #: 那一种（两边都报成功、后写的整份盖掉先写的）。串行化这一步之后，丢更新才暴露成本来
+        #: 的形态；对加了锁的实现它毫无影响（那一段本来就在 `_KB_LOCK` 里、已经是串行的）。
+        save_lock = threading.Lock()
+
+        def slow_load(*a, **kw):
+            data = real_load(*a, **kw)
+            if getattr(slow_here, "on", False):
+                time.sleep(self.LOAD_DELAY_SECONDS)
+            return data
+
+        def guarded_save(*a, **kw):
+            with save_lock:
+                return real_save(*a, **kw)
+
+        def absorber():
+            try:
+                for i in range(self.ROUNDS):
+                    barrier.wait(timeout=60)
+                    kb.absorb([_node(term="概念-%d" % i)],
+                              {"id": "jd-old", "job_title": "旧岗"})
+            except Exception as e:              # 异常必须带回主线程，否则会被 unittest 吞掉
+                errors.append("absorb 线程抛异常：%r" % (e,))
+
+        def other():
+            slow_here.on = True
+            try:
+                for _i in range(self.ROUNDS):
+                    barrier.wait(timeout=60)
+                    worker_b()
+            except Exception as e:
+                errors.append("%s 线程抛异常：%r" % (name, e))
+
+        ta = threading.Thread(target=absorber, name="kb-ref-absorb", daemon=True)
+        tb = threading.Thread(target=other, name="kb-ref-" + name, daemon=True)
+        with mock.patch.object(store, "load_knowledge", slow_load), \
+                mock.patch.object(store, "save_knowledge", guarded_save):
+            ta.start()
+            tb.start()
+            ta.join(180)
+            tb.join(180)
+        return errors, [t.name for t in (ta, tb) if t.is_alive()]
+
+    def _assert_no_absorbed_card_is_missing(self, sealed_terms):
+        data = store.load_knowledge()
+        have = {n.get("term") for n in data["nodes"]}
+        missing = sorted(sealed_terms - have)
+        self.assertEqual(missing, [],
+                         "absorb 沉淀的卡片被并发的整份写盘盖掉了（丢更新）：%r" % (missing,))
+        return data
+
+    def test_absorb_and_purge_never_lose_an_absorbed_card(self):
+        self._seed()
+        errors, stuck = self._run(lambda: kb.purge_jd_refs("jd-old"), "purge")
+        self.assertEqual(stuck, [], "并发用例没跑完（很可能被锁序/死锁挂住了）")
+        # ① **先看数据丢没丢**（本块的主判据）：收尾清一遍引用（此时已无并发写者），
+        #    再数 absorb 沉淀的卡片。丢更新时这里必红，而且红的就是"卡没了"本身。
+        settled, err = kb.purge_jd_refs("jd-old")
+        self.assertEqual(err, "")
+        data = self._assert_no_absorbed_card_is_missing(
+            {"概念-%d" % i for i in range(self.ROUNDS)})
+        leftover = [n.get("term") for n in data["nodes"] if "jd-old" in _ref_ids(n)]
+        self.assertEqual(leftover, [], "清引用没走完全程：还有卡片留着已删岗位的引用")
+        self.assertGreaterEqual(settled, 0)          # 只是把它读出来，不假设这一轮该命中几条
+        # ② 线程里不许抛异常（放在数据判据**后面**：丢更新才是首要判据）
+        self.assertEqual(errors, [])
+
+    def test_absorb_and_repoint_never_lose_an_absorbed_card(self):
+        self._seed()
+        errors, stuck = self._run(lambda: kb.repoint_jd_refs("jd-old", "jd-new"), "repoint")
+        self.assertEqual(stuck, [], "并发用例没跑完（很可能被锁序/死锁挂住了）")
+        settled, err = kb.repoint_jd_refs("jd-old", "jd-new")
+        self.assertEqual(err, "")
+        data = self._assert_no_absorbed_card_is_missing(
+            {"概念-%d" % i for i in range(self.ROUNDS)})
+        leftover = [n.get("term") for n in data["nodes"] if "jd-old" in _ref_ids(n)]
+        self.assertEqual(leftover, [], "重指没走完全程：还有卡片指着旧 id")
+        self.assertGreaterEqual(settled, 0)
+        self.assertEqual(errors, [])
+
+
+class KbRefLockOrderRuntimeTest(IsolatedCase):
+    """锁序的**运行时**探针：持外层锁的线程与"新接口"之间不许出现互相等待。
+
+    形状就是生产里的那条链：`jdid` / `jddelete` 先拿 `_JD_LOCK`、再拿 `_KB_LOCK`
+    （外层 → 内层）。与之并发的新接口只该取 `_KB_LOCK`；**若它反序**
+    （先 `_KB_LOCK`、再回头要 `_JD_LOCK`），两条线程就互等：
+
+        线程 A：持 `_JD_LOCK`，等 `_KB_LOCK`
+        线程 B（接口）：持 `_KB_LOCK`，等 `_JD_LOCK`     ← 死锁
+
+    ⚠️ 用 `acquire(timeout=...)` 而不是裸 `with`：**探针自己不许把整个套件拖死**
+    —— 红要红在断言上，不是把后续用例一起挂住。A 超时即判定失败并**释放** `_JD_LOCK`，
+    B 随之能走完，进程干干净净地退出（留下的失败断言就是证据）。
+    """
+
+    ACQUIRE_TIMEOUT = 2.0
+
+    def test_a_thread_holding_the_jd_lock_never_waits_forever_on_the_kb_lock(self):
+        store.ensure_profile()
+        store.save_knowledge({"version": kb.KB_VERSION, "nodes": [
+            _ref_card("c1", "C1", [{"id": "old", "job_title": "旧岗"}])]})
+        self.assertIn(self.tmp, store.knowledge_path(), "探针必须落在临时根里")
+        a_entered, b_entered = threading.Event(), threading.Event()
+        got_kb_lock = []
+        outcome = []
+
+        def holder_a():
+            with jdid._JD_LOCK:
+                a_entered.set()
+                b_entered.wait(10)                 # 等 B 走进接口（先拿到 _KB_LOCK）
+                time.sleep(0.3)
+                got = kb._KB_LOCK.acquire(timeout=self.ACQUIRE_TIMEOUT)
+                if got:
+                    kb._KB_LOCK.release()
+                got_kb_lock.append(got)
+
+        def caller_b():
+            a_entered.wait(10)
+            b_entered.set()
+            try:
+                outcome.append(kb.repoint_jd_refs("old", "new"))
+            except Exception as e:
+                outcome.append(e)
+
+        ta = threading.Thread(target=holder_a, name="kb-ref-lockorder-a", daemon=True)
+        tb = threading.Thread(target=caller_b, name="kb-ref-lockorder-b", daemon=True)
+        ta.start()
+        tb.start()
+        ta.join(20)
+        tb.join(20)
+        stuck = [t.name for t in (ta, tb) if t.is_alive()]
+        self.assertEqual(stuck, [], "锁序反了：两条线程互相等待，套件差点被拖死")
+        self.assertEqual(got_kb_lock, [True],
+                         "持 `_JD_LOCK` 的线程等不到 `_KB_LOCK`（超时 %ss）：新接口很可能在持 "
+                         "`_KB_LOCK` 时回头去取外层锁 —— 那正是死锁的形状" % self.ACQUIRE_TIMEOUT)
+        self.assertEqual(outcome, [(1, "")],
+                         "接口没把引用重指过去（或者抛了异常）")
+
+
+class KbRefLockOrderAstTest(unittest.TestCase):
+    """锁序铁律的**结构**断言：`_JOBS/_CONFIG` → `_JD`/`_MERGE` → `_KB` → 文件写。
+
+    为什么要 AST（不是正则）：说明文字里提到 `_JD_LOCK` 是**应该的**（铁律就写在注释里），
+    要抓的是**代码里真的去拿它**。两条判据：
+
+      ① `kb.py` 里一个 `_JD_LOCK` / `_MERGE_LOCK` 都不许出现 —— 新接口若在持 `_KB_LOCK`
+         时回头去取外层锁，就是死锁的经典形状（外层锁的持有者正等着 `_KB_LOCK`）；
+      ② 三个调用方里，`with kb._KB_LOCK:` 的**里面**不许再有取 `_JD_LOCK` / `_MERGE_LOCK`
+         的 `with`（反序）。
+    """
+
+    OUTER = ("_JD_LOCK", "_MERGE_LOCK")
+    CALLERS = ("jdid.py", "jddelete.py", "jobdup.py")
+
+    def _src(self, name):
+        src = store.read_text(os.path.join(store.ROOT, name))
+        self.assertTrue(src, "读不到 %s？" % name)
+        return src
+
+    @staticmethod
+    def _names(node):
+        """一段 AST 里出现过的锁名（属性名 + 裸名字）。"""
+        return ({n.attr for n in ast.walk(node) if isinstance(n, ast.Attribute)}
+                | {n.id for n in ast.walk(node) if isinstance(n, ast.Name)})
+
+    @classmethod
+    def _with_locks(cls, with_stmt):
+        """这个 `with` 语句**自己**的（不含 body）上下文表达式里出现过的锁名。"""
+        names = set()
+        for item in with_stmt.items:
+            names |= cls._names(item.context_expr)
+        return names
+
+    def test_kb_never_reaches_for_an_outer_lock(self):
+        used = self._names(ast.parse(self._src("kb.py")))
+        self.assertNotIn("_JD_LOCK", used,
+                         "kb.py 里去拿 `_JD_LOCK` 了：持 `_KB_LOCK` 时回头取外层锁 = 死锁形状")
+        self.assertNotIn("_MERGE_LOCK", used, "kb.py 里去拿 `_MERGE_LOCK` 了（同上）")
+
+    def test_no_caller_takes_an_outer_lock_inside_a_kb_lock_block(self):
+        offenders = []
+        for name in self.CALLERS:
+            tree = ast.parse(self._src(name))
+            for outer in [n for n in ast.walk(tree) if isinstance(n, ast.With)]:
+                if "_KB_LOCK" not in self._with_locks(outer):
+                    continue
+                for branch in outer.body:
+                    for inner in [n for n in ast.walk(branch) if isinstance(n, ast.With)]:
+                        bad = self._with_locks(inner) & set(self.OUTER)
+                        if bad:
+                            offenders.append("%s:%d 在 `with kb._KB_LOCK` 里取了 %s"
+                                             % (name, inner.lineno, sorted(bad)))
+        self.assertEqual(offenders, [],
+                         "锁序反了（外层锁必须在 `_KB_LOCK` **外面**拿）：%r" % (offenders,))
+
+    def test_the_three_callers_really_do_hold_the_kb_lock(self):
+        """反向：上面那条不许变成"没人取过 `_KB_LOCK`"的空断言。"""
+        for name in self.CALLERS:
+            self.assertIn("kb._KB_LOCK", self._src(name),
+                          "%s 已经不再持 `_KB_LOCK` 了？那这条 AST 断言就没验证到东西" % name)

@@ -28,6 +28,7 @@ from unittest import mock
 import app
 import jddelete
 import jdid
+import kb
 import store
 from tests.base import IsolatedCase
 
@@ -134,7 +135,17 @@ class _PurgeCase(IsolatedCase):
         return os.path.join(self._jd, name)
 
     def _card(self, cid):
-        return [n for n in store.load_knowledge()["nodes"] if n.get("id") == cid][0]
+        """盘上那张卡（**归一化视图**）。
+
+        ⚠️ 为什么要过 `kb.ensure_kb`：P3-3 之后"清引用"走的是 `kb.purge_jd_refs`，
+        而它（与 kb 的其余写入口一样）在写盘前会把整库过一遍 `ensure_kb` —— 复习三字段
+        （`review_count` / `last_reviewed_at` / `last_result`）会被补齐、非法的 `from_jds`
+        条目会被丢掉。那是**所有 kb 写路径共有的归一化**，不是"顺手改了 B 的卡"。
+        取同一种视图再比指纹，`'别的 JD 的东西逐字未变'` 这条断言才量的是**它本来要量的
+        东西**（记录/字段有没有被删、被改），而不是被归一化噪声盖过去。
+        """
+        return [n for n in kb.ensure_kb(store.load_knowledge())["nodes"]
+                if n.get("id") == cid][0]
 
     def _analysis_ids(self):
         return [j.get("id") for j in store.load_jobs()]

@@ -14,8 +14,9 @@
 
 **铁律**：
   1. `kb.py` 是纯数据模块，**绝不能** import 本模块（方向不能反）。
-  2. 写 `knowledge.json` 必须持 `kb._KB_LOCK`（本模块的 KB 写路径显式持同一把锁）——
-     否则会和 `absorb` / `record_interview` 并发写坏文件（本项目真实发生过丢更新）。
+  2. 写 `knowledge.json` **只经 `kb` 的窄接口**（`kb.merge_jd_refs`）：读-改-写整段由它
+     在 `kb._KB_LOCK` 里完成。本模块只在"备份 → 改库必须是一个临界区"这一点上重入那把锁
+     —— 否则会和 `absorb` / `record_interview` 并发写坏文件（本项目真实发生过丢更新）。
   3. 合并只标 `merged_into`，**绝不删岗位记录、绝不删报告、绝不删 JD 原文**（报告是用户的资产）。
   4. 合并前必备份（带时间戳；**每个目标只保留最新 `store.BACKUP_KEEP` 份**，更旧的轮转删掉），
      任一步失败用备份回滚；**备份读不出来时拒绝回滚**并如实报「回滚未完成」，绝不把文件写成空的
@@ -252,14 +253,14 @@ def _restore(path, backup):
         `_rollback` 根本不会走到这里、一个文件都不动；不把它做成硬错误。
       - 备份**存在但是 0 字节**：0 字节本身是合法原像（快照那一刻原文不存在 / 真的是 0 字节），
         但它**不许**盖到一份**现在有字节**的目标上 —— 那些字节是快照之后才出现的
-        （`_repoint_kb` / `write_json` / `save_jobs` 写的，或并发写者写的），**没有任何备份
+        （`kb.merge_jd_refs` / `write_json` / `save_jobs` 写的，或并发写者写的），**没有任何备份
         覆盖它们**，写回去就是"拿一次回滚换掉用户的数据"。当前真实路径上撞不到这一条
         （台账里得有 keep/drop 才有这次合并；面试 `status.json` 是被 `read_json` 认出 `job_id`
-        的；知识库要**本来就有卡**才会被 `_repoint_kb` 改写）—— 它是给"备份被外部截成 0 字节"
+        的；知识库要**本来就有卡**才会被 `kb.merge_jd_refs` 改写）—— 它是给"备份被外部截成 0 字节"
         和"我们快照之后有并发写者新建了目标"留的 fail-safe。
 
-    用 `RuntimeError`：与 `_repoint_kb` 的"拒绝写"同一个既有类型（全仓"前置条件不满足就中止"
-    的惯例），`_rollback` 只 catch `Exception`，两种成因用同一个类型表达"拒绝回滚"，
+    用 `RuntimeError`：与 `kb.merge_jd_refs` 的"坏库就拒绝"同一个既有类型（全仓"前置条件不满足
+    就中止"的惯例），`_rollback` 只 catch `Exception`，两种成因用同一个类型表达"拒绝回滚"，
     调用方与测试不必猜是哪种 OS 错误。
     """
     raw = store.read_bytes(backup)
@@ -297,50 +298,6 @@ def _rollback(backups):
             log.log_event("jobdup.rollback_failed", level="error",
                           file=os.path.basename(path), backup=backup, error=str(e))
     return ok, failed
-
-
-def _repoint_kb(keep_id, drop_id):
-    """标记「这个知识点来自哪个岗位」：`from_jds` 里的 drop_id → keep_id，并去掉重复项。
-
-    **调用方必须已持 `kb._KB_LOCK`**（读-改-写三步之间没有保护，否则会覆盖并发的 absorb）。
-
-    卡上**本来就有** keep_id 的项时，保留它（它的 job_title / date 才是 keep 的标准身份），
-    直接去掉 drop 的项；否则把 drop 的项**原位改 id**（保留它的 job_title / company / date）。
-
-    损坏的 `knowledge.json`（有内容但解析失败）直接抛错：`load_knowledge` 会把坏文件静默归成
-    `{"nodes": []}`，照它写回就等于把用户的整个库清空（本项目真实丢过 97 张卡）。
-    判据走 `store.knowledge_safe_to_write()`（唯一实现）。
-    """
-    ok, reason = store.knowledge_safe_to_write()
-    if not ok:
-        raise RuntimeError("knowledge.json 读不出来（有内容但读不出来）："
-                           "已放弃本次合并，绝不写成空库。原因：%s" % reason)
-    data = store.load_knowledge()
-    nodes = data.get("nodes") if isinstance(data, dict) else None
-    repointed = deduped = 0
-    for node in nodes or []:
-        if not isinstance(node, dict):
-            continue
-        frm = node.get("from_jds")
-        if not isinstance(frm, list):
-            continue
-        has_keep = any(isinstance(x, dict) and x.get("id") == keep_id for x in frm)
-        out = []
-        for x in frm:
-            if isinstance(x, dict) and x.get("id") == drop_id:
-                if has_keep:
-                    deduped += 1          # 已有 keep 项 → 去掉这个重复项
-                    continue
-                x = dict(x)               # 不原地改磁盘数据以外的引用，改一份副本
-                x["id"] = keep_id
-                repointed += 1
-                has_keep = True
-            out.append(x)
-        node["from_jds"] = out
-    if not repointed and not deduped:
-        return repointed, deduped     # 没有卡片提到 drop → 知识库一个字节都不动（别白重写 27 万字节）
-    store.save_knowledge(data)
-    return repointed, deduped
 
 
 def _interview_status_files(drop_id):
@@ -431,9 +388,17 @@ def _merge_jobs_locked(keep_id, drop_id):
         _snapshot(store.jobs_path(), ts, backups)
         # 知识库那一段的备份与读-改-写必须在同一把锁里：备份若在锁外取，中间挤进来一次
         # absorb 就会让「备份」不再是本次改动的原像，回滚会把别人的更新抹掉。
+        # 读-改-写本身收归 `kb.merge_jd_refs`（P3-3）：这里持着 `_KB_LOCK` 只是**重入**
+        # （备份 → 改库 必须是一个临界区），真正保护它的锁在 kb 自己的模块里。
         with kb._KB_LOCK:
             _snapshot(store.knowledge_path(), ts, backups)
-            repointed, deduped = _repoint_kb(keep_id, drop_id)
+            repointed, deduped, kb_ref_err = kb.merge_jd_refs(drop_id, keep_id)
+            if kb_ref_err:
+                # 坏库（有内容但读不出来）：**放弃本次合并，绝不写成空库**。
+                # 用 `RuntimeError`：全仓"前置条件不满足就中止"的既有类型，`_rollback` 只 catch
+                # `Exception`，与原来 `_repoint_kb` 那条路逐字同一形状。
+                raise RuntimeError("knowledge.json 读不出来（有内容但读不出来）："
+                                   "已放弃本次合并，绝不写成空库。原因：%s" % kb_ref_err)
 
         # 面试记录的清单**不在这里重新扫**：上面那道闸门已经扫过一次（并据此拒绝读不出来的情况），
         # 这里复用同一份清单 —— 否则"闸门扫的"与"写盘扫的"是两个时刻的输入（同源读取只改一半）。

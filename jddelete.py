@@ -688,28 +688,19 @@ def _tick():
             raise OSError("注入的删除失败（测试用）")
 
 
-def _strip_references(jd_id, planned_interviews, kb_data):
-    """在内存里把知识库与面试记录的引用清掉，返回 `(kb_data, kb_touched, iv_updates)`。
+def _interview_updates(planned_interviews):
+    """在内存里把面试记录的 `job_id` 清空，返回 `[(path, 新状态), ...]`。
 
-    **只清引用**：知识库卡片保留（只去掉 `from_jds` 里指向它的条目）、
-    面试记录保留（只把 `job_id` 清空）—— 这两条都是规格里的硬要求。
+    **只清引用**：面试记录保留（只把 `job_id` 清空）—— 规格里的硬要求。
 
     **面试记录只动 `planned_interviews` 里那几个路径**（那是留过底、也进过备份的那批）。
     原先这里**重新 glob 一遍**：事务中途新出现的记录会被改写，而它**既不在快照里、
     也不在备份里、回滚也救不回来** —— 改一份没有留底的用户文件是不能接受的。
     （新出现的那种由调用方在动手前先比对一次，见 `_purge_locked`。）
+
+    知识库那一半（去掉 `from_jds` 里的条目）已经收归 `kb.purge_jd_refs`（P3-3）：
+    读-改-写必须在 `kb._KB_LOCK` 里完成，本模块不再自己读改写（那份实现已删）。
     """
-    kb_touched = 0
-    for node in (kb_data.get("nodes") if isinstance(kb_data, dict) else []) or []:
-        if not isinstance(node, dict):
-            continue
-        frm = node.get("from_jds")
-        if not isinstance(frm, list):
-            continue
-        kept = [x for x in frm if not (isinstance(x, dict) and _text(x.get("id")) == jd_id)]
-        if len(kept) != len(frm):
-            node["from_jds"] = kept
-            kb_touched += 1
     iv_updates = []
     for hit in planned_interviews:
         st = store.read_json(hit["path"], None)
@@ -717,7 +708,7 @@ def _strip_references(jd_id, planned_interviews, kb_data):
             st = dict(st)
             st["job_id"] = ""
             iv_updates.append((hit["path"], st))
-    return kb_data, kb_touched, iv_updates
+    return iv_updates
 
 
 def purge_jd(jd_id, expect_fingerprint=""):
@@ -783,8 +774,10 @@ def _purge_locked(jd_id, plan):
     # 所有岗位的分析记录 / 所有 JD 记录一次抹掉（见两个 `_readable_*_or_raise`）。
     jobs_before = _readable_jobs_or_raise()
     jds_before = _readable_jds_or_raise()
-    # 知识库坏掉**不阻止删除**（不会被覆盖，坏着也不丢数据），只如实说明。
-    kb_data, kb_err = _knowledge_or_error()
+    # 知识库坏掉**不阻止删除**（不会被覆盖，坏着也不丢数据），只如实说明
+    # （那句话在 `_plan` 的 advisories 里说）。**这里不再自己读它**：引用清理那一整段
+    # 已经收归 `kb.purge_jd_refs`（P3-3）—— 读-改-写必须在 `kb._KB_LOCK` 里完成，
+    # 坏库时由它自己拒绝（返回 0 命中，于是一个字节都不写）。
     target_ids = set(str(r.get("id") or "") for r in plan["analyses"])   # 只用于回报与日志
     iv_before = {}
     for hit in plan["interviews"]:
@@ -847,9 +840,11 @@ def _purge_locked(jd_id, plan):
         store.save_jobs(kept_jobs)
         _tick()
         # 2d) 引用：知识库只清 `from_jds` 条目、面试记录只清 `job_id`
-        kb_data, kb_touched, iv_updates = _strip_references(jd_id, plan["interviews"], kb_data)
-        if kb_touched:
-            store.save_knowledge(kb_data)
+        # 知识库那一段走 kb 的窄接口：它自己持 `_KB_LOCK` 把整段读-改-写做完（坏库时
+        # 返回 (0, 原因) 且**一个字节都不写**，与本模块"坏库不阻止删除、也不会被覆盖"
+        # 的口径一致）。命中的卡片数进日志与回报（`kb_nodes`）。
+        kb_touched, _kb_ref_err = kb.purge_jd_refs(jd_id)
+        iv_updates = _interview_updates(plan["interviews"])
         _tick()
         for path, st in iv_updates:
             store.write_json(path, st)

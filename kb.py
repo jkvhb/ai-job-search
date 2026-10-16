@@ -306,7 +306,7 @@ def _merge_into(card, node):
     card["last_seen"] = _today()
 
 
-def _quarantine_corrupt_kb():
+def _quarantine_corrupt_kb(path=None):
     """损坏的 knowledge.json 先改名备份，绝不当空库静默覆盖。返回 True = 可以继续写盘。
 
     判据收归 `store.knowledge_safe_to_write()`（唯一实现）。**老判据为什么是错的**：
@@ -316,9 +316,11 @@ def _quarantine_corrupt_kb():
 
     改名失败时返回 False（调用方 absorb 会放弃这次写盘）：宁可这次不沉淀，
     也绝不能让坏文件被内存里的空库顶掉。
+
+    `path` 是给 `_with_kb_write(key=...)` 那条**带配置面**的路用的（默认 None = 当前档）。
     """
-    path = store.knowledge_path()
-    ok, reason = store.knowledge_safe_to_write()
+    path = path or store.knowledge_path()
+    ok, reason = store.knowledge_safe_to_write(path)
     if ok:
         return True
     # 文件名带自增序号：同秒内两次隔离（或两个进程）绝不能互相覆盖备份
@@ -346,7 +348,7 @@ _KB_BACKUP_FAILED = ("知识库读不出来，坏文件留档也失败，本次�
                      "先修好库、腾出磁盘再操作）")
 
 
-def _with_kb_write(fn, refuse_when=None, write_when_unreadable=True):
+def _with_kb_write(fn, refuse_when=None, write_when_unreadable=True, key=None):
     """knowledge.json 唯一写入口：持 `_KB_LOCK` → load → 改 → save，写盘前先隔离读不出来的旧文件。
 
     `fn(data)` 返回调用方要的返回值。
@@ -355,6 +357,9 @@ def _with_kb_write(fn, refuse_when=None, write_when_unreadable=True):
     （`set_state` / `record_review` / `merge_nodes`：它们写的**就是库里那张已有的卡**；
     `record_interview` 同理 —— 它虽然无条件 save，但坏库下 save 下去的只是一份空库，
     见该函数 docstring）。
+    `key` 是**配置面**（`store.knowledge_path(key)` 的那一个）：三个跨模块窄接口
+    （`purge_jd_refs` / `repoint_jd_refs` / `merge_jd_refs`）要把它透传进来 ——
+    否则一次带 key 的调用会**静默写到另一个档**去。其余入口都不带 key（默认 None = 当前档）。
 
     返回 `(是否真的调用过 fn, fn 的返回值或守卫给的原因)`：
 
@@ -394,15 +399,16 @@ def _with_kb_write(fn, refuse_when=None, write_when_unreadable=True):
     之前的旧内容又写回去 —— 那正好是 P0-1 要修的那件事。代价是每次写多一次读盘（几毫秒）。
     """
     with _KB_LOCK:
-        read_ok = store.knowledge_safe_to_write()[0]
+        kb_path = store.knowledge_path(key)
+        read_ok = store.knowledge_safe_to_write(kb_path)[0]
         if read_ok and refuse_when is not None:
-            because = refuse_when(ensure_kb(store.load_knowledge()))
+            because = refuse_when(ensure_kb(store.load_knowledge(key)))
             if because:
                 return False, because              # 没什么可写的：连隔离都不做，文件原样不动
         if not read_ok and not write_when_unreadable:
             log.log_event("kb.write_refused", level="warn", reason="corrupt_kb_unreadable")
             return False, _KB_WRITE_REFUSED
-        if not _quarantine_corrupt_kb():
+        if not _quarantine_corrupt_kb(kb_path):
             # 坏文件留档失败：宁可这次不沉淀，也绝不能让用户的卡被内存里的空库顶掉。
             # 用 `_KB_BACKUP_FAILED`（"试着留档但没成功"）而不是 `_KB_WRITE_REFUSED`
             # （"决定不碰你的文件、所以没有 .corrupt-*"）—— 两句说的事不一样。
@@ -501,6 +507,173 @@ def _card_index(data):
         if term_key:
             index.setdefault(term_key, n)
     return index
+
+
+# ---------- 跨模块的窄接口：清引用 / 重指引用（P3-3）----------
+#
+# 为什么要有这三个：`jddelete`（删岗位）、`jdid`（改 ID）、`jobdup`（合并）原先**各自**
+# 在 kb 之外做「load_knowledge → 改 from_jds → save_knowledge」，并各自解析 `kb._KB_LOCK`
+# —— 三份重复的 `_repoint_kb`（体检 §7.2）。读-改-写收进这里之后：
+#   * 保护它的锁与它同处一个模块（外面不必、也不该再碰 `kb._KB_LOCK`）；
+#   * 坏库哨兵、归一化、留档只有 `_with_kb_write` 那一份实现（P0-1）；
+#   * 三处调用方的差异（计数口径 / 判据是否去空白）在这里**参数化**，不再留第二份实现。
+#
+# 锁序铁律（见文件头）：这三个接口**只**取内层锁 `_KB_LOCK`，绝不回头去取
+# `_JD_LOCK` / `_MERGE_LOCK` —— 那些是调用方已经持着的**外层**锁，回头去要就是死锁形状。
+
+def _ref_id(x, strip):
+    """一条 `from_jds` 项指向的岗位 id（非 dict / 缺 id / id 不是字符串 → 空串）。
+
+    `strip` 不是洁癖而是**口径**：三处调用方历史上用的判据不同 ——
+    `jddelete` 去首尾空白（`_text()`），`jdid` / `jobdup` **逐字比**。收口时只搬家，
+    不顺手把两种判据统一成一种（那会改变用户手改出来的 `" jd1 "` 算不算同一条引用）。
+    """
+    if not isinstance(x, dict):
+        return ""
+    v = x.get("id")
+    if not isinstance(v, str):
+        return ""
+    return v.strip() if strip else v
+
+
+def _purge_refs_in(data, jd_id):
+    """原地删掉每张卡 `from_jds` 里指向 jd_id 的条目。返回被改动的**卡片数**（不落盘）。
+
+    判据与 `jddelete._strip_references` 原来那一份逐字同一把尺子（去首尾空白）；
+    `from_jds` 不是 list、条目不是 dict 一律跳过；**卡片本身留着**（"只清引用"是规格硬要求）。
+    """
+    touched = 0
+    for node in _as_list(data.get("nodes")):
+        if not isinstance(node, dict):
+            continue
+        frm = node.get("from_jds")
+        if not isinstance(frm, list):
+            continue
+        kept = [x for x in frm if _ref_id(x, True) != jd_id]
+        if len(kept) != len(frm):
+            node["from_jds"] = kept
+            touched += 1
+    return touched
+
+
+def _repoint_refs_in(data, old_id, new_id):
+    """原地把每张卡 `from_jds` 里指向 old 的条目重指到 new。返回
+    `(被改动的卡片数, 原位重指的条目数, 去掉的重复条目数)`（不落盘）。
+
+    语义与 `jdid._repoint_kb` / `jobdup._repoint_kb` **逐字同一套**：卡上本来就有 new 项时
+    保留它、去掉 old 那一条（否则同一个 JD 会被数两次）；否则把 old 项**原位改 id**
+    （保留它自己的 job_title / company / date）。判据是**逐字比较**（不去空白），与那两份一致。
+
+    旧实现里 `jobdup` 对每个有 `from_jds` 列表的卡都无条件回写 `node["from_jds"] = out`，
+    `jdid` 只在真的改了才回写 —— 落盘内容完全相同（没命中的卡 `out` 与旧列表逐项一致），
+    这里取 `jdid` 那种（不白改字典、也不白造一份列表）。
+    """
+    touched = repointed = deduped = 0
+    for node in _as_list(data.get("nodes")):
+        if not isinstance(node, dict):
+            continue
+        frm = node.get("from_jds")
+        if not isinstance(frm, list):
+            continue
+        has_new = any(_ref_id(x, False) == new_id for x in frm)
+        out, changed = [], False
+        for x in frm:
+            if _ref_id(x, False) == old_id:
+                if has_new:
+                    changed = True          # 已经有 new 项 → 去掉这个重复项
+                    deduped += 1
+                    continue
+                x = dict(x)               # 只改一份副本，不动传进来的那些 dict
+                x["id"] = new_id
+                has_new = True
+                changed = True
+                repointed += 1
+            out.append(x)
+        if changed:
+            node["from_jds"] = out
+            touched += 1
+    return touched, repointed, deduped
+
+
+def purge_jd_refs(jd_id, key=None):
+    """删岗位时清掉知识库里指向它的引用。返回 `(被改动的卡片数, err)`。
+
+    `jddelete.purge_jd` 的唯一知识库写路径（原来那份 `_strip_references` 已删）。
+    **只清引用、卡片留着**；没有卡片提到它就**一个字节都不写**（别白重写整份库）。
+
+    库读不出来时`(0, _KB_WRITE_REFUSED)` —— **拒绝写入、连留档都不做**，与
+    `jddelete` 本来的行为一致（"坏库不会被覆盖、坏着也不丢数据"）。
+    """
+    want = str(jd_id or "").strip()
+    if not want:
+        # 空 id 不做任何事（旧路径也到不了这里：`purge_jd` 在空 id 上就报 not_found 了）。
+        # 而且"去空白后为空"的判据会把 `{"id": "   "}` 这类条目也算成同一条 —— 不猜。
+        return 0, ""
+
+    def _fn(data):
+        touched = _purge_refs_in(data, want)
+        if touched:
+            store.save_knowledge(data, key)
+        return touched
+
+    invoked, result = _with_kb_write(_fn, write_when_unreadable=False, key=key)
+    if not invoked:
+        return 0, result                   # 库读不出来：一个字都没写，原因如实带回
+    return result, ""
+
+
+def repoint_jd_refs(old_id, new_id, key=None):
+    """改 ID（`jdid.rename_jd`）时把知识库里 old 的引用重指到 new。返回 `(被改动的卡片数, err)`。
+
+    计数口径是**卡片数**（`jdid` 记的 `kb_nodes`），与它原来的 `_repoint_kb` 一致。
+    没有卡片提到 old 就一个字节都不写；库读不出来时 `(0, _KB_WRITE_REFUSED)`。
+
+    ⚠️ `old` / `new` 先 `strip()`（调用方 `jdid` / `jobdup` 本来就这么规整），但**条目一侧
+    是逐字比**（见 `_ref_id`）。
+    """
+    old = str(old_id or "").strip()
+    new = str(new_id or "").strip()
+    if not old or not new or old == new:
+        # 无事可做。`rename_jd` 在 old == new 时自己就提前返回了；这里再兜一层：
+        # 把"没给 id"当成"没有引用命中"是唯一说得通的口径，绝不拿空串去匹配一堆空 id。
+        return 0, ""
+
+    def _fn(data):
+        touched, _repointed, _deduped = _repoint_refs_in(data, old, new)
+        if touched:
+            store.save_knowledge(data, key)
+        return touched
+
+    invoked, result = _with_kb_write(_fn, write_when_unreadable=False, key=key)
+    if not invoked:
+        return 0, result
+    return result, ""
+
+
+def merge_jd_refs(drop_id, keep_id, key=None):
+    """合并（`jobdup.merge_jobs`）时把被并掉的 drop 的引用重指到 keep。
+    返回 `(原位重指的条目数, 去掉的重复条目数, err)`。
+
+    变换与 `repoint_jd_refs` **同一份核心遍历**（只留一份实现），差别只在**计数口径**：
+    `jobdup` 的对外字段是 `kb_repointed` / `kb_deduplicated`，数的是 `from_jds`
+    **条目**而不是卡片 —— 那是 `merge_jobs` 的返回值与 `jobdup.merge_done` 日志的形状，
+    收口时不许改。两个计数都是 0 时一个字节都不写；库读不出来时 `(0, 0, _KB_WRITE_REFUSED)`。
+    """
+    drop = str(drop_id or "").strip()
+    keep = str(keep_id or "").strip()
+    if not drop or not keep or drop == keep:
+        return 0, 0, ""                    # 同上：无事可做
+
+    def _fn(data):
+        _touched, repointed, deduped = _repoint_refs_in(data, drop, keep)
+        if repointed or deduped:
+            store.save_knowledge(data, key)
+        return repointed, deduped
+
+    invoked, result = _with_kb_write(_fn, write_when_unreadable=False, key=key)
+    if not invoked:
+        return 0, 0, result
+    return result[0], result[1], ""
 
 
 def set_state(node_id, state):
