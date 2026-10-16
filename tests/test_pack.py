@@ -9,7 +9,10 @@
 三条反向用例是本文件的牙齿：漏模块 / 漏 web 模板 → 必须**点名**缺了哪个文件；
 不许写成"只要不抛异常就算过"。
 
-本文件不 import store/log、不碰真实 `data/`，所有落盘都在临时目录里。
+本文件不 import store/log，所有落盘都在临时目录里。
+**唯一的例外**：`ExamplePlaceholderTest` 会**只读**地看一眼真实 `data/`，把"用户自己的真名"
+取出来当比较基准（P0-15：README 的示例串不许再写真名）—— 真名只用于 `assertNotIn`，
+既不写进任何文件、也不打印（失败信息里只报关键词长度）。
 """
 import importlib
 import os
@@ -213,6 +216,120 @@ class RealRepoTest(unittest.TestCase):
         # verify() 整条路径也要跑通（PII 那几条不算本测试的事）
         dep_text = [i for i in PACK.verify(zpath, root=REPO) if "缺少依赖文件" in i]
         self.assertEqual([], dep_text)
+
+
+# ---- P0-15：泄漏扫描必须自动吃「当前 profile 自己的 PII」----
+# 背景：`.leak-keywords.txt` **被 gitignore** ⇒ 干净检出 / 新机器上它不存在 ⇒ 关键词表为空
+# ⇒ 带真名的分享包照样通过并可发出去（实测：本机恰好留着那个文件才偶然拦住）。
+# ⚠️ 下面所有"名字"都是**自造假名**；用户真名只在 `ExamplePlaceholderTest` 里从 `data/`
+#    **只读**取出来做比较，绝不写进文件、绝不打印。
+FAKE_PROFILE_KEY = "甲方测试档"
+FAKE_RESUME_NAME = "乙方测试名-母版"
+
+
+def _line_of(path, n):
+    with open(path, encoding="utf-8") as f:
+        return f.read().splitlines()[n - 1]
+
+
+class ProfilePiiTest(unittest.TestCase):
+    """没有 .leak-keywords.txt 时，当前 profile 自己的名字也必须被 `verify()` 拦住。"""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="pack-pii-")
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        for rel, text in (("app.py", FAKE_APP), ("aaa.py", "# aaa\nVALUE = 'aaa'\n"),
+                          ("bbb.py", "# bbb\nVALUE = 'bbb'\n"),
+                          ("web/x.html", "<html>x</html>\n"), ("web/demo.json", "{}\n")):
+            _write(os.path.join(self.root, rel), text)
+        self.zip_path = os.path.join(self.root, "out.zip")
+        self.assertFalse(os.path.exists(os.path.join(self.root, ".leak-keywords.txt")),
+                         "本用例的前提是本地**没有** .leak-keywords.txt（干净检出）")
+
+    # ---- 工具 ----
+
+    def make_profile(self, key=FAKE_PROFILE_KEY, resumes=(FAKE_RESUME_NAME,)):
+        """造一个"当前档"：档名 + 简历文件名都用自造假名。"""
+        pdir = os.path.join(self.root, "data", "profiles", key)
+        os.makedirs(os.path.join(pdir, "resumes"), exist_ok=True)
+        _write(os.path.join(self.root, "data", "current_profile.txt"), key)
+        for n in resumes:
+            _write(os.path.join(pdir, "resumes", n), "# 假简历正文（正文一个字都不许进关键词表）\n")
+        return pdir
+
+    def build(self, pii=""):
+        """按包里真实的样子造 zip；pii 非空 = 故意把那段字符串夹带进包。"""
+        if pii:
+            _write(os.path.join(self.root, "aaa.py"), "# 故意夹带：%s\n" % pii)
+        with zipfile.ZipFile(self.zip_path, "w") as z:
+            for rel, full in PACK.collect(root=self.root, files=FAKE_FILES, dirs=["web"]):
+                z.write(full, PKG_NAME + "/" + rel)
+        return self.zip_path
+
+    # ---- 需求一：自动并入 profile 自己的 PII ----
+
+    def test_auto_keywords_cover_profile_and_resume_names(self):
+        self.make_profile()
+        kws = PACK.profile_leak_keywords(self.root)
+        self.assertIn(FAKE_PROFILE_KEY, kws, "当前档名必须进关键词表")
+        self.assertIn("乙方测试名", kws, "简历文件名必须去扩展名、按分隔符切片后进表")
+
+    def test_verify_blocks_profile_key_without_keyword_file(self):
+        self.make_profile()
+        issues = PACK.verify(self.build(pii=FAKE_PROFILE_KEY), root=self.root)
+        self.assertTrue(any(FAKE_PROFILE_KEY in i for i in issues),
+                        "档名进了分享包，verify() 却没拦：%r" % (issues,))
+
+    def test_verify_blocks_resume_name_without_keyword_file(self):
+        self.make_profile()
+        issues = PACK.verify(self.build(pii=FAKE_RESUME_NAME), root=self.root)
+        self.assertTrue(any("乙方测试名" in i for i in issues),
+                        "简历名进了分享包，verify() 却没拦：%r" % (issues,))
+
+    def test_resume_content_never_enters_keywords(self):
+        """正文不许进关键词表：把正文写成一句独特的话，它不该变成关键词。"""
+        pdir = self.make_profile()
+        secret = "正文里的独特句子绝不入表"
+        _write(os.path.join(pdir, "resumes", FAKE_RESUME_NAME), secret + "\n")
+        self.assertNotIn(secret, PACK.profile_leak_keywords(self.root))
+        self.assertEqual([], PACK.verify(self.build(pii=secret), root=self.root))
+
+    # ---- 需求二：不许误伤 ----
+
+    def test_verify_passes_when_pack_has_no_pii(self):
+        self.make_profile()
+        self.assertEqual([], PACK.verify(self.build(), root=self.root))
+
+    def test_one_char_and_short_ascii_keywords_are_not_used(self):
+        """1 个汉字 / 2 个字母的组合会把**每个包**都判成泄漏 ⇒ 一律不入表。"""
+        self.make_profile(key="ab", resumes=("单-字.md", "c.md"))
+        self.assertEqual([], PACK.profile_leak_keywords(self.root))
+        self.assertEqual([], PACK.verify(self.build(pii="单 ab c"), root=self.root))
+
+    def test_generic_names_are_not_used(self):
+        """包**自己**就会写 `data/profiles/default/resumes/我的简历.md`，
+        所以 default / 我的 / 简历 / 母版 这些通用词一旦入表，每个包都会被自己判成泄漏。"""
+        self.make_profile(key="default", resumes=("我的简历.md", "简历-母版.md"))
+        self.assertEqual([], PACK.profile_leak_keywords(self.root))
+        self.assertEqual([], PACK.verify(self.build(pii="data/profiles/default 我的简历"), root=self.root))
+
+
+class ExamplePlaceholderTest(unittest.TestCase):
+    """需求二（P0-15）：README 的简历文件名示例必须是**明显占位**，不许再写真名。"""
+
+    def _real_pii(self):
+        """用户自己的真名判据：**只从 data/ 只读**推导，一个字都不落盘、不打印。"""
+        return PACK.profile_leak_keywords(REPO)
+
+    def _assert_no_real_pii(self, text, where):
+        for kw in self._real_pii():
+            self.assertNotIn(kw, text, "%s 里还留着真实 PII（关键词长度 %d）" % (where, len(kw)))
+
+    def test_readme_resume_example_is_placeholder(self):
+        for n in (271, 272):
+            line = _line_of(os.path.join(REPO, "README.md"), n)
+            self.assertIn("示例", line, "README.md:%d 必须写明这是占位示例：%r" % (n, line))
+            self._assert_no_real_pii(line, "README.md:%d" % n)
 
 
 if __name__ == "__main__":

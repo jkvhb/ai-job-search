@@ -9,6 +9,9 @@
   1. 自动剔除 API Key（config.json 重新生成，key 留空）
   2. 自动剔除个人数据（简历 / 报告 / 岗位台账 / 日志 / 上传的 JD 图与原文）
   3. 打包完成后会反向扫描 zip，确认没有明文 key、没有个人信息，有问题直接报错
+     （P0-15：个人信息关键词**自动并入当前 profile 自己的档名与简历文件名**，
+      不再依赖被 gitignore 的 `.leak-keywords.txt` —— 那个文件在干净检出上不存在，
+      于是"关键词表为空 ⇒ 不扫 PII ⇒ 带真名的包照样发出去"，本机只是恰好留着它才偶然拦住）
   4. 反向扫描里还有一条**依赖自检**：从真实仓库推导「app.py 等源码 import 了哪些本地模块、
      引用了哪些 web/ 静态文件」，缺一个就报错并删包（P0-10：以前包里少 9 个 .py，
      朋友解压后双击 启动.bat 直接 ImportError，而 verify() 照样打印「✔ 通过」）。
@@ -264,14 +267,154 @@ def collect(root=None, files=None, dirs=None):
     return items
 
 
-def leak_keywords(root=None):
-    """从 .leak-keywords.txt 读取要拦截的个人信息关键词。
+# ---- 自动并入「当前 profile 自己的 PII」（P0-15）----
+# 为什么不能只靠 `.leak-keywords.txt`：那个文件**被 .gitignore**（里面就是真名/手机号，
+# 本来也不该入库）⇒ 干净检出 / 新机器上它根本不存在 ⇒ `leak_keywords()` 返回空表 ⇒
+# `verify()` 只查 API Key、**不查 PII** ⇒ 带真名的分享包照样通过、可以发出去。
+# 实测：本机恰好留着那个文件，才偶然拦住 app.py / README.md 里的真名（否则它早发出去了）。
+#
+# 所以关键词表必须**自成来源**：不看那个可选文件，直接从 `data/profiles/<当前档>/` 推导 ——
+# "当前这个用户自己的名字"本身就是判据，不需要任何人再维护一份清单。
+#
+# 只吃「**名字**」这一类短标识，绝不读进任何正文：
+#   - 数据来源只有两处：`data/current_profile.txt` 的那一行档名（= `store.current_profile()`
+#     的来源）与 `data/profiles/<档>/resumes/` 的**文件名**（`os.listdir`，正文一个字节都不读）；
+#   - 简历的**显示名**就是文件名主干：`resumelib.add_version(name=…)` 里 `name` 直接决定
+#     `resumes/<name>.md`（见 `_resume_rel(clean)`），所以扫目录等价于读 `resumes.json` 的
+#     `name` / `file` 字段，还省掉一次"解析用户 JSON"的风险（P0-6 那类坏文件正是解析出来的）；
+#   - ⚠️ 不扫 `resumes/快照/`：里面的名字是版本 id（`rv_0001`），不含身份信息；
+#   - ⚠️ 不扫 `config.json`：本仓库的配置里**没有任何姓名字段**（只有 text_model /
+#     vision_model / search_providers / max_searches，见 `store.DEFAULT_CONFIG`）——
+#     哪天真加了"我的名字"这种字段，往 `_profile_name_sources()` 里加一行即可；
+#   - 数据源严格限定在 `data/profiles/` 之内（绝不"顺便"去扫 ~/.ssh 之类家目录）。
+_SEP_RE = re.compile(r"[\s\-_.·|/\\()（）【】\[\]]+")
 
-    该文件**不入库**（见 .gitignore）——避免为了"检测个人信息"而把个人信息写进源码。
-    每行一个关键词，# 开头为注释。文件不存在时只检查 API Key。
+# 长度判据 —— 过短的关键词等于「把每一个包都判成泄漏」（`verify()` 一报就删包）：
+#   - 含非 ASCII（中文姓名）：至少 **2 个字**。单字太泛（"张"、"李"），而且 1 个字在源码/
+#     文档里的出现率极高，一个这样的关键词就能让这个工具**永远打不出包**。
+#   - 纯 ASCII（拼音档名 / 英文简历名）：至少 **3 个字符**且至少含一个字母。两字母组合
+#     （"in" / "cv" / "ok" / "md"）在源码里到处都是；纯数字（"2024"）只是年份/序号，不是身份。
+_ASCII_MIN = 3
+_CJK_MIN = 2
+
+# 通用词：**不是身份**，却必然会被从文件名里切出来（或本来就是兜底档名）。
+# 依据是实测，不是拍脑袋：
+#   - `main()` **自己**往包里写 `data/profiles/default/resumes/我的简历.md` ⇒ "default" /
+#     "我的" / "简历" 一旦入表，**每一个包都会被它自己写进去的起步简历判成泄漏**；
+#   - 本机实测 `data/current_profile.txt` 的内容就是 `default`（用户没设过档名）；
+#   - README / app.py 满篇"母版 / 快照 / 版本 / 简历"，简历文件名也常带这些分类词。
+# 代价是"某人的真名恰好就是这些词"时漏检 —— 与"每个包都被删"相比，这个方向更合理。
+#
+# ⚠️ 两种匹配方式不能混：
+#   - 中文按**子串**判：`我的简历` 这种整段没被分隔符切开的名字，按整串比是比不中的
+#     （实测 `test_generic_names_are_not_used` 就是这么红的）。中文两字词当子串命中
+#     （"张三-个人简历" 里的 "个人简历"）不会误伤真名 —— 真名叫"我的简历"是不现实的。
+#   - 英文只按**整串**判：`cv` / `new` / `old` 当子串会误伤真英文名
+#     （"newman" / "goldman" / "cvmaker" 全被吃掉），只认"这一段就等于这个词"。
+_GENERIC_CJK = ("简历", "母版", "版本", "快照", "我的", "副本", "终版", "定稿", "草稿",
+                "初稿", "通用", "模板", "正文", "备份", "汇总", "新版", "旧版", "示例")
+_GENERIC_ASCII = frozenset([
+    "default", "resume", "cv", "final", "copy", "master", "version", "backup",
+    "new", "old", "template",
+])
+
+
+def _is_generic(word):
+    """这一段只是"简历文件的分类词"，不是身份？（匹配方式的取舍见上面那条注释）"""
+    if word.lower() in _GENERIC_ASCII:
+        return True
+    return any(g in word for g in _GENERIC_CJK)
+
+
+def _usable_keyword(word):
+    """这个词够不够"具体"到可以当泄漏关键词？（长度判据见上面那条注释）"""
+    if not word:
+        return False
+    if all(ord(c) < 128 for c in word):
+        return len(word) >= _ASCII_MIN and bool(re.search(r"[A-Za-z]", word))
+    return len(word) >= _CJK_MIN
+
+
+def _name_fragments(text):
+    """把一个"名字"切成可用片段：`示例-姓名-母版.md` → `示例` / `姓名` / `母版` 三段，
+    其中 `示例`、`母版` 是通用词被丢掉，最后只剩 `姓名`。
+
+    ⚠️ 只对**文件名主干 / 档名**这类短标识调用，绝不对正文调用。
     """
-    p = os.path.join(root or ROOT, ".leak-keywords.txt")
+    out = []
+    for part in _SEP_RE.split(str(text or "")):
+        if not _usable_keyword(part) or _is_generic(part):
+            continue
+        out.append(part)
+    return out
+
+
+def _profile_keys(root):
+    """该扫哪些档？返回档名列表。
+
+    口径与 `store.current_profile()` 一致（文件不存在 → default；内容为空 → default），
+    但**多一条 fail-safe**：档名文件存在却读不出来时，`store` 是抛 `ProfileUnreadable`
+    （拒绝启动），这里只是"**不知道当前是谁**" ⇒ 改成把 `data/profiles/` 下**每个档**都扫。
+    宁可多拦几个（都是用户自己的档），也不在"读不出来"时静默一条 PII 都不扫 ——
+    那不扫的样子**和以前那个假绿灯一模一样**，正是本项要根治的习惯。
+    """
+    fp = os.path.join(root, "data", "current_profile.txt")
+    try:
+        with open(fp, "r", encoding="utf-8") as f:
+            key = f.read().strip()
+        return [key] if key else ["default"]
+    except FileNotFoundError:
+        return ["default"]
+    except Exception:
+        pass
+    pr = os.path.join(root, "data", "profiles")
+    try:
+        return sorted(d for d in os.listdir(pr) if os.path.isdir(os.path.join(pr, d)))
+    except OSError:
+        return []
+
+
+def profile_leak_keywords(root=None):
+    """从**当前 profile 自己的名字**推导要拦截的 PII 关键词（P0-15，不依赖任何配置文件）。
+
+    只读两处短标识：档名 + `resumes/` 下的**文件名**（理由见文件里那一段注释）。
+    推不出来（没有 `data/`、名字全是通用词/太短）就返回 `[]` —— 那说明这台机器上
+    没有"自己的名字"可保护，不是失败。
+    """
+    root = root or ROOT
+    kws, seen = [], set()
+
+    def add(words):
+        for w in words:
+            if w not in seen:
+                seen.add(w)
+                kws.append(w)
+
+    for key in _profile_keys(root):
+        add(_name_fragments(key))
+        resumes = os.path.join(root, "data", "profiles", key, "resumes")
+        try:
+            names = sorted(os.listdir(resumes))
+        except OSError:
+            continue
+        for n in names:
+            # 只认**文件**：`resumes/快照/` 是目录，直接跳过（版本 id 不是身份）。
+            if os.path.isfile(os.path.join(resumes, n)):
+                add(_name_fragments(os.path.splitext(n)[0]))
+    return kws
+
+
+def leak_keywords(root=None):
+    """要拦截的个人信息关键词：**可选的人工补充表** + **自动并入的当前 profile 自己的 PII**。
+
+    `.leak-keywords.txt` 是可选的（被 .gitignore，干净检出/新机器上没有它）；真正兜底的是
+    自动推导（见 `profile_leak_keywords`）。所以 P0-15 之后，即使那个文件不存在，
+    "分享包里出现用户自己的名字"也一定会被 `verify()` 拦下 —— 以前这里是"文件不在就
+    静默不扫 PII"，那正是假绿灯。每行一个关键词，# 开头为注释。
+    """
+    root = root or ROOT
     kws = []
+    p = os.path.join(root, ".leak-keywords.txt")
     try:
         with open(p, "r", encoding="utf-8") as f:
             for line in f:
@@ -280,6 +423,9 @@ def leak_keywords(root=None):
                     kws.append(line)
     except Exception:
         pass
+    for kw in profile_leak_keywords(root):
+        if kw not in kws:
+            kws.append(kw)
     return kws
 
 
