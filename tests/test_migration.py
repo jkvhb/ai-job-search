@@ -1167,6 +1167,10 @@ class ReportHealthBackupTest(IsolatedCase):
 
     模板用**临时文件**（`mock.patch` 掉 `TEMPLATE`）：这条用例钉的是备份行为，
     不该被 `web/report_template.html` 的并发改动牵连。
+
+    ⚠️ 本脚本**另一批**用例在 `tests/test_report_health.py::ReportHealthExitCodeTest`（P1-21：
+    `--刷新模板` 有失败就必须非零退出 + 点名，以及「已是当前模板」这种正常跳过仍要 0）——
+    那个文件钉退出码，这里钉备份，两边互补、不重复。
     """
 
     def setUp(self):

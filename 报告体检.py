@@ -261,30 +261,56 @@ def main():
     elif do_fix or do_tpl:
         # 与两个迁移脚本同一口径：无事可做的一轮不建备份（备份是回滚的**前提**，没有改动就
         # 无从回滚），一个字节都不写。
-        print("本次无需改动：没有任何报告需要刷新模板或清理来源"
+        # ⚠️ 只敢说「**能读出来的**报告」：读不出 REPORT_DATA 的那几份算"刷不了"（见下面
+        # `--刷新模板` 的判据），在这里断言"没有任何报告需要刷新"就是替它们说假话。
+        print("本次无需改动：**能读出来的**报告没有一份需要刷新模板或清理来源"
               "（本次**未建备份** —— 备份只为回滚改动而建）。\n")
 
+    # ---- `--刷新模板` 的结果必须**如实**（审计 §3 P1-21）----
+    # 老实现：每份失败只 print 一行，最后照样 `return 0` —— 脚本自己说"完成"，调用方（人/CI）
+    # 只看退出码就以为一切正常。现在把「跳过」与「失败」**分开**，判据三选一、互斥：
+    #   * 成功（`rerender → True`）：这一份真的被重写了；
+    #   * 正常跳过（`rerender → False`）：盘上那份与当前模板渲染出来的**逐字相同** ⇒
+    #     一个字节都不用写（真幂等带来的正常结果）。**绝不算失败** —— 否则每跑一次都在报错，
+    #     人就会开始无视这个退出码，比不报还坏；
+    #   * 失败：这一份**没能刷新**，两种都算（都要点名、都要非零退出）：
+    #       ① 读不出 REPORT_DATA（`rerender → None`）：这份文件不是本工具能刷的报告或已损坏，
+    #          工具对它**一个字节都没动** —— 此时说"刷新完成"就是假话；
+    #       ② 渲染/写盘抛异常（模板读不出来 / 只读文件 / 磁盘满…）：连原因一起点名。
+    tpl_failed = 0
     if do_tpl:
-        ok = bad = same = 0
+        ok = same = 0
+        failures = []                      # [(文件名, 为什么没能刷新)]：不只一个计数，必须点名
         for p in files:
+            name = os.path.basename(p)
             try:
                 done = rerender(p)
             except Exception as e:
-                bad += 1
-                print("  ⚠ 失败 %s: %s" % (os.path.basename(p), e))
+                failures.append((name, "刷新时报错：%s" % e))
+                print("  ⚠ 失败 %s: %s" % (name, e))
                 continue
             if done is None:
-                bad += 1
-                print("  ⚠ 跳过（读不出 REPORT_DATA）：%s" % os.path.basename(p))
+                failures.append((name, "读不出 REPORT_DATA（不是本工具能刷的报告，或已损坏），"
+                                       "本份**一个字节都没写**"))
+                print("  ⚠ 失败（读不出 REPORT_DATA，一个字都没写）：%s" % name)
             elif done:
                 ok += 1
             else:
                 same += 1
-        print("模板刷新完成：成功 %d 份，已是当前模板 %d 份，跳过/失败 %d 份" % (ok, same, bad))
+        tpl_failed = len(failures)
+        print("模板刷新完成：成功 %d 份，已是当前模板 %d 份，失败 %d 份"
+              % (ok, same, len(failures)))
+        if failures:
+            # 汇总点名（上面每份已经点过一次；这里再列一遍，方便只读最后几行的人）：
+            # "有失败"这件事必须能从输出**和退出码**两个地方看出来。
+            print("\n⚠ 有 %d 份报告**没能刷新模板**：" % len(failures))
+            for fname, why in failures:
+                print("    - %s：%s" % (fname, why))
+            print("⇒ 本次**没有全部成功**，退出码 1（人/CI 必须能察觉；别只看「完成」那两个字）")
         if backup:
             print("备份保留在 %s\n" % _backup_note(backup))
         if not do_fix:
-            return 0
+            return 1 if tpl_failed else 0
 
     tot = drop = 0
     changed = []
@@ -326,7 +352,9 @@ def main():
     print("\n完成：共删除 %d 条非本领域来源，%d 个节点降级为「AI 整理待查证」。" % (total_drop, total_wiped))
     if backup:
         print("备份保留在 %s" % _backup_note(backup))
-    return 0
+    # `--fix` 的退出码不变（本批只动 `--刷新模板`）；但**同时带了 `--刷新模板`**时，
+    # 上面那批刷新失败必须照样传出去，不能被后面这段清理的成功掩盖。
+    return 1 if tpl_failed else 0
 
 
 if __name__ == "__main__":
