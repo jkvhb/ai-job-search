@@ -14,6 +14,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -6815,6 +6816,432 @@ class UiLogWriteFailureRouteTest(IsolatedCase):
         self.assertEqual(h._status, 200)
         self.assertEqual(h._body, {"ok": True}, "成功路径的形状被改了")
         self.assertIn("ui.unit_probe", _log_events())
+
+
+# ============================================================ 追加四：同类漏网 4 处（A 组）
+# 前一位实现者修 ①-⑤（见上面那段注释）时，只读排查又点名了**同样形状**的 4 处。
+# 其中两处**比回空更糟**——它们把"读不出来"说成了另一件**具体**的事：
+#   ⑥ GET /api/knowledge/review  ← 知识库读不出来 ⇒ queue:[] + 全 0 ⇒「今天没有要复习的」✗
+#   ⑦ GET /api/job/outcome       ← 台账读不出来 ⇒ 404「找不到岗位：x」✗
+#                                  （说这个岗位**不存在**，用户会以为岗位被程序删了）
+#   ⑧ GET /api/resumes 的盘上文件列表 ← `os.path.isdir()` 静默 False ⇒ files:[]
+#                                  （与同一响应里 `resumelib.list_versions()` 的**成功**结果自相矛盾：
+#                                    有版本记录、却说盘上没文件）
+#   ⑨ GET /api/interview/status|list ← status.json 读不出来 ⇒ {} / 记录被 `continue` 掉
+#                                  （404「找不到该面试记录」/ 那场面试从列表里静默消失，P1-23）
+# 判据与状态码一律照 ①-⑤ 那一把尺子：`app._unreadable`（= store 的 strict 读 +
+# `store.file_has_bytes_to_lose`，与 `store.*_safe_to_write` 同一把尺子；⑤ 用的是
+# `os.listdir` 的异常分支）。**对照组一条都不能少**：真的没有 / 真的是 0 字节 ⇒ 照旧回空（或 404）。
+class KnowledgeReviewUnreadableRouteTest(IsolatedCase):
+    """⑥ `/api/knowledge/review`：知识库读不出来 ⇒ 如实报错，**绝不回空复习队列**。
+
+    这条最要紧：复习队列是「今天该复习什么」的**唯一入口** —— 回空队列 + 全 0，界面就会说
+    「今天没有要复习的」，而用户的卡其实在盘上（只是读不出来）。
+    状态码选 **500**（同 ①：服务端读不出**自己的**数据文件，不是客户端发错了什么）。
+    """
+
+    def test_an_unreadable_knowledge_file_is_not_an_empty_review_queue(self):
+        path = store.knowledge_path()
+        raw = _write_unreadable(path, "我的知识库：中文卡片")
+        self.assertGreater(os.path.getsize(path), 0, "反证：盘上确实有内容")
+        self.assertRaises(UnicodeDecodeError, raw.decode, "utf-8")
+
+        h = _get("/api/knowledge/review")
+        body = h.json_body()
+        self.assertNotEqual(body.get("queue"), [],
+                            "读不出来却回了空队列（旧行为）：界面会说「今天没有要复习的」")
+        self.assertEqual(h.code, 500, "读不出来却回了 %r（旧行为：200 + 空队列）" % (h.code,))
+        self.assertFalse(body.get("ok"))
+        self.assertIn("knowledge.json", str(body.get("error")), "没说是哪个文件读不出来")
+        self.assertIn("kb.review_read_failed", _log_events(), "读不出来必须留一条日志（取证）")
+
+    def test_a_fresh_profile_still_gets_an_empty_review_queue(self):
+        """对照组：**真的没有**（新档案）照旧 200 + 空队列 —— 不许被一律报成读不出来。"""
+        self.assertFalse(os.path.exists(store.knowledge_path()))
+        h = _get("/api/knowledge/review")
+        self.assertEqual(h.code, 200)
+        body = h.json_body()
+        self.assertTrue(body.get("ok"))
+        self.assertEqual(body["queue"], [])
+        self.assertEqual(body["stats"]["due"], 0)
+        self.assertNotIn("kb.review_read_failed", _log_events(), "没有读失败却记了日志")
+
+    def test_a_zero_byte_knowledge_file_still_gets_an_empty_review_queue(self):
+        """0 字节也是"第一次"（与 store 的 `knowledge_safe_to_write` 同一把尺子）。"""
+        open(store.knowledge_path(), "wb").close()
+        h = _get("/api/knowledge/review")
+        self.assertEqual(h.code, 200, "0 字节是合法的「第一次」，不该被报成读不出来")
+        self.assertEqual(h.json_body()["queue"], [])
+
+    def test_the_success_shape_is_unchanged(self):
+        store.save_knowledge({"nodes": [{"id": "rlhf", "term": "RLHF", "state": "待学习"}]})
+        h = _get("/api/knowledge/review")
+        self.assertEqual(h.code, 200)
+        body = h.json_body()
+        self.assertEqual(sorted(body.keys()), ["ok", "queue", "stats"])
+        self.assertEqual([n["term"] for n in body["queue"]], ["RLHF"])
+        self.assertEqual(sorted(body["stats"].keys()), ["due", "mastered", "reviewed_today"])
+
+
+class JobOutcomeUnreadableRouteTest(_OutcomeRouteCase):
+    """⑦ `/api/job/outcome`：台账读不出来 ⇒ 500，**绝不回「找不到岗位：x」的 404**。
+
+    「读不出来」与「台账里确实没有这个岗位」是两件**相反**的事。旧实现把前者也说成后者 ——
+    用户会以为自己那个岗位被程序删了（比回空更糟）。404 只留给后半句（对照组）。
+    """
+
+    def test_an_unreadable_jobs_file_is_not_a_missing_job(self):
+        path = store.jobs_path()
+        raw = _write_unreadable(path, "我的台账：中文记录")
+        self.assertGreater(os.path.getsize(path), 0, "反证：盘上确实有内容")
+        self.assertRaises(UnicodeDecodeError, raw.decode, "utf-8")
+
+        h = _get("/api/job/outcome?id=j1")
+        body = h.json_body()
+        self.assertNotEqual(h.code, 404,
+                            "读不出来却回了 404「找不到岗位」—— 把「读不出来」说成「这个岗位不存在」")
+        self.assertEqual(h.code, 500, "读不出来却回了 %r（旧行为：404）" % (h.code,))
+        self.assertFalse(body.get("ok"))
+        self.assertIn("jobs.json", str(body.get("error")), "没说是哪个文件读不出来")
+        self.assertIn("outcome.read_failed", _log_events(), "读不出来必须留一条日志（取证）")
+
+    def test_an_unreadable_jds_file_is_not_a_missing_job(self):
+        """JD 级真相（`jds.json`）读不出来同样是"台账读不出来"（`_ledger_store_error` 的两个半边）。"""
+        raw = _write_unreadable(store.p_path("jds.json"), "我的JD库：中文记录")
+        self.assertRaises(UnicodeDecodeError, raw.decode, "utf-8")
+        h = _get("/api/job/outcome?id=j1")
+        self.assertEqual(h.code, 500, "JD 库读不出来却回了 %r" % (h.code,))
+        self.assertIn("jds.json", str(h.json_body().get("error")))
+
+    def test_a_readable_ledger_without_this_job_is_still_a_404(self):
+        """对照组：**台账读得出来、里面确实没有这个岗位** ⇒ 照旧 404（既有语义一个字不改）。"""
+        self._job("j1")
+        h = _get("/api/job/outcome?id=" + quote("没有这个岗位"))
+        self.assertEqual(h.code, 404)
+        self.assertIn("找不到岗位", h.json_body().get("error", ""))
+        self.assertNotIn("outcome.read_failed", _log_events())
+
+    def test_the_success_shape_is_unchanged(self):
+        self._job("j1")
+        h = _get("/api/job/outcome?id=j1")
+        self.assertEqual(h.code, 200)
+        body = h.json_body()
+        self.assertEqual(sorted(body.keys()),
+                         ["application", "has_ai", "id", "jd_id", "ok", "statuses", "terminal"])
+        self.assertTrue(body["ok"])
+
+
+class ResumeFilesListUnreadableRouteTest(IsolatedCase):
+    """⑧ `/api/resumes` 的 `files`：简历目录**存在却读不出来** ⇒ 如实报错，**绝不回 `files:[]`**。
+
+    为什么选 **500 + ok:false**（而不是 `files:null` + error）：`files` 的契约一直是**一个数组**
+    （前端与老前端直接 `files.filter` / `.map`，`unregistered` 也是从它算出来的）；`null` 会让
+    它们渲染出 `undefined` 或静默少一半，等于把"读不出来"换成另一种假话。
+    仓库里「目录读不出来」的既有先例就长这样 —— `/api/reports` 的
+    500「报告目录 `…` 读不出来：… —— 这不是「你没有报告」」（⑤），这里照抄同一句式与同一个状态码。
+    """
+
+    def _unreadable_dir(self):
+        """把 `resumes/` 变成一个**同名文件**：路径存在、`isdir()` 为 False（旧行为正是这一支静默回 []）。"""
+        d = store.p_path("resumes")
+        shutil.rmtree(d)                       # `ensure_profile()` 建过它
+        raw = "这不是目录，是简历目录的位置被占了".encode("gbk")
+        with open(d, "wb") as f:
+            f.write(raw)
+        return d, raw
+
+    def test_a_resumes_path_that_is_not_a_directory_is_not_an_empty_file_list(self):
+        d, raw = self._unreadable_dir()
+        self.assertTrue(os.path.exists(d), "反证：路径确实存在（不是「目录不存在」那一支）")
+        self.assertFalse(os.path.isdir(d), "反证：确实不是目录（旧行为正是这一支静默回 files:[]）")
+        self.assertRaises(UnicodeDecodeError, raw.decode, "utf-8")
+
+        h = _get("/api/resumes")
+        body = h.json_body()
+        self.assertNotEqual(body.get("files"), [],
+                            "读不出来却回了空文件列表（旧行为）：与同一响应里的版本记录自相矛盾")
+        self.assertEqual(h.code, 500, "读不出来却回了 %r（旧行为：200 + files:[]）" % (h.code,))
+        self.assertFalse(body.get("ok"))
+        self.assertIn("resumes", str(body.get("error")), "没说清是哪个目录读不出来")
+        self.assertIn("resume.files_read_failed", _log_events(), "读不出来必须留一条日志（取证）")
+
+    def test_the_self_contradiction_the_old_code_shipped(self):
+        """反证"自相矛盾"真的会发生：版本记录**读得出来**（非空），盘上文件列表却回空。"""
+        resumelib.create_version("母版", "第一版内容")
+        self._unreadable_dir()
+        self.assertTrue(resumelib.list_versions(), "夹具前提：版本记录那一半必须真的读得出来")
+
+        body = _get("/api/resumes").json_body()
+        self.assertNotEqual(body.get("files"), [],
+                            "有版本记录、却说盘上没文件（旧行为）：两半自相矛盾")
+
+    def test_a_missing_resumes_dir_is_still_an_empty_file_list(self):
+        """对照组：**真的还没有简历目录**照旧回空（`FileNotFoundError` 那一支）。"""
+        shutil.rmtree(store.p_path("resumes"))
+        self.assertFalse(os.path.exists(store.p_path("resumes")))
+        h = _get("/api/resumes")
+        self.assertEqual(h.code, 200)
+        self.assertEqual(h.json_body()["files"], [])
+        self.assertNotIn("resume.files_read_failed", _log_events(), "没有读失败却记了日志")
+
+    def test_the_success_shape_is_unchanged(self):
+        resumelib.create_version("母版", "第一版内容")
+        h = _get("/api/resumes")
+        self.assertEqual(h.code, 200)
+        body = h.json_body()
+        self.assertEqual(sorted(body.keys()),
+                         ["files", "include_removed", "ok", "resumes", "unregistered"])
+        self.assertIn("母版.md", body["files"])
+        self.assertEqual(body["unregistered"], [])
+
+
+class InterviewRecordUnreadableRouteTest(IsolatedCase):
+    """⑨ `/api/interview/status` + `/api/interview/list`：`status.json` 读不出来 ≠ 这条记录不存在。
+
+    旧行为：`interview.status()` 回 `{}` ⇒ 路由 404「找不到该面试记录」；`list_interviews` 里
+    `continue` 掉 ⇒ 那场面试**从列表里消失**（体检 P1-23：用户的录音还在盘上，人却以为丢了）。
+    状态码/话术沿用这两条路由**既有**的 500（`_GET_ERROR_SAYS`：面试状态 / 面试记录列表读取失败），
+    只是把原因从静默改成如实说出；404 仍留给"确实没有这条记录"（对照组）。
+    """
+
+    def _unreadable_status(self, interview_id):
+        path = store.interview_file(interview_id, "status.json")
+        return path, _write_unreadable(path, "{\"state\": \"done\", \"job_id\": \"中文岗位\"}")
+
+    def test_an_unreadable_status_file_is_not_a_missing_interview(self):
+        path, raw = self._unreadable_status("iv_bad")
+        self.assertGreater(os.path.getsize(path), 0, "反证：盘上确实有内容")
+        self.assertRaises(UnicodeDecodeError, raw.decode, "utf-8")
+
+        h = _get("/api/interview/status?id=iv_bad")
+        body = h.json_body()
+        self.assertNotEqual(h.code, 404,
+                            "读不出来却回了 404「找不到该面试记录」—— 用户以为录音丢了")
+        self.assertEqual(h.code, 500, "读不出来却回了 %r（旧行为：404）" % (h.code,))
+        self.assertFalse(body.get("ok"))
+        self.assertIn("status.json", str(body.get("error")), "没说是哪个文件读不出来")
+        self.assertIn("interview.status_error", _log_events(), "读不出来必须留一条日志（取证）")
+
+    def test_an_unreadable_status_file_does_not_vanish_from_the_list(self):
+        store.save_interview_json("iv_ok", "status.json", {"state": "done", "job_id": "j1"})
+        self._unreadable_status("iv_bad")
+
+        h = _get("/api/interview/list?job=j1")
+        self.assertNotEqual(h.code, 200,
+                            "有记录读不出来却回了 200：那条记录被静默吃掉了（旧行为）")
+        self.assertEqual(h.code, 500)
+        self.assertIn("status.json", str(h.json_body().get("error")))
+        self.assertIn("interview.list_error", _log_events(), "读不出来必须留一条日志（取证）")
+
+    def test_a_missing_status_file_is_still_a_true_404(self):
+        """对照组：**确实没有这条记录**照旧 404（既有语义一个字不改）。"""
+        self.assertFalse(os.path.exists(store.interview_file("nope", "status.json")))
+        h = _get("/api/interview/status?id=nope")
+        self.assertEqual(h.code, 404)
+        self.assertIn("找不到", h.json_body().get("error", ""))
+        self.assertNotIn("interview.status_error", _log_events())
+
+    def test_a_zero_byte_status_file_is_still_a_missing_interview(self):
+        """0 字节 = 里面一个字节都没有（与 store 同一把尺子）⇒ 照旧 404，不许报成读不出来。"""
+        store.save_interview_json("iv0", "status.json", {"state": "done"})
+        open(store.interview_file("iv0", "status.json"), "wb").close()
+        h = _get("/api/interview/status?id=iv0")
+        self.assertEqual(h.code, 404, "0 字节被误报成读不出来")
+        self.assertNotIn("interview.status_error", _log_events())
+
+    def test_the_success_shapes_are_unchanged(self):
+        store.save_interview_json("iv1", "status.json", {"state": "done", "job_id": "j1"})
+        h = _get("/api/interview/status?id=iv1")
+        self.assertEqual(h.code, 200)
+        body = h.json_body()
+        self.assertEqual(body["state"], "done")
+        self.assertEqual(body["id"], "iv1")
+        self.assertIs(body["running"], False)
+        self.assertTrue(body["ok"])
+
+        h2 = _get("/api/interview/list?job=j1")
+        self.assertEqual(sorted(h2.json_body().keys()), ["interviews", "job", "ok"])
+        self.assertEqual([r["id"] for r in h2.json_body()["interviews"]], ["iv1"])
+
+
+# ============================================================ C5：死路由 `DELETE /api/jobs`
+# 体检 §7.1 判它死（前端不调用）。grep 证据（`web/index.html` + `web/report_template.html` +
+# 全仓非 tests：只有注释/文档提到它，**没有**任何 `DELETE` 到 `/api/jobs` 的调用；
+# 全仓也没有第二个地方用它的 `keep_files` 参数）。它**不只是死**：老实现按**分析 id**
+# `load_jobs()` → 改 → `save_jobs()`（跨多次调用的复合读-改-写，无备份、绕开合并语义），
+# 而现在卡片上的 id 是 **JD id** —— 真删除走 `/api/jd/purge`（预演 + 二次确认 + 备份）。
+class DeadJobDeleteRouteTest(IsolatedCase):
+    """钉住"这条死路由真的没了"，免得哪天照着老代码又抄回来。"""
+
+    def test_the_dead_route_is_gone_and_touches_nothing(self):
+        store.save_jobs([{"id": "j1", "jd_id": "j1", "report": "j1.html", "score": 80.0}])
+        before = _disk_bytes(store.jobs_path())
+
+        h = _sandbox_handler("DELETE", "/api/jobs?id=j1", b"", {})
+
+        self.assertEqual(h._status, 404, "死路由还能删台账：%r" % (h._body,))
+        self.assertEqual(_disk_bytes(store.jobs_path()), before, "删台账的路由仍然动了盘")
+        self.assertNotIn("job.delete", _log_events())
+
+    def test_the_real_delete_path_still_exists(self):
+        """对照：**真删除**走的是 `/api/jd/purge` 那一套（预演 + 二次确认 + 备份），它必须还在
+        （POST 侧由既有用例钉着，见 `JdPurgeRouteTest` / `JdDeleteFrontendTest`）。"""
+        self.assertIn("/api/jd/purge_preview", app._GET_ERROR_SAYS)
+
+
+# ============================================================ 追加五：`.sub` 的两处 CSS 声明合并（C6）
+# 症状：`web/index.html` 里 `.sub{…}` 定义了**两次**（原来 :13 与 :84）。两条选择器同为**单类**、
+# 特异性相同 ⇒ 后定义的赢，但**逐属性**赢：先定义那条独有的 `color` / `font-size` 仍然生效
+# （后一块没有这两个属性）。合并 = 把层叠后的**扁平属性集合**写成一处的 `_SUB_EFFECTIVE`，
+# 一个属性都不许漏（漏了就是视觉回归），也不许把输的那份独有的属性丢掉。
+#
+# 等价性证据（改前用 `git show HEAD:web/index.html` 跑同一份层叠探针，改后再跑一次）：
+#   color:var(--muted) / font-size:13px（:13 独有，仍然生效）
+#   margin-bottom：两块都有 → **:84 的 7px 赢**（:13 的 18px 被覆盖）
+#   其余 8 个属性只有 :84 有 ⇒ 全部生效。两侧的属性表逐条相同（见汇报里的对照表）。
+_SUB_EFFECTIVE = {
+    "color": "var(--muted)",          # 原 :13 独有（后那块没有它 ⇒ 它仍然生效）
+    "font-size": "13px",              # 原 :13 独有
+    "display": "flex",                # 原 :84（赢的那份）
+    "align-items": "center",
+    "gap": "10px",
+    "flex-wrap": "wrap",
+    "padding": "7px 10px",
+    "border": "1px solid var(--line)",
+    "border-radius": "9px",
+    "margin-bottom": "7px",           # 两块都有 → 后定义的赢（:13 的 18px 被覆盖）
+    "background": "#fff",
+}
+
+
+def _css_blocks(selector):
+    """`web/index.html` 的 `<style>` 里**选择器恰好等于** selector 的声明块（按源码顺序）。
+
+    够用的解析：先去掉注释，再按 `选择器{声明}` 扫；只认选择器**逐字相等**的那些
+    （`.sub .rn` / `.subs` 这类都不是"`.sub` 自己被定义了两次"）。
+    """
+    with open(os.path.join(store.ROOT, "web", "index.html"), "r", encoding="utf-8") as f:
+        src = f.read()
+    style = src[src.index("<style>"):src.index("</style>")]
+    style = re.sub(r"/\*.*?\*/", "", style, flags=re.S)
+    out = []
+    for m in re.finditer(r"([^{}]+)\{([^{}]*)\}", style):
+        if m.group(1).strip() == selector:
+            out.append(m.group(2))
+    return out
+
+
+def _css_decls(block):
+    """`a:b;c:d` → `[(a, b), …]`（按源码顺序）。"""
+    out = []
+    for item in block.split(";"):
+        item = item.strip()
+        if not item:
+            continue
+        k, _, v = item.partition(":")
+        out.append((k.strip(), v.strip()))
+    return out
+
+
+def _sub_effective_map():
+    """`.sub` 的全部声明块**按层叠规则**摊平成一份"浏览器实际生效"的属性表（后定义者赢、逐属性）。"""
+    eff = {}
+    for block in _css_blocks(".sub"):
+        for k, v in _css_decls(block):
+            eff[k] = v
+    return eff
+
+
+class SubCssSingleDeclarationTest(IsolatedCase):
+    """`.sub` 必须**只剩一处**声明，且那份声明逐属性等于改动前浏览器实际生效的集合。"""
+
+    def test_dot_sub_is_declared_exactly_once(self):
+        blocks = _css_blocks(".sub")
+        self.assertEqual(len(blocks), 1,
+                         "`.sub` 还定义了 %d 处（原来 :13 与 :84 两处，后定义者赢）—— 必须合并成一处"
+                         % len(blocks))
+
+    def test_the_merged_values_are_exactly_what_the_cascade_used_to_produce(self):
+        """合并后**逐属性**等于原来的层叠结果：漏掉先定义块的 color/font-size 就是视觉回归。"""
+        self.assertEqual(_sub_effective_map(), _SUB_EFFECTIVE,
+                         "合并后的生效属性集合与改动前不一致（视觉会变）")
+
+    def test_the_single_block_carries_every_property_itself(self):
+        """那一处自己就得写全（不是"后面还有一块补"）—— 并把赢的那份 8 个属性逐条钉住。"""
+        block = _css_blocks(".sub")[0]
+        self.assertEqual(dict(_css_decls(block)), _SUB_EFFECTIVE)
+        for k in ("display", "align-items", "gap", "flex-wrap", "padding", "border",
+                  "border-radius", "background"):
+            self.assertIn(k, _SUB_EFFECTIVE, "输的那份里独有的属性被丢了：%s" % k)
+
+
+# ============================================================ 追加六：500 的 body 里那句人话被前端丢了（B 组）
+# 服务端这条线**已经**把"哪个文件、什么原因"写进了 500 的 body（`{ok:false, error:"…"}`），
+# 但 `loadJobs` / `loadConfig` 先判 `resp.ok !== true` 就抛 ⇒ 用户只看到「接口返回 HTTP 500」，
+# 那句人话被丢在路上。修法：`!resp.ok` 时**也**试着读 body 里的 error；
+# body 不是 JSON / 没有 error ⇒ 退化回原来那句（**不许**因此再抛一个异常）。
+_SERVER_SAY_500 = "知识库 `knowledge.json` 读不出来：Expecting value: line 1 column 1 (char 0)"
+
+
+class ServerSentenceOn500Test(IsolatedCase):
+    """B：500（`ok:false` + `error`）时，界面要显示**服务端写好的那句人话**，而不是只有 HTTP 码。"""
+
+    def test_load_jobs_shows_the_servers_sentence_not_just_the_http_code(self):
+        _need_node()
+        out = web_probe.run_index(
+            "var msgs = [];\n"
+            "toast = function(m){ msgs.push(String(m)); };\n"
+            "logUI = function(){};\n"
+            "fetch = function(){ return Promise.resolve({ok:false, status:500, json:function(){"
+            " return Promise.resolve({ok:false, error: __fixture.say}); }}); };\n"
+            "await loadJobs();\n"
+            "out.msg = msgs.join(' | ');\n"
+            "out.err = String(LEDGER_ERR);\n",
+            {"say": _SERVER_SAY_500})
+
+        self.assertIn(_SERVER_SAY_500, out["msg"],
+                      "500 的 body 里服务端已经写好了原因，界面却只显示了 HTTP 码：%r" % (out,))
+        self.assertIn(_SERVER_SAY_500, out["err"])
+
+    def test_load_config_shows_the_servers_sentence_not_just_the_http_code(self):
+        _need_node()
+        out = web_probe.run_index(
+            "fetch = function(){ return Promise.resolve({ok:false, status:500, json:function(){"
+            " return Promise.resolve({ok:false, error: __fixture.say}); }}); };\n"
+            "await loadConfig();\n"
+            "out.st = String($('#cfgSt').textContent);\n",
+            {"say": _SERVER_SAY_500})
+
+        self.assertIn(_SERVER_SAY_500, out["st"],
+                      "设置页同样把服务端那句人话丢了：%r" % (out,))
+
+    def test_a_non_json_error_body_falls_back_to_the_http_line(self):
+        """对照组：body 不是 JSON ⇒ 退化回原来那句（HTTP 码照说），**且不多抛一个异常**。"""
+        _need_node()
+        out = web_probe.run_index(
+            "var msgs = [];\n"
+            "toast = function(m){ msgs.push(String(m)); };\n"
+            "logUI = function(){};\n"
+            "fetch = function(){ return Promise.resolve({ok:false, status:502, json:function(){"
+            " return Promise.reject(new Error('not json')); }}); };\n"
+            "await loadJobs();\n"
+            "out.msg = msgs.join(' | ');\n")
+
+        self.assertIn("502", out["msg"], "退化路径连 HTTP 码都没说：%r" % (out,))
+        self.assertEqual(out.get("unexpected"), [], "退化路径多抛了一个异常")
+
+    def test_a_successful_response_still_reads_the_body_normally(self):
+        """对照组：`ok:true` 的成功路径**一个字都不许改**（body 也只许读一次）。"""
+        _need_node()
+        out = web_probe.run_index(
+            _FETCH_OK_JS +
+            "await loadJobs();\n"
+            "out.count = String($('#jobCount').textContent);\n"
+            "out.err = String(LEDGER_ERR);\n",
+            {"resp": {"jds": [], "categories": [], "statuses": []}})
+
+        self.assertEqual(out["err"], "")
+        self.assertEqual(out["count"], "0")
 
 
 if __name__ == "__main__":

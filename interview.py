@@ -75,8 +75,44 @@ KB_DIRECTIVES = """你是资深 AI 领域技术面试复盘教练。读下面这
 
 
 # ---------------------------------------------------------------- 状态（status.json）
+class RecordUnreadable(Exception):
+    """面试记录的 `status.json` **在盘上却读不出来**（≠「没有这条记录」）。
+
+    为什么必须是异常而不是"回空"：`status()` 的 `{}` 同时被当成"这条记录不存在"
+    （`/api/interview/status` 据此回 404），`list_interviews()` 里则是 `continue` 掉
+    ⇒ 那场面试**从列表里消失**（体检 P1-23）。把"读不出来"塞进这两个信号，就是把
+    「记录被写坏了、录音还在盘上」说成「这个 id 不存在」——**比回空更糟**。
+    """
+
+
 def _now():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _read_status_strict(interview_id):
+    """strict 读 `status.json`：返回 `(数据, 读不出来的原因)`；原因非空 = 不可信。
+
+    判据与仓库里别处**同一把尺子**（`jdid._interview_status_paths` /
+    `jobdup._interview_status_files` / `store` 自己的 `*_safe_to_write`）：
+    `store.file_has_bytes_to_lose(path)` —— **文件不存在 / 真的是 0 字节** = 合法的"还没有状态"
+    （新记录、第一次写之前），回空；其余（有字节却读不出来）才是"读不出来"。
+    `store` 里没有面试文件的 strict 读，所以这里用同一个 store 判据，**绝不另造一套尺子**。
+
+    ⚠️ **只读**：不隔离、不改名、不写盘（坏文件原样留着，等用户或重试自己处理）。
+    """
+    path = store.interview_file(interview_id, "status.json")
+    if not path or not os.path.exists(path):
+        return {}, ""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        if store.file_has_bytes_to_lose(path):
+            return {}, "面试记录 `%s` 读不出来：%s" % (path, e)
+        return {}, ""
+    if not isinstance(data, dict):
+        return {}, "面试记录 `%s` 的结构不对（应当是一个 JSON 对象）" % path
+    return data, ""
 
 
 def _read_status(interview_id):
@@ -175,8 +211,14 @@ def status(interview_id):
     于是重启后前端会显示「上次被中断，可重试」，而不是永远转圈。
 
     `estimate_hint` 只在真知道音频时长时才有这个键（拿不到就不给，前端自己退回「已运行 N 分钟」）。
+
+    ⚠️ **`status.json` 读不出来 ⇒ 抛 `RecordUnreadable`**（不是回 `{}`）：回 `{}` 会让路由
+    答出 404「找不到该面试记录」—— 那是把「记录被写坏了」说成「这个 id 不存在」（P1-23）。
+    "确实没有这条记录"仍然是 `{}`（既有语义一个字不动）。
     """
-    st = _read_status(interview_id)
+    st, err = _read_status_strict(interview_id)
+    if err:
+        raise RecordUnreadable(err)
     if not st:
         return {}
     if st.get("state") in ("transcribing", "analyzing") and not is_running(interview_id):
@@ -188,20 +230,33 @@ def status(interview_id):
 
 
 def list_interviews(job_id=""):
-    """某个岗位下的面试记录 id（按 mtime 倒序，最近的在前）。纯本地目录扫描。"""
+    """某个岗位下的面试记录 id（按 mtime 倒序，最近的在前）。纯本地目录扫描。
+
+    ⚠️ **任何一份 `status.json` 读不出来 ⇒ 抛 `RecordUnreadable`**（体检 P1-23 的另一半）：
+    旧写法 `store.load_interview_json(..., {})` 把"读不出来"兜成 `{}` 然后 `continue` ——
+    那份记录**静默消失**，用户以为录音丢了。**"读不出来"就是"不知道它挂在哪个岗位下"**，
+    而"不知道"不许当成"不属于这次查询"：与 `jdid._interview_status_paths` /
+    `jobdup._interview_status_files`（同一个闸门的两处先例）**同一口径 —— 拒绝整次、
+    如实说出是哪份文件**。0 字节 / 文件不存在**不算**读不出来（里面一个字节都没有，
+    也就没有 `job_id` 可指），照旧跳过（对照组：真的没有 ⇒ 空列表）。
+    """
     jid = str(job_id or "").strip()
     if not jid:
         return []
     root = store.interviews_dir()
-    if not os.path.isdir(root):
-        return []
+    try:
+        names = os.listdir(root)
+    except FileNotFoundError:
+        return []                     # 真的还没有面试目录 = 合法的「0 条记录」，照旧回空
+    except OSError as e:
+        raise RecordUnreadable("面试记录目录 `%s` 读不出来：%s" % (root, e))
     found = []
-    for name in os.listdir(root):
-        try:
-            st = store.load_interview_json(name, "status.json", {})
-        except Exception:
-            continue
-        if isinstance(st, dict) and str(st.get("job_id") or "") == jid:
+    for name in names:
+        st, err = _read_status_strict(name)
+        if err:
+            raise RecordUnreadable("%s（这条记录没法归到哪个岗位，所以这次列表一个字都不回，"
+                                   "绝不把它静默吃掉）" % err)
+        if st and str(st.get("job_id") or "") == jid:
             found.append((os.path.getmtime(store.interview_dir(name)), name))
     found.sort(key=lambda x: (-x[0], x[1]))
     return [name for _, name in found]

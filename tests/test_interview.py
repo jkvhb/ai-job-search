@@ -879,5 +879,75 @@ class JobBackgroundTest(IsolatedCase):
         self.assertEqual(store.load_interview_json("iv1", "feedback.json")[self.JID]["applied"], True)
 
 
+class StatusUnreadableTest(IsolatedCase):
+    """`status.json` **读不出来** ≠「这条面试记录不存在」（体检 P1-23）。
+
+    旧行为：`_read_status` 走 `store.load_interview_json(..., {})`（一切失败都兜成 `{}`）⇒
+    `status()` 回 `{}` ⇒ 路由 404「找不到该面试记录」；`list_interviews` 里 `continue` ⇒
+    那场面试**从列表里消失**。两处都是把"读不出来"说成别的东西。
+
+    判据与仓库里别处**同一把尺子**（`jdid._interview_status_paths` / `jobdup._interview_status_files`）：
+    `store.file_has_bytes_to_lose(path)` —— **文件不存在 / 真的是 0 字节** = 合法的"还没有状态"，
+    照旧回空（对照组）；其余（有字节却读不出来）必须响亮。
+    """
+
+    def _unreadable(self, interview_id, text="{\"state\": \"done\", \"job_id\": \"中文岗位\"}"):
+        path = store.interview_file(interview_id, "status.json")
+        folder = os.path.dirname(path)
+        if folder:
+            os.makedirs(folder, exist_ok=True)
+        raw = text.encode("gbk")
+        with open(path, "wb") as f:
+            f.write(raw)
+        return path, raw
+
+    def test_status_raises_instead_of_pretending_the_record_is_missing(self):
+        path, raw = self._unreadable("iv_bad")
+        self.assertGreater(os.path.getsize(path), 0, "反证：盘上确实有内容")
+        self.assertRaises(UnicodeDecodeError, raw.decode, "utf-8")
+        # 旧行为的形状（这一句才是"把读不出来说成别的东西"本身）：
+        # 读不出来被兜成 `{}` —— 与"没有这条记录"**完全同一个信号**
+        self.assertEqual(store.load_interview_json("iv_bad", "status.json", {}), {},
+                         "旧行为：读不出来被兜成 {}（路由据此回 404「找不到该面试记录」）")
+
+        with self.assertRaises(interview.RecordUnreadable) as ctx:
+            interview.status("iv_bad")
+        self.assertIn("status.json", str(ctx.exception), "没说是哪个文件读不出来")
+        self.assertIn(os.path.basename(path), str(ctx.exception))
+
+    def test_list_interviews_raises_instead_of_dropping_the_record(self):
+        store.save_interview_json("iv_ok", "status.json", {"state": "done", "job_id": "j1"})
+        self._unreadable("iv_bad")
+        with self.assertRaises(interview.RecordUnreadable) as ctx:
+            interview.list_interviews("j1")
+        self.assertIn("status.json", str(ctx.exception))
+
+    def test_a_missing_status_file_is_still_empty_and_never_raises(self):
+        """对照组：**确实没有**照旧 `{}` / 空列表（既有语义一个字不改）。"""
+        self.assertFalse(os.path.exists(store.interview_file("nope", "status.json")))
+        self.assertEqual(interview.status("nope"), {})
+        self.assertEqual(interview.list_interviews("nope"), [])
+
+    def test_a_zero_byte_status_file_is_still_empty(self):
+        """0 字节 = 里面一个字节都没有（与 store 的写盘判据同一把尺子）⇒ 照旧 `{}`。"""
+        store.save_interview_json("iv0", "status.json", {"state": "done"})
+        open(store.interview_file("iv0", "status.json"), "wb").close()
+        self.assertEqual(interview.status("iv0"), {})
+
+    def test_a_non_object_status_file_is_unreadable_not_missing(self):
+        """结构不对（JSON 能解析、但不是对象）同样是"读不出来" —— 与 `read_knowledge_strict` 同一口径。"""
+        store.save_interview_json("iv_arr", "status.json", ["不是对象"])
+        with self.assertRaises(interview.RecordUnreadable):
+            interview.status("iv_arr")
+
+    def test_a_readable_record_still_returns_the_same_shape(self):
+        """对照组：读得出来时形状不变（state / interrupted / estimate_hint 三条分支照旧）。"""
+        store.save_interview_json("iv1", "status.json",
+                                  {"state": "transcribing", "started_at": "2026-01-01 00:00:00"})
+        self.assertEqual(interview.status("iv1")["state"], "interrupted")   # 没有活动线程
+        store.save_interview_json("iv2", "status.json", {"state": "done", "job_id": "j2"})
+        self.assertEqual(interview.list_interviews("j2"), ["iv2"])
+
+
 if __name__ == "__main__":
     unittest.main()

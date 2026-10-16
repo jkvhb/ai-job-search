@@ -10,7 +10,11 @@
   body{background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;line-height:1.6;padding:24px 16px;-webkit-font-smoothing:antialiased}
   .wrap{max-width:1000px;margin:0 auto}
   h1{font-size:22px;font-weight:700;margin-bottom:4px}
-  .sub{color:var(--muted);font-size:13px;margin-bottom:18px}
+  /* `.sub`：**合并自原来两处声明**（原来 :13 与 :84）。两条选择器同为单类、特异性相同 ⇒
+     后定义的赢，但**逐属性**赢：先定义那块的 `color` / `font-size` 仍然生效（后一块没有它们），
+     `margin-bottom` 两块都有则取后者的 7px。所以这里是层叠后的**扁平集合**：生效值取后者，
+     先定义块独有的属性一个不漏。逐属性对照见 tests/test_app.py::SubCssSingleDeclarationTest。 */
+  .sub{color:var(--muted);font-size:13px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:7px 10px;border:1px solid var(--line);border-radius:9px;margin-bottom:7px;background:#fff}
   nav{display:flex;gap:6px;margin-bottom:16px;flex-wrap:wrap}
   nav button{background:var(--card);border:1px solid var(--line);border-radius:9px;padding:8px 16px;font-size:13.5px;font-weight:600;cursor:pointer;color:var(--sub);transition:.15s}
   nav button.active{background:var(--accent);color:#fff;border-color:var(--accent)}
@@ -81,7 +85,7 @@
   .jidcode{background:#f1f4fa;border:1px solid var(--line);padding:2px 8px;border-radius:7px;font-size:12.5px;word-break:break-all;color:var(--ink)}
   .jidcnt{font-size:12.3px;font-weight:600;color:var(--sub);flex:none}
   .subs{margin:2px 0 0;padding:9px 0 0;border-top:1px dashed var(--line)}
-  .sub{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:7px 10px;border:1px solid var(--line);border-radius:9px;margin-bottom:7px;background:#fff}
+  /* `.sub` 的规则已合并到样式表顶部那一处（原来这里还有第二份 `.sub{}`，后定义者赢 ⇒ 已合并） */
   .sub .rn{font-size:13.5px;font-weight:600;min-width:110px}
   .sub .sc{font-weight:700;font-size:13px;color:var(--sub)}
   .sub .sc.g{color:var(--green)} .sub .sc.a{color:var(--amber)} .sub .sc.r{color:var(--red)}
@@ -466,6 +470,15 @@ window.addEventListener('unhandledrejection', e => logUI('js_unhandled_rejection
 function show(el, cls, msg){ el.className='status on '+cls; el.textContent=msg; }
 function toast(msg){ const t=$('#toast'); t.textContent=msg; t.classList.add('on'); clearTimeout(window.__tt); window.__tt=setTimeout(()=>t.classList.remove('on'),1400); }
 function copyText(txt){ navigator.clipboard.writeText(txt).then(()=>toast('已复制：'+txt)).catch(()=>toast('复制失败，请手动选中')); }
+/* 非 2xx 时该对用户说什么：**服务端已经把"哪个文件读不出来、什么原因"写进了 body**
+   （`{ok:false, error:"…"}`）—— 先试着把那句人话读出来，别让它丢在路上（用户只看得到
+   「接口返回 HTTP 500」比什么都难查）。body 不是 JSON / 没有 error ⇒ 退回原来那句，
+   与改动前**逐字同一句**；这里也**绝不**再抛一个新的异常。 */
+async function httpSay(resp){
+  let said = '';
+  try{ const b = await resp.json(); said = String((b && b.error) || '').trim(); }catch(_e){}
+  return said || ('接口返回 HTTP ' + ((resp && resp.status) || '?'));
+}
 
 let JOBS = [], CATS = [], STATS = [];
 
@@ -513,7 +526,7 @@ async function loadJobs(){
   LEDGER_ERR = '';
   try{
     const resp = await fetch('/api/jds');
-    if(!resp || resp.ok !== true) throw new Error('接口返回 HTTP ' + ((resp && resp.status) || '?'));
+    if(!resp || resp.ok !== true) throw new Error(await httpSay(resp));   // 500/4xx 的 body 里那句人话照读出来
     r = await resp.json();
     if(!r || r.ok === false || !Array.isArray(r.jds)) throw new Error((r && r.error) || '返回里没有 jds 列表');
   }catch(e){
@@ -2711,7 +2724,7 @@ async function loadConfig(){
   // 设置页一片空白，与"从没配过"完全分不开（用户会以为自己填的 Key 丢了）。
   try{
     const resp = await fetch('/api/config');
-    if(!resp || resp.ok !== true) throw new Error('接口返回 HTTP ' + ((resp && resp.status) || '?'));
+    if(!resp || resp.ok !== true) throw new Error(await httpSay(resp));   // 500 的 body 里那句人话照读出来
     const c = await resp.json();
     if(!c || c.ok === false) throw new Error((c && c.error) || '返回里没有配置内容');
     if(!c.text_model || !c.vision_model) throw new Error('返回的配置里没有模型设置');

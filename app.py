@@ -1171,12 +1171,33 @@ _RESUME_EXTS = (".md", ".txt")
 _LINEAGE_CONTINUE = ("continue", "child", "延续", "子版")
 
 
-def _resume_files():
-    """磁盘上真实的简历文件名（与老实现同一口径，供前端下拉 / 老前端使用）。"""
+def _resume_files_strict():
+    """磁盘上真实的简历文件名 + **目录读不出来**时的原因（读得出 / 目录真的不存在 → 空串）。
+
+    ⚠️ **为什么不能再用 `os.path.isdir()` 当闸**（旧写法正是这一处漏网）：它对"没有这个目录"
+    （合法：还没建过简历目录）与"路径存在、但不是目录 / 读不出来"（必须报错）**静默回同一个 False**
+    ⇒ `files: []`。而同一响应里 `resumelib.list_versions()` 可能**成功地**回了一串版本记录 ——
+    两半自相矛盾：有版本记录，却说盘上没文件（用户会以为简历被删了）。
+    判据与 `/api/reports`（§P1-14 的第 5 处）**逐字同一套**：直接 `os.listdir`，`FileNotFoundError`
+    才是"真的没有"（回空），其余 `OSError`（含 `NotADirectoryError`）一律如实报出去。
+    """
     d = store.p_path("resumes")
-    if not os.path.isdir(d):
-        return []
-    return sorted(f for f in os.listdir(d) if f.lower().endswith(_RESUME_EXTS))
+    try:
+        names = os.listdir(d)
+    except FileNotFoundError:
+        return [], ""        # 真的还没有简历目录 = 合法的「盘上 0 份」，照旧回空
+    except OSError as e:
+        return [], "简历目录 `%s` 读不出来：%s —— 这不是「你盘上没有简历」。" % (d, e)
+    return sorted(f for f in names if f.lower().endswith(_RESUME_EXTS)), ""
+
+
+def _resume_files():
+    """磁盘上真实的简历文件名（与老实现同一口径，供前端下拉 / 老前端使用）。
+
+    ⚠️ 这里**丢掉了**"读不出来"的原因（调用方只要一份名字列表）。需要区分
+    "读不出来"与"真的没有"的地方一律用 `_resume_files_strict()` —— `/api/resumes` 就是。
+    """
+    return _resume_files_strict()[0]
 
 
 def save_resume_version(name, content, parent_id="", lineage=""):
@@ -2149,7 +2170,18 @@ class Handler(BaseHTTPRequestHandler):
             all_versions = resumelib.list_versions(include_removed=True)
             versions = all_versions if include_removed else [r for r in all_versions
                                                             if not r.get(resumelib.REMOVED)]
-            files = _resume_files()
+            # ⚠️ **"读不出来"绝不是"盘上 0 份简历"**（同类漏网的第 ⑧ 处）：旧写法 `_resume_files()`
+            # 拿 `os.path.isdir()` 当闸，目录**存在却读不出来 / 根本不是目录**时静默回 `files: []`
+            # —— 而上面 `list_versions()` 那半边的结果**是成功的**，两半自相矛盾（有版本记录、
+            # 却说盘上没文件）。判据换成 `/api/reports` 那一套（`FileNotFoundError` 才是"真的没有"）。
+            # 状态码选 **500 + ok:false**（不选 `files:null` + error）：`files` 的契约一直是**数组**
+            # （前端与老前端直接 `.filter` / `.map`，`unregistered` 也从它算出来），`null` 会让它们
+            # 渲染出 `undefined` 或静默少一半 —— 那是把"读不出来"换成另一种假话。
+            files, files_err = _resume_files_strict()
+            if files_err:
+                log.log_event("resume.files_read_failed", level="warn",
+                              dir=store.p_path("resumes"), error=files_err)
+                return self._send(500, {"ok": False, "error": files_err})
             registered = {str(r.get("name") or "") for r in all_versions}
             return self._send(200, {
                 "ok": True,
@@ -2246,6 +2278,10 @@ class Handler(BaseHTTPRequestHandler):
             # ⚠️ **"读不出来"绝不是"共 0 个岗位"**（P1-14 的服务端根源）：判据见
             # `_ledger_store_error`（store 的 strict 读 + 「盘上真有一个字节可丢吗」）。
             # **500**：服务端读不出自己的台账 —— 与这两条路由"没人接住的意外"既有的 500 同口径。
+            # ⚠️ **这条路由只有读**：老代码里那个 `DELETE /api/jobs`（按 id 删记录 + 删文件）**已删**
+            # —— 体检 §7.1 判它死（前端一处都没调用），而且它按**分析 id** 去 `load_jobs()` → 改 →
+            # `save_jobs()`（跨多次调用的复合读-改-写、无备份、绕开合并/引用同步），现在卡片上的 id
+            # 是 **JD id**，传过去会删错或 404。**真删除走 `/api/jd/purge`**（预演 → 二次确认 → 备份）。
             ledger_err = _ledger_store_error()
             if ledger_err:
                 log.log_event("jobs.read_failed", level="warn", route=p, error=ledger_err)
@@ -2300,6 +2336,16 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 limit = 20
             limit = max(1, min(limit, 200))
+            # ⚠️ **"读不出来"绝不是"今天没有要复习的"**：`load_knowledge()` 读/解析失败时照旧回
+            # `{"nodes": []}` ⇒ 队列空 + 全 0 ⇒ 界面说「今天没有要复习的」。而这条路由是复习队列的
+            # **唯一入口** —— 对着一份读不出来的档案说这句话，就是把用户的卡说成不存在。
+            # 判据与 `/api/knowledge` **逐字同源**（store 的 strict 读 + `_unreadable` 那把尺子）：
+            # **500**（服务端读不出自己的知识库）；**对照组**照旧 —— 真的空库 / 新档案（文件不存在、
+            # 或真的是 0 字节）走 `_unreadable` 的假分支 ⇒ 200 + 空队列，别把它做成一律报错。
+            _kb, kb_err = store.read_knowledge_strict()
+            if _unreadable(kb_err, store.knowledge_path()):
+                log.log_event("kb.review_read_failed", level="warn", error=kb_err)
+                return self._send(500, {"ok": False, "error": kb_err})
             data = store.load_knowledge()
             queue = kb.review_queue(data, limit=limit)
             today = datetime.now().strftime("%Y-%m-%d")
@@ -2369,6 +2415,15 @@ class Handler(BaseHTTPRequestHandler):
             jid = store.safe_name(q.get("id", [""])[0])
             if not jid:
                 return self._send(400, {"ok": False, "error": "缺少岗位 id"})
+            # ⚠️ **"台账读不出来"绝不是"这个岗位不存在"**：`_job_in_ledger` 走 `store.load_jobs()`，
+            # 读不出来时回 None ⇒ 旧实现照旧回 **404「找不到岗位：x」** —— 把"读不出来"说成
+            # "这个岗位（已经被删了）"，**比回空更糟**。所以先问同一把尺子（`_ledger_store_error`：
+            # store 的 strict 读 + `file_has_bytes_to_lose`），读不出来就 **500 + 人话**；
+            # **404 只留给"台账读得出来、里面确实没有这个岗位"**（那才是既有的 404 语义）。
+            ledger_err = _ledger_store_error()
+            if ledger_err:
+                log.log_event("outcome.read_failed", level="warn", route=p, error=ledger_err)
+                return self._send(500, {"ok": False, "error": ledger_err})
             rec = _job_in_ledger(jid)
             if rec is None:
                 # 200 之外唯一正确的一支：404（表里没有这个岗位）
@@ -3083,34 +3138,10 @@ class Handler(BaseHTTPRequestHandler):
             log.log_event("resume.remove", version=vid, name=rec.get("name"))
             return self._send(200, {"ok": True, "removed": rec, "name": rec.get("name"),
                                     "note": "已移出列表；简历文件与母版快照仍留在盘上"})
-        if u.path == "/api/jobs":
-            job_id = store.safe_name(q.get("id", [""])[0])
-            jobs = store.load_jobs()
-            hit = None
-            rest = []
-            for j in jobs:
-                if j.get("id") == job_id:
-                    hit = j
-                else:
-                    rest.append(j)
-            if not hit:
-                return self._send(404, {"ok": False, "error": "找不到该岗位记录"})
-            keep_files = q.get("keep_files", ["0"])[0] == "1"
-            if not keep_files:
-                for key in ("jd_image", "jd_text_file"):
-                    fn = hit.get(key)
-                    if fn:
-                        try:
-                            os.remove(os.path.join(store.p_path("jd"), fn))
-                        except Exception:
-                            pass
-                try:
-                    os.remove(os.path.join(store.p_path("reports"), hit.get("report") or ""))
-                except Exception:
-                    pass
-            store.save_jobs(rest)
-            log.log_event("job.delete", id=job_id, title=hit.get("job_title"), keep_files=keep_files)
-            return self._send(200, {"ok": True})
+        # ⚠️ `DELETE /api/jobs` 已**删除**（体检 §7.1 判死；grep 证据：`web/index.html`、
+        # `web/report_template.html` 与全仓非 tests 代码里**没有任何**调用，也没有别处用它的
+        # `keep_files` 参数）。不动它的理由见 `GET /api/jobs` 那段注释：**真删除走 `/api/jd/purge`**
+        # （预演 → 二次确认 → 备份），而它按分析 id 做跨多次调用的复合读-改-写、无备份。
         return self._send(404, {"error": "not found"})
 
 
