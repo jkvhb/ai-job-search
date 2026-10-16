@@ -14,6 +14,7 @@ import contextlib
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -6350,6 +6351,470 @@ class FrontendLogsUnreadableTest(IsolatedCase):
                       "真的 0 条却不显示条数（旧实现也没有这句）：%r" % (out,))
         self.assertNotIn("读不出来", blob, "真的 0 条被误报成读不出来")
         self.assertIn("还没有日志", out["list"])
+
+
+# ============================================================ P1-14 / P1-15 的**服务端根源**
+# 前一位实现者做 `do_GET` 外层兜底时顺手做了一次只读排查，找到 5 处**服务端仍然把
+# "读不出来"当成"空"**的 GET（体检报告 P1-14「共 0 个岗位」/ P1-15「设置全空白」的根因）：
+#
+#   ① GET /api/jobs、/api/jds  ← `jobs.json` / `jds.json` 读不出来 ⇒ 一律回空行
+#   ② GET /api/knowledge       ← `knowledge.json` 读不出来 ⇒ 空节点
+#   ③ GET /api/config          ← 坏 `config.json` 被读成**默认配置**（与"从没配过"一模一样）
+#   ④ GET /api/jd_text         ← 非 UTF-8 原文被兜成空串（盘上其实有字节）
+#   ⑤ GET /api/reports         ← `isdir()` 静默 False ⇒「0 份报告」
+#
+# 前端的"读失败要响亮"半边**早就有**（`LEDGER_ERR` / `loadConfig` 的 try-catch /
+# `kbLoad` 判 `ok===false` / `showJdText` 判 `r.error`）；缺的只是**服务端把失败如实回出去** ——
+# 服务端回的是"真的 0 条"，前端**根本无从分辨**。
+#
+# 判据一律用 `store` 里**已有的** strict 读（`read_jobs_strict` / `read_jds_strict` /
+# `read_knowledge_strict` / `read_config_strict`）——"读不出来 ≠ 没有"这条口径在仓库里
+# **只准有一份实现**，这里不另写一套。只额外问一句 `store.file_has_bytes_to_lose(path)`：
+# 它与 store 自己那三个 `*_safe_to_write` 是**同一把尺子**，回答"盘上真有一个字节可丢吗"。
+# **不存在 / 真的是 0 字节** = 合法的"第一次" ⇒ 照旧回空（前端照旧显示 0 条）。
+def _write_unreadable(path, text="我的台账：中文内容"):
+    """造一份**存在但读不出来**的文件（真非 UTF-8、含中文），返回原始字节。
+
+    返回原始字节是为了让调用方**自证**两句反证："盘上确实有内容" + "真的读不出来"
+    （`raw.decode("utf-8")` 抛 `UnicodeDecodeError`）。这两句不能省：少了它们，
+    一个"把 0 字节空文件也报成读不出来"的假修法照样能骗过断言。
+    """
+    folder = os.path.dirname(path)
+    if folder:
+        os.makedirs(folder, exist_ok=True)
+    raw = text.encode("gbk")
+    with open(path, "wb") as f:
+        f.write(raw)
+    return raw
+
+
+def _log_events():
+    """隔离根里已落盘的日志事件名（读不出来 = 空列表：测试自己不许因此炸）。"""
+    try:
+        with open(log.LOG_FILE, "r", encoding="utf-8") as f:
+            return [json.loads(line).get("event") for line in f if line.strip()]
+    except Exception:
+        return []
+
+
+class LedgerUnreadableRouteTest(IsolatedCase):
+    """① `/api/jobs` + `/api/jds`：台账 / JD 库读不出来 ⇒ 如实报错，**绝不回空台账**。
+
+    状态码选 **500**（既不是 200、也不是 4xx）：这是**服务端读不出自己的数据文件** ——
+    服务器无法完成这次请求。这两条路由里"没人接住的意外"本来就已经由 `do_GET` 的外层兜底
+    统一成 500（见 `GetOuterTryTest`），所以 500 是它们**既有**的"读盘失败"状态码；
+    这里只是把"读不出来"从**静默回空**改成**说出来**。
+    """
+
+    def test_an_unreadable_jobs_file_is_not_an_empty_ledger(self):
+        path = store.jobs_path()
+        raw = _write_unreadable(path)
+        self.assertGreater(os.path.getsize(path), 0, "反证：盘上确实有内容")
+        self.assertRaises(UnicodeDecodeError, raw.decode, "utf-8")      # 反证：真的读不出来
+
+        for route in ("/api/jobs", "/api/jds"):
+            with self.subTest(route=route):
+                h = _get(route)
+                body = h.json_body()
+                self.assertNotEqual(body.get("jobs"), [],
+                                    "读不出来却回了一个空台账（旧行为）：界面只会说「共 0 个岗位」")
+                self.assertNotEqual(body.get("jds"), [], "读不出来却回了空 jds 列表")
+                self.assertFalse(body.get("ok"), "读不出来却说 ok")
+                self.assertEqual(h.code, 500,
+                                 "读不出来却回了 %r（旧行为：200 + 空台账）" % (h.code,))
+                self.assertIn("jobs.json", str(body.get("error")), "没说是哪个文件读不出来")
+        self.assertIn("jobs.read_failed", _log_events(), "读不出来必须留一条日志（取证）")
+
+    def test_an_unreadable_jds_file_is_not_an_empty_ledger(self):
+        path = store.p_path("jds.json")
+        raw = _write_unreadable(path, "我的JD库：中文记录")
+        self.assertGreater(os.path.getsize(path), 0, "反证：盘上确实有内容")
+        self.assertRaises(UnicodeDecodeError, raw.decode, "utf-8")
+
+        h = _get("/api/jobs")
+        body = h.json_body()
+        self.assertNotEqual(body.get("jds"), [], "JD 库读不出来却回了空台账")
+        self.assertEqual(h.code, 500, "读不出来却回了 %r（旧行为：200 + 空台账）" % (h.code,))
+        self.assertIn("jds.json", str(body.get("error")), "没说是哪个文件读不出来")
+
+    def test_a_fresh_profile_is_still_an_empty_ledger(self):
+        """对照组：**真的没有**（新建档案，文件压根不存在）照旧回空 —— 不许被一律报成"读不出来"。"""
+        self.assertFalse(os.path.exists(store.jobs_path()))
+        self.assertFalse(os.path.exists(store.p_path("jds.json")))
+        for route in ("/api/jobs", "/api/jds"):
+            with self.subTest(route=route):
+                h = _get(route)
+                self.assertEqual(h.code, 200)
+                body = h.json_body()
+                self.assertIsNot(body.get("ok"), False, "没有台账被误报成读不出来")
+                self.assertEqual(body["jds"], [])
+        self.assertNotIn("jobs.read_failed", _log_events(), "没有读失败却记了日志")
+
+    def test_a_zero_byte_ledger_file_is_still_an_empty_ledger(self):
+        """0 字节也是"第一次"（与 store 的 `jobs_safe_to_write` 同一把尺子）。"""
+        open(store.jobs_path(), "wb").close()
+        open(store.p_path("jds.json"), "wb").close()
+        h = _get("/api/jobs")
+        self.assertEqual(h.code, 200, "0 字节是合法的「第一次」，不该被报成读不出来")
+        body = h.json_body()
+        self.assertIsNot(body.get("ok"), False)
+        self.assertEqual(body["jds"], [])
+
+    def test_the_success_shape_is_unchanged(self):
+        """成功路径的字段名/结构**一个字都不许改**（前端一堆地方在读 `r.jds` / `r.jobs`）。"""
+        self.assertEqual(sorted(_get("/api/jobs").json_body().keys()),
+                         ["categories", "jds", "jobs", "statuses"])
+        self.assertEqual(sorted(_get("/api/jds").json_body().keys()),
+                         ["categories", "jds", "jobs", "ok", "statuses", "total"])
+
+
+class KnowledgeUnreadableRouteTest(IsolatedCase):
+    """② `/api/knowledge`：知识库读不出来 ⇒ 如实报错，**绝不回空知识库**（500，理由同上）。"""
+
+    def test_an_unreadable_knowledge_file_is_not_an_empty_kb(self):
+        path = store.knowledge_path()
+        raw = _write_unreadable(path, "我的知识库：中文卡片")
+        self.assertGreater(os.path.getsize(path), 0, "反证：盘上确实有内容")
+        self.assertRaises(UnicodeDecodeError, raw.decode, "utf-8")
+
+        h = _get("/api/knowledge")
+        body = h.json_body()
+        self.assertNotEqual(body.get("nodes"), [],
+                            "读不出来却回了空节点列表（旧行为）：界面只会说「共 0 个知识点」")
+        self.assertEqual(h.code, 500, "读不出来却回了 %r（旧行为：200 + 空库）" % (h.code,))
+        self.assertFalse(body.get("ok"))
+        self.assertIn("knowledge.json", str(body.get("error")), "没说是哪个文件读不出来")
+        self.assertIn("kb.read_failed", _log_events(), "读不出来必须留一条日志（取证）")
+
+    def test_a_fresh_profile_is_still_an_empty_kb(self):
+        """对照组：**真的没有**照旧回空知识库（`ok:true` + 0 个知识点）。"""
+        self.assertFalse(os.path.exists(store.knowledge_path()))
+        h = _get("/api/knowledge")
+        self.assertEqual(h.code, 200)
+        body = h.json_body()
+        self.assertTrue(body.get("ok"))
+        self.assertEqual(body["nodes"], [])
+        self.assertNotIn("kb.read_failed", _log_events(), "没有读失败却记了日志")
+
+    def test_a_zero_byte_knowledge_file_is_still_an_empty_kb(self):
+        open(store.knowledge_path(), "wb").close()
+        h = _get("/api/knowledge")
+        self.assertEqual(h.code, 200, "0 字节是合法的「第一次」，不该被报成读不出来")
+        self.assertEqual(h.json_body()["nodes"], [])
+
+
+class ConfigUnreadableRouteTest(IsolatedCase):
+    """③ `/api/config`：配置读不出来 ⇒ 如实报错，**绝不回那份"没配过"的默认配置**。
+
+    为什么这是 P1-15 的服务端根源：`load_config()` 在任何读/解析失败时回 `DEFAULT_CONFIG`
+    （`api_key=''`、`search_providers=[]`）—— 它与"从没配过"**一模一样**，
+    前端再聪明也无从分辨。状态码 500（理由同 ①）。
+    """
+
+    def test_an_unreadable_config_file_is_not_the_default_config(self):
+        path = store.config_path()
+        raw = _write_unreadable(path, "我的配置：中文内容")
+        self.assertGreater(os.path.getsize(path), 0, "反证：盘上确实有内容")
+        self.assertRaises(UnicodeDecodeError, raw.decode, "utf-8")
+
+        h = _get("/api/config")
+        body = h.json_body()
+        self.assertNotIn("text_model", body,
+                         "读不出来却回了默认配置（旧行为）：它与「你从没配过」一模一样，"
+                         "用户会以为自己填的 API Key 丢了")
+        self.assertEqual(h.code, 500, "读不出来却回了 %r（旧行为：200 + 默认配置）" % (h.code,))
+        self.assertFalse(body.get("ok"))
+        self.assertIn("config.json", str(body.get("error")), "没说是哪个文件读不出来")
+        self.assertIn("config.read_failed", _log_events(), "读不出来必须留一条日志（取证）")
+
+    def test_a_fresh_profile_still_gets_the_default_config(self):
+        """对照组：**真的没配过**照旧回默认配置（`text_model` 必须在，前端读它）。"""
+        self.assertFalse(os.path.exists(store.config_path()))
+        h = _get("/api/config")
+        self.assertEqual(h.code, 200)
+        body = h.json_body()
+        self.assertIsNot(body.get("ok"), False, "没配过被误报成读不出来")
+        self.assertIn("text_model", body)
+        self.assertIn("vision_model", body)
+        self.assertNotIn("config.read_failed", _log_events(), "没有读失败却记了日志")
+
+    def test_a_zero_byte_config_file_still_gets_the_default_config(self):
+        open(store.config_path(), "wb").close()
+        h = _get("/api/config")
+        self.assertEqual(h.code, 200, "0 字节是合法的「第一次」，不该被报成读不出来")
+        self.assertIn("text_model", h.json_body())
+
+
+class JdTextUnreadableRouteTest(IsolatedCase):
+    """④ `/api/jd_text`：JD 原文**存在却读不出来** ⇒ 如实报错，**绝不回空串**。
+
+    状态码选 **409**（与既有的 `/api/resumes?name=` 对齐 —— 那条就是同一件事的先例，Task 1.10b）：
+    盘上那份原文**现在的状态与这次读取冲突**（有字节、但不是 UTF-8 文本）。
+    **500 会是句假话**："服务器内部错误"让用户以为程序坏了，其实是他的文件不是 UTF-8。
+    """
+
+    JD_ID = "本科_示例_标注_文本_北京_6-8K_0007"
+
+    def _a_jd_whose_text_is_unreadable(self):
+        jdid.upsert_jd({"id": self.JD_ID, "jd_text_file": self.JD_ID + ".txt"})
+        store.ensure_profile()
+        path = store.p_path("jd", self.JD_ID + ".txt")
+        return path, _write_unreadable(path, "岗位职责：中文原文")
+
+    def test_an_unreadable_jd_text_is_not_an_empty_string(self):
+        path, raw = self._a_jd_whose_text_is_unreadable()
+        self.assertGreater(os.path.getsize(path), 0, "反证：盘上确实有内容")
+        self.assertRaises(UnicodeDecodeError, raw.decode, "utf-8")
+
+        h = _get("/api/jd_text?id=" + quote(self.JD_ID))
+        body = h.json_body()
+        self.assertNotEqual(body.get("text"), "",
+                            "读不出来却回了空串（旧行为）：界面只会说「没有保存 JD 原文」")
+        self.assertEqual(h.code, 409, "读不出来却回了 %r（旧行为：200 + 空串）" % (h.code,))
+        self.assertFalse(body.get("ok"))
+        self.assertIn(self.JD_ID + ".txt", str(body.get("error")), "没说是哪个文件读不出来")
+        self.assertIn("jd.text_read_failed", _log_events(), "读不出来必须留一条日志（取证）")
+
+    def test_a_missing_jd_text_is_still_a_true_404(self):
+        """对照组：**真的没有原文**照旧 404（既有语义，一个字不改）。"""
+        jdid.upsert_jd({"id": self.JD_ID})
+        h = _get("/api/jd_text?id=" + quote(self.JD_ID))
+        self.assertEqual(h.code, 404)
+        self.assertIn("没有保存", h.json_body().get("error", ""))
+
+    def test_a_zero_byte_jd_text_is_still_an_empty_string(self):
+        """对照组：0 字节的原文是"真的没有原文" ⇒ 照旧 200 + 空串（前端显示「没有原文」是对的）。"""
+        jdid.upsert_jd({"id": self.JD_ID, "jd_text_file": self.JD_ID + ".txt"})
+        store.ensure_profile()
+        open(store.p_path("jd", self.JD_ID + ".txt"), "wb").close()
+        h = _get("/api/jd_text?id=" + quote(self.JD_ID))
+        self.assertEqual(h.code, 200)
+        self.assertEqual(h.json_body()["text"], "")
+
+
+class ReportsUnreadableRouteTest(IsolatedCase):
+    """⑤ `/api/reports`：报告目录**不可读** ⇒ 如实报错，**绝不回「0 份报告」**。
+
+    触发方式：把 `reports/` 变成一个**同名文件** —— 路径存在、`os.path.isdir()` 为 False
+    （`os.listdir()` 抛 `NotADirectoryError`）。这一支与"目录不存在"必须分开：
+    "真的还没有报告目录"是空（对照组），"有东西但读不了"是 P1-14 的第 5 处（500）。
+    """
+
+    def _reports_path(self):
+        return store.p_path("reports")
+
+    def test_a_reports_path_that_is_not_a_directory_is_not_zero_reports(self):
+        d = self._reports_path()
+        shutil.rmtree(d)                       # `ensure_profile()` 建过它
+        raw = "这不是目录".encode("gbk")
+        with open(d, "wb") as f:
+            f.write(raw)
+        self.assertTrue(os.path.exists(d), "反证：路径确实存在（不是「目录不存在」那一支）")
+        self.assertFalse(os.path.isdir(d), "反证：确实不是目录（旧行为正是这一支静默回 0）")
+        self.assertRaises(UnicodeDecodeError, raw.decode, "utf-8")
+
+        h = _get("/api/reports")
+        body = h.json_body()
+        self.assertNotEqual(body.get("reports"), [],
+                            "读不出来却回了「0 份报告」（旧行为）：用户以为报告都没了")
+        self.assertEqual(h.code, 500, "读不出来却回了 %r（旧行为：200 + 空列表）" % (h.code,))
+        self.assertFalse(body.get("ok"))
+        self.assertIn("reports", str(body.get("error")), "没说清是哪个目录读不出来")
+        self.assertIn("reports.read_failed", _log_events(), "读不出来必须留一条日志（取证）")
+
+    def test_a_missing_reports_dir_is_still_zero_reports(self):
+        """对照组：**真的还没有报告目录**照旧回空（`FileNotFoundError` 那一支）。"""
+        shutil.rmtree(self._reports_path())
+        self.assertFalse(os.path.exists(self._reports_path()))
+        h = _get("/api/reports")
+        self.assertEqual(h.code, 200)
+        self.assertEqual(h.json_body()["reports"], [])
+        self.assertNotIn("reports.read_failed", _log_events(), "没有读失败却记了日志")
+
+    def test_the_success_shape_is_unchanged(self):
+        _write_report("20261015_岗A_80分.html", "<html></html>")
+        h = _get("/api/reports")
+        self.assertEqual(h.code, 200)
+        body = h.json_body()
+        self.assertEqual(sorted(body.keys()), ["reports"])
+        self.assertEqual([r["name"] for r in body["reports"]], ["20261015_岗A_80分.html"])
+
+
+# ============================================================ 追加一：请求体上限**会挡正常用户**
+# 实测（只读量过本仓真实夹具 `data/profiles/default/jd/*.jpg`）：最大 **923258 字节**（三张都是它），
+# 以 base64 data URL 进 JSON body 后 ≈**1231012 字节** = 旧上限 2 MiB 的 **58.7%**，
+# **余量只有 1.70×** —— 一张 ≥1.7MB 的**正常**截图就会被 413 挡下，还被告知
+# 「请检查是不是发错了内容」（把正常用户当坏人）。旧注释写的「实测最大也就几百 KB …
+# 2MB 对正常请求是 10 倍以上的余量」**与盘上的事实不符**。
+def _base64_screenshot(image_bytes):
+    """模拟"一张 `image_bytes` 字节的截图进 JSON body"（data URL + base64）。
+
+    长度精确可控：base64 是 `4*ceil(n/3)` 字节；这里直接给等长的 `"A"`，它**既是合法 base64
+    也是合法 JSON 字符串**。不引第三方依赖、不真做图片编码 —— 要钉的是"body 有多大"。
+    """
+    return "data:image/jpeg;base64," + ("A" * (4 * ((image_bytes + 2) // 3)))
+
+
+class JsonBodySizeLimitTest(IsolatedCase):
+    """追加一：`MAX_JSON_BODY_BYTES` 必须容得下**正常**截图（2MB 图 → ≈2.67MiB body）。"""
+
+    IMAGE_BYTES = 2 * 1024 * 1024          # 一张 2MB 的手机截图（正常量级，不是极端值）
+
+    def _analyze_body(self):
+        b64 = _base64_screenshot(self.IMAGE_BYTES)
+        raw = json.dumps({"jd_text": "岗位职责：语音数据质检", "image": b64,
+                          "resume_name": "母版.md"}, ensure_ascii=False).encode("utf-8")
+        return b64, raw
+
+    def test_a_two_megabyte_screenshot_is_accepted(self):
+        """**这张图必须传得上去**（旧上限 2 MiB ⇒ 413 ⇒ 本条红）。"""
+        b64, raw = self._analyze_body()
+        self.assertGreater(len(raw), 2 * 1024 * 1024,
+                           "夹具前提：这份 body 必须**超过旧上限 2 MiB**，否则钉不住这条回归")
+
+        with mock.patch.object(app, "do_analyze",
+                               return_value="20261016_岗A_80分.html") as called:
+            h = _sandbox_handler("POST", "/api/analyze", raw,
+                                 {"Content-Length": str(len(raw)),
+                                  "Content-Type": "application/json"})
+
+        # ⚠️ 这条**先**跑：它才是"正常用户的截图能不能传上去"本身。
+        # （夹具前提放在它前面，是因为夹具不成立时下面这句话的诊断信息会误导人。）
+        self.assertEqual(h._status, 200,
+                         "一张正常大小的截图被 %r 挡下了：%r" % (h._status, h._body))
+        self.assertTrue(h._body.get("ok"), h._body)
+        # 反证：整个 body 真的被读进来、解析、**完整喂给了 do_analyze**（不是"没读也算过"）
+        self.assertEqual(len(called.call_args[0][1]), len(b64),
+                         "截图没有被完整读出来 —— 这次所谓的「通过」是假的")
+
+    def test_a_twenty_megabyte_body_is_still_rejected_without_reading_it(self):
+        """对照组：20MB 的 body 仍然 413，而且**一个字节都不读**（防吃满内存）。"""
+        raw = b'{"jd_text": "' + (b"x" * (20 * 1024 * 1024)) + b'"}'
+        self.assertGreater(len(raw), app.MAX_JSON_BODY_BYTES)
+        h = _sandbox_handler("POST", "/api/analyze", raw,
+                             {"Content-Length": str(len(raw))})
+
+        self.assertEqual(h._status, 413, "超过上限的 body 没被拒：%r" % (h._body,))
+        self.assertFalse(h._body.get("ok"))
+        self.assertEqual(h.rfile.tell(), 0, "超限请求还是把 body 读了 —— 内存会被吃满")
+
+    def test_the_413_message_guides_the_user_instead_of_blaming_them(self):
+        """413 的文案要**如实 + 能指导**：说清本次多大、上限多大、该怎么做。"""
+        declared = app.MAX_JSON_BODY_BYTES + 1
+        h = _sandbox_handler("POST", "/api/analyze", b"", {"Content-Length": str(declared)})
+        msg = h._body.get("error") or ""
+
+        self.assertEqual(h._status, 413)
+        self.assertNotIn("发错了内容", msg,
+                         "把正常用户当坏人：旧文案让他去检查自己发错了什么")
+        self.assertIn("本次", msg)                 # 说清这次是多大
+        self.assertIn("上限", msg)
+        self.assertIn("8.0 MB", msg)               # 上限如实写出来（8 MiB）
+        self.assertIn("压缩", msg)                 # 能指导下一步该干什么
+
+
+# ============================================================ 追加二：类型错不许静默忽略
+# P1-13 修的是"body **读不出来**"；这一条修的是它的兄弟 —— body 读得出来、但**字段类型错**。
+# 旧写法 `if isinstance(body.get(k), dict)` 对类型错的字段**直接跳过**，照常 `save_config`
+# + `ok:true` ⇒ 用户看到「设置已保存 ✓」，而他发上来的那部分**一个字段都没写进去**。
+class ConfigTypeErrorRouteTest(IsolatedCase):
+    """追加二：`POST /api/config` 的类型错 → **400 拒绝 + 一个字节都不写盘**。
+
+    为什么选 (A) 拒绝而不是 (B)"存能认的 + 报告被忽略的"：① 与 P1-13 同一口径
+    （body 有问题 → 400，绝不"当成没改任何东西"照常保存）；② `save_config` 是**整份覆盖**，
+    "存一半"会让用户以为整份都生效了 —— 半个成功比一个失败更难查；③ 这种 body
+    **只可能来自手写 / 出错的调用方**，正常前端一直发的是
+    `{text_model:{…}, vision_model:{…}, search_providers:[…]}`。
+    """
+
+    def _post(self, body):
+        raw = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        return _sandbox_handler("POST", "/api/config", raw,
+                                {"Content-Length": str(len(raw)),
+                                 "Content-Type": "application/json"})
+
+    def test_a_wrong_typed_field_is_rejected_not_silently_ignored(self):
+        store.save_config(json.loads(json.dumps(store.DEFAULT_CONFIG)))   # 盘上先有一份**读得出来**的配置
+        before = _disk_bytes(store.config_path())
+
+        h = self._post({"text_model": "garbage"})
+
+        self.assertEqual(h._status, 400,
+                         "类型错被 %r 咽下去了（旧行为：200 + ok:true）：%r"
+                         % (h._status, h._body))
+        self.assertFalse(h._body.get("ok"), "类型错却回了 ok:true")
+        msg = h._body.get("error") or ""
+        self.assertIn("text_model", msg, "没点名是哪个字段出错")
+        self.assertIn("dict", msg, "没说期望的是什么类型")
+        self.assertEqual(_disk_bytes(store.config_path()), before,
+                         "被 400 拒绝的请求**还是写盘了**")
+        self.assertIn("config.save_rejected", _log_events(), "拒绝必须留一条日志（取证）")
+
+    def test_every_known_wrong_typed_field_is_named(self):
+        for body, field in (({"text_model": "x"}, "text_model"),
+                            ({"vision_model": 5}, "vision_model"),
+                            ({"search_providers": {"a": 1}}, "search_providers")):
+            with self.subTest(field=field):
+                h = self._post(body)
+                self.assertEqual(h._status, 400,
+                                 "%s 类型错被咽下去了：%r" % (field, h._body))
+                self.assertIn(field, h._body.get("error") or "")
+        self.assertFalse(os.path.exists(store.config_path()), "被拒绝的请求写盘了")
+
+    def test_a_normal_config_body_still_saves_with_ok_true(self):
+        """对照组：正常 body 照旧 200 + `ok:true`，而且字段**真的落盘了**。"""
+        h = self._post({"text_model": {"base_url": "https://x/v1", "model": "m", "api_key": "k"},
+                        "vision_model": {"base_url": "https://v/v1", "model": "vm"},
+                        "search_providers": [{"name": "tavily",
+                                              "base_url": "https://api.tavily.com",
+                                              "api_key": "sk"}]})
+
+        self.assertEqual(h._status, 200, h._body)
+        self.assertEqual(h._body, {"ok": True}, "成功路径的形状被改了")
+        cfg = store.load_config()
+        self.assertEqual(cfg["text_model"]["api_key"], "k")
+        self.assertEqual(cfg["vision_model"]["model"], "vm")
+        self.assertEqual([p["name"] for p in cfg["search_providers"]], ["tavily"])
+        self.assertNotIn("config.save_rejected", _log_events())
+
+    def test_a_partial_body_is_still_accepted(self):
+        """对照组：**没有这个字段**是合法的（前端只发要改的部分 / 老前端不认新字段）。
+
+        没有这条，修法很容易变成"少一个字段就 400" —— 那是把新版前端钉死在老后端上。
+        """
+        h = self._post({"text_model": {"model": "只有模型名"}})
+        self.assertEqual(h._status, 200, h._body)
+        self.assertEqual(h._body, {"ok": True})
+
+
+# ============================================================ 追加三：`/api/log` 丢掉写盘失败
+# `log.log_event` 写不进盘时**返回 `None`**（P1-5 的新判据），而 `/api/log` 是它唯一丢返回值的
+# 调用方：旧写法照旧回 `ok:true` ⇒ "这条 UI 日志根本没落盘"变成一句**看不见的假话**。
+class UiLogWriteFailureRouteTest(IsolatedCase):
+    """追加三：日志没落盘 ⇒ `ok:false` + 一句人话；落盘了 ⇒ 照旧 `{}` 形状的 `ok:true`。"""
+
+    def _post(self, body):
+        raw = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        return _sandbox_handler("POST", "/api/log", raw,
+                                {"Content-Length": str(len(raw)),
+                                 "Content-Type": "application/json"})
+
+    def test_a_log_that_never_reached_the_disk_is_not_reported_as_ok(self):
+        with mock.patch.object(log, "log_event", return_value=None):
+            h = self._post({"event": "unit_probe", "level": "info"})
+
+        self.assertEqual(h._status, 200, "这不是服务器坏了：状态码照旧 200")
+        self.assertFalse(h._body.get("ok"),
+                         "日志根本没落盘却回了 ok:true（旧行为）—— 取证线索悄悄没了")
+        self.assertIn("没有写进盘", h._body.get("error") or "",
+                      "没把「这条日志没落盘」说清楚：%r" % (h._body,))
+
+    def test_a_log_that_did_reach_the_disk_still_returns_ok_true(self):
+        """对照组：正常落盘照旧 `ok:true`，而且**形状一个字不改**。"""
+        h = self._post({"event": "unit_probe"})
+        self.assertEqual(h._status, 200)
+        self.assertEqual(h._body, {"ok": True}, "成功路径的形状被改了")
+        self.assertIn("ui.unit_probe", _log_events())
 
 
 if __name__ == "__main__":

@@ -2733,7 +2733,11 @@ $('#saveCfgBtn').addEventListener('click', async ()=>{
                 vision_model:{label:'Kimi（识图 OCR / 读 JD 截图）',base_url:$('#vBase').value.trim(),model:$('#vModel').value.trim(),api_key:$('#vKey').value.trim()},
                 search_providers: SP};
   const r = await fetch('/api/config', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)}).then(x=>x.json());
-  show($('#cfgSt'), r.ok?'ok':'err', r.ok?'设置已保存 ✓':'保存失败');
+  // 失败时把服务端那句人话**原样显示**（与 `saveJob` / `clearLogs` 同一口径）：
+  // 只说一句「保存失败」等于把"哪个字段的类型不对 / 为什么一个字节都没写盘"吞掉，
+  // 用户只能瞎试 —— 那正是 P1-13/P1-15 一路在修的那种假话。
+  show($('#cfgSt'), r.ok?'ok':'err',
+       r.ok ? '设置已保存 ✓' : ('保存失败：' + ((r && r.error) || '服务端没有说明原因')));
 });
 
 /* ---------- 🧠 知识库（阶段 3.1） ---------- */

@@ -113,11 +113,26 @@ DEMO_ID = "示例_语音文本评测_80分"   # 示例报告固定文件名，�
 SOP_FILES = ["00-求职SOP总纲.md", "02-预筛与打分.md", "03-JD拆解.md", "04-简历大纲.md", "05-面试准备.md"]
 
 # JSON 请求体的上限（P1-13）。理由：本工具**唯一**的 POST body 是分析参数（JD 原文 / base64
-# 截图 / 简历名），实测最大也就几百 KB；`_json_body` 会把整个 body 读进内存，所以没有一个上限
-# 的话，一个坏请求（或本机服务被别的网页打）就能把内存吃满、让服务卡死。
+# 截图 / 简历名）；`_json_body` 会把整个 body 读进内存，所以没有一个上限的话，一个坏请求
+# （或本机服务被别的网页打）就能把内存吃满、让服务卡死。
 # 口径与 `interview.MAX_UPLOAD_BYTES`（音频上传 500MB）一致：**先看 Content-Length，超限一个
-# 字节都不读**。2MB 对正常请求是 10 倍以上的余量，对恶意请求足够小。
-MAX_JSON_BODY_BYTES = 2 * 1024 * 1024
+# 字节都不读**。
+#
+# ⚠️ **8 MiB 是实测定的，不是拍的**（旧值 2 MiB 会挡下**正常**截图）：
+#   - 本仓真实夹具 `data/profiles/default/jd/*.jpg` 最大 **923258 字节**（三张都是它）；
+#   - 截图以 base64 data URL 进 JSON body ⇒ 923258 → **≈1231012 字节**（4/3 加引号与字段名）；
+#   - 那已经是旧上限 2 MiB 的 **58.7%**，**余量只有 1.70×** —— 一张 ≥1.7MB 的**正常**截图
+#     就会被 413 挡下，还会被告知"请检查是不是发错了内容"（把正常用户当坏人）。
+# 8 MiB 的依据：4 MB 的截图 base64 后 ≈5.4 MB，8 MiB 留出 ≈1.5× 余量；
+# 再大就该压缩了（对恶意请求而言 8 MiB 也仍然是个硬上限：超限**一个字节都不读**）。
+MAX_JSON_BODY_BYTES = 8 * 1024 * 1024
+
+
+def _size_text(n):
+    """把字节数写成给人看的字符串（≥1 MB 用 MB 一位小数，否则 KB）。"""
+    if n >= 1024 * 1024:
+        return "%.1f MB" % (n / 1024.0 / 1024.0)
+    return "%.0f KB" % (n / 1024.0)
 
 # `Handler._json_body()` 的返回值之一：**已经自己回过 400/413** 了（body 读不出来 / 太大）。
 # 用哨兵而不是"抛异常"或"返回 None"：路由里那条 `body.get(...)` 必须**不可能**被误当成
@@ -662,6 +677,56 @@ def _jd_row(jd_id, records):
         if not str(row.get("report") or ""):
             row["report"] = str(rows[-1].get("report") or "")
     return row
+
+
+def _config_type_error(body):
+    """`POST /api/config` 的 body 里**有类型错的字段**吗？返回一句人话（都对就回空串）。
+
+    ⚠️ **"没有这个字段"与"字段类型错"必须分开**：前者**合法**（前端只发它要改的部分、
+    老前端不认新字段），后者是**调用方发错了东西** —— 后者绝不能静默忽略（理由见调用点）。
+    """
+    if not isinstance(body, dict):
+        return ("请求体必须是一个对象，收到的是 %s —— 这次一个字节都没有写盘。"
+                % type(body).__name__)
+    wanted = (("text_model", dict), ("vision_model", dict), ("search_providers", list))
+    for key, want in wanted:
+        if key in body and not isinstance(body[key], want):
+            return ("设置 `%s` 的类型不对：应当是 %s，收到的是 %s（%s）—— "
+                    "这次一个字节都没有写盘，请检查发上来的内容。"
+                    % (key, want.__name__, type(body[key]).__name__, str(body[key])[:80]))
+    return ""
+
+
+def _unreadable(err, path):
+    """strict 读报了原因时，盘上**真的有东西可丢**吗？
+
+    判据是 `store.file_has_bytes_to_lose` —— 与 store 自己那三个 `*_safe_to_write` 用的
+    **同一把尺子**：**不存在 / 真的是 0 字节** = 合法的"第一次"（新建档案；用户在别处
+    `open(..., "w")` 也会留下 0 字节空文件），照旧回空；其余（**有字节却读不出来**）
+    才是"读不出来"，必须如实报出去。
+
+    ⚠️ 为什么不直接拿 strict 读的原因当判据：0 字节的 `jobs.json` / `knowledge.json`
+    在 `json.load` 眼里同样是 `Expecting value: line 1 column 1` —— 拿它当判据就会把
+    "新建档案"报成"读不出来"（那是另一种假话，而且让新用户第一次打开就看见一片红）。
+    """
+    return bool(err) and store.file_has_bytes_to_lose(path)
+
+
+def _ledger_store_error():
+    """台账那一行**读不出来**的原因（都读得出来回空串）。
+
+    判据只用 `store` 的 strict 读 ——"读不出来 ≠ 没有"这条口径在仓库里**只准有一份实现**，
+    这里不另写一套。为什么两条数据文件都要问：`_ledger_rows()` 的每一行是 `jobs.json`
+    （分析记录）与 `jds.json`（JD 级真相，经 `jdid.find_jd`）**拼**出来的 ——
+    任何一半读不出来，界面拿到的都是一份**残缺却看起来完整**的台账。
+    """
+    _jobs, jobs_err = store.read_jobs_strict()
+    if _unreadable(jobs_err, store.jobs_path()):
+        return jobs_err
+    _jds, jds_err = store.read_jds_strict()
+    if _unreadable(jds_err, store.p_path("jds.json")):
+        return jds_err
+    return ""
 
 
 def _ledger_rows():
@@ -1935,9 +2000,10 @@ class Handler(BaseHTTPRequestHandler):
                           declared_bytes=n, limit=MAX_JSON_BODY_BYTES,
                           path=urlparse(self.path).path)
             self._send(413, {"ok": False, "error":
-                             "请求体太大（声明 %d 字节，上限 %d MB）：没有执行任何操作。"
-                             "请检查是不是发错了内容。"
-                             % (n, MAX_JSON_BODY_BYTES // 1024 // 1024)})
+                             "请求体太大（本次 %s，上限 %s）：没有执行任何操作。"
+                             "若是上传的 JD 截图，请先压缩或裁剪小一点再传"
+                             "（图片以 base64 进请求体会比原图大约 1/3）。"
+                             % (_size_text(n), _size_text(MAX_JSON_BODY_BYTES))})
             return _NO_BODY_SENTINEL
         raw = self.rfile.read(n)
         if not raw:
@@ -2033,6 +2099,14 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_file(fp, ctype)
 
         if p == "/api/config":
+            # ⚠️ **"读不出来"绝不是"从没配过"**（P1-15 的服务端根源）：`load_config()` 在
+            # 任何读/解析失败时回 `DEFAULT_CONFIG`（`api_key=''`、`search_providers=[]`）——
+            # 它与"真的没配过"**一模一样**，前端再聪明也无从分辨（用户会以为自己填的 Key 丢了）。
+            # 判据用 store 的 strict 读；**500**（服务端读不出自己的配置文件，不是 200）。
+            _cfg, cfg_err = store.read_config_strict()
+            if _unreadable(cfg_err, store.config_path()):
+                log.log_event("config.read_failed", level="warn", error=cfg_err)
+                return self._send(500, {"ok": False, "error": cfg_err})
             return self._send(200, store.load_config())
 
         if p == "/api/resumes":
@@ -2140,8 +2214,23 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, out)
 
         if p == "/api/reports":
+            # ⚠️ **"读不出来"绝不是"0 份报告"**（P1-14 的第 5 处）：旧写法
+            # `os.listdir(d) if os.path.isdir(d) else []` 把两种**相反**的情形混成同一个信号 ——
+            # "还没有报告目录"（合法，回空）与"有东西但读不了 / 根本不是目录"（必须报错）。
+            # 直接 listdir 再分别接异常：`isdir()` 对"没权限 / 被占用"也静默回 False，
+            # 只有在这里接 `OSError` 才接得住。
+            d = store.p_path("reports")
+            try:
+                names = os.listdir(d)
+            except FileNotFoundError:
+                names = []          # 真的还没有报告目录 = 合法的「0 份」，照旧回空
+            except OSError as e:
+                log.log_event("reports.read_failed", level="warn", path=d, error=str(e))
+                return self._send(500, {"ok": False,
+                                        "error": "报告目录 `%s` 读不出来：%s —— "
+                                                 "这不是「你没有报告」。" % (d, e)})
             out = []
-            for f in (os.listdir(store.p_path("reports")) if os.path.isdir(store.p_path("reports")) else []):
+            for f in names:
                 if not f.lower().endswith(".html"):
                     continue
                 fp = os.path.join(store.p_path("reports"), f)
@@ -2154,6 +2243,13 @@ class Handler(BaseHTTPRequestHandler):
             # §4：`merged_into` 非空的只是「已合并」标记，不该继续出现在列表里
             # （否则用户台账里会同时看到被并的那条，等于合并没生效）。
             # 阶段 4A：**一行 = 一个 JD** —— JD 级字段来自 `jds.json`，份数/最高分现算。
+            # ⚠️ **"读不出来"绝不是"共 0 个岗位"**（P1-14 的服务端根源）：判据见
+            # `_ledger_store_error`（store 的 strict 读 + 「盘上真有一个字节可丢吗」）。
+            # **500**：服务端读不出自己的台账 —— 与这两条路由"没人接住的意外"既有的 500 同口径。
+            ledger_err = _ledger_store_error()
+            if ledger_err:
+                log.log_event("jobs.read_failed", level="warn", route=p, error=ledger_err)
+                return self._send(500, {"ok": False, "error": ledger_err})
             rows = _ledger_rows()
             return self._send(200, {"jobs": rows, "jds": rows,
                                     "categories": store.CATEGORIES, "statuses": store.STATUSES})
@@ -2161,6 +2257,11 @@ class Handler(BaseHTTPRequestHandler):
         if p == "/api/jds":
             # JD 列表 + 聚合（份数 / 最高分 / 每份分析）。与 /api/jobs 同一份数据 ——
             # 分开的路径只是因为「JD 库」是新概念，前端要有个明确的入口。
+            # 读不出来的判据与状态码同 `/api/jobs`（前端 `loadJobs` 读的就是这一条）。
+            ledger_err = _ledger_store_error()
+            if ledger_err:
+                log.log_event("jobs.read_failed", level="warn", route=p, error=ledger_err)
+                return self._send(500, {"ok": False, "error": ledger_err})
             rows = _ledger_rows()
             return self._send(200, {"ok": True, "jds": rows, "jobs": rows,
                                     "total": len(rows),
@@ -2173,6 +2274,13 @@ class Handler(BaseHTTPRequestHandler):
             # 手改坏的 knowledge.json 曾让这里抛 TypeError，服务器直接关连接 —— 客户端拿到的是
             # RemoteDisconnected，连 500 都没有。现在由 do_GET 的外层兜底成结构化 500
             # （话术见 `_GET_ERROR_SAYS`），前端才能显示「知识库读取失败」而不是静默白屏。
+            # ⚠️ 但"**读出来是空库**"是另一件事（P1-14 的第 2 处）：`load_knowledge()` 在
+            # 读/解析失败时也回 `{"nodes": []}` ⇒ 界面说「共 0 个知识点」。判据用 store 的
+            # strict 读（**500**：服务端读不出自己的知识库）。
+            _kb, kb_err = store.read_knowledge_strict()
+            if _unreadable(kb_err, store.knowledge_path()):
+                log.log_event("kb.read_failed", level="warn", error=kb_err)
+                return self._send(500, {"ok": False, "error": kb_err})
             data = store.load_knowledge()
             return self._send(200, {
                 "ok": True,
@@ -2216,7 +2324,21 @@ class Handler(BaseHTTPRequestHandler):
                 path = _jd_text_path({"id": (jd or {}).get("id") or (rec or {}).get("id")})
             if not path or not os.path.exists(path):
                 return self._send(404, {"error": "没有保存 JD 原文"})
-            return self._send(200, {"text": store.read_text(path, "")})
+            # ⚠️ **"读不出来"绝不是"没有原文"**（P1-14 的第 4 处）：非 UTF-8 / 被锁的原文
+            # 在 `store.read_text` 里会被兜成空串 ⇒ 界面说「没有保存 JD 原文」，
+            # 而盘上其实有字节。判据与 `/api/resumes?name=` **逐字同源**（那是既有的先例，
+            # Task 1.10b，也是本仓库唯一一次为这件事定过状态码的地方）：
+            # **409** —— 盘上那份东西**现在的状态**与这次读取冲突（有字节、但不是 UTF-8 文本）。
+            # **500 会是句假话**：「服务器内部错误」让用户以为是程序坏了，其实是他的文件不是 UTF-8。
+            text = store.read_text(path, "")
+            if not text and store.content_bytes_present(path):
+                log.log_event("jd.text_read_failed", level="warn", path=path)
+                return self._send(409, {"ok": False,
+                                        "error": "JD 原文「%s」读不出来（不是空的）：文件里有字节，"
+                                                 "但不是 UTF-8 文本、或读不出内容。"
+                                                 "请把它另存为 UTF-8 的 .txt 再试。"
+                                                 % os.path.basename(path)})
+            return self._send(200, {"text": text})
 
         if p == "/api/jd/purge_preview":
             # 阶段 D：**真删除**的只读预演（先列清单 + 两次确认里的第一次）。
@@ -2467,7 +2589,18 @@ class Handler(BaseHTTPRequestHandler):
         if p == "/api/log":
             ev = str(body.get("event") or "unknown")
             payload = {k: v for k, v in body.items() if k not in ("event", "level")}
-            log.log_event("ui." + ev, level=str(body.get("level") or "info"), data=payload)
+            rec = log.log_event("ui." + ev, level=str(body.get("level") or "info"), data=payload)
+            # ⚠️ P1-5：`log_event` **写不进盘时回 `None`**（磁盘满 / 被占用 / 没有写权限 /
+            # data 不可序列化）。旧写法把返回值丢掉、照旧回 `ok:true` —— 于是"这条 UI 日志
+            # 根本没落盘"变成一句**看不见的假话**（调用方拿它当"已记录"，取证线索悄悄没了）。
+            # 选 **`ok:false` + 一句人话**，不加新字段：前端 `logUI` 只发不看回包，
+            # 而全仓其余失败分支的出口都是 `ok` + `error` —— 多造一个 `logged` 等于再立
+            # 一个"没人读的信号"，那正是本仓反复栽过的那种假绿。
+            if rec is None:
+                return self._send(200, {"ok": False,
+                                        "error": "这条日志没有写进盘（日志文件被占用 / 没有写权限 / "
+                                                 "磁盘满）：你的这次操作本身没有受影响，"
+                                                 "但这条记录丢了。"})
             return self._send(200, {"ok": True})
 
         if p == "/api/logs/bundle":
@@ -2492,6 +2625,19 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"ok": True})
 
         if p == "/api/config":
+            # ⚠️ **字段类型错不许静默忽略**（P1-13 的兄弟）：旧写法 `if isinstance(body.get(k), dict)`
+            # 对类型错的字段**直接跳过** ⇒ 照常 `save_config` + `ok:true` —— 用户看到
+            # 「设置已保存 ✓」，而他发上来的那部分**一个字段都没写进去**（又一句"看起来成功了"）。
+            # 选 **(A) 400 拒绝、一个字节都不写盘**（不是"存能认的 + 报告被忽略的"）：
+            #   ① 与 P1-13 同一口径（body 读不出来 → 400，绝不"当成没改任何东西"照常保存）；
+            #   ② `save_config` 是**整份覆盖**，"存一半"会让用户以为整份都生效了 ——
+            #      半个成功比一个失败更难查（本仓最贵的一课）；
+            #   ③ 这份 body 的形状**只可能来自手写 / 出错的调用方**，正常前端一直发的是
+            #      `{text_model:{…}, vision_model:{…}, search_providers:[…]}`。
+            type_err = _config_type_error(body)
+            if type_err:
+                log.log_event("config.save_rejected", level="warn", error=type_err)
+                return self._send(400, {"ok": False, "error": type_err})
             cfg = store.load_config()
             changed = []
             for k in ("text_model", "vision_model"):
