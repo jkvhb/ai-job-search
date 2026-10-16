@@ -703,7 +703,26 @@ function kCard(n, expanded){
 }
 
 /* ---------- 🗺 力导向图谱（零依赖 canvas） ---------- */
-let kG = null;   // { nodes, edges, idx, canvas, raf, scale, ox, oy, drag, pan, hover, settled }
+let kG = null;   // { nodes, edges, idx, canvas, raf, rafSteps, scale, ox, oy, drag, pan, hover, settled }
+
+/* 布局预算：**迭代轮数上限随 N 递减**。
+   kStep 每轮是 O(N²) 的两两作用力（500 节点 = 12.5 万对/轮），旧实现固定跑 500 轮 ⇒
+   体检 §6 实测 N=50→7ms、150→32ms、300→114ms、**500→322ms**（主线程明显冻结）。
+   这里按 40000/N 递减、下限 80 轮、上限 500 轮：
+     N≤80 → 500（小图维持旧上限）｜N=150 → 267｜N=300 → 133｜N=500 → **80**
+   ⚠️ **代价：布局结果与旧版不再逐像素一致，而且是肉眼可见的不同**（实测 N=500 收工时
+      节点一轮还走 ~90–135px，图更大更散；N≤150 则会提前收敛、看不出差别）。这是**有意的
+      性能取舍**：宁可少摆几轮，也不让报告页首帧冻住几百毫秒。图太大的时候本来也摆不好
+      ——旧版 N=500 跑满 500 轮，kFit 已经卡在下限 0.25，照样有 23/500 个节点落在画布外。
+   ⚠️ 判据一律**可数量**（轮数 / 位移阈值），**不许**引入墙钟做停止条件 ——
+      墙钟换台机器或并发跑就会 flaky（本项目明令禁止）。 */
+function kIterCap(n){ return Math.max(80, Math.min(500, Math.round(40000 / Math.max(n, 1)))); }
+
+/* 提前收敛判据的阈值：**单个节点**这一轮的位移（L1：|vx|+|vy|，省一次 sqrt，且比欧氏距离更严）。
+   连续两轮都 < 1px ⇒ 肉眼看已经不抖了，收工（不必跑满 kIterCap）。
+   为什么不用旧的 `energy`（Σv²）当判据：能量随节点数**线性增长**，N=50 就永远压不到 0.05 ——
+   于是「收敛判据」形同虚设，N 大时实际是"跑满 500 轮"（体检 §6 的 322ms 就是这么来的）。 */
+const K_MOVE_EPS = 1;
 
 function kGraphData(){
   const known = {};
@@ -756,15 +775,20 @@ function kStep(g, W, H){
     const fx = dx/d*f, fy = dy/d*f;
     a.vx += fx; a.vy += fy; b.vx -= fx; b.vy -= fy;
   });
-  let energy = 0;
+  /* 返回值仍然是「能量总和」（kRun 那套每帧动画的判据还在用它）；**另外**记一个
+     `g.lastMove` = 这一轮里**单个节点**的最大位移 —— 它才是与 N 无关的收敛量（见 K_MOVE_EPS）。 */
+  let energy = 0, lastMove = 0;
   N.forEach(nd => {
     nd.vx += (W/2 - nd.x) * 0.0016;
     nd.vy += (H/2 - nd.y) * 0.0016;
     nd.vx *= 0.86; nd.vy *= 0.86;
     nd.x += nd.vx;
     nd.y += nd.vy;
+    const mv = Math.abs(nd.vx) + Math.abs(nd.vy);      // 这一轮它走了多远（L1）
+    if (mv > lastMove) lastMove = mv;
     energy += nd.vx*nd.vx + nd.vy*nd.vy;
   });
+  g.lastMove = lastMove;
   return energy;
 }
 
@@ -813,10 +837,17 @@ function kDraw(){
   ctx.restore();
 }
 
-/* 首帧前把布局跑到收敛，这样用户看到的是「已经摆好」的图，不会看见乱跳 */
-function kSettle(g, W, H, iters){
-  let e = 1;
-  for (let i = 0; i < iters && e > 0.05; i++) e = kStep(g, W, H);
+/* 首帧前把布局跑到收敛，这样用户看到的是「已经摆好」的图，不会看见乱跳。
+   ⚠️ 与旧版**不再逐像素一致**：轮数由 kIterCap（随 N 递减）定，并且连续两轮没怎么动就提前收工
+   （两处取舍见 kIterCap / K_MOVE_EPS 的注释）。 */
+function kSettle(g, W, H){
+  const cap = kIterCap(g.nodes.length);
+  let e = 1, still = 0;
+  for (let i = 0; i < cap; i++){
+    e = kStep(g, W, H);
+    still = (g.lastMove < K_MOVE_EPS) ? still + 1 : 0;
+    if (still >= 2) break;              // 连续两轮每个节点都几乎没动 ⇒ 收敛，提前收工
+  }
   return e;
 }
 
@@ -836,19 +867,30 @@ function kFit(g, W, H){
   g.oy = H/2 - ((b + d)/2) * g.scale;
 }
 
+/* 图谱态下的每帧动画：每帧最多 12 轮（与以前一样），但**整段唤醒的总轮数**也受 kIterCap 约束。
+   旧实现只看 `energy > 0.35`：能量随 N 增长，N 大的图永远压不到阈值 ⇒ rAF 永不停止，
+   每帧 12 轮 O(N²) 一直烧主线程（体检 §6 说的「每一帧」）。
+   ⚠️ 与旧版的行为差别（有意）：N 大时拖完节点后动画会在预算用尽时停下，不再无限跑。 */
 function kRun(){
   const c = document.getElementById('kgCanvas');
   if (!c || !kG) return;
   const W = c.clientWidth || 700, H = c.clientHeight || 420;
-  let e = 1;
-  for (let i = 0; i < 12 && e > 0.35; i++) e = kStep(kG, W, H);
+  const cap = kIterCap(kG.nodes.length);
+  let e = 1, i = 0;
+  for (; i < 12 && e > 0.35; i++){
+    e = kStep(kG, W, H);
+    kG.rafSteps = (kG.rafSteps || 0) + 1;
+    if (kG.rafSteps >= cap) break;           // 预算用尽：停下，别一直烧主线程
+  }
   kDraw();
-  kG.settled = (e <= 0.35);
+  kG.settled = (e <= 0.35) || kG.rafSteps >= cap;
   if (kG.settled){ kG.raf = null; return; }          // 收敛后停 rAF，省 CPU
   kG.raf = requestAnimationFrame(kRun);
 }
 
-function kWake(){ if (kG && !kG.raf) kG.raf = requestAnimationFrame(kRun); }
+/* 唤醒（拖动结束后重新收敛）：**预算重新给** —— 否则首帧那次同步收敛已经把预算吃光，
+   之后再也唤醒不动（`kG.rafSteps` 归零即重新拿到 kIterCap 那么多轮）。 */
+function kWake(){ if (kG && !kG.raf){ kG.rafSteps = 0; kG.raf = requestAnimationFrame(kRun); } }
 
 /* 事件坐标 → 图谱世界坐标。用 kG.canvas（每次进图谱态都刷新）而不是闭包里捕获的元素，
    否则 window 上只注册一次的 mousemove/mouseup 会一直拿着第一次那张已废弃的 canvas。 */
@@ -870,10 +912,10 @@ function initGraph(root){
   const W = c.clientWidth || 700, H = c.clientHeight || 420;
   const data = kGraphData();
   kG = { nodes: data.nodes, edges: data.edges, idx: data.idx, canvas: c,
-         raf: null, scale: 1, ox: 0, oy: 0, drag: null, pan: null, hover: null,
+         raf: null, rafSteps: 0, scale: 1, ox: 0, oy: 0, drag: null, pan: null, hover: null,
          moved: false, settled: false };
   kSeed(kG, W, H);
-  kSettle(kG, W, H, 500);      // 同步跑到收敛（约 30–80ms）
+  kSettle(kG, W, H);           // 同步跑到收敛（轮数随 N 递减 + 提前收敛，见 kIterCap/K_MOVE_EPS）
   kFit(kG, W, H);              // 一次性对准
   kDraw();                     // 画一帧即可，此后无自动动画
   kG.settled = true;

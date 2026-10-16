@@ -1479,5 +1479,322 @@ class LinkSchemeWhitelistTest(IsolatedCase):
                          % ([a for a in lblank if 'rel="noopener' not in a],))
 
 
+# ================================================================ 批 6.2 图谱布局 O(N²) 收敛
+#
+# 体检 §6 实测（`web/report_template.html` 的 kStep/kSettle/kRun）：力导向布局**每一轮**都做
+# O(N²) 的两两作用力迭代，而同步收敛固定跑 500 轮 —— N=50→7ms、150→32ms、300→114ms、
+# **500→322ms**（主线程明显冻结）；图谱态下 kRun 还每帧再跑 12 轮、且对 N 大的图**永不停止**。
+# 修法：迭代上限随 N 递减（`kIterCap`）+ 「连续两轮每个节点位移都 < 1px」提前收工
+# （模板里 `K_MOVE_EPS` / `kIterCap` 的注释写清了取舍，这里只钉行为）。
+#
+# ⚠️ 三条纪律（都变成断言，不靠自觉）：
+# 1. **判据必须是可数量**：这里数的是「kStep 真被执行了几轮」—— 探针把 kStep 包一层计数；
+#    以及「每轮里**单个节点**的最大位移」（每轮前后各拍一次坐标，自己算）。
+#    **绝不用墙钟**（换台机器 / 并发跑就 flaky，体检与计划都明令禁止）。
+# 2. **诚实标注行为变化**：轮数变少 ⇒ 布局结果与旧版**不再逐像素一致**（有意的性能取舍）。
+#    所以断言**不是**「布局与旧版相同」，而是：轮数 ≤ 上限 + 小图仍在有限轮数内收敛
+#    （最后两轮最大位移 < 阈值）。
+# 3. **反假绿**：同时断节点数 / 连线数与输入一致 —— 否则「图谱压根没布局（0 轮）」
+#    也能让轮数断言通过。
+#
+# ⚠️ 判据的阈值为什么是「< 2px」而模板停的条件更严（`K_MOVE_EPS = 1px`）：模板是在
+# **刚好**越过阈值那一轮停的，收工时最后两轮的位移天然贴着 1px，用 1px 去断会与随机种子擦边
+# （实测 N=50 三个种子分别停在 89 / 119 / 232 轮，最后两轮位移 0.95~0.99px）。
+# 断言放宽到 2px（节点半径 14~22px 的 1/10 都不到，肉眼看不见）就与种子无关了；
+# 「提前收敛判据真的在起作用」由**轮数 < 上限**那条断言钉住（把判据删掉 ⇒ 跑满上限 ⇒ 红）。
+
+#: `kStep` 计数器：包一层 kStep，数「真跑了几轮」+「每轮单个节点的最大位移」。
+#: **不读模板自己报的任何字段**（自报的计数不可信），也不碰墙钟。
+_GRAPH_COUNT = """
+if (typeof kStep !== 'function' || typeof initGraph !== 'function')
+  throw new Error('模板里没有 kStep / initGraph —— 图谱那段被改名或删了');
+let __px = null, __py = null;
+function __snap(g){                                          // 每轮开始前的坐标
+  const n = g.nodes.length;
+  if (!__px || __px.length !== n){ __px = new Float64Array(n); __py = new Float64Array(n); }
+  for (let i = 0; i < n; i++){ __px[i] = g.nodes[i].x; __py[i] = g.nodes[i].y; }
+}
+function __maxMove(g){                                        // 这一轮里单个节点的最大位移
+  let m = 0;
+  for (let i = 0; i < g.nodes.length; i++){
+    const dx = g.nodes[i].x - __px[i], dy = g.nodes[i].y - __py[i];
+    const d = Math.sqrt(dx*dx + dy*dy);
+    if (d > m) m = d;
+  }
+  return m;
+}
+const __moves = [];
+let __steps = 0;
+const __step = kStep;
+kStep = function(gg, W, H){
+  __snap(gg);
+  const r = __step(gg, W, H);
+  __moves.push(__maxMove(gg));
+  __steps++;
+  return r;
+};
+"""
+
+#: ① 同步收敛（首帧那条路）：只走 initGraph ⇒ kSettle。
+_GRAPH_SETTLE = _GRAPH_COUNT + """
+kView = 'graph';
+initGraph(document.getElementById('knowBox'));
+out.steps = __steps;
+out.moves = __moves;
+out.nodes = kG ? kG.nodes.length : -1;
+out.edges = kG ? kG.edges.length : -1;
+out.pos = kG ? kG.nodes.filter(n => isFinite(n.x) && isFinite(n.y)).length : -1;
+out.nan = kG ? kG.nodes.filter(n => !isFinite(n.x) || !isFinite(n.y)).length : -1;
+"""
+
+#: ② 图谱态下的每帧动画（拖动后 kWake 唤醒那条路）：**总轮数**也得有上限，
+#: 否则 N 大的图 energy 永远压不到阈值 ⇒ raf 永不停止，每帧 12 轮 O(N²) 一直烧主线程。
+#: ⚠️ 帧是**从探针的 raf 队列里取出来手动跑**的（垫片的 raf 不自动触发）——
+#: 所以 `kWake()` 真排了一帧、真跑了帧，都得断言（否则这条会变成恒真的假绿：
+#: `kG.settled` 可能还留着 initGraph 收工时的那个 true）。
+_GRAPH_FRAMES = _GRAPH_COUNT + """
+kView = 'graph';
+initGraph(document.getElementById('knowBox'));
+const __settleSteps = __steps;
+kWake();                                     // 模拟「拖动后重新收敛」：预算是重新给的
+out.awake = __raf.length;
+let __frames = 0;
+/* ⚠️ 循环条件**不能**带 `!kG.settled`：initGraph 收工时它把 settled 置成了 true，
+   拿它当条件就一帧都不跑（这正是我第一版那条用例假绿的原因）。只看 raf 队列还有没有帧。 */
+while (__raf.length && __frames < 40){
+  const fn = __raf.shift();                  // 手动跑一帧（等价于浏览器派发 rAF 回调）
+  kG.raf = null;
+  fn();
+  __frames++;
+}
+out.settleSteps = __settleSteps;
+out.frameSteps = __steps - __settleSteps;
+out.frames = __frames;
+out.settled = !!(kG && kG.settled);
+out.nodes = kG ? kG.nodes.length : -1;
+"""
+
+
+def _iter_cap(n):
+    """模板里 `kIterCap(n)` 的**镜像**：`max(80, min(500, round(40000 / n)))`。
+
+    为什么要镜像一遍：这里断的是「500 张卡的迭代轮数 ≤ 上限」这个**合同**（计划 §6.2 的判据），
+    不是「模板里某个常量等于多少」。上限实现（模板注释里写着随 N 递减的理由）与这里必须同步改；
+    行为退化成「固定 N 轮」（体检 §6 的旧形态）时，这条必然红。
+    - N=500 → 80 轮（旧：500 轮，O(N²) 差 6.25 倍）
+    - N≤80 → 500（小图维持旧上限，只有提前收敛判据会提前收工）
+    """
+    return max(80, min(500, round(40000 / max(n, 1))))
+
+
+def _graph_map(n):
+    """一份 N 个节点的知识地图：链式 `related` ⇒ n-1 条连线，且**没有悬空引用**。"""
+    return [{"id": "n%d" % i, "term": "概念%d" % i, "definition": "d",
+             "layer": 0 if i < 3 else 1, "sources": [], "timeline": [],
+             "interview_questions": [], "confidence": "guess",
+             "related": ([{"id": "n%d" % (i + 1), "relation": "关联"}] if i + 1 < n else [])}
+            for i in range(n)]
+
+
+def _graph_data(n):
+    return {"job_title": "语音数据质检", "score": 91.5, "verdict": "建议投递",
+            "scores": [{"name": "匹配度", "score": 91.5, "weight": 10}],
+            "knowledge": _graph_map(n)}
+
+
+# 探针：真跑**报告模板**的图谱 JS（最小 DOM 垫片 + 一个能画画的 canvas）。
+# 与 `PROBE`（只回 `#main` 的 innerHTML）同一套切法与 base64 口径，区别是它接受一段
+# **跑在页面作用域里**的 `scenario`（因此能直接调 `initGraph` / `kStep` / `kWake` / `kRun`），
+# 并把 scenario 写进 `out` 的东西回传。
+GRAPH_PROBE = r"""
+const fs = require('fs');
+const vm = require('vm');
+
+function bail(o){
+  process.stdout.write(Buffer.from(JSON.stringify(o == null ? null : o), 'utf8').toString('base64'));
+  process.exit(0);
+}
+
+let payload;
+try { payload = JSON.parse(fs.readFileSync(0, 'utf8')); }
+catch (e) { bail({ fatal: '探针拿不到输入：' + String(e && e.message || e) }); }
+
+const src = String(payload.src || '');
+const scenario = String(payload.scenario || '');
+
+/* 切法同 `PROBE`：数据那行的 `<script>` 起、到 `</script>` 止。
+   ⚠️ 报告里注释中就写着字面量 `</script>`，所以**不能**按标签找（会切错段落）。 */
+const ANCHOR = 'const REPORT_DATA = ';
+const a = src.indexOf(ANCHOR);
+if (a < 0) bail({ fatal: '找不到 ' + ANCHOR + '（模板锚点变了？）' });
+const open = src.lastIndexOf('<script>', a);
+const i = (open < 0) ? a : (open + '<script>'.length);
+const j = src.indexOf('\n', a);
+const rest = src.slice(j + 1);
+const end = rest.indexOf('</script>');
+const pageJs = src.slice(i, j + 1) + rest.slice(0, end < 0 ? rest.length : end);
+/* 切错了就别往下跑：空跑出来的"绿"是假绿（这几条断言的全部意义就是数 kStep） */
+if (pageJs.indexOf('function kStep(g, W, H)') < 0 || pageJs.indexOf('function initGraph(root)') < 0)
+  bail({ fatal: '切出来的不是报告模板的图谱脚本（锚点变了？）：' + pageJs.length + ' 字符' });
+
+/* ---- 最小 DOM 垫片（比 `PROBE` 那个多一个能画画的 canvas）---- */
+function canvas2d(){
+  const noop = () => {};
+  return { setTransform: noop, clearRect: noop, save: noop, restore: noop, translate: noop,
+           scale: noop, beginPath: noop, moveTo: noop, lineTo: noop, stroke: noop, arc: noop,
+           fill: noop, fillText: noop, globalAlpha: 1, strokeStyle: '', fillStyle: '',
+           lineWidth: 1, font: '', textAlign: '', textBaseline: '' };
+}
+const store = {};
+const mk = (id) => ({ id, innerHTML: '', textContent: '', value: '', style: {}, dataset: {},
+  clientWidth: 700, clientHeight: 420, width: 0, height: 0,
+  classList: { add(){}, remove(){}, toggle(){}, contains(){ return false; } },
+  addEventListener(){}, removeEventListener(){}, querySelector(){ return null; },
+  querySelectorAll(){ return []; }, getContext(){ return canvas2d(); },
+  getBoundingClientRect(){ return { left: 0, top: 0 }; },
+  appendChild(){}, removeChild(){}, insertBefore(){}, focus(){}, click(){},
+  setAttribute(){}, getAttribute(){ return null; } });
+const g = id => (store[id] || (store[id] = mk(id)));
+for (const id of ['main', 'hero', 'heroScore', 'heroVerdict', 'foot', 'toc', 'offline',
+                  'hint', 'knowBox', 'kgCanvas', 'totalVal'])
+  g(id);
+const document = { getElementById: id => store[id] || null, querySelector: () => null,
+  querySelectorAll: () => [], createElement: () => mk(''), addEventListener() {},
+  documentElement: {}, body: mk('body') };
+const window = { devicePixelRatio: 1, scrollY: 0, innerWidth: 1200, addEventListener() {},
+  removeEventListener() {}, print() {} };
+window.window = window;
+const localStorage = { getItem: () => null, setItem() {}, removeItem() {} };
+const location = { href: 'file:///probe.html', origin: 'null', reload() {} };
+const ctx = { document, window, localStorage, location, navigator: {}, Promise, queueMicrotask,
+  fetch: () => Promise.reject(new Error('probe: no network')), setTimeout, clearTimeout,
+  console, JSON, Math, Object, Array, String, Number, Date, Float64Array, isFinite, Error,
+  reportError() {} };
+/* rAF **真排队**（不自动触发）：这样 `kWake()` 排的那一帧能被 scenario 手动取出、真跑。
+   返回 0 的话 `kG.raf` 是假值，帧循环看起来"跑完了"，其实一帧都没跑（假绿）。 */
+const rafQueue = [];
+ctx.requestAnimationFrame = fn => { rafQueue.push(fn); return rafQueue.length; };
+ctx.cancelAnimationFrame = () => {};
+ctx.__raf = rafQueue;
+
+const ctxObj = vm.createContext(ctx);
+try { vm.runInContext(pageJs, ctxObj, { timeout: 60000 }); }
+catch (e) { bail({ fatal: '跑模板 JS 失败：' + String((e && e.stack) || e) }); }
+
+/* scenario 跑在**同一个 context** 里（因此拿得到 kStep / initGraph / kWake / kRun 这些真函数），
+   回传的东西一律写进 `out`。 */
+ctxObj.out = {};
+try { vm.runInContext(';' + scenario, ctxObj, { timeout: 120000 }); }
+catch (e) { bail({ fatal: 'scenario 跑不起来：' + String((e && e.stack) || e) }); }
+bail(ctxObj.out);
+"""
+
+
+def _graph_run(data, scenario, timeout=180):
+    """跑报告模板的图谱 JS，回传 scenario 写进 `out` 的东西。失败一律**响亮报错**。"""
+    need_node()
+    tpl = store.read_text(app.TEMPLATE_PATH)
+    if not tpl:
+        raise AssertionError("读不到报告模板 %s" % app.TEMPLATE_PATH)
+    src = (tpl.replace("__TITLE__", "探针")
+              .replace("__REPORT_DATA__",
+                       json.dumps(data, ensure_ascii=False).replace("</", "<\\/")))
+    tmp = None
+    try:
+        tmp = tempfile.mkdtemp()
+        script = os.path.join(tmp, "graph_probe.js")
+        store.write_text(script, GRAPH_PROBE)
+        payload = json.dumps({"src": src, "scenario": scenario}, ensure_ascii=False)
+        out = subprocess.run([NODE, script], input=payload.encode("utf-8"),
+                             capture_output=True, timeout=timeout)
+        if out.returncode != 0:
+            raise AssertionError("Node 图谱探针失败（exit=%s）：%s"
+                                 % (out.returncode, out.stderr.decode("utf-8", "replace")[-2000:]))
+        got = json.loads(base64.b64decode(out.stdout.decode("ascii").strip()).decode("utf-8"))
+    finally:
+        if tmp:
+            shutil.rmtree(tmp, ignore_errors=True)
+    if not isinstance(got, dict):
+        raise AssertionError("图谱探针回传的不是对象：%r" % (got,))
+    if got.get("fatal"):
+        raise AssertionError("图谱探针跑不起来：%s" % got["fatal"])
+    return got
+
+
+class KnowledgeGraphLayoutTest(IsolatedCase):
+    """批 6.2：图谱布局「迭代次数随 N 递减 + 提前收敛」—— 判据全是可数量（轮数 / 位移）。"""
+
+    def setUp(self):
+        super().setUp()
+        need_node()          # 缺 Node → 红（理由见 `need_node`），**不**静默跳过
+
+    def _settle(self, n):
+        out = _graph_run(_graph_data(n), _GRAPH_SETTLE)
+        self.assertGreater(out.get("steps", 0), 0,
+                           "kStep 一次都没跑（图谱压根没布局 —— 轮数断言会变成恒真的假绿）：%r" % (out,))
+        self.assertEqual((out["nodes"], out["edges"]), (n, n - 1),
+                         "图谱的节点数 / 连线数与输入不一致：%r" % (out,))
+        return out
+
+    # ---------------------------------------------------------- ① 500 张卡：轮数有上限
+    def test_a_500_card_map_settles_within_the_iteration_cap(self):
+        """**本块的核心验收**（计划 §6.2 的判据）：500 张卡的同步布局轮数 ≤ 上限。
+
+        旧实现固定 500 轮 · O(N²) ⇒ 体检实测 322ms 冻结主线程（`steps` 会是 500）。
+        """
+        out = self._settle(500)
+        cap = _iter_cap(500)
+        self.assertLess(out["steps"], 500,
+                        "还是固定 500 轮（体检 §6 的 O(N²) 形态）：跑了 %d 轮" % out["steps"])
+        self.assertLessEqual(out["steps"], cap,
+                             "500 张卡跑了 %d 轮（上限 %d）：迭代数没有随 N 递减" % (out["steps"], cap))
+        self.assertEqual(out["nan"], 0, "布局把节点坐标算成了 NaN/Inf：%r" % (out,))
+
+    # ---------------------------------------------------------- ② 中图：是**提前收敛**在收工
+    def test_a_mid_size_map_stops_by_convergence_before_the_cap(self):
+        """N=50 的**上限就是旧的 500** ⇒ 它必须靠「连续两轮位移 < 1px」提前收工。
+
+        这一条专门钉提前收敛判据：把它删掉（只留上限）时，这里会跑满 500 轮 ⇒ 红。
+        """
+        out = self._settle(50)
+        cap = _iter_cap(50)
+        self.assertEqual(cap, 500, "N=50 的上限不再是旧的 500 —— 这一条就断不到提前收敛了")
+        self.assertLess(out["steps"], cap,
+                        "N=50 跑满了 %d 轮：提前收敛判据没生效（等于把它删了）" % cap)
+        self.assertLess(max(out["moves"][-2:]), 2.0,
+                        "收工时最后两轮还在动（单个节点位移 > 2px/轮）：%r" % (out["moves"][-2:],))
+        self.assertEqual(out["nan"], 0, "布局把节点坐标算成了 NaN/Inf：%r" % (out,))
+
+    # ---------------------------------------------------------- ③ 对照组：小图不许被改坏
+    def test_a_small_map_still_gets_a_complete_finite_layout(self):
+        """**对照组**：N=5 的小地图照旧摆得出来（每个节点都拿到坐标、没有 NaN、连线数对）。
+
+        这条**改动前就是绿的**（旧的能量判据对 N=5 也会提前收工）——它的价值是
+        「迭代数变少」这个改动不许把小图改坏。
+        """
+        out = self._settle(5)
+        self.assertEqual(out["pos"], 5, "有节点没拿到坐标：%r" % (out,))
+        self.assertEqual(out["nan"], 0, "小地图的坐标里有 NaN/Inf：%r" % (out,))
+        self.assertLessEqual(out["steps"], _iter_cap(5),
+                             "小地图跑了 %d 轮（上限 %d）" % (out["steps"], _iter_cap(5)))
+        self.assertLess(max(out["moves"][-2:]), 2.0,
+                        "小地图收工时最后两轮还在动：%r" % (out["moves"][-2:],))
+
+    # ---------------------------------------------------------- ④ 每帧动画也要有上限
+    def test_the_frame_loop_leaves_no_unbounded_animation(self):
+        """图谱态下的每帧循环**必须在有限轮数内停下**（旧版对 N 大的图 raf 永不停止）。
+
+        旧实现用「能量总和 > 0.35」当停止条件：能量随 N 增长，500 张卡时永远压不下去
+        ⇒ 每帧 12 轮 O(N²) 一直烧主线程（体检 §6 说的「每一帧」）。
+        """
+        out = _graph_run(_graph_data(500), _GRAPH_FRAMES)
+        self.assertEqual(out["nodes"], 500, "图谱节点数与输入不一致：%r" % (out,))
+        self.assertGreater(out["frames"], 0,
+                           "一帧都没跑（kWake 没排上帧 → 这半条断言会恒真）：%r" % (out,))
+        self.assertTrue(out["settled"], "40 帧内没停下来（每帧 12 轮 O(N²) 会一直烧主线程）：%r" % (out,))
+        self.assertLessEqual(out["frameSteps"], _iter_cap(500),
+                             "唤醒后每帧循环跑了 %d 轮（上限 %d）" % (out["frameSteps"], _iter_cap(500)))
+
+
 if __name__ == "__main__":
     unittest.main()
