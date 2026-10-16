@@ -116,7 +116,7 @@ class _Builder:
 
 
 # ---------------------------------------------------------------- ① 读 / 写 / 容错
-class GetAndSaveTest(IsolatedCase):
+class GetAndStoreTest(IsolatedCase):
     def test_get_of_an_unknown_jd_raises_lookup_error(self):
         """岗位不存在 → LookupError（不是静默空字典：那会让调用方以为「这个 JD 没有缓存」）。"""
         for bad in (JD_A, "", None, "  "):
@@ -150,10 +150,10 @@ class GetAndSaveTest(IsolatedCase):
                 jdid.upsert_jd({"id": JD_A, "jd_facts": {"knowledge": junk}})
                 self.assertIsNone(jdfacts.knowledge_of(JD_A))
 
-    def test_save_knowledge_writes_through_to_the_real_file(self):
+    def test_store_writes_through_to_the_real_file(self):
         jdid.upsert_jd({"id": JD_A})
         with mock.patch.object(jdfacts, "_now", return_value="2026-10-03 00:35"):
-            jdfacts.save_knowledge(JD_A, _nodes("seed"), "computed")
+            jdfacts._store(JD_A, _nodes("seed"), "computed")
         facts = _raw_facts(JD_A)                                  # ← 落盘那一行，不是读侧
         self.assertEqual(_jdump(facts["knowledge"]), _jdump(_nodes("seed")))
         self.assertEqual(facts["knowledge_at"], "2026-10-03 00:35")
@@ -161,7 +161,7 @@ class GetAndSaveTest(IsolatedCase):
         self.assertEqual(jdfacts.get(JD_A)["knowledge_at"], "2026-10-03 00:35")
         self.assertEqual(_jdump(jdfacts.knowledge_of(JD_A)), _jdump(_nodes("seed")))
 
-    def test_save_knowledge_keeps_the_first_generated_at(self):
+    def test_store_keeps_the_first_generated_at(self):
         """**首次生成时间保留**：knowledge_at 是「这份知识地图第一次生成于何时」。
 
         覆盖掉它就等于把「这份地图有多旧」这条信息弄丢（复用时要展示给用户看）。
@@ -174,7 +174,7 @@ class GetAndSaveTest(IsolatedCase):
         jdid.upsert_jd({"id": JD_A, "jd_facts": {"knowledge": _nodes("第一次"),
                                                 "knowledge_at": "2020-01-01 08:00"}})
         with mock.patch.object(jdfacts, "_now", return_value="2026-11-01 12:00"):
-            jdfacts.save_knowledge(JD_A, _nodes("第二次"), "seeded:r9")
+            jdfacts._store(JD_A, _nodes("第二次"), "seeded:r9")
         facts = _raw_facts(JD_A)
         self.assertEqual(facts["knowledge_at"], "2020-01-01 08:00")     # 旧的时间没被动
         self.assertEqual(_jdump(facts["knowledge"]), _jdump(_nodes("第二次")))   # 内容换了
@@ -182,9 +182,9 @@ class GetAndSaveTest(IsolatedCase):
         # 第二次：先写一次（t1），再写一次（t2）→ knowledge_at 必须还是 t1
         jdid.upsert_jd({"id": JD_B})
         with mock.patch.object(jdfacts, "_now", return_value="2026-10-03 00:35"):
-            jdfacts.save_knowledge(JD_B, _nodes("first"), "computed")
+            jdfacts._store(JD_B, _nodes("first"), "computed")
         with mock.patch.object(jdfacts, "_now", return_value="2026-12-31 23:59"):
-            jdfacts.save_knowledge(JD_B, _nodes("second"), "computed")
+            jdfacts._store(JD_B, _nodes("second"), "computed")
         self.assertEqual(_raw_facts(JD_B)["knowledge_at"], "2026-10-03 00:35")
         self.assertEqual(_jdump(_raw_facts(JD_B)["knowledge"]), _jdump(_nodes("second")))
 
@@ -196,7 +196,7 @@ class GetAndSaveTest(IsolatedCase):
         """
         jdid.upsert_jd({"id": JD_A, "jd_facts": {"knowledge": [], "knowledge_at": "2020-01-01 08:00"}})
         with mock.patch.object(jdfacts, "_now", return_value="2026-11-01 12:00"):
-            jdfacts.save_knowledge(JD_A, _nodes("新"), "computed")
+            jdfacts._store(JD_A, _nodes("新"), "computed")
         facts = _raw_facts(JD_A)
         self.assertEqual(facts["knowledge_at"], "2026-11-01 12:00",
                          "新地图沿用了那份空地图的时间戳（报告会显示错的时间）")
@@ -207,46 +207,46 @@ class GetAndSaveTest(IsolatedCase):
         """`knowledge_at` 有值但**没有**地图（用户手改 / 迁移留下的孤儿）→ 同样不沿用。"""
         jdid.upsert_jd({"id": JD_A, "jd_facts": {"knowledge_at": "2020-01-01 08:00"}})
         with mock.patch.object(jdfacts, "_now", return_value="2026-11-01 12:00"):
-            jdfacts.save_knowledge(JD_A, _nodes("新"), "computed")
+            jdfacts._store(JD_A, _nodes("新"), "computed")
         self.assertEqual(_raw_facts(JD_A)["knowledge_at"], "2026-11-01 12:00")
 
-    def test_save_knowledge_stamps_a_time_only_when_there_was_none(self):
+    def test_store_stamps_a_time_only_when_there_was_none(self):
         jdid.upsert_jd({"id": JD_A})
         with mock.patch.object(jdfacts, "_now", return_value="2026-10-03 00:35"):
-            self.assertEqual(jdfacts.save_knowledge(JD_A, _nodes("x"), "computed")["knowledge_at"],
+            self.assertEqual(jdfacts._store(JD_A, _nodes("x"), "computed")["knowledge_at"],
                              "2026-10-03 00:35")
 
-    def test_save_knowledge_keeps_other_facts_keys(self):
+    def test_store_keeps_other_facts_keys(self):
         """只动三个键：`seeded_at`（以及用户/将来加的键）必须原样留着。"""
         jdid.upsert_jd({"id": JD_A, "jd_facts": {"seeded_at": "2026-09-01 10:00", "别的": [1]}})
-        jdfacts.save_knowledge(JD_A, _nodes("x"), "computed")
+        jdfacts._store(JD_A, _nodes("x"), "computed")
         facts = _raw_facts(JD_A)
         self.assertEqual(facts["seeded_at"], "2026-09-01 10:00")
         self.assertEqual(facts["别的"], [1])
         self.assertEqual(facts["knowledge_source"], "computed")
 
-    def test_save_knowledge_accepts_the_nodes_dict_form(self):
+    def test_store_accepts_the_nodes_dict_form(self):
         """容错：`{"nodes": [...]}`（旧报告/手写数据里出现过这种形态，kb 也认）→ 存成列表。"""
         jdid.upsert_jd({"id": JD_A})
-        jdfacts.save_knowledge(JD_A, {"nodes": _nodes("dict")}, "computed")
+        jdfacts._store(JD_A, {"nodes": _nodes("dict")}, "computed")
         self.assertEqual(_jdump(_raw_facts(JD_A)["knowledge"]), _jdump(_nodes("dict")))
 
-    def test_save_knowledge_of_an_unknown_jd_raises_and_creates_no_file(self):
+    def test_store_of_an_unknown_jd_raises_and_creates_no_file(self):
         with self.assertRaises(LookupError):
-            jdfacts.save_knowledge(JD_A, _nodes("x"), "computed")
+            jdfacts._store(JD_A, _nodes("x"), "computed")
         self.assertFalse(os.path.exists(store.p_path("jds.json")),
                          "给不存在的岗位存缓存时居然凭空造出了一个 jds.json")
 
-    def test_save_knowledge_rejects_garbage_without_writing(self):
+    def test_store_rejects_garbage_without_writing(self):
         jdid.upsert_jd({"id": JD_A})
         before = store.read_text(store.p_path("jds.json"), None)
         for junk in ("不是列表", 5, None, {"没有nodes": 1}, {"nodes": "不是列表"}):
             with self.subTest(junk=junk):
                 with self.assertRaises(ValueError):
-                    jdfacts.save_knowledge(JD_A, junk, "computed")
+                    jdfacts._store(JD_A, junk, "computed")
                 self.assertEqual(store.read_text(store.p_path("jds.json"), None), before)
 
-    def test_save_knowledge_rejects_a_missing_source_instead_of_writing_an_empty_one(self):
+    def test_store_rejects_a_missing_source_instead_of_writing_an_empty_one(self):
         """`knowledge_source` 是契约的一部分（报告照着它写来源标记）→ **不许静默写成 ""**。
 
         审查 Nit：`_text(source) or ""` 会把「调用方传错了」这种 bug 悄悄落盘成一个空来源。
@@ -256,19 +256,18 @@ class GetAndSaveTest(IsolatedCase):
         for junk in (None, "", "   ", 5, [], {}):
             with self.subTest(source=junk):
                 with self.assertRaises(ValueError):
-                    jdfacts.save_knowledge(JD_A, _nodes("x"), junk)
+                    jdfacts._store(JD_A, _nodes("x"), junk)
                 self.assertEqual(store.read_text(store.p_path("jds.json"), None), before)
         # 反向对照：合法来源照旧写得进去
-        jdfacts.save_knowledge(JD_A, _nodes("x"), " seeded:r1 ")
+        jdfacts._store(JD_A, _nodes("x"), " seeded:r1 ")
         self.assertEqual(_raw_facts(JD_A)["knowledge_source"], "seeded:r1")
 
-    def test_save_knowledge_allows_an_empty_list_but_it_is_not_a_usable_cache(self):
+    def test_store_allows_an_empty_list_but_it_is_not_a_usable_cache(self):
         """空列表是合法的「真算结果」（这个 JD 没抽出知识点），但不是可用的缓存。"""
         jdid.upsert_jd({"id": JD_A})
-        jdfacts.save_knowledge(JD_A, [], "computed")
+        jdfacts._store(JD_A, [], "computed")
         self.assertEqual(_raw_facts(JD_A)["knowledge"], [])
         self.assertIsNone(jdfacts.knowledge_of(JD_A))
-        self.assertTrue(jdfacts.needs_compute(JD_A, False))
 
     def test_read_modify_write_happens_under_the_jd_lock(self):
         """读 `jd_facts` → 改 → 写回是**一个临界区**：不在锁里读就会并发丢更新。
@@ -285,29 +284,9 @@ class GetAndSaveTest(IsolatedCase):
             return real_find(jd_id, *a, **kw)
 
         with mock.patch.object(jdid, "find_jd", watch):
-            jdfacts.save_knowledge(JD_A, _nodes("x"), "computed")
+            jdfacts._store(JD_A, _nodes("x"), "computed")
         self.assertTrue(seen, "整个写路径居然没读过 jds.json，这条测试就没验证到东西")
         self.assertEqual(seen, [True], "读 jd_facts 时没有持 _JD_LOCK：%s" % seen)
-
-
-class NeedsComputeTest(IsolatedCase):
-    def test_the_four_combinations(self):
-        """`needs_compute(jd_id, refresh)` 的四种组合：有/没有缓存 × 刷不刷新。"""
-        jdid.upsert_jd({"id": JD_A})
-        self.assertTrue(jdfacts.needs_compute(JD_A, False))       # 没缓存，不刷新 → 要算
-        self.assertTrue(jdfacts.needs_compute(JD_A, True))        # 没缓存，刷新   → 要算
-        jdfacts.save_knowledge(JD_A, _nodes("x"), "computed")
-        self.assertFalse(jdfacts.needs_compute(JD_A, False))      # 有缓存，不刷新 → 不用算
-        self.assertTrue(jdfacts.needs_compute(JD_A, True))        # 有缓存，刷新   → 要算
-
-    def test_it_answers_only_about_the_cache_not_about_seeding(self):
-        """没有缓存但有可播种的报告时它也是 True —— 播种是 resolve 的第 ② 级，不在这里判。"""
-        jdid.upsert_jd({"id": JD_A})
-        _analysis("r1", JD_A, "2026-10-01 09:00")
-        _write_report("r1.html", {"report_id": "r1", "knowledge": _nodes("report")})
-        self.assertTrue(jdfacts.needs_compute(JD_A, False))
-        self.assertEqual(jdfacts.seed_from_reports(JD_A), (True, "r1"))
-        self.assertFalse(jdfacts.needs_compute(JD_A, False))       # 播种之后就有缓存了
 
 
 # ---------------------------------------------------------------- ② 播种
@@ -465,7 +444,7 @@ class SeedFromReportsTest(IsolatedCase):
         **内容与时间戳对不上**（报告拿 A 的时间显示 B 的内容）。
         """
         jdid.upsert_jd({"id": JD_A})
-        jdfacts.save_knowledge(JD_A, _nodes("computed"), "computed")     # A 的真算已经落盘
+        jdfacts._store(JD_A, _nodes("computed"), "computed")     # A 的真算已经落盘
         _analysis("r1", JD_A, "2026-10-01 09:00")
         _write_report("r1.html", {"report_id": "r1", "knowledge": _nodes("report")})
         before = _raw_facts(JD_A)
@@ -705,7 +684,6 @@ class ResolveTest(IsolatedCase):
         self.assertEqual((nodes, source), ([], "computed"))
         self.assertEqual(_raw_facts(JD_A)["knowledge"], [])
         self.assertIsNone(jdfacts.knowledge_of(JD_A))              # 空缓存不算「有缓存」
-        self.assertTrue(jdfacts.needs_compute(JD_A, False))
 
     def test_an_empty_map_does_not_lend_its_timestamp_to_the_next_compute(self):
         """空地图不算可用缓存（既有约定）→ 它落盘的时间戳也不许被下一份**非空**地图沿用。
@@ -738,7 +716,7 @@ class ResolveTest(IsolatedCase):
 
         def read_then_race(path):
             data = real_read(path)
-            jdfacts.save_knowledge(JD_A, _nodes("computed"), "computed")   # 另一个线程刚算完
+            jdfacts._store(JD_A, _nodes("computed"), "computed")   # 另一个线程刚算完
             return data
 
         b = _Builder(_nodes("绝不该出现"))

@@ -1087,12 +1087,14 @@ def _diff_of(reply):
 
 
 def _call_text_model(prompt, cfg, chat=None):
-    """文本模型调用的**唯一**出口（调用约定与 `interview._call_model` 逐字一致）。
-
-    ``chat`` 的注入约定是 **`chat(prompt, cfg)` 两参**（与 `interview.analyze` /
-    `outcome.attribute` 一致）；默认实现走 `llm.call_openai_compatible`。
-    模型细节（base_url / key / model / temperature）只在这里收口 ——
+    """文本模型调用的**唯一**出口。注入约定是 **`chat(prompt, cfg)` 两参**
+    （与 `interview._call_model` / `outcome._call_model` 一致）；默认实现走
+    `llm.call_openai_compatible`。模型细节（base_url / key / model / temperature）只在这里收口 ——
     **绝不把网络细节漏进"变更比对"的业务逻辑里**，也**绝不自己拼 HTTP**。
+
+    与 `interview._call_model` 的差别（原文写的是"逐字一致"，那是**不实**的，别照抄）：
+    这里**没有** `system` / `json_mode` 两个参数 —— 本模块只有"变更比对"这一处调用，
+    提示词是一整段、而且**永远要 JSON**（`json_mode=True` 是写死的，`interview` 那边可以传 False）。
 
     `llm.call_openai_compatible` 是**模块属性、调用时现取**（不是 import 时绑定）：
     测试 patch 它一次就能挡住整条路（`resumelib` 不持有它的旧引用）。

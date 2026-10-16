@@ -221,17 +221,6 @@ def extract_nodes(jd_text, cfg, chat=None):
     return nodes[:MAX_CORE]
 
 
-def merge_sources(a, b):
-    """按 url 去重合并来源"""
-    seen, out = set(), []
-    for s in list(a or []) + list(b or []):
-        u = (s or {}).get("url")
-        if u and u not in seen:
-            seen.add(u)
-            out.append(s)
-    return out
-
-
 BRAIN_SYSTEM = """你是知识网络构建专家。给定一个核心概念，列出候选人还需要了解的 2~3 个**关联知识点**。
 
 只输出 JSON：{"related":[{"id":"英文短标识","term":"术语","definition":"专业定义(50字内)",

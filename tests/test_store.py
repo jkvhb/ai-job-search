@@ -34,6 +34,19 @@ class StorePathTest(IsolatedCase):
         p = store.p_path("jobs.json", key="carol")
         self.assertTrue(p.endswith(os.path.join("profiles", "carol", "jobs.json")))
 
+    def test_a_misspelled_key_kwarg_blows_up_instead_of_hitting_the_default_profile(self):
+        """拼错的 kwarg 必须**当场报错**，而不是被静默忽略、读写到 default profile。
+
+        原先签名是 `p_path(*parts, **kw)` + `kw.get("key")`：`kye="dave"` 会被吞掉，
+        于是"给 dave 写"变成"给 default 写"（P5-7 那条【实跑】）。
+        """
+        store.set_current_profile("dave")
+        with self.assertRaises(TypeError):
+            store.p_path("jobs.json", kye="dave")
+        # 反向对照：正确写法照旧解析到指定 profile
+        self.assertTrue(store.p_path("jobs.json", key="dave").endswith(
+            os.path.join("profiles", "dave", "jobs.json")))
+
     def test_set_and_get_current_profile(self):
         store.set_current_profile("dave")
         self.assertEqual(store.current_profile(), "dave")

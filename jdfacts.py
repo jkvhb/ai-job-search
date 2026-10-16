@@ -67,17 +67,19 @@ _INFLIGHT = {}                      # jd_id -> _Flight：这个 JD 上正在「�
 
 
 class _Flight(object):
-    """一次「真算」的登记。`done` 给等待者发信号；`source` / `nodes` / `error` 是那次的结果。
+    """一次「真算」的登记。`done` 给等待者发信号；`nodes` / `error` 是那次的结果。
 
     第二个线程**等它算完直接拿结果**，绝不各算一遍。领导者失败（builder 抛异常）时
     `error` 会被填上、`done` **照样**会被置上：等待者醒来发现没有结果就自己再去算一次 ——
     **绝不死等**。
+
+    这里**没有** `source`：等待者一律按「复用」（`SOURCE_CACHE`）报，不读领导者的来源
+    —— 理由见 `_compute_once` 里那段产品裁定（报了 `computed` 用户会以为又烧了一遍额度）。
     """
-    __slots__ = ("done", "source", "nodes", "error")
+    __slots__ = ("done", "nodes", "error")
 
     def __init__(self):
         self.done = threading.Event()
-        self.source = SOURCE_COMPUTED
         self.nodes = None
         self.error = None
 
@@ -157,15 +159,6 @@ def knowledge_of(jd_id):
     return _as_nodes(get(jd_id).get("knowledge")) or None
 
 
-def needs_compute(jd_id, refresh=False):
-    """「要真算吗」：有缓存且没要求刷新 → False；其余（无缓存 / 强制刷新）→ True。
-
-    它**只回答缓存够不够**：没有缓存但能播种时同样是 True —— 播种是 `resolve` 的第 ② 级，
-    不在这里判（否则「读报告」的判定会散成两套）。
-    """
-    return bool(refresh) or knowledge_of(jd_id) is None
-
-
 # ---------------------------------------------------------------- 写
 def _store(jd_id, nodes, source, at=None, seeded_at=None, only_if_no_cache=False):
     """在 `jdid._JD_LOCK` 里「读 `jd_facts` → 改 → 写回」，返回落盘后的那份 `jd_facts`。
@@ -207,17 +200,6 @@ def _store(jd_id, nodes, source, at=None, seeded_at=None, only_if_no_cache=False
         return facts
 
 
-def save_knowledge(jd_id, nodes, source):
-    """写 `jd_facts.knowledge` + `knowledge_source` + `knowledge_at`。
-
-    `knowledge_at` 是这份地图的生成时间：**旧缓存是非空列表**时保留它（首次生成时间比这次写入
-    更有信息量），否则盖成本次时间。`source` 必须是非空字符串（报告照着它写来源标记）。
-
-    岗位不存在 → LookupError（绝不凭空造一条 JD 记录）。
-    """
-    return _store(jd_id, nodes, source)
-
-
 # ---------------------------------------------------------------- 播种
 def _report_of(analysis):
     """一条分析记录的报告文件 → `(绝对路径, 报告id)`；定位不了 → `(None, None)`。
@@ -239,10 +221,15 @@ def _report_of(analysis):
 
 
 def _seed(jd_id):
-    """播种的实体：`(节点列表, 报告id)`；读不出来 → `(None, None)`（绝不猜、绝不崩）。"""
+    """播种的实体：写进去了就返回**报告id**；读不出来 → `None`（绝不猜、绝不崩）。
+
+    只回一个值就够：唯一调用方 `seed_from_reports` 要知道的正是「写成功了没有、是哪份报告」，
+    而写成功时节点列表**必然非空**（下面 `if not nodes: continue` 保证了这一点）。
+    回一份调用方随即丢掉的节点列表，只会让人以为"外面还要用这份节点"。
+    """
     want = _text(jd_id)
     if not want or jdid.find_jd(want) is None:
-        return None, None
+        return None
     # created_at 升序；坏报告**跳过继续找**，不能因为最新那份没知识就放弃播种
     for analysis in jdid.analyses_of(want):
         path, rid = _report_of(analysis)
@@ -265,10 +252,10 @@ def _seed(jd_id):
             # 临界区里发现已经有可用缓存（窄窗口：另一个线程刚把真算落盘）→ 放弃这次播种写。
             # 调用方（`resolve`）会再看一眼缓存：那时那份缓存比任何旧报告都新。
             log.log_event(EVENT_SEED_SKIPPED, jd=want, report=rid)
-            return None, None
+            return None
         log.log_event("analyze.knowledge_seeded", jd=want, report=rid, nodes=len(nodes))
-        return nodes, rid
-    return None, None
+        return rid
+    return None
 
 
 def seed_from_reports(jd_id):
@@ -281,8 +268,8 @@ def seed_from_reports(jd_id):
     **播种写守卫**：进 `_JD_LOCK` 临界区后重判一次，此刻已经有可用缓存（比如另一个线程刚
     真算完）就**放弃这次写入**、同样返回 `(False, None)` —— 绝不用旧报告覆盖更新的那份。
     """
-    nodes, rid = _seed(jd_id)
-    if nodes and rid:
+    rid = _seed(jd_id)
+    if rid:
         return (True, rid)
     return (False, None)
 
@@ -329,9 +316,9 @@ def _compute_once(jd_id, jd_text, cfg, builder, refresh):
             if not nodes:
                 nodes = list(other.nodes or [])   # 空地图（`[]` 不算可用缓存）：结果就是它那份
             log.log_event(EVENT_JOINED, jd=jd_id, nodes=len(nodes), ms=int(waited * 1000))
-            # ⚠️ 按**复用**报，不报 `other.source`（产品裁定）：报告里那一行小字的全部意义是
-            # 「**本次有没有重新搜索**」（模板原文：「复用该岗位 <日期> 生成的那份（本次没有
-            # 重新搜索）」）。等待者确实没有重新搜索 —— 它只是在旁边等领导者的那一次。
+            # ⚠️ 按**复用**报，**绝不**报领导者那次算出来的来源（产品裁定）：报告里那一行小字的
+            # 全部意义是「**本次有没有重新搜索**」（模板原文：「复用该岗位 <日期> 生成的那份
+            # （本次没有重新搜索）」）。等待者确实没有重新搜索 —— 它只是在旁边等领导者的那一次。
             # 报 `computed` 会让用户以为这次又烧了一遍 ~53 次搜索额度，而那正是这一行要传达
             # 的信息。「这是等待者（不是缓存命中）」由上面的 `analyze.knowledge_joined` 分辨。
             return nodes, SOURCE_CACHE
@@ -351,7 +338,8 @@ def _compute_once(jd_id, jd_text, cfg, builder, refresh):
             raise
         finally:
             if result is not None:
-                mine.nodes, mine.source = result
+                # 只把「结果」交出去；来源不登记（等待者一律按「复用」报，见上面那段裁定）。
+                mine.nodes = result[0]
             mine.done.set()                 # 先把结果放出去（`done` 一置上等待者就会读它）…
             _leave_flight(jd_id, mine)      # …再注销登记
 

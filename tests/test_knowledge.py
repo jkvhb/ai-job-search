@@ -43,15 +43,6 @@ class ExtractTest(IsolatedCase):
                                                                        "model": "m"}}, chat=chat), [])
 
 
-class SourceMergeTest(IsolatedCase):
-    def test_merge_sources_dedupes_by_url(self):
-        a = [{"url": "https://x", "title": "T"}]
-        b = [{"url": "https://x", "title": "T2"}, {"url": "https://y", "title": "T3"}]
-        out = knowledge.merge_sources(a, b)
-        self.assertEqual(len(out), 2)
-        self.assertEqual({s["url"] for s in out}, {"https://x", "https://y"})
-
-
 class BrainstormTest(IsolatedCase):
     def test_brainstorm_adds_layer1_nodes(self):
         chat = fake_chat_factory(['{"related":[{"id":"sft","term":"SFT","definition":"d",'

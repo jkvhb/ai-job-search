@@ -197,27 +197,19 @@ def _fingerprint_of(plan):
     预演与执行之间数据变了（多了/少了一条分析、换了一份报告）→ 指纹变 →
     `purge_jd` 拒绝执行。用户确认的是**那一份**清单，不是另一份。
 
-    ⚠️ `plan` 既可能是 `_plan` 的内部形状，也可能是摊平后的 `preview_purge` 形状：
-    前者是 `"analyses"`/`"files"`/`"kb_cards"`/`"interviews"`，后者把引用摆成
-    `refs.knowledge.cards`。两种都认 —— 它们只是同一份数据的两种投影。
+    ⚠️ 只认 `_plan` 的**内部形状**（`"analyses"`/`"files"`/`"kb_cards"`/`"interviews"`）：
+    三个调用点（`preview_purge`、`purge_jd` 的两处比对）传的全部是 `_plan` 的返回值。
+    `preview_purge` 摊平后的**对外形状**（引用摆成 `refs.knowledge.cards`）从不经过这里 ——
+    它自己也带着 `analyses` 这份同样的内部投影，所以那份形状连"另一种投影"都算不上。
     """
-    def pick(*names):
-        for n in names:
-            v = plan.get(n) if isinstance(plan, dict) else None
-            if v:
-                return v
-        return []
-
-    refs = (plan.get("refs") or {}) if isinstance(plan, dict) else {}
-    cards = pick("kb_cards") or ((refs.get("knowledge") or {}).get("cards") or [])
-    interviews = pick("interviews") or ((refs.get("interviews") or {}).get("records") or [])
     parts = ["jd=" + str(plan.get("id") or "")]
     parts += ["a=" + str(a.get("id") or "") + ":" + str(a.get("report") or "")
-              for a in pick("analyses", "_analyses")]
+              for a in plan["analyses"]]
     parts += ["f=" + str(f.get("where") or "") + "/" + str(f.get("name") or "")
-              for f in pick("files", "_files")]
-    parts += ["k=" + str(c.get("id") or "") + ":" + str(c.get("hits") or 0) for c in cards]
-    parts += ["i=" + str(r.get("id") or "") for r in interviews]
+              for f in plan["files"]]
+    parts += ["k=" + str(c.get("id") or "") + ":" + str(c.get("hits") or 0)
+              for c in plan["kb_cards"]]
+    parts += ["i=" + str(r.get("id") or "") for r in plan["interviews"]]
     return _digest("\n".join(parts))
 
 
@@ -575,10 +567,12 @@ def _backup_dir():
 
 
 def _copy_into_backup(entry, dest):
-    """把一个待删文件拷进备份（保留相对目录），返回 (相对路径, 原 mtime, sha256) 或 None。
+    """把一个待删文件拷进备份（保留相对目录）。**没有返回值**。
 
     备份的文件**一个字节都不改**（`copy2` 连 mtime 一起带过去），
     回滚时用这份副本来恢复 —— 所以"备份成功了"这件事必须**核对 sha256**，不靠"cp 没报错"。
+    核对用的 sha256 只在这里的 if 里消费（不符就抛错、这一步失败 = 一个字节都还没动），
+    调用方要的是"没抛异常"这件事本身，不是这份 sha256/mtime。
     """
     src = os.path.join(store.p_path(entry["where"]), entry["name"])
     rel = os.path.join(entry["where"], entry["name"])
@@ -589,7 +583,6 @@ def _copy_into_backup(entry, dest):
         got = hashlib.sha256(f.read()).hexdigest()
     if got != entry["sha"]:
         raise JdPurgeError("备份出的文件与盘上的不一致（sha256 不符）：%s" % rel)
-    return rel, os.stat(src).st_mtime, got
 
 
 def _copy_state_into_backup(dest, snapshots, jd_id):
@@ -684,12 +677,6 @@ def _write_bytes(path, raw):
         os.makedirs(d, exist_ok=True)
     with open(path, "wb") as f:
         f.write(raw)
-
-
-def _write_json(path, obj):
-    """原子写 JSON，并触发 `_FAIL_AFTER` 注入点（生产恒为 0）。"""
-    store.write_json(path, obj)
-    _tick()
 
 
 def _tick():

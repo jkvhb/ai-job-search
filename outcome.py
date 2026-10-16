@@ -217,15 +217,6 @@ def _not_terminal_message(job):
             % (status, "／".join(TERMINAL)))
 
 
-def report_data_of(job_id):
-    """读回 application.outcome_ai（供报告渲染与前端判断「是否已复盘」）。
-
-    没归因过（或值被写坏成非字典）→ None；岗位不存在 → LookupError。
-    """
-    ai = _raw_application(_require_job(job_id)).get("outcome_ai")
-    return ai if isinstance(ai, dict) else None
-
-
 # ---------------------------------------------------------------- 归因素材（喂模型 = 报告里的「原始依据」）
 def _jd_facts(job):
     """JD 要点：复盘报告里的报告数据（拆解/打分/硬门槛）+ 原始 JD 文本。

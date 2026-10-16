@@ -374,11 +374,12 @@ def _split_text(text, limit):
     chunks, cur = [], ""
     for line in text.splitlines(True):
         while len(line) > limit:                    # 单行比 limit 还长：先塞满当前块，再硬切它
-            room = limit - len(cur)
-            if room <= 0:
+            room = limit - len(cur)                 # cur 恒 ≤ limit → room ≥ 0
+            if room <= 0:                           # 只可能是 0：cur 正好满 → 先把它交出去
                 chunks.append(cur)
                 cur = ""
-                room = limit
+                # 此处**不必**再写一句 `room = limit`（原先有一句，是死赋值）：下面两行在
+                # room == 0 时都是空操作，下一轮开头 `room = limit - len("")` 会自己量成 limit。
             cur += line[:room]
             line = line[room:]
             chunks.append(cur)

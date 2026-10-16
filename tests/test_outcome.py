@@ -240,14 +240,14 @@ class AttributionStorageTest(IsolatedCase):
     def test_attribution_is_stored_on_the_job(self):
         _job()
         outcome.save_result("j1", "已拒", "预算冻结")
-        self.assertIsNone(outcome.report_data_of("j1"))       # 还没归因：如实回 None
+        self.assertIsNone(outcome.application_of("j1")["outcome_ai"])   # 还没归因：如实回 None
         out = outcome.attribute("j1", cfg={}, chat=fake_chat('{"verdict_summary":"总评"}'))
-        self.assertEqual(outcome.report_data_of("j1"), out)   # 真落到 application.outcome_ai
-        self.assertEqual(outcome.report_data_of("j1")["verdict_summary"], "总评")
+        self.assertEqual(outcome.application_of("j1")["outcome_ai"], out)   # 真落到 application.outcome_ai
+        self.assertEqual(outcome.application_of("j1")["outcome_ai"]["verdict_summary"], "总评")
 
-    def test_report_data_of_unknown_job_raises_lookup(self):
+    def test_application_of_unknown_job_raises_lookup(self):
         with self.assertRaises(LookupError):
-            outcome.report_data_of("没有这个岗位")
+            outcome.application_of("没有这个岗位")
 
     def test_model_order_is_preserved(self):
         """模型给的顺序就是优先级顺序 —— 绝不排序。
@@ -306,7 +306,7 @@ class AttributionStorageTest(IsolatedCase):
                 outcome.attribute("j1", cfg={}, chat=fake_chat("完全不是 JSON"))
         self.assertTrue(str(cm.exception).startswith("模型没有返回可解析的归因结果"),
                         "错误必须出自 outcome 自己的校验口径：%s" % cm.exception)
-        self.assertIsNone(outcome.report_data_of("j1"))
+        self.assertIsNone(outcome.application_of("j1")["outcome_ai"])
         self.assertEqual(outcome.application_of("j1")["outcome_reason"], "预算冻结")
 
     def test_interviews_are_not_fed_twice_on_repeat_attribution(self):

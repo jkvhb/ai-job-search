@@ -152,9 +152,14 @@ def set_current_profile(key=None):
     return k
 
 
-def p_path(*parts, **kw):
-    """解析到指定 key 的 profile；未指定则用「当前 profile」（多用户隔离的关键）"""
-    return os.path.join(profile_dir(kw.get("key") or current_profile()), *parts)
+def p_path(*parts, key=None):
+    """解析到指定 key 的 profile；未指定则用「当前 profile」（多用户隔离的关键）。
+
+    ⚠️ `key` 是**关键字专用**参数（签名里写在 `*parts` 之后），不是 `**kw` 里 `kw.get("key")`：
+    后者会把拼错的 kwarg（`kye="dave"`）**静默忽略**，于是调用方以为在读写 dave 的 profile，
+    实际动的是 default 的 —— 写错一个字母就动错人的数据。现在拼错当场 `TypeError`。
+    """
+    return os.path.join(profile_dir(key or current_profile()), *parts)
 
 
 # ---------- 读写 ----------
