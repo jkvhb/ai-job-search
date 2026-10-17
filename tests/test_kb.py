@@ -832,6 +832,288 @@ class DuplicateTest(IsolatedCase):
         self.assertEqual(len(kb.find_duplicates(store.load_knowledge())), 20)
 
 
+# ---------------------------------------------------------------- 批 6.3：find_duplicates 的剪枝
+# 为什么要有这一组：`find_duplicates` 是纯 O(N²) 两两比较，**库很干净也不提前返回**
+# （体检 §6 实测：145 卡 0.03s ／ 500→0.38s ／ 1000→1.52s ／ **2000→5.71s**）。
+# 剪枝是纯性能改动，所以本组的**主判据是"判据不许变"**（逐条相同），性能只作次判据。
+#
+# 夹具字符池：本领域真实术语里的**词素**（两字词），一个术语 = 3 个词素（6 字）。
+# 真实 145 卡里 4~6 字占 ~2/3、用到 ~296 个不同的字；这份池子 110 个词素 = 220 个字，
+# 量级接近。合成夹具其实比真实库**散**（真实术语共享更多词素 ⇒ 索引键碰撞更多），
+# 所以它并不占便宜：实测候选对占全量对的 ~8%（真实 145 卡上 4.7%）。
+_FX_MORPHEMES = (
+    "省略", "识别", "恢复", "根因", "分析", "抽样", "检验", "幻觉", "标注", "规范",
+    "流程", "策略", "体系", "机制", "方法", "标准", "系统", "数据", "模型", "推理",
+    "训练", "评估", "优化", "微调", "对齐", "蒸馏", "提示", "向量", "检索", "排序",
+    "嵌入", "注意", "力度", "损失", "正则", "编码", "解码", "缓存", "并发", "事务",
+    "索引", "分区", "副本", "容灾", "降级", "熔断", "限流", "幂等", "一致", "依赖",
+    "注入", "反射", "代理", "装饰", "适配", "观察", "工厂", "单例", "迭代", "生成",
+    "闭包", "作用", "原型", "继承", "多态", "封装", "抽象", "接口", "实现", "对象",
+    "实例", "属性", "字段", "约束", "校验", "断言", "覆盖", "分支", "循环", "异常",
+    "捕获", "堆栈", "断点", "调试", "监控", "告警", "指标", "采样", "聚合", "分组",
+    "窗口", "滑动", "延迟", "吞吐", "压力", "容量", "扩缩", "预热", "灰度", "回滚",
+    "发布", "版本", "升级", "兼容", "弃用", "迁移", "备份", "演练", "故障", "复盘",
+)
+
+
+def _fx_lcg(state):
+    """自带的确定性伪随机（**不用 `random` 模块**：不依赖它内部算法跨版本稳定）。"""
+    return (state * 1103515245 + 12345) % (2 ** 31)
+
+
+def _fx_terms(n):
+    """前 n 个夹具术语。**前缀一致**：n=50 的序列就是 n=2000 序列的前 50 个。"""
+    out, seen, state = [], set(), 20261015
+    m = len(_FX_MORPHEMES)
+    while len(out) < n:
+        state = _fx_lcg(state)
+        a = _FX_MORPHEMES[state % m]
+        state = _fx_lcg(state)
+        b = _FX_MORPHEMES[state % m]
+        state = _fx_lcg(state)
+        c = _FX_MORPHEMES[state % m]
+        t = a + b + c
+        if t in seen:
+            continue
+        seen.add(t)
+        out.append(t)
+    return out
+
+
+def _fx_variant_terms(n):
+    """在 `_fx_terms(n)` 上**按固定下标注入**已知重复（四种判据都覆盖到）。
+
+    注入规则（`i` 是 37 的倍数、`base` 是前一张卡）：
+      `base + 方法` ⇒ 包含/同义后缀；`base[:2] + 的 + base[2:]` ⇒ 插入式；
+      `base[:-2] + 机制` ⇒ 同义后缀；其余原样（等于 base ⇒ 不成对，做对照）。
+    """
+    ts = _fx_terms(n)
+    for i in range(37, n, 37):
+        base = ts[i - 1]
+        k = i % 4
+        if k == 0:
+            ts[i] = base + "方法"
+        elif k == 1:
+            ts[i] = base[:2] + "的" + base[2:]
+        elif k == 2:
+            ts[i] = base[:-2] + "机制"
+        else:
+            ts[i] = base
+    return ts
+
+
+def _fx_kb(terms):
+    return {"version": 1, "nodes": [{"id": t, "term": t} for t in terms]}
+
+
+def _fx_triples(dups):
+    return [(d["a"], d["b"], d["reason"]) for d in dups]
+
+
+def _reference_find_duplicates(kb_data, limit=20):
+    """**改前**的实现：逐字照抄剪枝之前 `kb.find_duplicates` 的那圈两两比较。
+
+    等价性用例拿它当对照物（它是"判据"的独立副本，不是被测量对象）。保留它的另一个用处是
+    钉住**顺序**与 `limit` 的既有语义（够了就 return —— 包含 `limit=0` 那个怪语义）。
+    """
+    ids = [n.get("id") for n in kb.ensure_kb(kb_data)["nodes"]
+           if isinstance(n.get("id"), str) and n.get("id")]
+    out = []
+    for i in range(len(ids)):
+        for j in range(i + 1, len(ids)):
+            reason = kb._dup_reason(ids[i], ids[j])
+            if reason:
+                out.append({"a": ids[i], "b": ids[j], "reason": reason})
+                if len(out) >= limit:
+                    return out
+    return out
+
+
+# ---- 期望值：全部由**改前**实现跑出来并存死（"先跑出改前的结果存成期望值"）----
+# 手工夹具：四种判据 + 单字 id + 非字符串/空 id + 重复 id + term 与 id 不一致的卡。
+_FX_TRICKY_KBS = {"version": 1, "nodes": [
+    {"id": "机器学习", "term": "机器学习"},
+    # ⚠️ 下面这张卡**故意让 term 与 id 不一致**（用户手改过的库）：判据只吃 id，
+    # 所以索引键也只能按 id 建 —— 谁把键建成 term 或整张卡的序列化，这一对就会消失。
+    {"id": "机器学习算法", "term": "手改过的别名（term 与 id 不一致）"},
+    {"id": "省略恢复", "term": "省略恢复"},
+    {"id": "省略识别及恢复", "term": "省略识别及恢复"},
+    {"id": "训练体系", "term": "训练体系"},
+    {"id": "训练机制", "term": "训练机制"},
+    # 「猫体系 / 猫机制」：词干只有 1 个字，**没有任何共享的字对** ⇒ 只可能靠"同义后缀"键命中
+    {"id": "猫体系", "term": "猫体系"},
+    {"id": "猫机制", "term": "猫机制"},
+    {"id": "数据标注处理流程", "term": "数据标注处理流程"},
+    {"id": "数据标注审核流程", "term": "数据标注审核流程"},
+    # 单字 id：与它成对必须靠"短卡兜底"（差 4 字以内）；差 5 字的「猫科动物类」不许成对
+    {"id": "猫", "term": "猫"},
+    {"id": "猫科动物", "term": "猫科动物"},
+    {"id": "猫科动物类", "term": "猫科动物类"},
+    {"id": 5, "term": "非字符串 id"},
+    {"id": None, "term": "None id"},
+    {"id": {}, "term": "字典 id"},
+    {"id": [], "term": "列表 id"},
+    {"id": "", "term": "空 id"},
+    {"id": "重复卡", "term": "重复卡"},
+    {"id": "重复卡", "term": "同一 id 的第二张（a==b 不成对）"},
+]}
+
+# 改前实现在 _FX_TRICKY_KBS 上的**全量**结果（limit 取大）：10 条，顺序也是它的顺序。
+_FX_TRICKY_DUPS = [
+    ("机器学习", "机器学习算法", "包含"),
+    ("省略恢复", "省略识别及恢复", "插入式"),
+    ("训练体系", "训练机制", "同义后缀"),
+    ("猫体系", "猫机制", "同义后缀"),
+    ("猫体系", "猫", "包含"),
+    ("猫机制", "猫", "包含"),
+    ("数据标注处理流程", "数据标注审核流程", "首尾相近"),
+    ("猫", "猫科动物", "包含"),
+    ("猫", "猫科动物类", "包含"),
+    ("猫科动物", "猫科动物类", "包含"),
+]
+
+# 40 张「概念N号」：配对远多于默认 limit=20 ⇒ 钉住"截断的是**扫描顺序的前 20 条**"。
+_FX_LIMIT40_KBS = _fx_kb(["概念%d号" % i for i in range(40)])
+_FX_LIMIT40_DUPS = [
+    ("概念0号", "概念10号", "插入式"),
+    ("概念0号", "概念20号", "插入式"),
+    ("概念0号", "概念30号", "插入式"),
+    ("概念1号", "概念10号", "插入式"),
+    ("概念1号", "概念11号", "插入式"),
+    ("概念1号", "概念12号", "插入式"),
+    ("概念1号", "概念13号", "插入式"),
+    ("概念1号", "概念14号", "插入式"),
+    ("概念1号", "概念15号", "插入式"),
+    ("概念1号", "概念16号", "插入式"),
+    ("概念1号", "概念17号", "插入式"),
+    ("概念1号", "概念18号", "插入式"),
+    ("概念1号", "概念19号", "插入式"),
+    ("概念1号", "概念21号", "插入式"),
+    ("概念1号", "概念31号", "插入式"),
+    ("概念2号", "概念12号", "插入式"),
+    ("概念2号", "概念20号", "插入式"),
+    ("概念2号", "概念21号", "插入式"),
+    ("概念2号", "概念22号", "插入式"),
+    ("概念2号", "概念23号", "插入式"),
+]
+
+_FX_DIRTY200_DUPS = [
+    ("多态演练优化", "多态的演练优化", "插入式"),
+    ("对象优化演练", "对象优化演练方法", "包含"),
+    ("故障向量副本", "故障的向量副本", "插入式"),
+]
+_FX_DIRTY1000_DUPS = [
+    ("多态演练优化", "多态的演练优化", "插入式"),
+    ("对象优化演练", "对象优化演练方法", "包含"),
+    ("故障向量副本", "故障的向量副本", "插入式"),
+    ("属性系统堆栈", "属性系统堆栈方法", "包含"),
+    ("适配接口正则", "适配的接口正则", "插入式"),
+    ("数据指标排序", "数据指标排序方法", "包含"),
+    ("注入回滚备份", "注入的回滚备份", "插入式"),
+    ("缓存对齐微调", "缓存对齐微调方法", "包含"),
+    ("训练反射限流", "训练的反射限流", "插入式"),
+    ("分区限流单例", "分区限流单例方法", "包含"),
+    ("向量嵌入滑动", "向量的嵌入滑动", "插入式"),
+    ("闭包迁移迭代", "闭包迁移迭代方法", "包含"),
+    ("告警闭包分区", "告警的闭包分区", "插入式"),
+]
+# 2000 卡（干净夹具）上的两条意外同义后缀配对 —— 也是"旧实现不可能提前返回"的反证（2 < limit）。
+_FX_CLEAN2000_DUPS = [
+    ("作用一致规范", "作用一致标准", "同义后缀"),
+    ("调试升级策略", "调试升级机制", "同义后缀"),
+]
+
+
+class FindDuplicatesPruningTest(IsolatedCase):
+    """批 6.3：`find_duplicates` 的 O(N²) 剪枝（**判据与顺序一字不改，只少比较**）。
+
+    剪枝思路（细节与证明见 `kb._block_keys` 的 docstring）：先用**一次线性扫描**给每张卡建
+    索引键，只对"键与别人撞上"的卡两两比较。判据完全没动 —— 候选集是原判据的**超集**，
+    所以结果逐条相同；`limit` 的截断顺序也不变（仍按 (i, j) 升序）。
+
+    **本组用例的"红"法（诚实说明）**：等价性用例在改前**是绿的** —— 因为期望值就是从改前
+    实现冻出来的，"行为不变"本来就该绿。改前真正红的是两条 2000 卡用例：
+    旧实现要比较 2000×1999/2 = 1,999,000 次、实测 5.8~6.1s，两条断言都过不去。
+    """
+
+    def test_pruned_result_matches_the_reference_on_small_fixtures(self):
+        """N=50/200：剪枝结果与**改前实现**逐条相同（含顺序）。"""
+        for n in (50, 200):
+            for terms in (_fx_terms(n), _fx_variant_terms(n)):
+                data = _fx_kb(terms)
+                self.assertEqual(kb.find_duplicates(data, limit=10 ** 9),
+                                 _reference_find_duplicates(data, limit=10 ** 9),
+                                 "剪枝改变了判据（N=%d）" % n)
+
+    def test_pruned_result_matches_the_frozen_expected_on_medium_fixtures(self):
+        """N=200/1000/2000：与**改前跑出来存死的期望值**逐条相同（顺序也相同）。
+
+        N=1000/2000 不再跑对照实现（全量两两要 1.5s / 6s，白等），改用冻死的期望值 ——
+        它们同样是"改前的结果"，只是提前算好写在这里。
+        """
+        cases = [
+            (_fx_kb(_fx_variant_terms(200)), _FX_DIRTY200_DUPS),
+            (_fx_kb(_fx_variant_terms(1000)), _FX_DIRTY1000_DUPS),
+            (_fx_kb(_fx_terms(2000)), _FX_CLEAN2000_DUPS),
+        ]
+        for data, expected in cases:
+            self.assertEqual(_fx_triples(kb.find_duplicates(data, limit=10 ** 9)), expected)
+        # 干净夹具上一条都不许多出来（否则"2000 卡"那条的耗时就没有判别力了）
+        self.assertEqual(_fx_triples(kb.find_duplicates(_fx_kb(_fx_terms(1000)), limit=10 ** 9)), [])
+
+    def test_tricky_cards_still_pair_up_exactly_as_before(self):
+        """四种判据 + 单字 id + 非字符串/空 id + term 与 id 不一致：11 条期望值一字不差。"""
+        self.assertEqual(_fx_triples(kb.find_duplicates(_FX_TRICKY_KBS, limit=10 ** 9)),
+                         _FX_TRICKY_DUPS)
+        # 默认 limit=20 时上面这 10 条还装得下 ⇒ 与全量相同
+        self.assertEqual(_fx_triples(kb.find_duplicates(_FX_TRICKY_KBS)), _FX_TRICKY_DUPS)
+
+    def test_limit_still_truncates_the_same_scan_order_prefix(self):
+        """`limit` 截断的必须是**扫描顺序的前 limit 条**（剪枝不许改变 (i, j) 的遍历顺序）。"""
+        self.assertEqual(_fx_triples(kb.find_duplicates(_FX_LIMIT40_KBS)), _FX_LIMIT40_DUPS)
+        self.assertEqual(len(kb.find_duplicates(_FX_LIMIT40_KBS)), 20)
+        # 既有语义里 limit=0 不是"不限量"（`len(out) >= 0` 恒真 ⇒ 只出一条）——照旧
+        self.assertEqual(_fx_triples(kb.find_duplicates(_FX_LIMIT40_KBS, limit=0)),
+                         _FX_LIMIT40_DUPS[:1])
+        self.assertEqual(_fx_triples(kb.find_duplicates(_FX_LIMIT40_KBS, limit=1)),
+                         _FX_LIMIT40_DUPS[:1])
+
+    def test_pruning_cuts_the_number_of_pairwise_comparisons(self):
+        """2000 卡：剪枝必须真的**少比较**（确定性判据，不靠墙钟）。
+
+        改前实测：`_dup_reason` 被调 1,999,000 次（全量对）；剪枝后 159,031 次（~8%）。
+        阈值取"全量对的 1/4"（500k）：留 3 倍余量，但"把剪枝改回全量两两"必红。
+
+        ⚠️ 为什么墙钟断言**不在这条**里：`mock.patch.object(wraps=...)` 每次调用要走一层
+        MagicMock（实测 159k 次 = +1.9s），带上它测耗时就成了在测 mock 的开销 ——
+        所以耗时单独一条、不带 spy（见下一条）。
+        """
+        data = _fx_kb(_fx_terms(2000))
+        with mock.patch.object(kb, "_dup_reason", wraps=kb._dup_reason) as spy:
+            dups = kb.find_duplicates(data, limit=10 ** 9)
+        self.assertEqual(_fx_triples(dups), _FX_CLEAN2000_DUPS, "剪枝改变了判据")
+        total_pairs = 2000 * 1999 // 2
+        self.assertLess(len(_FX_CLEAN2000_DUPS), 20,
+                        "反证：这张夹具上旧实现不可能提前返回（命中数 < limit），比较次数才有判别力")
+        self.assertLess(spy.call_count, total_pairs // 4,
+                        "剪枝没起作用：_dup_reason 调了 %d 次（全量 %d 次）"
+                        % (spy.call_count, total_pairs))
+
+    def test_2000_cards_stay_under_the_wall_clock_budget(self):
+        """次判据（宽松，别当唯一证据）：2000 卡剪枝后墙钟 < 2s。
+
+        改前实测 5.79~6.12s（干净库也不提前返回），剪枝后本机 ~0.62s ⇒ 3 倍余量。
+        这是纯墙钟断言，所以**不带 spy**（理由见上一条）。
+        """
+        data = _fx_kb(_fx_terms(2000))
+        t0 = time.perf_counter()
+        dups = kb.find_duplicates(data, limit=10 ** 9)
+        elapsed = time.perf_counter() - t0
+        self.assertEqual(_fx_triples(dups), _FX_CLEAN2000_DUPS, "剪枝改变了判据")
+        self.assertLess(elapsed, 2.0,
+                        "2000 张卡剪枝后仍要 %.2fs（改前实测 5.8~6.1s）" % elapsed)
+
+
 class ManualMergeTest(IsolatedCase):
     def test_merge_moves_sources_and_records_alias(self):
         kb.absorb([_node(term="省略恢复", sources=[_src("https://a")])], {"id": "j1"})

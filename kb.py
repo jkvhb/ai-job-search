@@ -1127,22 +1127,112 @@ def _dup_reason(a, b):
     return None
 
 
+# ---------------------------------------------------------------- find_duplicates 的剪枝索引
+# 批 6.3：原来是**无条件**两两比较（O(N²)），库很干净也不提前返回 —— 145 卡 0.03s、
+# 1000 卡 1.52s、2000 卡 5.71s，而 /api/knowledge 每次打开知识库 tab 都全量重算。
+# 剪枝只回答"这张卡**可能**跟谁重复"：候选集必须是真配对的**超集**，撞上之后仍由
+# `_dup_reason` 说了算 ⇒ 判据、结果、顺序、`limit` 截断语义一个字都不用改。
+#
+# `_MAX_LEN_GAP = 4`：`_dup_reason` 里「包含」「插入式」两处长度差门槛都是 4。
+_MAX_LEN_GAP = 4
+# 短串的一个相邻字对，在长串里两字之间最多夹进 4 个插入字 ⇒ 距离 ≤ 1 + 4 = 5。
+_PAIR_MAX_GAP = _MAX_LEN_GAP + 1
+# 「同义后缀」的词干键让"单字 id"的兜底池半径还可能被后缀词撑大（词干 1 字 + 最长后缀词）
+_TAIL_MAX_LEN = max(len(w) for w in _TAIL_WORDS)
+
+
+def _block_keys(s):
+    """`s` **若与别的卡重复就必然与对方共享**的索引键（`find_duplicates` 的剪枝索引）。
+
+    ⚠️ 方向不能反：这里给的是"真配对 ⇒ 共享某键"的**必要条件**，所以宁可多给键（多比较几对），
+    也绝不能漏键（漏一个键就会漏掉一对真重复 —— 那正是"剪枝改变了判据"）。
+
+    为什么这几类键够用（`d = |len(长) - len(短)|`；下面用到的三种判据都要求 `d ≤ 4`）：
+
+      ① 「包含」：短的是长的**连续子串** ⇒ 短串的每个相邻字对在长串里也**相邻**（距离 1）。
+      ② 「插入式」：短的是长的**子序列**且 `d ≤ 4` ⇒ 长串 = 短串 + 最多 4 个插入字，于是短串的
+         每个相邻字对在长串里的距离 ≤ 1 + 4 = 5。两边都生成"距离 1..5 的有序字对"，
+         所以短串那一对（距离 1）与长串那一对（距离 ≤5）是**同一个键值**。
+         单看"距离 1"是不够的：插入式配对常常一个相邻字对都不剩
+         （「省略恢复」vs「省略识别及恢复」里 `略|恢` 就被「识别及」拆开了，靠 `省|恢` 这类
+         距离 ≤5 的字对才撞得上）。
+      ③ 「同义后缀」：`_strip_tail` 之后的词干相同 ⇒ 直接把词干当键。
+         **这一条不能省**：词干可能只剩 1 个字（「猫体系」/「猫机制」），两边没有任何共享字对。
+      ④ 「首尾相近」：要求前 4 字相同 ⇒ 至少共享一个相邻字对（已被 ①②的字对键覆盖）。
+
+    边界：长度 ≤ 1 的 id 没有任何字对，也没有词干可用，由调用方的"单字兜底"逐对比较
+    （见 `_candidate_pairs`）——那种卡在真实库里是畸形数据，逐对比一遍最省心也最不容易错。
+    """
+    keys = set()
+    n = len(s)
+    for gap in range(1, _PAIR_MAX_GAP + 1):
+        for i in range(n - gap):
+            keys.add(("字对", s[i], s[i + gap]))
+    keys.add(("词干", _strip_tail(s)))
+    return keys
+
+
+def _candidate_pairs(ids):
+    """可能重复的下标对 `(i, j)`（`i < j`，按升序给出）—— **一次线性扫描**建索引得来。
+
+    键只被一张卡持有的那些卡直接跳过：一个键只出现一次 ⇒ 它不可能与任何卡重复
+    （这正是批 6.3 要的剪枝；库很干净时几乎全部卡片都被跳过，于是"干净库"是**快**的，
+    而不是"照样把 N² 跑完"）。
+    """
+    n = len(ids)
+    buckets = {}
+    for i, s in enumerate(ids):
+        for key in _block_keys(s):
+            bucket = buckets.get(key)
+            if bucket is None:
+                buckets[key] = [i]
+            else:
+                bucket.append(i)
+    cand = set()
+    for bucket in buckets.values():
+        if len(bucket) < 2:
+            continue
+        for x in range(len(bucket)):
+            ix = bucket[x]
+            for y in range(x + 1, len(bucket)):
+                iy = bucket[y]
+                cand.add(ix * n + iy if ix < iy else iy * n + ix)
+    # 单字 id（长度 ≤ 1）的兜底：它没有字对键，只可能靠「包含」与长度 ≤ 1+4 的卡成对
+    # （「同义后缀」那条被词干键覆盖了：词干只剩 1 字 ⇒ 对方长度 ≤ 1 + 最长后缀词 = 3，也在这个池子里）。
+    # 这类卡极少，逐个跟"短卡池"比一遍即可 —— 宁可多比，绝不漏对。
+    singles = [i for i, s in enumerate(ids) if len(s) <= 1]
+    if singles:
+        pool_radius = max(_MAX_LEN_GAP + 1, 1 + _TAIL_MAX_LEN)
+        short_pool = [i for i, s in enumerate(ids) if len(s) <= pool_radius]
+        for i in singles:
+            for j in short_pool:
+                if i != j:
+                    cand.add(i * n + j if i < j else j * n + i)
+    return sorted(cand)
+
+
 def find_duplicates(kb, limit=20):
     """启发式找出可能指同一概念的术语对。**只提示，绝不自动合并**（错并难发现）。
 
     只取字符串 id：知识库可被用户手改出 `"id": 5`，非字符串既无法比较大小写与包含关系，
     也会在 `5 in "abc"` 处抛 TypeError。
+
+    批 6.3 起**先剪枝再两两比较**（原来是纯 O(N²)，库很干净也不提前返回）：先按 `_block_keys`
+    建一次线性索引，只比较"索引键与别人撞上"的卡。判据与顺序**一字不改**：
+    候选集是 `_dup_reason` 真配对的超集，遍历次序仍是 (i, j) 升序，所以 `limit` 截断的
+    仍是同样的前 limit 条（含 `limit=0` 时只出一条这个既有怪语义）。
     """
     ids = [n.get("id") for n in ensure_kb(kb)["nodes"]
            if isinstance(n.get("id"), str) and n.get("id")]
     out = []
-    for i in range(len(ids)):
-        for j in range(i + 1, len(ids)):
-            reason = _dup_reason(ids[i], ids[j])
-            if reason:
-                out.append({"a": ids[i], "b": ids[j], "reason": reason})
-                if len(out) >= limit:
-                    return out
+    n = len(ids)
+    for packed in _candidate_pairs(ids):
+        i, j = divmod(packed, n)
+        reason = _dup_reason(ids[i], ids[j])
+        if reason:
+            out.append({"a": ids[i], "b": ids[j], "reason": reason})
+            if len(out) >= limit:
+                return out
     return out
 
 
