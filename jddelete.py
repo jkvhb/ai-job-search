@@ -194,13 +194,14 @@ def _digest(text):
 def _fingerprint_of(plan):
     """执行确认用的指纹：把"将要删什么"压成一个短串。
 
-    预演与执行之间数据变了（多了/少了一条分析、换了一份报告）→ 指纹变 →
-    `purge_jd` 拒绝执行。用户确认的是**那一份**清单，不是另一份。
+    预演与执行之间数据变了（多了/少了一条分析、换了一份报告、**多/少了一条会被清掉的
+    悬空合并引用**）→ 指纹变 → `purge_jd` 拒绝执行。用户确认的是**那一份**清单，不是另一份。
 
-    ⚠️ 只认 `_plan` 的**内部形状**（`"analyses"`/`"files"`/`"kb_cards"`/`"interviews"`）：
-    三个调用点（`preview_purge`、`purge_jd` 的两处比对）传的全部是 `_plan` 的返回值。
-    `preview_purge` 摊平后的**对外形状**（引用摆成 `refs.knowledge.cards`）从不经过这里 ——
-    它自己也带着 `analyses` 这份同样的内部投影，所以那份形状连"另一种投影"都算不上。
+    ⚠️ 只认 `_plan` 的**内部形状**（`"analyses"`/`"files"`/`"kb_cards"`/`"interviews"`/
+    `"merged_refs"`）：三个调用点（`preview_purge`、`purge_jd` 的两处比对）传的全部是
+    `_plan` 的返回值。`preview_purge` 摊平后的**对外形状**（引用摆成 `refs.knowledge.cards`）
+    从不经过这里 —— 它自己也带着 `analyses` 这份同样的内部投影，所以那份形状连"另一种投影"
+    都算不上。
     """
     parts = ["jd=" + str(plan.get("id") or "")]
     parts += ["a=" + str(a.get("id") or "") + ":" + str(a.get("report") or "")
@@ -210,6 +211,10 @@ def _fingerprint_of(plan):
     parts += ["k=" + str(c.get("id") or "") + ":" + str(c.get("hits") or 0)
               for c in plan["kb_cards"]]
     parts += ["i=" + str(r.get("id") or "") for r in plan["interviews"]]
+    # 批 7.2：这次**顺带**要清的悬空合并引用也是"将要动什么"的一部分 —— 用户确认的那份清单里
+    # 写着"会顺带清理 N 条"，N 变了（多一条 / 少一条）就不是同一份清单了。
+    parts += ["m=" + str(r.get("id") or "") + ":" + str(r.get("merged_into") or "")
+              for r in (plan.get("merged_refs") or [])]
     return _digest("\n".join(parts))
 
 
@@ -229,6 +234,44 @@ def _analyses_of(jd_id, rows=None):
 def _report_name(rec):
     """一条分析报告的文件名（走 `safe_name`，挡越级路径）。没有 → 空串。"""
     return store.safe_name(rec.get("report")) if isinstance(rec, dict) else ""
+
+
+def _purge_identities(jd_id, rows):
+    """这次真删会**从台账里消失**的身份集合：这个 JD 的 id + 挂在它下面每条分析的 id。
+
+    为什么两套身份都要收（批 7.2）：`merged_into` 记的是**一个台账身份**，而台账里两套身份
+    并存（迁移后 `jd_id`、迁移前 `id`，见文件头"两套口径"）—— `jobdup.merge_jobs` 收到的
+    是 `jobs.json` 记录的 `id`，所以写下的 `merged_into` **可能指向分析 id，而不是 JD id**。
+    只认 `jd_id` 的话，"合并目标没了"会漏掉那一半，被合并的记录照样永久消失在台账里。
+    """
+    gone = {jd_id} if jd_id else set()
+    for rec in rows:
+        if _jd_id_of_record(rec) == jd_id:
+            rid = _text(rec.get("id"))
+            if rid:
+                gone.add(rid)
+    return gone
+
+
+def _dangling_merged_refs(jd_id, rows):
+    """删除这个 JD 之后会**悬空**的 `merged_into` → `[{id, merged_into, jd_id, report}]`。
+
+    **只读**（预演直接列它）。判据刻意**不是**"`merged_into` 现在指不到东西"：那种"本来就
+    悬空"的记录属于另外的体检项，删除不该顺手改与它无关的记录 —— 这里算的是**这次删除会弄断
+    的那一批**（指向 `_purge_identities` 里任何一个身份）。
+
+    要跟着记录一起被删掉的那些不列：它们没有"清引用"这回事（记录本身没了）。
+    """
+    gone = _purge_identities(jd_id, rows)
+    out = []
+    for rec in rows:
+        if not isinstance(rec, dict) or _jd_id_of_record(rec) == jd_id:
+            continue
+        target = _text(rec.get("merged_into"))
+        if target and target in gone:
+            out.append({"id": str(rec.get("id") or ""), "merged_into": target,
+                        "jd_id": _jd_id_of_record(rec), "report": _report_name(rec)})
+    return out
 
 
 def _referenced_by_survivors(jd_id, rows=None):
@@ -336,6 +379,9 @@ def _plan(jd_id):
     # 两个"会被覆盖"的文件的读失败合并成一个 `unreadable`（对外只暴露一个字段）。
     unreadable = "；".join(x for x in (jobs_err, jds_err) if x)
     analyses = _analyses_of(jd_id, rows) if jd_id else []
+    # 批 7.2：删除**之后**会悬空的 `merged_into`（指向这次要删掉的身份、但记录挂在别的 JD 下）。
+    # 它们不会随记录一起消失，所以必须单独清、而且必须**先在预演里列出来**。
+    merged_refs = _dangling_merged_refs(jd_id, rows) if jd_id else []
     if jd is None and not analyses:
         if unreadable:
             return {"id": jd_id, "jd": None, "found": True, "unreadable": unreadable,
@@ -352,6 +398,16 @@ def _plan(jd_id):
         advisories.append({"kind": "unreadable_knowledge", "message":
                            "%s —— 这次**不会**清理指向它的引用（卡片保留、文件不重写），"
                            "但删除本身照做" % kb_err})
+    # 批 7.2：**先说出来**再动手 —— 否则用户不知道这次删除会顺带改别的记录。
+    if merged_refs:
+        advisories.append({"kind": "dangling_merged", "message":
+                           "这次会**顺带清理 %d 条悬空合并引用**：有 %d 条已合并记录的 "
+                           "`merged_into` 指向这个岗位（或它名下的分析）。删除之后它们会指向一个"
+                           "不存在的 id，而台账会把 `merged_into` 非空的记录全部过滤掉 —— "
+                           "这些记录就会**永久消失、也再也删不掉**。清理只去掉那个标记"
+                           "（记录本身保留），清完它们重新出现在台账里：%s"
+                           % (len(merged_refs), len(merged_refs),
+                              "、".join(str(r.get("id") or "（无 id）") for r in merged_refs))})
     # ① 每一条分析的报告文件（**逐条**列，哪怕两条分析引同一份也只列一次并说明）
     survivors = _referenced_by_survivors(jd_id, rows)
     for rec in analyses:
@@ -435,6 +491,7 @@ def _plan(jd_id):
             "knowledge_err": kb_err,
             "analyses": analyses, "files": files,
             "kb_cards": _kb_hits(jd_id, _kb_data), "interviews": _interview_hits(jd_id),
+            "merged_refs": merged_refs,
             "advisories": advisories}
 
 
@@ -470,11 +527,19 @@ def preview_purge(jd_id):
       "files":    [{"name","where","kind","exists","kept","note","why"}],
       "refs": {"knowledge": {"hits": 2, "cards": [{id,term,hits,other_sources}],
                              "cards_kept": 2, "note": "只清引用，卡片保留"},
-               "interviews": {"hits": 1, "records": [{id,title}]}},
-      "summary": {"analyses": 2, "files": 3, "reports": 2, "kb_hits": 2, "interviews": 1},
+               "interviews": {"hits": 1, "records": [{id,title}]},
+               "merged": {"hits": 1, "records": [{id,merged_into,jd_id,report}],
+                          "note": "只清 `merged_into`，记录重新出现在台账里"}},
+      "summary": {"analyses": 2, "files": 3, "reports": 2, "kb_hits": 2, "interviews": 1,
+                  "merged_hits": 1},
       "advisories": [{"kind","message"}],
       "not_found": "..."}          # 找不到时非空（给用户看的那句话）
     ```
+
+    `refs.merged`（批 7.2）= 这次删除会**顺带清理**的悬空合并引用：`merged_into` 指向这个岗位
+    （或它名下某条分析）的记录。**必须先列出来** —— 否则用户看不出这次删除会动别的记录。
+    清理后它们不再带 `merged_into`，于是重新成为台账里的一行（`app._ledger_rows()` 的过滤
+    规则一个字不动）。
 
     **`can_purge=false` 有**两个**原因**（前端只认这一个字段，不必区分）：
       1. `found=false`（**这个 ID 根本不存在**）—— 路由对那一支回 404；
@@ -497,9 +562,10 @@ def preview_purge(jd_id):
                 "not_found": reason, "reason": reason,
                 "jd_record": None, "analyses": [], "files": [],
                 "refs": {"knowledge": {"hits": 0, "cards": [], "cards_kept": 0, "note": ""},
-                         "interviews": {"hits": 0, "records": []}},
+                         "interviews": {"hits": 0, "records": []},
+                         "merged": {"hits": 0, "records": [], "note": ""}},
                 "summary": {"analyses": 0, "files": 0, "reports": 0, "kb_hits": 0,
-                            "interviews": 0},
+                            "interviews": 0, "merged_hits": 0},
                 "advisories": []}
     advisories = list(plan["advisories"])
     if plan["jd"] is None:
@@ -520,6 +586,7 @@ def preview_purge(jd_id):
              for f in plan["files"]]
     kb_cards = plan["kb_cards"]
     interviews = plan["interviews"]
+    merged_refs = plan["merged_refs"]
     unreadable = str(plan.get("unreadable") or "")
     return {
         "ok": True, "id": jd_id, "found": True, "jd_exists": plan["jd"] is not None,
@@ -539,18 +606,25 @@ def preview_purge(jd_id):
                      "cards": kb_cards, "cards_kept": len(kb_cards),
                      "note": "只清 `from_jds` 里指向它的条目，**卡片本身保留**（知识是通用的）"},
                  "interviews": {"hits": len(interviews), "records": interviews,
-                                "note": "只把 `job_id` 清空，**面试记录本身保留**"}},
+                                "note": "只把 `job_id` 清空，**面试记录本身保留**"},
+                 "merged": {
+                     "hits": len(merged_refs), "records": merged_refs,
+                     "note": "这次会顺带清理的**悬空合并引用**：只去掉 `merged_into` 那个标记"
+                             "（记录本身保留），清完它们**重新出现在台账里**（合并目标已经没了，"
+                             "再把它们过滤掉就是永久看不见、也删不掉）"}},
         "summary": {"analyses": len(analyses),
                     "files": len(files),
                     "reports": len([f for f in files if f["kind"] == "analysis_report"]),
                     "kb_hits": sum(c["hits"] for c in kb_cards),
-                    "interviews": len(interviews)},
+                    "interviews": len(interviews),
+                    "merged_hits": len(merged_refs)},
         "advisories": advisories,
         # ---- 内部键（带下划线）：`purge_jd` 的指纹与删除都只读它们，绝不读摊平后的那份 ----
         "_analyses": plan["analyses"],
         "_files": plan["files"],
         "_kb_cards": kb_cards,
         "_interviews": interviews,
+        "_merged_refs": merged_refs,
     }
 
 
@@ -689,17 +763,36 @@ def _tick():
 
 
 def _drop_jd_records(jobs, jd_id):
-    """`store.update_jobs` 用的 `fn`：把挂在这个 JD 下面的分析记录摘掉。
+    """`store.update_jobs` 用的 `fn`：摘掉挂在这个 JD 下面的分析记录，**并清掉会悬空的
+    `merged_into`**（批 7.2）。
 
-    返回 `(要写回的列表, 删除的条数)`。**总是返回列表**（而不是 `None`）：本模块这一处历来是
-    "无条件写回"（`save_jobs` 顺带负责留档 + 轮转），改成就地跳过会改变留档节奏 = 改对外行为。
+    返回 `(要写回的列表, {"analyses": 删除条数, "merged": 清掉的引用条数,
+    "records": [{id,merged_into,jd_id}]})`。**总是返回列表**（而不是 `None`）：本模块这一处
+    历来是"无条件写回"（`save_jobs` 顺带负责留档 + 轮转），改成就地跳过会改变留档节奏 =
+    改对外行为。
+
+    为什么必须在这里清（而不是另开一次读-改-写）：`app._ledger_rows()` 会把 `merged_into`
+    非空的记录全部过滤掉（那是**有意**的）。合并目标被真删之后，那些记录的 `merged_into`
+    就指向一个**已经不存在的 id** —— 过滤规则照样命中 ⇒ 它们在台账里**永久消失、也删不掉**
+    （报告与 JD 原文还占着盘）。语义是「**合并目标没了 ⇒ 被合并的那条记录重新可见**」，
+    所以只清**指向这次会被删掉的身份**的那一批（`_purge_identities`），指向别的存活岗位的
+    一条都不动。
 
     判据与 `_analyses_of` 同一口径（`_jd_id_of_record`：`jd_id` 优先、退回 `id`）。
     ⚠️ 只改内存：它是在 `_JOBS_LOCK` 里跑的，而调用方还持着 `_JD_LOCK` + `_KB_LOCK`
     （与原来在同一行调 `save_jobs` 取的是**同一把**锁，锁序逐边不变）。
     """
     kept = [j for j in jobs if _jd_id_of_record(j) != jd_id]
-    return kept, len(jobs) - len(kept)
+    gone = _purge_identities(jd_id, jobs)
+    cleared = []
+    for j in kept:
+        target = _text(j.get("merged_into")) if isinstance(j, dict) else ""
+        if target and target in gone:
+            j.pop("merged_into", None)
+            cleared.append({"id": str(j.get("id") or ""), "merged_into": target,
+                            "jd_id": _jd_id_of_record(j)})
+    return kept, {"analyses": len(jobs) - len(kept),
+                  "merged": len(cleared), "records": cleared}
 
 
 def _interview_updates(planned_interviews):
@@ -729,7 +822,7 @@ def purge_jd(jd_id, expect_fingerprint=""):
     """**真删**：备份 → 删记录 + 删文件 + 清引用；任何一步失败就从备份**逐字节**回滚。
 
     返回 `{"ok": True, "id", "backup", "removed_files", "skipped_files", "analyses",
-             "kb_hits", "interviews"}`；失败抛 `JdPurgeError`（此时**已经回滚**）。
+             "kb_hits", "interviews", "merged_refs"}`；失败抛 `JdPurgeError`（此时**已经回滚**）。
 
     `expect_fingerprint` 非空时，与当前计划的指纹比对：不一致 → 拒绝执行
     （用户确认的是预演时那份清单）。
@@ -858,7 +951,11 @@ def _purge_locked(jd_id, plan):
         # 会被整份顶掉。现在判据挪进临界区、作用在**刚读出来**的那份上。
         # ⚠️ 无条件写回（哪怕这次一条都没删）：刻意保留老行为 —— `save_jobs` 同时负责
         # 判据 + `.bak-` 留档 + 轮转，改成就地跳过会改变留档节奏（那是对外行为）。
-        store.update_jobs(lambda jobs: _drop_jd_records(jobs, jd_id))
+        #
+        # 批 7.2：**清悬空 `merged_into` 也在同一次 `fn` 里**（`_drop_jd_records` 里做）：
+        # 另开一次读-改-写就是又一次"跨多次 store 调用的复合 RMW"，而且两条记录的状态会
+        # 在两次写之间被人看见（记录已删、标记还悬空）。`fn` 只改内存，不动锁序。
+        dropped = store.update_jobs(lambda jobs: _drop_jd_records(jobs, jd_id))
         _tick()
         # 2d) 引用：知识库只清 `from_jds` 条目、面试记录只清 `job_id`
         # 知识库那一段走 kb 的窄接口：它自己持 `_KB_LOCK` 把整段读-改-写做完（坏库时
@@ -887,7 +984,7 @@ def _purge_locked(jd_id, plan):
         log.log_event("jd.purged", jd=jd_id, backup=os.path.basename(backup),
                       files=len(removed), skipped=len(skipped),
                       analyses=len(target_ids), kb_nodes=kb_touched,
-                      interviews=len(iv_updates))
+                      interviews=len(iv_updates), merged_refs=dropped["merged"])
     except Exception:
         pass                        # 日志写不进去不该让一次已经成功的删除算失败
     return {"ok": True, "id": jd_id, "backup": backup,
@@ -900,7 +997,10 @@ def _purge_locked(jd_id, plan):
             "analyses": sorted(target_ids),
             "kb_hits": len([c for c in plan["kb_cards"]]),
             "kb_nodes": kb_touched,
-            "interviews": len(iv_updates)}
+            "interviews": len(iv_updates),
+            # 批 7.2：这次**顺带**清掉的悬空合并引用（预演里已经列过的那批）。回给前端是为了
+            # 让"删除顺手动了别的记录"这件事在结果里也说得清，而不是只出现在预演里。
+            "merged_refs": {"hits": dropped["merged"], "records": dropped["records"]}}
 
 
 def _rollback(backup, originals, mtimes, to_delete, iv_before):

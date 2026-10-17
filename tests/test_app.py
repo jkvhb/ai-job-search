@@ -1691,6 +1691,35 @@ class LedgerFilterTest(_AnalyzeRouteCase):
         self.assertFalse(body.get("ok"))
         self.assertEqual(jdid.find_jd("d")["job_title"], "语音/文本评测")   # 盘上确实没被改
 
+    def test_purging_the_merge_target_revives_the_merged_record(self):
+        """批 7.2（体检报告 §8 结构性第 2 条）：删掉**合并目标**之后，被合并的那条记录必须重新可见。
+
+        缺陷形状：`d` 的 `merged_into` 指向 `k`；真删 `k` 之后这条引用**悬空**，而
+        `_ledger_rows()`（`merged_into` 非空就跳过，见其 docstring）照样把它过滤掉 ⇒
+        `d` 从台账里永久消失（界面上看不见、也点不到"删除"），它的报告与 JD 原文还占着盘。
+        修法：删除时把**指向被删岗位的** `merged_into` 清掉（过滤规则一个字不动）。
+        """
+        # 合并两个岗位：k 保留、d 并入（真实合并写下的就是 `merged_into: k`）
+        self._old_job("k")
+        self._old_job("d", merged_into="k")
+        code, body = self._get("/api/jobs")
+        self.assertEqual(code, 200)
+        self.assertEqual([j["id"] for j in body["jobs"]], ["k"])
+        # ① 预演要**先说出来**：这次会顺带清理 1 条悬空合并引用（用户才知道会动别的记录）
+        code, prev = self._get("/api/jd/purge_preview?jd=k")
+        self.assertEqual(code, 200, prev)
+        self.assertEqual(prev["refs"]["merged"]["hits"], 1, prev["refs"])
+        self.assertEqual([r["id"] for r in prev["refs"]["merged"]["records"]], ["d"])
+        # ② 真删合并目标
+        code, body = self._post_json("/api/jd/purge", {"id": "k"})
+        self.assertEqual(code, 200, body)
+        # ③ 悬空引用被清掉 ⇒ `d` 重新成为台账里的一行（这就是「重新可见」）
+        self.assertEqual([j["id"] for j in body["jobs"]], ["d"],
+                         "被合并的记录没有重新出现在台账里：它在界面上永久消失、也删不掉")
+        rec = [j for j in store.load_jobs() if j.get("id") == "d"][0]
+        self.assertNotIn("merged_into", rec,
+                         "合并目标已经没了，`merged_into` 还留着 ⇒ 这条记录会被永久过滤掉")
+
 
 # ⚠️ 本块的核心不变量：**同一份 JD 分析两次 → 只有 1 个 JD、2 份分析**。
 # 「报告文件名 = 岗位身份」那个根因（文件名里嵌日期+分数）就是靠它根除的。

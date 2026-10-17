@@ -2955,6 +2955,9 @@ class Handler(BaseHTTPRequestHandler):
                                     "analyses": res["analyses"],
                                     "kb_nodes": res["kb_nodes"],
                                     "interviews": res["interviews"],
+                                    # 批 7.2：这次顺带清掉了几条悬空合并引用（预演里已列过）。
+                                    # 它们清完之后重新成为台账里的一行 —— `jobs` 里就能看见。
+                                    "merged_refs": res["merged_refs"],
                                     "jobs": rows})
 
         if p == "/api/job/result":

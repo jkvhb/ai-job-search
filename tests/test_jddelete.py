@@ -28,6 +28,7 @@ from unittest import mock
 import app
 import jddelete
 import jdid
+import jobdup
 import kb
 import store
 from tests.base import IsolatedCase
@@ -45,6 +46,9 @@ JD_A = "本科_甲单位_标注质检_文本_北京_13-26K_0001"
 JD_B = "硕士_乙单位_语音评测_语音_上海_20-30K_0002"
 A1, A2 = "20261001_甲岗_66分", "20261005_甲岗_72分"
 B1 = "20261006_乙岗_88分"
+# 第三个岗位（批 7.2 的**对照组**：删它不许动任何 `merged_into`）
+JD_C = "本科_丙单位_运营_文本_广州_9-12K_0003"
+C1 = "20261007_丙岗_70分"
 JD_A_TEXT = "统本标注（视频标注）：负责数据质检验收，熟悉 ASR 与 TTS 评测流程。" * 3
 JD_B_TEXT = "语音/文本评测：负责语音数据质检与 Bad Case 归因。" * 3
 
@@ -392,6 +396,97 @@ class JdPurgeExecuteTest(_PurgeCase):
         self.assertIn("别的 JD", "\n".join(str(s.get("why") or "") for s in res["skipped_files"]))
         # A 那份**没被别人用**的报告照旧被删（不是"因为有一份要留就全都不删"）
         self.assertFalse(os.path.exists(self._report(A2 + ".html")))
+
+
+class MergedRefCleanupTest(_PurgeCase):
+    """批 7.2（体检报告 §8 结构性第 2 条）：**一条记录会永久从台账消失**。
+
+    缺陷形状：`jobdup.merge_jobs` 只打 `merged_into` 标记、不删记录；`app._ledger_rows()`
+    把 `merged_into` 非空的记录全部过滤掉（那是**有意**的：合并掉的记录不该显示）。
+    于是真删掉**合并目标**之后，被合并那条的 `merged_into` 指向一个**已经不存在的 id**，
+    过滤规则照样命中 ⇒ 它从台账里永久消失、也删不掉，报告与 JD 原文还占着盘。
+
+    修法（语义 = 「合并目标没了 ⇒ 被合并的那条记录重新可见」）：删除时把**指向这次会被删掉
+    的任何身份**的 `merged_into` 清掉 —— 而 `app._ledger_rows()` 的过滤规则一个字不动。
+    """
+
+    def _record(self, rid):
+        for j in store.load_jobs():
+            if j.get("id") == rid:
+                return j
+        self.fail("台账里已经没有记录 %s 了" % rid)
+
+    def _merged_map(self):
+        return {j.get("id"): j.get("merged_into") for j in store.load_jobs()}
+
+    def _ledger_ids(self):
+        return [r.get("id") for r in app._ledger_rows()]
+
+    def test_the_merged_record_becomes_visible_again_after_purging_the_target(self):
+        """合并 A+B ⇒ 删 A ⇒ B 那条必须重新出现在台账里（旧实现必红）。"""
+        res = jobdup.merge_jobs(A1, B1)                 # 真实的合并：B1 被打上 merged_into=A1
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(self._record(B1)["merged_into"], A1)
+        self.assertEqual(self._ledger_ids(), [JD_A])    # 合并生效：B 那一行被过滤掉了
+
+        jddelete.purge_jd(JD_A)                         # 真删掉**合并目标**
+
+        self.assertNotIn("merged_into", self._record(B1),
+                         "合并目标已经没了，`merged_into` 还留着 ⇒ 这条记录在台账里永久消失")
+        self.assertEqual(self._ledger_ids(), [JD_B], "被合并的记录没有重新出现在台账里")
+
+    def test_preview_lists_the_dangling_merge_references_it_will_clear(self):
+        """预演必须列出「这次会顺带清理 N 条悬空合并引用」—— 否则用户看不出会动别的记录。"""
+        jobdup.merge_jobs(A1, B1)
+        p = jddelete.preview_purge(JD_A)
+        merged = p["refs"]["merged"]
+        self.assertEqual(merged["hits"], 1, "预演没列出这次会顺带清理的悬空合并引用")
+        self.assertEqual([r["id"] for r in merged["records"]], [B1])
+        self.assertEqual(merged["records"][0]["merged_into"], A1)
+        self.assertEqual(p["summary"]["merged_hits"], 1)
+        text = json.dumps(p["advisories"], ensure_ascii=False)
+        self.assertIn("悬空", text)
+        self.assertIn("1 条", text)                     # 数量要念得出来，不是一个含糊的"有"
+        self.assertEqual(self._record(B1)["merged_into"], A1, "预演就改了 `merged_into`（它必须只读）")
+
+    def test_purging_an_unrelated_jd_leaves_every_merge_reference_alone(self):
+        """对照组：删一个**与合并无关**的岗位 ⇒ 所有 `merged_into` 原样（一条都不许动）。"""
+        jdid.upsert_jd({"id": JD_C, "job_title": "丙岗（运营）", "jd_text_file": JD_C + ".txt"})
+        app._save_analysis({"id": C1, "jd_id": JD_C, "report": C1 + ".html", "score": 70.0,
+                            "resume": "简历甲", "created_at": "2026-10-07 09:00"})
+        store.write_text(self._report(C1 + ".html"), _report_html("丙岗"))
+        jobdup.merge_jobs(A1, B1)                       # B1 → A1（A1 在这次删除中**存活**）
+        before = self._merged_map()
+        before.pop(C1)                                  # 只有 C1 会随这次删除一起消失
+        self.assertEqual(before.get(B1), A1)            # 对照组的前提：确实有一条 merged_into
+        self.assertEqual(jddelete.preview_purge(JD_C)["summary"]["merged_hits"], 0)
+
+        jddelete.purge_jd(JD_C)                         # 删一个与合并无关的岗位
+
+        self.assertEqual(self._merged_map(), before,
+                         "删无关岗位时动了别人的 `merged_into`（把全部引用都清掉了）")
+        self.assertEqual(self._record(B1)["merged_into"], A1)
+        self.assertEqual(self._ledger_ids(), [JD_A], "指向存活岗位的合并标记仍然该把 B 过滤掉")
+
+    def test_the_merge_cleanup_lands_in_the_same_update_jobs_transaction(self):
+        """清悬空引用必须和摘记录**在同一次** `store.update_jobs` 里（不许自己 load/save 两次）。"""
+        jobdup.merge_jobs(A1, B1)
+        calls = []
+        real = store.update_jobs
+
+        def watch(fn, key=None):
+            calls.append(True)
+            return real(fn, key)
+
+        with mock.patch.object(store, "update_jobs", watch):
+            res = jddelete.purge_jd(JD_A)
+
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(len(calls), 1,
+                         "清悬空引用另开了一次读-改-写：台账又被跨多次调用的读-改-写覆盖了")
+        self.assertNotIn("merged_into", self._record(B1))
+        self.assertEqual(res["merged_refs"]["hits"], 1)
+        self.assertEqual([r["id"] for r in res["merged_refs"]["records"]], [B1])
 
 
 class JdPurgeRollbackTest(_PurgeCase):
