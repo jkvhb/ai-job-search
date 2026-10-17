@@ -126,11 +126,21 @@ function mkEl(key){
      `renderJobs` 的注释明确依赖这一点。 */
   const btnCache = {};
   const el = {
-    _html: '', _htmlRev: 0, value: '', textContent: '', hidden: false, className: '',
+    _html: '', _htmlRev: 0, _htmlSets: 0, value: '', textContent: '', hidden: false, className: '',
     src: '', files: null,
     dataset: {}, style: {}, options: [], selectedIndex: 0,
     classList: { add(){}, remove(){}, toggle(){}, contains(){ return false; } },
-    addEventListener(){}, removeEventListener(){}, appendChild(){}, removeChild(){},
+    /* 事件监听器**真记下来**（批 6.1 新增，纯增量）：垫片以前把它当空函数，
+       于是"用户敲了一下搜索框"这件事在桩里根本发生不了 —— 防抖/节流这类
+       时间相关的行为就只能靠读源码断言（那种断言假绿过）。现在就绪，
+       由 `ctx.__fire(sel, type, ev)` 把它们叫起来。 */
+    _handlers: {},
+    addEventListener(type, fn){ (el._handlers[type] = el._handlers[type] || []).push(fn); },
+    removeEventListener(type, fn){
+      const a = el._handlers[type];
+      if(a){ const i = a.indexOf(fn); if(i >= 0) a.splice(i, 1); }
+    },
+    appendChild(){}, removeChild(){},
     insertBefore(){}, focus(){}, click(){}, setAttribute(){}, getAttribute(){ return null; },
     querySelector(){ return null; },
     querySelectorAll(sel){
@@ -146,6 +156,7 @@ function mkEl(key){
     set(v){
       el._html = String(v == null ? '' : v);
       el._htmlRev++;
+      el._htmlSets++;                     // 「渲染了几次」= 这个元素被赋过几次 innerHTML（批 6.1）
       if (SELECTS.has(key)) el.value = firstOptionValue(el._html);
     }
   });
@@ -175,6 +186,19 @@ const ctx = {
   encodeURIComponent, decodeURIComponent, setTimeout, clearTimeout, setInterval, clearInterval,
   queueMicrotask, requestAnimationFrame: () => 0, cancelAnimationFrame(){}, reportError(){},
   __alerts: [], __confirms: [], __confirmQueue: [], __fetchJson: { ok: true },
+  /* ---- 事件与渲染次数（批 6.1 新增；既有 API 一个字没改，纯增量）----
+     这两个钩子给的是**可数量**的判据（次数），不是墙钟：
+       `__fire(sel, type, ev)`：把页面**真的注册过**的那个监听器叫起来
+         （以前 addEventListener 是空函数，"敲一下搜索框"在桩里根本发生不了）；
+       `__htmlSets(sel)`：那个元素被赋过几次 innerHTML —— 也就是"渲染了几次"。
+     返回调用到的监听器个数，便于调用方确认"真的叫起来了"（没注册 ⇒ 0，别静默空跑）。 */
+  __fire: (sel, type, ev) => {
+    const el = elOf(sel);
+    const list = ((el._handlers || {})[type] || []).slice();
+    list.forEach(fn => fn(ev || {}));
+    return list.length;
+  },
+  __htmlSets: sel => elOf(sel)._htmlSets || 0,
   /* 从**渲染出来的** innerHTML 里解析 option（不碰垫片的内部状态）：
      调用方据此断言"那一条选项"到底是哪个 value。 */
   __opts: sel => {

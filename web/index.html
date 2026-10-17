@@ -906,7 +906,8 @@ function renderJobs(){
   box.querySelectorAll('[data-jddel]').forEach(b=>b.addEventListener('click',()=>jdDelete(b.dataset.jddel)));
   ivPaintStats();       // 先用缓存里的面试统计把行内文字填上（没缓存就等 ivLoadStats 回来再填）
   ocPaintStats();       // 行内「已复盘」标记：数据就在台账行里，不需要额外请求
-  ivLoadStats();        // 每个岗位问一次 /api/interview/list（没有「列出全部面试」的接口）
+  ivLoadStats();        // 每个岗位问一次 /api/interview/list（没有「列出全部面试」的接口）；
+                        // 批 6.1 起由 ivLoadStats 自己限量：在途去重 + 在飞 ≤ 8
 }
 
 /* 展开 / 收起某个 JD 的子报告；状态记在 JD_OPEN 里，重渲染后不丢 */
@@ -1192,9 +1193,17 @@ async function showJdText(id){
   w.document.write('<meta charset="utf-8"><title>JD 原文</title><pre style="white-space:pre-wrap;font:14px/1.7 -apple-system,\'Microsoft YaHei\',sans-serif;padding:24px;max-width:820px;margin:auto">'+esc(r.text)+'</pre>');
   w.document.close();
 }
+/* 搜索框**防抖**（批 6.1，体检 §6 实测的最严重前端性能问题）：
+   改前每敲一个键都直接 `renderJobs()` —— 300 个岗位时一次全量重建 ≈ 1.47 MB HTML
+   （桩内实测 66 ms），输入框被按在地上摩擦。写法**照抄知识库搜索框 `#kbQ`**
+   （见 `initKnowTab`：`clearTimeout(kbT); kbT = setTimeout(kbLoad, 250)`），同一个 250ms。
+   `#fCat/#fStatus/#fSort` 是下拉选择（一次点击 = 一个确定的选择），**不加防抖**：
+   防抖只该合并"连续敲键"，不该把单次操作也吞掉（对照组见 tests/test_web_search.py）。 */
+let jqT = null;                       // 台账搜索输入的节流句柄
 ['#q','#fCat','#fStatus','#fSort'].forEach(s=>{
   const el = $(s);
-  el.addEventListener(s==='#q'?'input':'change', renderJobs);
+  el.addEventListener(s==='#q'?'input':'change',
+    s==='#q' ? ()=>{ clearTimeout(jqT); jqT = setTimeout(renderJobs, 250); } : renderJobs);
 });
 
 /* ---------------- 🎤 面试复盘（上传 / 轮询 / 打开报告） ----------------
@@ -1221,8 +1230,15 @@ let IV_CACHE = {};                // jobId -> {rows:[该岗位的面试记录]}�
 let IV_FAILED = {};               // jobId -> 1：这一轮读失败过，不再反复重试（重载台账时清空）
 let IV_WEAK = null;               // jobId -> 「没答上」卡数；null = 没拿到，一个都不显示（绝不当成 0）
 let ivSeq = 0;                    // 台账统计的请求代次：只认最新一次（与 kbSeq 同款竞态守卫）
+let IV_INFLIGHT = {};             // jobId -> 1：**这一代**正在飞的统计请求（在途去重，见 ivLoadStats）
 
-function ivCacheClear(){ ivSeq++; IV_CACHE = {}; IV_FAILED = {}; IV_WEAK = null; }
+/* 同时在飞的统计请求上限（批 6.1 的"限量"）。
+   上限公式：`在飞 ≤ min(IV_STAT_MAX_INFLIGHT, miss.length)` —— 300 个岗位时 **300 并发 → ≤ 8 并发**。
+   为什么是 8：与 `ThreadingHTTPServer` 的属性对得上（改前的一瞬间 300 个请求 = 300 条线程），
+   8 条足以跑满本地磁盘 I/O，又不至于让浏览器/服务端同一瞬间开几百条连接。 */
+const IV_STAT_MAX_INFLIGHT = 8;
+
+function ivCacheClear(){ ivSeq++; IV_CACHE = {}; IV_FAILED = {}; IV_WEAK = null; IV_INFLIGHT = {}; }
 
 /* ---- 纯文案函数：探针直接调它们，DOM 无关 ---- */
 function ivReportUrl(iid){ return '/reports/' + encodeURIComponent('iv_' + iid + '.html'); }
@@ -1310,32 +1326,66 @@ async function ivWeakCounts(){
   }
 }
 
+/* 台账行内统计：**限量**取数（批 6.1，体检 §6 实测的最严重前端性能问题）。
+   改前是 `Promise.all(miss.map(...))`：300 个岗位 ⇒ **一瞬间 300 个请求**
+   （`ThreadingHTTPServer` ⇒ 一瞬间 300 条线程）；而且 `miss` 只看 `IV_CACHE` / `IV_FAILED`、
+   **不看"正在飞"** ⇒ 连敲 5 个搜索键（每个键都走一次 renderJobs）就是 5×300 个请求。
+
+   为什么选"限量"而不是"合并"：服务端的 `/api/interview/list` **一次只认一个岗位**
+   （`interview.list_interviews()` 在 job 为空时直接回 `[]`，见 interview.py），
+   要一次问回多个岗位得给后端加一条新路由，而 `app.py` 不在本批允许改动的文件里。
+   所以本批落地两条**可被探针数出来**的限量（上限公式写在 IV_STAT_MAX_INFLIGHT 的注释里）：
+
+     ① **在途去重**（`IV_INFLIGHT`）：同一个岗位正在路上就不再发第二次 —— 连敲 N 下不再乘 N 倍；
+     ② **并发上限**（`IV_STAT_MAX_INFLIGHT = 8`）：worker 池，任何时刻在飞的统计请求 ≤ 8。
+
+   ⚠️ **限量不是少算**：`miss` 里的每个岗位最终都会被取到并写进 `IV_CACHE`
+   （除非它自己读失败 ⇒ `IV_FAILED`，与改前同一套"这一轮不再重试"的纪律），
+   收尾照旧 `ivPaintStats()` 逐行把数字填进去 —— 用户看到的数字与改前**一模一样**。
+
+   代次（`ivSeq`）**只由 `ivCacheClear()`（台账重载）推进**：旧的响应依然被丢弃，
+   但**同一代**里的多次渲染共用一趟。改前每次调用都 `++ivSeq`，配上"在途去重"就是
+   自己把自己的结果丢掉（数字永远出不来），所以这里改成只记代次、不自增。 */
 async function ivLoadStats(){
   // IV_FAILED：读失败的岗位这一轮不再重试 —— 否则每敲一个搜索字就重发一轮请求 + 弹一次 toast
-  const miss = JOBS.filter(j=>!IV_CACHE[j.id] && !IV_FAILED[j.id]);
-  if(!miss.length){ ivPaintStats(); return; }
-  const seq = ++ivSeq;
-  const res = await Promise.all(miss.map(async j=>{
+  // IV_INFLIGHT：正在飞的也不再发（连敲搜索键时这一条才是真正省下 N 倍请求的那条）
+  const miss = JOBS.filter(j=>!IV_CACHE[j.id] && !IV_FAILED[j.id] && !IV_INFLIGHT[j.id]);
+  if(!miss.length){ ivPaintStats(); return 0; }
+  const gen = ivSeq;                    // 记下代次（**不自增**）：台账重载后这一趟整批作废
+  miss.forEach(j=>{ IV_INFLIGHT[j.id] = 1; });
+  let sent = 0, failed = 0;
+  const one = async j=>{
+    sent++;
     try{
       const d = await (await fetch('/api/interview/list?job=' + encodeURIComponent(j.id))).json();
       if(!d || d.ok === false) throw new Error((d && d.error) || '服务无响应');
       return [j.id, Array.isArray(d.interviews) ? d.interviews : [], ''];
     }catch(e){
       return [j.id, null, e.message];
+    }finally{
+      delete IV_INFLIGHT[j.id];         // 成败都从"在飞"里摘掉：失败由 IV_FAILED 记着，这一轮不再发
     }
-  }));
-  if(seq !== ivSeq) return;             // 旧的响应后到 → 丢弃，绝不覆盖新结果
-  let failed = 0;
-  res.forEach(([id, rows, err])=>{
-    if(rows) IV_CACHE[id] = {rows: rows};
-    else { IV_FAILED[id] = 1; failed++; logUI('iv.list_failed', {job: id, error: err}, 'error'); }
-  });
+  };
+  const queue = miss.slice();
+  const worker = async ()=>{
+    while(queue.length){
+      const [id, rows, err] = await one(queue.shift());
+      if(gen !== ivSeq) continue;       // 台账换了代：这一条作废（不写缓存，也绝不覆盖新结果）
+      if(rows) IV_CACHE[id] = {rows: rows};
+      else { IV_FAILED[id] = 1; failed++; logUI('iv.list_failed', {job: id, error: err}, 'error'); }
+    }
+  };
+  const workers = [];
+  for(let i=0; i<Math.min(IV_STAT_MAX_INFLIGHT, queue.length); i++) workers.push(worker());
+  await Promise.all(workers);
+  if(gen !== ivSeq) return sent;
   if(failed) toast('有 ' + failed + ' 个岗位的面试记录没读出来（详见日志）');
   // 一条面试记录都没有时不必去读知识库：M 只在「面试 N 次」有数时才可能显示
   const anyRecs = Object.keys(IV_CACHE).some(k=>IV_CACHE[k].rows.length > 0);
   if(anyRecs && IV_WEAK === null) IV_WEAK = await ivWeakCounts();
-  if(seq !== ivSeq) return;
+  if(gen !== ivSeq) return sent;
   ivPaintStats();
+  return sent;                          // 本次**真的发出**的请求数（探针/日志可查；不影响既有调用方）
 }
 
 function ivPaintStats(){
