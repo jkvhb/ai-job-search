@@ -3,6 +3,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import shutil
 import unittest
 import zipfile
@@ -462,6 +463,116 @@ class LogEventWriteFailureTest(IsolatedCase):
         self.assertGreaterEqual(log.LOG_WRITE_FAILURES, 1, "空路径下没写盘也必须留痕")
         self.assertEqual(log.LAST_LOG_WRITE_FAILURE.get("event"), "t.nopath")
         self.assertIn("t.nopath", err.getvalue())
+
+
+# ---------------------------------------------------------------- 批 6.5 日志轮转
+class LogRotationTest(IsolatedCase):
+    """按**大小**轮转，且**一条记录都不许丢**（批 6.5）。
+
+    选定契约（先读了 `read_logs` 的既有调用方再定，见 `log.read_logs` / `log.archive_paths`
+    的 docstring）：
+      - 写新记录**之前**，当前文件若已达 `log.LOG_ROTATE_BYTES`（生产 1 MiB），
+        就把当前文件**改名**成 `events.jsonl.<YYYYmmdd_HHMMSS_微秒>`（**改名，不是截断**）；
+      - `read_logs` 读的是**所有段**（存档按时间升序 + 当前文件），所以界面上
+        「最近 N 条」「共 N 条」跨轮转仍是一条不少 —— 这正是"轮转不许丢证据"的落点；
+      - 存档**不删**（阈值只决定分几段，不决定留多久）；
+      - 轮转失败**不许吃掉这条记录**：记录照旧写进当前文件，只在 stderr 留一行痕迹。
+
+    阈值在用例里被压到 300 字节（生产 1 MiB）：不压小就不可能用单元测试触发轮转。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.addCleanup(setattr, log, "LOG_ROTATE_BYTES", log.LOG_ROTATE_BYTES)
+        log.LOG_ROTATE_BYTES = 300          # 一条记录 ~150 字节 ⇒ 两三条就轮转一次
+
+    def _archives(self):
+        """磁盘上的存档名（只认 `<日志文件名>.<时间戳>` 这个形状，老的在前）。"""
+        d = os.path.dirname(log.LOG_FILE)
+        base = os.path.basename(log.LOG_FILE)
+        if not os.path.isdir(d):
+            return []
+        return sorted(n for n in os.listdir(d)
+                      if n.startswith(base + ".")
+                      and re.match(r"^\d{8}_\d{6}_\d{6}$", n[len(base) + 1:]))
+
+    def test_rotation_creates_an_archive_and_loses_no_record(self):
+        """主判据：超过阈值 ⇒ 出现存档 + 最近的记录都在 + 老记录也读得到。
+
+        改前红在这两处：`assertTrue(self._archives(), ...)`（压根没有轮转），
+        以及 `read_logs` 只读当前文件（轮转后就读不到旧段）。
+        """
+        for i in range(12):
+            log.log_event("e%d" % i)
+        self.assertTrue(self._archives(), "当前文件超过阈值后必须出现存档")
+        self.assertEqual([r["event"] for r in log.read_logs(5).records],
+                         ["e7", "e8", "e9", "e10", "e11"], "轮转后最近 5 条必须一条不少")
+        page = log.read_logs(10 ** 9)
+        self.assertEqual([r["event"] for r in page.records],
+                         ["e%d" % i for i in range(12)], "轮转不许丢记录（存档里的老记录也要读得到）")
+        self.assertEqual(page.total, 12)
+
+    def test_no_archive_below_the_threshold(self):
+        """对照组：没到阈值 ⇒ **不轮转**、不产生存档、当前文件就是全部。"""
+        log.LOG_ROTATE_BYTES = 10 ** 9
+        for i in range(5):
+            log.log_event("e%d" % i)
+        self.assertEqual(self._archives(), [], "没到阈值不许轮转、不许产生存档")
+        page = log.read_logs(10 ** 9)
+        self.assertEqual([r["event"] for r in page.records], ["e%d" % i for i in range(5)])
+        self.assertEqual(page.total, 5)
+
+    def test_every_archive_is_readable_and_names_sort_chronologically(self):
+        """多段：存档名字必须**升序 = 时间升序**（`read_logs` 就靠这个拼回全量顺序）。"""
+        for i in range(20):
+            log.log_event("e%d" % i)
+        archives = self._archives()
+        self.assertGreaterEqual(len(archives), 2, "20 条记录（阈值 300 字节）至少该轮转两次")
+        on_disk = []
+        for name in archives + [os.path.basename(log.LOG_FILE)]:
+            with open(os.path.join(os.path.dirname(log.LOG_FILE), name), encoding="utf-8") as f:
+                on_disk += [json.loads(l)["event"] for l in f if l.strip()]
+        self.assertEqual(on_disk, ["e%d" % i for i in range(20)],
+                         "存档（升序）+ 当前文件拼起来必须正好是写入顺序、一条不多一条不少")
+
+    def test_rotation_failure_still_keeps_the_record(self):
+        """轮转失败（改名被占用等）**不许**把这条记录一起弄丢 —— 那才是真丢证据。"""
+        log.LOG_ROTATE_BYTES = 1            # 让每次写都尝试轮转
+        log.log_event("e0")
+        log.log_event("e1")
+        archives_before = self._archives()
+        err = io.StringIO()
+        with mock.patch("os.replace", side_effect=OSError(17, "另一个进程占着")):
+            with contextlib.redirect_stderr(err):
+                back = log.log_event("e2")
+        self.assertIsNotNone(back, "轮转失败也必须把这条记录写进盘")
+        self.assertIn("轮转", err.getvalue(), "轮转失败必须在 stderr 留一行痕迹")
+        self.assertEqual(self._archives(), archives_before, "轮转没成功就不该凭空多出存档")
+        self.assertEqual([r["event"] for r in log.read_logs(10 ** 9).records], ["e0", "e1", "e2"])
+
+    def test_user_copied_backup_file_is_not_treated_as_a_segment(self):
+        """只认 `<日志名>.<时间戳>`：用户手工拷的 `.bak-*` 不许被当成日志段读进来。"""
+        for i in range(6):
+            log.log_event("e%d" % i)
+        decoy = log.LOG_FILE + ".bak-手动拷的"
+        with open(decoy, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"event": "手工拷的文件，不是日志段"}) + "\n")
+        self.assertNotIn(decoy, log.archive_paths())
+        self.assertEqual(log.read_logs(10 ** 9).total, 6, "手工拷的 .bak 不许被当成日志段")
+        self.assertEqual(self._archives(), [os.path.basename(p) for p in log.archive_paths()],
+                         "archive_paths() 与磁盘上的存档名必须一致（老的在前）")
+
+    def test_feedback_bundle_carries_the_archives_too(self):
+        """反馈包不许因为轮转变空：刚轮转过时当前文件可能只剩一两条，存档必须一起进包。"""
+        for i in range(12):
+            log.log_event("e%d" % i)
+        archives = self._archives()
+        self.assertTrue(archives)
+        name = log.build_log_bundle(port=1234)
+        with zipfile.ZipFile(os.path.join(os.path.dirname(log.LOG_FILE), name)) as z:
+            names = z.namelist()
+        for a in archives:
+            self.assertIn(a, names, "存档必须一起进反馈包")
 
 
 if __name__ == "__main__":

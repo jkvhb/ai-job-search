@@ -10,7 +10,7 @@ import traceback
 import uuid
 import zipfile
 from collections import namedtuple
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import store
 
@@ -93,6 +93,88 @@ def refresh():
     return LOG_FILE
 
 
+# ---------------------------------------------------------------- 日志轮转（批 6.5）
+# 为什么按**大小**轮转：单文件无上限地长下去，记事本打不开、反馈包也越来越臃肿；
+# 但日志是证据，**一条都不许丢** —— 所以轮转只做一件事：把当前文件**改名**成存档，
+# 一条记录都不删除、不截断、不清理（阈值只决定分几段，不决定留多久）。
+#
+# ⚠️ 生产阈值 1 MiB：日志按天算也不会太碎，而归档后的段仍然能被 `read_logs` 读回来。
+LOG_ROTATE_BYTES = 1024 * 1024
+
+# 存档名的形状：`<日志文件名>.<YYYYmmdd_HHMMSS_微秒>`（定宽 ⇒ 名字升序 = 时间升序）。
+_ARCHIVE_STAMP_FORMAT = "%Y%m%d_%H%M%S_%f"
+_ARCHIVE_STAMP_RE = re.compile(r"^\d{8}_\d{6}_\d{6}$")
+
+
+def archive_paths():
+    """当前日志的**全部存档**路径，老的在前（`read_logs` / 反馈包都按这个顺序拼回去）。
+
+    **只认 `<日志文件名>.<YYmmdd_HHMMSS_微秒>` 这个形状**：用户手工拷的
+    `events.jsonl.bak-...`（或 `.DAMAGED-...`）**不是**轮转产物，不许被当成日志段读进来 ——
+    那会让「共 N 条」凭空变大，而且那些文件里的东西不归本进程管。
+
+    目录还不存在 / 列不出来 ⇒ 回 `[]`（**真的没有存档**）：这是读路径，
+    不能因为"日志目录还没建"就把界面打成"日志读不出来"。
+    """
+    if not LOG_FILE:
+        return []
+    d = os.path.dirname(LOG_FILE) or "."
+    base = os.path.basename(LOG_FILE)
+    prefix = base + "."
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return []
+    return sorted(os.path.join(d, n) for n in names
+                  if n.startswith(prefix) and _ARCHIVE_STAMP_RE.match(n[len(prefix):]))
+
+
+def _next_archive_path():
+    """给当前文件算一个**不撞名**的存档名。
+
+    同一微秒里连着轮转两次（测试里阈值压到 1 字节时真会发生）不能重名 ——
+    `os.replace` 撞名就**覆盖**掉上一段，那等于丢证据，所以逐个微秒往后找空位。
+    """
+    d = os.path.dirname(LOG_FILE) or "."
+    base = os.path.basename(LOG_FILE)
+    now = datetime.now()
+    for bump in range(1000):
+        stamp = (now + timedelta(microseconds=bump)).strftime(_ARCHIVE_STAMP_FORMAT)
+        path = os.path.join(d, "%s.%s" % (base, stamp))
+        if not os.path.exists(path):
+            return path
+    raise OSError("同一微秒内轮转 1000 次仍算不出不撞名的存档名：%s" % base)
+
+
+def _rotate_log_locked():
+    """当前文件已达阈值就**改名**成存档。返回是否真的轮转了。
+
+    ⚠️ **本函数绝不抛**，也**绝不删任何东西**：轮转失败只该少一次分段，
+    绝不该把这条记录一起弄丢 —— 调用方（`log_event`）会照旧把记录追加进当前文件。
+    失败时在 stderr 留一行痕迹（含"轮转"字样），便于事后看出来日志为什么没分段。
+    """
+    if not LOG_FILE:
+        return False                       # 路径没解析出来：没有什么可轮转的
+    try:
+        size = os.path.getsize(LOG_FILE)
+    except OSError:
+        return False                       # 文件还不存在（第一条记录）：没有可轮转的东西
+    if size <= 0 or size < LOG_ROTATE_BYTES:
+        return False
+    try:
+        target = _next_archive_path()
+        os.replace(LOG_FILE, target)       # 改名（同目录原子替换），不是截断、不是删除
+        return True
+    except Exception as e:
+        try:
+            sys.stderr.write("[log] 日志轮转失败（这条记录照旧写进当前文件，不会丢）：%s: %s\n"
+                             % (type(e).__name__, e))
+            sys.stderr.flush()
+        except Exception:
+            pass
+        return False
+
+
 def _mask_keys(s):
     """字符串里的凭证打码：前缀 Key（保留前 8 位）+ `Bearer <长串>`。规则见 KEY_PAT 的注释。"""
     return BEARER_PAT.sub("Bearer ***", KEY_PAT.sub(r"\1***", s))
@@ -171,6 +253,9 @@ def log_event(event, level="info", data=None, **kw):
         os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
         line = json.dumps(rec, ensure_ascii=False) + "\n"
         with _LOG_LOCK:
+            # 轮转必须在**持锁**里做：两个线程同时判断"该轮转了"会把同一段改名两次。
+            # 它自己绝不抛（失败只留一行 stderr），所以这条记录一定会继续往下写。
+            _rotate_log_locked()
             with open(LOG_FILE, "a", encoding="utf-8") as f:
                 f.write(line)
     except Exception as e:
@@ -221,6 +306,10 @@ class LogPage(namedtuple("LogPage", "records total")):
 def read_logs(limit=200):
     """读最近日志，返回 `LogPage`（可解包成 `(records, total)`，见该类说明）。
 
+    **读的是所有段**：`archive_paths()`（存档，老的在前）+ 当前文件。轮转只**改名**不删记录，
+    所以「最近 N 条」「共 N 条」跨轮转仍是一条不少；`lines` / `blank_lines` / `bad_lines`
+    也是各段之和（恒等式照旧成立）。名字对不上存档形状的文件（用户手工拷的 `.bak-…`）不算段。
+
     **口径（P1-7）**：`total` = **能解析的记录总条数**，`records` = 其中最后 `limit` 条，
     于是 `len(records) == min(limit, total)` 恒成立 —— "两个数对不上"从根上没了。
     行数口径单独给（`lines` / `blank_lines` / `bad_lines`）：坏行与空行既不会被悄悄算进条数，
@@ -234,28 +323,33 @@ def read_logs(limit=200):
         # 档名文件读不出来时 LOG_FILE 是空串占位（见 _initial_log_file）：
         # 这不是"没有日志"，是"日志路径压根没解析出来"，同样不许说成 0 条。
         return LogPage([], 0, error="日志路径为空（档名文件读不出来，见 LOG_PATH_ERROR）")
-    if not os.path.exists(LOG_FILE):
-        return LogPage([], 0)                     # 文件不存在 = 真的没有日志
-    try:
-        with open(LOG_FILE, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-    except Exception as e:
-        # 存在却读不出来（编码不对 / 权限 / 被独占…）：如实带回，不冒充 0 条
-        return LogPage([], 0, error="日志文件 `%s` 存在却读不出来：%s" % (LOG_FILE, e))
+    # **所有段**：存档（老的在前）+ 当前文件。轮转后老记录还在存档里，
+    # 所以界面上「最近 N 条」「共 N 条」跨轮转仍是一条不少（这是"轮转不许丢证据"的落点）。
     parsed = []
     blank = 0
     bad = 0
-    for line in lines:
-        line = line.strip()
-        if not line:
-            blank += 1
-            continue
+    total_lines = 0
+    for path in archive_paths() + [LOG_FILE]:
+        if not os.path.exists(path):
+            continue                       # 这段不存在（还没写第一条 / 存档被用户手工挪走）
         try:
-            parsed.append(json.loads(line))
-        except Exception:
-            bad += 1
+            with open(path, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+        except Exception as e:
+            # 存在却读不出来（编码不对 / 权限 / 被独占…）：如实带回，不冒充 0 条
+            return LogPage([], 0, error="日志文件 `%s` 存在却读不出来：%s" % (path, e))
+        total_lines += len(lines)
+        for line in lines:
+            line = line.strip()
+            if not line:
+                blank += 1
+                continue
+            try:
+                parsed.append(json.loads(line))
+            except Exception:
+                bad += 1
     return LogPage(parsed[-limit:] if limit > 0 else parsed, len(parsed),
-                   lines=len(lines), blank_lines=blank, bad_lines=bad)
+                   lines=total_lines, blank_lines=blank, bad_lines=bad)
 
 
 LOG_GUIDE = """# 反馈日志包说明
@@ -264,6 +358,8 @@ LOG_GUIDE = """# 反馈日志包说明
 
 ## 包含内容
 - `events.jsonl` —— 全部操作与执行日志，每行一条 JSON（用户操作 / 接口调用 / 模型调用 / 报错堆栈）
+- `events.jsonl.<时间戳>`（可能有多份）—— 日志超过 1 MiB 时轮转出的**历史段**，按时间升序；
+  轮转只改名、**绝不删记录**，所以老记录都在这些段里（同样一起打包，阅读顺序见文件名时间戳）
 - `env.json` —— 运行环境信息（版本、模型名、数据量统计、本进程日志写失败次数），**不含任何 API Key**
   - `counts` 里**只有真的数出来**的项；**某项缺失 = 它数不出来**，原因在同级 `counts_unreadable` 里
     （**缺失不等于 0**，不要当成"用户没有简历/岗位"）
@@ -370,6 +466,10 @@ def build_log_bundle(port=8000):
         "log_write_failures": write_failure_stats(),
     }
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+        # 存档必须一起进包：刚轮转过时当前文件可能只剩一两条，只带当前文件
+        # 会让反馈包"看起来像清空过" —— 而老记录其实都在存档里。
+        for segment in archive_paths():
+            z.write(segment, os.path.basename(segment))
         if os.path.exists(LOG_FILE):
             z.write(LOG_FILE, "events.jsonl")
         z.writestr("env.json", json.dumps(env, ensure_ascii=False, indent=2))
