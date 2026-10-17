@@ -666,6 +666,26 @@ def _bad(msg, **kw):
     return ValueError(msg)
 
 
+def _jd_id_mover(old, new):
+    """造一个给 `store.update_jobs` 用的 `fn`：把 `jd_id == old` 的分析记录改指 `new`。
+
+    返回 `fn(jobs) -> (要写回的列表 或 None, 改了几条)`；一条都没改 → 回 `None`
+    （**一个字节都不写**，与老写法 `if jobs_moved:` 的语义一致）。
+    ⚠️ `fn` 只改内存：它是在 `_JOBS_LOCK` 里跑的，而调用方还持着 `_JD_LOCK` + `_KB_LOCK`
+    （与原来在同一行调 `store.save_jobs` 取的是**同一把**锁，锁序逐边不变）。
+    ⚠️ 判据必须只认 `jd_id`（**不退回 `id`**）：迁移前的老记录靠 `id` 当身份，但 `rename_jd`
+    历来只改 `jd_id` 那些，改成"退回 id"会顺手改掉别的记录（既有用例钉着这一条）。
+    """
+    def move(jobs):
+        moved = 0
+        for j in jobs:
+            if isinstance(j, dict) and j.get("jd_id") == old:
+                j["jd_id"] = new
+                moved += 1
+        return (jobs if moved else None), moved
+    return move
+
+
 def rename_jd(old_id, new_id, key=None):
     """改一个 JD 的 ID，并把**所有引用**同步改过去。成功返回新 id 字符串。
 
@@ -792,11 +812,13 @@ def rename_jd(old_id, new_id, key=None):
                     st = dict(st)
                     st["job_id"] = new
                     iv_new.append((path, st))
-            jobs_new = [dict(j) for j in jobs if isinstance(j, dict)]
+            # 台账那一段：这里**只做预检**（有几条记录要跟着改指新 ID）—— 真正落盘时
+            # 由 `store.update_jobs` 在 `_JOBS_LOCK` 里重新读一份最新的、再改（计划 2.4）。
+            # ⚠️ 老写法在这一步把第 764 行那份**快照**改好、到第 7 步整份写回：改名窗口里
+            # 挤进来的一次分析落盘（`upsert_job`）会被整份顶掉（丢更新，报告还在盘上）。
             jobs_moved = 0
-            for j in jobs_new:
-                if j.get("jd_id") == old:
-                    j["jd_id"] = new
+            for j in jobs:
+                if isinstance(j, dict) and j.get("jd_id") == old:
                     jobs_moved += 1
 
             # ---- 7) 落盘（逐文件；失败用内存原像回滚已写的文件）----
@@ -832,7 +854,12 @@ def rename_jd(old_id, new_id, key=None):
                     store.write_json(path, st)
                 if jobs_moved:
                     written.append((store.jobs_path(key), store.read_bytes(store.jobs_path(key))))
-                    store.save_jobs(jobs_new, key)
+                    # 读-改-写整段收进 `store.update_jobs`（计划 2.4）：判据作用在**刚读出来**
+                    # 的那份台账上，而不是第 764 行的快照。原像在上面按字节取好（只读、无副作用），
+                    # 写成不成都由它自己收尾（原子写）⇒ 回滚前提与老写法一致。
+                    # ⚠️ 此刻本线程持着 `_JD_LOCK` + `_KB_LOCK`：这里取 store 的 `_JOBS_LOCK`
+                    # 与原来在同一行调 `store.save_jobs` 取的是**同一把**锁，锁序逐边不变。
+                    store.update_jobs(_jd_id_mover(old, new), key)
             except BaseException as e:
                 for path, before in reversed(written):
                     try:

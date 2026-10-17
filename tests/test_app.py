@@ -7423,5 +7423,133 @@ class ServerSentenceOn500Test(IsolatedCase):
         self.assertEqual(out["count"], "0")
 
 
+class ReportFileNameRaceTest(IsolatedCase):
+    """P3-1 / 计划 2.2：报告文件名的 **TOCTOU** + 非原子写。
+
+    老实现用 `os.path.exists(...)` 找空位（`app.py` 里那个 `while`）：那是"先问再拿"——
+    两个并发分析可以**同时**问出"`(3).html` 没人用"，于是两份报告写同一个文件，
+    后写的把先写的**整份覆盖**：一份**已经花过模型额度**的分析凭空消失（报告文件还在盘上，
+    内容却已经是另一份的）。
+
+    判据必须是"**拿到手才算数**"：`open(path, "x")`（= `O_CREAT|O_EXCL`）由内核保证
+    "只有一个线程/进程能创建这个名字"，抢不到（`FileExistsError`）就换下一个序号重试。
+    ⚠️ 文件名**同时就是报告 id**（去掉 `.html`）：`jobs.json.report`、`report_state/<id>.json`、
+    前端 `body["report"][:-5]`、`jdfacts._report_of` 都按它定位 ⇒ 命名规则与返回值
+    一个字符都不许变（下面 `test_sequential_renders_increment_without_overwriting` 钉着它）。
+    """
+
+    def _reports_dir(self):
+        return store.p_path("reports")
+
+    def _html_files(self):
+        room = self._reports_dir()
+        if not os.path.isdir(room):
+            return []
+        return sorted(f for f in os.listdir(room) if f.endswith(".html"))
+
+    def _payload_of(self, name):
+        return _extract_report_data(store.read_text(os.path.join(self._reports_dir(), name)))
+
+    def test_two_threads_rendering_the_same_name_both_survive(self):
+        """两个线程**同时**渲染同名报告 ⇒ 两个文件都在、各自内容完整（老实现必丢一份）。
+
+        定序手法：把 `store.write_text` 换成"先在会合点等另一个线程、再真写"。会合点在
+        **`render_report` 的锁外**（这个函数本来就不持任何锁），所以：
+          * 老实现：两个线程此刻**已经算完同一个文件名**（都没写过盘、`exists` 都判"没人用"）
+            ⇒ 会合后两份内容写进同一个文件 ⇒ 只剩一份；
+          * 新实现：第二个线程在**独占创建**那一步就拿到 `(2).html` 了 ⇒ 两个不同的路径。
+        """
+        ready = threading.Barrier(2)
+        real_write_text = store.write_text
+
+        def slow_write_text(path, content):
+            ready.wait(20)
+            return real_write_text(path, content)
+
+        out, errors = {}, {}
+
+        def worker(tag):
+            try:
+                out[tag] = app.render_report({"job_title": "并发岗位", "score": 80.0,
+                                              "marker": tag})
+            except BaseException as e:            # noqa: BLE001 - 线程里的异常必须被断言看到
+                errors[tag] = e
+
+        with mock.patch.object(store, "write_text", slow_write_text):
+            ts = [threading.Thread(target=worker, args=(tag,), name="render-%s" % tag)
+                  for tag in ("A", "B")]
+            for t in ts:
+                t.start()
+            for t in ts:
+                t.join(30)
+        self.assertFalse(any(t.is_alive() for t in ts), "有渲染线程没跑完（死等）")
+        self.assertEqual(errors, {}, "渲染线程里抛了异常：%r" % errors)
+
+        self.assertNotEqual(out["A"], out["B"],
+                            "两个并发渲染拿到了**同一个报告文件名**（TOCTOU）：后写的会整份覆盖先写的")
+        self.assertEqual(self._html_files(), sorted([out["A"], out["B"]]),
+                         "reports/ 里不是恰好两份报告：%r" % self._html_files())
+        for tag in ("A", "B"):
+            name = out[tag]
+            raw = store.read_text(os.path.join(self._reports_dir(), name))
+            self.assertTrue(raw.rstrip().endswith("</html>"),
+                            "%s 不是一份完整的报告（半截写入？）" % name)
+            payload = self._payload_of(name)
+            self.assertIsInstance(payload, dict, "%s 里的 REPORT_DATA 抽不出来" % name)
+            self.assertEqual(payload.get("marker"), tag,
+                             "%s 的内容不是这一份（被另一份整份覆盖了）" % name)
+            self.assertEqual(payload.get("report_id"), name[:-5],
+                             "文件名与报告 id 的关系变了（前端 / report_state 靠它定位）")
+
+    def test_sequential_renders_increment_without_overwriting(self):
+        """对照组：单线程连渲 N 份 ⇒ 文件名**依次递增**、一个都不覆盖。"""
+        names = [app.render_report({"job_title": "连渲岗位", "score": 80.0, "marker": i})
+                 for i in range(4)]
+        self.assertEqual(len(set(names)), 4, "文件名重复了：%r" % names)
+        self.assertEqual(names[1:], ["%s(%d).html" % (names[0][:-5], n) for n in (2, 3, 4)],
+                         "序号规则变了（必须是 `base.html` / `base(2).html` / …）：%r" % names)
+        self.assertEqual(self._html_files(), sorted(names), "reports/ 里的文件与返回值对不上")
+        for i, name in enumerate(names):
+            payload = self._payload_of(name)
+            self.assertEqual((payload or {}).get("marker"), i, "%s 的内容不是第 %d 份" % (name, i))
+
+    def test_an_occupied_name_moves_to_the_next_number(self):
+        """已被占名 ⇒ 跳到 `(2)`，而且老报告**逐字节没被动过**。"""
+        first = app.render_report({"job_title": "占名岗位", "score": 80.0, "marker": "第一份"})
+        path = os.path.join(self._reports_dir(), first)
+        raw_first = store.read_bytes(path)
+
+        # 自证夹具：这个名字真的"被占"了 —— 独占创建会抛 FileExistsError（重试逻辑靠它）
+        with self.assertRaises(FileExistsError):
+            open(path, "x")
+
+        second = app.render_report({"job_title": "占名岗位", "score": 80.0, "marker": "第二份"})
+        self.assertEqual(second, "%s(2).html" % first[:-5],
+                         "被占的名字没有被跳过去：%r" % second)
+        self.assertEqual(store.read_bytes(path), raw_first, "老报告被改动了")
+        self.assertEqual(self._payload_of(first).get("marker"), "第一份")
+        self.assertEqual(self._payload_of(second).get("marker"), "第二份")
+
+    def test_a_failed_write_leaves_no_placeholder(self):
+        """写盘失败 ⇒ 不许留下"独占创建"出来的空占位（它会被 `/api/reports` 当成一份报告）。"""
+        before = self._html_files()
+        with mock.patch.object(store, "write_text", side_effect=OSError("注入的写失败")):
+            with self.assertRaises(OSError):
+                app.render_report({"job_title": "写失败岗位", "score": 80.0})
+        self.assertEqual(self._html_files(), before,
+                         "渲染失败后 reports/ 里多出了文件：0 字节的占位会被当成一份真报告列出")
+
+    def test_a_fixed_id_still_overwrites_in_place(self):
+        """固定名（示例报告 / 面试复盘 / 结果面板）照旧**直接覆盖**，不许产生 `(2)` 副本。"""
+        first = app.render_report({"job_title": "结果岗", "score": 80.0, "marker": 1},
+                                  fixed_id="oc_j1")
+        second = app.render_report({"job_title": "结果岗", "score": 80.0, "marker": 2},
+                                   fixed_id="oc_j1")
+        self.assertEqual(first, "oc_j1.html")
+        self.assertEqual(second, first)
+        self.assertEqual(self._html_files(), ["oc_j1.html"])
+        self.assertEqual(self._payload_of(first).get("marker"), 2)     # 覆盖成功，不是追加
+
+
 if __name__ == "__main__":
     unittest.main()

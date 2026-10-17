@@ -229,6 +229,28 @@ class MergeTest(IsolatedCase):
         self.assertTrue(backups)                         # 备份存在且保留
         self.assertTrue(glob.glob(store.p_path("knowledge.json") + ".bak-*"))
 
+    def test_the_ledger_is_written_through_the_transaction(self):
+        """回归钉：打 `merged_into` 那一段必须走 `store.update_jobs`（计划 2.4）。
+
+        改回"拿第 352 行那份快照 → `save_jobs`"就红：那种写法会把合并窗口里挤进来的
+        一次分析落盘（`upsert_job`）整份顶掉（报告还在盘上、台账里却看不到那次分析）。
+        """
+        self._two_jobs()
+        calls = []
+        real = store.update_jobs
+
+        def watch(fn, key=None):
+            calls.append(True)
+            return real(fn, key)
+
+        with mock.patch.object(store, "update_jobs", watch):
+            jobdup.merge_jobs("keep", "drop")
+
+        self.assertEqual(len(calls), 1,
+                         "合并没有走 `store.update_jobs`：台账又变成跨多次调用的读-改-写了")
+        self.assertEqual({j["id"]: j.get("merged_into") for j in store.load_jobs()},
+                         {"drop": "keep", "keep": None})
+
 
 class MergeIdempotenceTest(IsolatedCase):
     """**计划外补充**：幂等不能只断言「没抛异常」——第二次必须**一个文件都不动**。"""

@@ -347,6 +347,21 @@ def merge_jobs(keep_id, drop_id):
         return _merge_jobs_locked(keep_id, drop_id)
 
 
+def _mark_drop_merged(jobs, drop_id, keep_id):
+    """`store.update_jobs` 用的 `fn`：给 drop 那条打上 `merged_into`。
+
+    返回 `(要写回的列表, 标记成功了吗)`；临界区里找不到那条记录 → `(None, False)`
+    （**一个字节都不写**，由调用方响亮失败）。
+    ⚠️ 本函数**只改内存**：绝不许在这里取锁 / 读别的文件 —— 它是在 `_JOBS_LOCK` 里跑的，
+    而调用方还持着 `_MERGE_LOCK`（`tests/test_store.py::UpdateJobsTransactionTest` 钉着这条约定）。
+    """
+    for j in jobs:
+        if isinstance(j, dict) and j.get("id") == drop_id:
+            j["merged_into"] = keep_id
+            return jobs, True
+    return None, False
+
+
 def _merge_jobs_locked(keep_id, drop_id):
     """merge_jobs 的主体，**调用方必须已持 _MERGE_LOCK**（拆出来只为让锁的范围一眼可见）"""
     raw = store.load_jobs()
@@ -417,8 +432,19 @@ def _merge_jobs_locked(keep_id, drop_id):
             st["job_id"] = keep_id
             store.write_json(path, st)
 
-        drop["merged_into"] = keep_id
-        store.save_jobs(raw)              # 原样写回整份台账，只多了一个 merged_into
+        # 台账那一段（计划 2.4）：读-改-写收进 `store.update_jobs` —— 整段在 `_JOBS_LOCK` 里，
+        # 而且用的必须是**刚读出来**的那份、不是第 352 行那份快照。老写法 `save_jobs(raw)`
+        # 把旧快照整份写回：合并窗口里挤进来的一次分析落盘（`upsert_job`）会被整份顶掉
+        # —— 报告文件还在盘上，台账里却再也看不到那次刚花过模型额度的分析。
+        # ⚠️ `fn` 只改内存（此刻本线程持着 `_MERGE_LOCK`，去取 store 的 `_JOBS_LOCK` 是
+        # "外层 → 内层"，与原来在同一行调 `save_jobs` 取的是同一把锁，锁序逐边不变）。
+        marked = store.update_jobs(lambda jobs: _mark_drop_merged(jobs, drop_id, keep_id))
+        if not marked:
+            # 临界区里那条记录不见了（合并窗口里被别的写者删掉，例如一次并发的真删除）：
+            # 不改写、也不谎报成功。`RuntimeError` 与其余失败同一条路（下面 `except` 会回滚）。
+            raise RuntimeError(
+                "台账里 drop 岗位（%s）在合并过程中被别的写者删掉了：本次合并中止并回滚，"
+                "绝不把一份已经不是最新状态的快照写回盘上。" % drop_id)
     except BaseException as e:
         restored, failed = _rollback(backups)
         log.log_exc("jobdup.merge_failed", e, keep=keep_id, drop=drop_id,

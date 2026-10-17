@@ -400,6 +400,41 @@ def _render_report_page(path):
     return tpl.replace("__TITLE__", title).replace("__REPORT_DATA__", payload)
 
 
+def _reserve_report_name(base):
+    """在 `reports/` 里**独占**占下一个可用文件名，返回 `(文件名, 绝对路径)`。
+
+    为什么不能用 `os.path.exists` 找空位（体检 §5 P3-1）：那是"先问再拿"的 TOCTOU ——
+    两个并发分析可以**同时**问出"`(3).html` 没人用"，于是两份报告写同一个文件：后写的把
+    先写的**整份覆盖**，一份已经花过模型额度的分析凭空消失（更糟的是并发 `os.replace`
+    到同一个目标在 Windows 上还会 `PermissionError`，那一份连文件都留不下）。
+    判据必须是"**拿到手才算数**"：`open(path, "x")`（= `O_CREAT|O_EXCL`）由内核保证
+    "只有一个人能创建这个名字"，抢不到（`FileExistsError`）就换下一个序号重试。
+
+    序号与老实现**逐字一致**：`base.html` → `base(2).html` → `base(3).html`…
+    ⚠️ 这个文件名**同时就是报告 id**（去掉 `.html`）：`jobs.json` 的 `report`、
+    `report_state/<id>.json`、前端 `body["report"][:-5]`、`jdfacts._report_of` 全都按它
+    定位 ⇒ 命名规则与返回的字符串一个字符都不许变。
+
+    返回值里带上绝对路径，是为了让调用方写完就把这一份交出去。占位文件本身是 **0 字节**
+    （真正的字节由 `store.write_text` 的原子写换进去）⇒ 调用方失败时要自己收拾
+    （见 `render_report` 的 `except`）：否则 `reports/` 里会多一份 0 字节的"报告"，
+    `GET /api/reports` 会把它当一份真报告列给用户。
+    """
+    room = store.p_path("reports")
+    os.makedirs(room, exist_ok=True)
+    n = 1
+    while True:
+        fname = base + ".html" if n == 1 else "%s(%d).html" % (base, n)
+        path = os.path.join(room, fname)
+        try:
+            with open(path, "x"):        # 独占创建：这个名字被我拿到了才算数
+                pass
+        except FileExistsError:
+            n += 1
+            continue
+        return fname, path
+
+
 def render_report(d, fixed_id=None):
     # 写盘与 serve 共用同一份 kind 判定：否则磁盘上那份会是与用户看到的不同的骨架
     tpl_path = report_template_for(d)
@@ -415,17 +450,16 @@ def render_report(d, fixed_id=None):
         raise RuntimeError("报告模板是空文件：%s" % tpl_path)
     job = store.slug(d.get("job_title") or "岗位")
     score_disp = "%g" % d["score"]
+    reserved = not fixed_id
     if fixed_id:
-        # 固定文件名（示例报告）：重复生成直接覆盖，不产生 (2)(3) 副本
+        # 固定文件名（示例报告 / 面试复盘 / 结果面板）：重复生成直接覆盖，不产生 (2)(3) 副本
         fname = fixed_id + ".html"
+        path = os.path.join(store.p_path("reports"), fname)
     else:
         score_file = "%g" % round(d["score"])
         base = "%s_%s_%s分" % (datetime.now().strftime("%Y%m%d"), job, score_file)
-        fname = base + ".html"
-        n = 2
-        while os.path.exists(os.path.join(store.p_path("reports"), fname)):
-            fname = "%s(%d).html" % (base, n)
-            n += 1
+        # **独占创建**占名（P3-1）：抢不到就换下一个序号，绝不能"先问再拿"
+        fname, path = _reserve_report_name(base)
     d["report_id"] = fname[:-5]
     if tpl_path == INTERVIEW_TEMPLATE_PATH:
         # 复盘报告不能顶着「岗位匹配分析 · 0分」的标题出现在浏览器标签页 / 打印页眉上
@@ -438,7 +472,17 @@ def render_report(d, fixed_id=None):
         title = "%s · 岗位匹配分析 · %s分 · %s" % (d.get("job_title") or "岗位", score_disp, d.get("verdict") or "")
     payload = json.dumps(d, ensure_ascii=False).replace("</", "<\\/")
     html = tpl.replace("__TITLE__", title).replace("__REPORT_DATA__", payload)
-    store.write_text(os.path.join(store.p_path("reports"), fname), html)
+    try:
+        store.write_text(path, html)       # 原子写（同目录临时文件 + os.replace）
+    except BaseException:
+        if reserved:
+            # 渲染失败时把**我们自己刚占的那个空占位**收掉：留着会被 `/api/reports` 当成
+            # 一份真报告列出来（0 字节、打不开），而那个时刻连一次分析都没成功。
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        raise
     return fname
 
 

@@ -339,6 +339,27 @@ class JdPurgeExecuteTest(_PurgeCase):
         self.assertFalse(os.path.exists(self._jd_file(jd_id + ".txt")))
         self.assertEqual(len(self._analysis_ids()), 3)   # 一条分析都没被顺手删掉
 
+    def test_the_ledger_is_written_through_the_transaction(self):
+        """回归钉：摘掉本 JD 的分析记录那一段必须走 `store.update_jobs`（计划 2.4）。
+
+        改回"把闸门读到的那份 `jobs_before` 筛完直接 `save_jobs`"就红 —— 删除窗口里
+        挤进来的一次分析落盘（`upsert_job`）会被整份顶掉（报告还在，台账里却没了）。
+        """
+        calls = []
+        real = store.update_jobs
+
+        def watch(fn, key=None):
+            calls.append(True)
+            return real(fn, key)
+
+        with mock.patch.object(store, "update_jobs", watch):
+            res = jddelete.purge_jd(JD_A)
+
+        self.assertTrue(res["ok"], res)
+        self.assertEqual(len(calls), 1,
+                         "删除没有走 `store.update_jobs`：台账又变成跨多次调用的读-改-写了")
+        self.assertEqual(self._analysis_ids(), [B1])
+
     def test_purging_a_missing_jd_is_a_clear_error(self):
         before = _tree(store.profile_dir())
         with self.assertRaises(jddelete.JdPurgeError) as ctx:

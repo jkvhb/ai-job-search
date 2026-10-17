@@ -583,6 +583,40 @@ def upsert_job(record, key=None):
         return record
 
 
+def update_jobs(fn, key=None):
+    """台账的**复合**读-改-写：在 `_JOBS_LOCK` 里 `load → fn(jobs) → save`（一次临界区）。
+
+    谁用（计划 2.4 的三处复合 RMW，它们的病根都是"`load_jobs()` → 改 → `save_jobs()`
+    跨了**两次** store 调用"）：`jobdup._merge_jobs_locked`、`jddelete._purge_locked`、
+    `jdid.rename_jd`。`_JOBS_LOCK` 只保证**单次**调用原子 ⇒ 中间挤进来另一个写者
+    （例如另一次分析落盘的 `upsert_job`），后写的整份覆盖照样把它顶掉。
+
+    **`fn(jobs)` 的契约**：
+      * 收到的是**刚读出来**的那份列表（可以直接就地改，不必复制）；
+      * 返回一个二元组 `(要写回的列表, 返回值)`；
+      * 第一个元素**不是 `None`** ⇒ 走 `save_jobs` 写回（连带判据 + `.bak-` 留档）；
+      * 第一个元素**是 `None`** ⇒ **一个字节都不写**（"这次没有改动"的显式表达，
+        例如 `jdrefs` / `jdid` 那种"改了 0 条就不写盘、也不留备份"的语义）；
+      * 第二个元素由本函数**原样返回**给调用方（要计数给计数、要新值给新值）。
+
+    ⚠️ **`fn` 抛异常 ⇒ 异常原样冒出去、一个字节都不写盘**（这就是"事务"的全部含义：
+    读-改-写的中间态永不落盘）。`fn` 里的日志等外部副作用**不在**事务范围内。
+
+    ⚠️ **`fn` 只许在内存里改，绝不许在它里面取别的锁 / 调别的模块**：调用方往往是持着
+    `_JD_LOCK` / `_MERGE_LOCK` / `_KB_LOCK` 进来的（那三处的调用点就是），此刻再去取上层锁
+    就是**反序**。本函数只取 store 的 `_JOBS_LOCK`（叶子模块的锁，恒为最内层）——
+    与调用方**原本**在同一行调 `load_jobs` / `save_jobs` 取的是**同一把**、同一个位置，
+    所以换成它**不新增任何锁序边**（证：`store` 只 import 标准库、从不引用上层锁，
+    见 `tests/test_store.py::UpdateJobsTransactionTest::test_store_never_takes_an_outer_lock`）。
+    """
+    with _JOBS_LOCK:
+        jobs = load_jobs(key)
+        next_jobs, result = fn(jobs)
+        if next_jobs is not None:
+            save_jobs(next_jobs, key)
+        return result
+
+
 def find_job(job_id, key=None):
     for j in load_jobs(key):
         if j.get("id") == job_id:

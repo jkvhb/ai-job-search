@@ -526,6 +526,27 @@ class RenameJdTest(IsolatedCase):
         self.assertEqual(store.load_interview_json("iv1", "status.json")["job_id"], self.NEW)
         self.assertEqual(store.load_jobs()[0]["jd_id"], self.NEW)          # 分析也跟着改
 
+    def test_the_ledger_is_written_through_the_transaction(self):
+        """回归钉：台账 `jd_id` 那一段必须走 `store.update_jobs`（计划 2.4）。
+
+        改回"把第 764 行那份快照改好、第 7 步整份 `save_jobs`"就红 —— 改名窗口里挤进来的
+        一次分析落盘（`upsert_job`）会被整份顶掉（报告还在盘上，台账里却看不到那次分析）。
+        """
+        self._fixture()
+        calls = []
+        real = store.update_jobs
+
+        def watch(fn, key=None):
+            calls.append(True)
+            return real(fn, key)
+
+        with mock.patch.object(store, "update_jobs", watch):
+            jdid.rename_jd(self.OLD, self.NEW)
+
+        self.assertEqual(len(calls), 1,
+                         "改名没有走 `store.update_jobs`：台账又变成跨多次调用的读-改-写了")
+        self.assertEqual(store.load_jobs()[0]["jd_id"], self.NEW)
+
     def test_rename_updates_each_reference_individually(self):
         """补强（计划外）：三处引用**逐处单独断言**，另外两处故意写坏也不会被掩盖。
 

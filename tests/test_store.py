@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+import ast
 import glob
 import importlib
 import io
@@ -1541,6 +1542,230 @@ class ElementShapeStrictDeepTest(IsolatedCase):
         self.assertEqual(store.jobs_safe_to_write(), (True, ""))
         self.assertEqual(store.jds_safe_to_write(), (True, ""))
         self.assertEqual(store.knowledge_safe_to_write(), (True, ""))
+
+
+class UpdateJobsTransactionTest(IsolatedCase):
+    """P3-8 / 计划 2.4：`store.update_jobs` —— 台账的**复合**读-改-写必须是一个临界区。
+
+    要修的形态（`jobdup._merge_jobs_locked` / `jddelete._purge_locked` / `jdid.rename_jd`
+    三处都是它）：`load_jobs()` → 改 → `save_jobs()` 跨了**两次** store 调用，而 `_JOBS_LOCK`
+    只保证**单次**调用原子 ⇒ 两个写者各自读、各自整份写回，后写的把先写的**静默顶掉**。
+
+    ⚠️ 这个夹具怎么制造"必丢"（实测踩过一版**假绿**的夹具，写法必须照这里）：
+
+    用一个**事件**而不是 Barrier 来定序 —— A（慢改者）先读到旧台账、把 `a_loaded` 置位、
+    在"改"这一步里停 SLOW_SECONDS；B 等到 `a_loaded` 才开始读。于是：
+
+      * 老骨架（锁外 load → 改 → save）：A 读完之后 B 才读，B 读到的是**同一份旧台账**；
+        B 先写完，A 再把自己的旧快照整份写回 ⇒ **B 的改动被顶掉**（这就是要抓的那一次丢更新）。
+      * `update_jobs`：A 的那段"改"是**持着 `_JOBS_LOCK`** 跑的 ⇒ B 卡在锁上，等 A 写完之后
+        才**读到 A 的结果**、再改自己的那条 ⇒ 两条都在。
+
+    ⚠️ 两个坑：
+    1. **不许用 Barrier 在调用前定序**：`save_jobs` 自己整段持 `_JOBS_LOCK`，被 Barrier 唤醒的那个
+       线程去 `load_jobs` 时会**卡在这把锁上**，于是两个 load 被强行串开 ⇒ 老骨架也"不丢"
+       ⇒ 上一条对照直接**假绿**（实测：`lost == []`）。
+    2. **更不许把会合点放进临界区内部**（例如放进 `fn` 里等另一个线程到达）：`update_jobs` 正常
+       工作时另一个线程根本进不来 ⇒ 会合永远等不到 ⇒ 30 秒后超时或死等。所以这里的 `fn`
+       只**单向**停一下（自己睡 `SLOW_SECONDS`），不等任何人。
+    """
+
+    ROUNDS = 3
+    SLOW_SECONDS = 0.05
+
+    def _run_race(self, rmw):
+        """跑 ROUNDS 轮"A 先读、B 后读、A 后写"的竞争；`rmw(who, slow, a_loaded)` 是 RMW 骨架。"""
+        errors = {}
+        a_loaded = threading.Event()
+
+        def worker(who, slow):
+            try:
+                if who == "B":
+                    # A 一定已经**读到**那份旧台账了，B 从这一刻才出发
+                    if not a_loaded.wait(20):
+                        raise AssertionError("A 没能先读到台账（夹具没构成竞争）")
+                rmw(who, slow, a_loaded)
+            except BaseException as e:            # noqa: BLE001 - 线程里的异常必须能被断言看到
+                errors[threading.current_thread().name] = e
+
+        ts = [threading.Thread(target=worker, args=(who, slow), name="editor-%s" % who)
+              for who, slow in (("A", True), ("B", False))]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join(60)
+        self.assertFalse(any(t.is_alive() for t in ts), "有线程没跑完（死等）")
+        self.assertEqual(errors, {}, "线程里抛了异常：%r" % errors)
+
+    def _edit_in_memory(self, jobs, who, round_no):
+        for j in jobs:
+            if isinstance(j, dict) and j.get("id") == who:
+                j["touched_%d" % round_no] = who
+
+    def test_two_threads_editing_different_records_keep_both(self):
+        """两个线程各改**不同**的一条 ⇒ 两条改动都必须留下来（老骨架必丢一条）。"""
+        store.save_jobs([{"id": "A", "score": 60.0}, {"id": "B", "score": 60.0}])
+
+        def via_update_jobs(who, slow, a_loaded):
+            for round_no in range(self.ROUNDS):
+                def edit(jobs, who=who, round_no=round_no):
+                    if slow:                      # 慢改者：拉宽"读完之后、写回之前"那段
+                        a_loaded.set()
+                        time.sleep(self.SLOW_SECONDS)
+                    self._edit_in_memory(jobs, who, round_no)
+                    return jobs, True
+
+                store.update_jobs(edit)
+
+        self._run_race(via_update_jobs)
+
+        rows = {j.get("id"): j for j in store.load_jobs()}
+        self.assertEqual(sorted(rows), ["A", "B"], "台账里的记录被顶掉了：%r" % sorted(rows))
+        for round_no in range(self.ROUNDS):
+            for who in ("A", "B"):
+                self.assertEqual(rows[who].get("touched_%d" % round_no), who,
+                                 "第 %d 轮里 %s 的改动被另一个线程的整份覆盖顶掉了（丢更新）：%r"
+                                 % (round_no + 1, who, rows[who]))
+
+    def test_the_fixture_really_catches_a_lost_update(self):
+        """自证夹具：**同一个**竞争夹具下，老骨架（锁外 load → 改 → save）必丢一条。
+
+        这条是**对照/证据**（它断言的是"丢了一条"）：没有它，上面那条绿只能说明
+        "夹具根本没制造出竞争"，说明不了 `update_jobs` 真的挡掉了丢更新。
+        它同时钉住了"把 `update_jobs` 改回锁外 load/save"这个变异确实会被抓到。
+        """
+        store.save_jobs([{"id": "A", "score": 60.0}, {"id": "B", "score": 60.0}])
+
+        def old_style(who, slow, a_loaded):
+            for round_no in range(self.ROUNDS):
+                jobs = store.load_jobs()          # ← 锁只护这一次 load
+                if slow:
+                    a_loaded.set()
+                    time.sleep(self.SLOW_SECONDS)
+                self._edit_in_memory(jobs, who, round_no)
+                store.save_jobs(jobs)             # ← 锁只护这一次 save（中间的改动裸奔）
+
+        self._run_race(old_style)
+
+        rows = {j.get("id"): j for j in store.load_jobs()}
+        lost = [who for who in ("A", "B")
+                if any(rows.get(who, {}).get("touched_%d" % r) != who
+                       for r in range(self.ROUNDS))]
+        self.assertTrue(lost,
+                        "夹具没能制造出丢更新：两条改动都留下来了 ⇒ 这条对照失去意义，"
+                        "上面那条 `update_jobs` 的绿也就没有说服力")
+
+    def test_a_raising_fn_writes_not_a_single_byte(self):
+        """`fn` 抛异常 ⇒ **一个字节都不写盘**（连 `.bak-` 都不许多一份）。"""
+        store.save_jobs([{"id": "A", "score": 60.0}])
+        path = store.jobs_path()
+        raw = store.read_bytes(path)
+        folder = os.path.dirname(path)
+        before = sorted(os.listdir(folder))
+
+        def boom(jobs):
+            jobs[0]["score"] = 0.0                    # 就地改：这种中间态绝不许落盘
+            jobs.append({"id": "半截分析"})
+            raise ValueError("注入的失败")
+
+        with self.assertRaises(ValueError):
+            store.update_jobs(boom)
+
+        with open(path, "rb") as f:
+            self.assertEqual(f.read(), raw, "fn 抛异常时台账必须逐字节未变")
+        self.assertEqual(sorted(os.listdir(folder)), before,
+                         "fn 抛异常时连 .bak- 都不该多出来（留档必须发生在「确定要写」之后）")
+
+    def test_it_returns_what_fn_decides_and_none_means_no_write(self):
+        """返回值就是 `fn` 给的那个东西；`fn` 用 `None` 说"没改动" ⇒ 一个字节都不写。"""
+        store.save_jobs([{"id": "A", "score": 60.0}])
+        raw = store.read_bytes(store.jobs_path())
+
+        self.assertEqual(store.update_jobs(lambda jobs: (None, "没改动")), "没改动")
+        self.assertEqual(store.read_bytes(store.jobs_path()), raw,
+                         "fn 说没改动，就不该写盘（也不该留 .bak-）")
+
+        def bump(jobs):
+            jobs[0]["score"] = 99.0
+            return jobs, len(jobs)
+
+        self.assertEqual(store.update_jobs(bump), 1, "返回值必须是 fn 决定的那一个")
+        self.assertEqual(store.load_jobs()[0]["score"], 99.0)
+        self.assertEqual(store.update_jobs(lambda jobs: (jobs, None)), None,
+                         "fn 决定返回 None 时也原样返回 None")
+
+    def test_the_fn_sees_the_freshest_ledger_not_a_stale_snapshot(self):
+        """`fn` 拿到的必须是**刚读出来**的那份：调用方读快照 → 中途别人写了 → 这里要能看见。
+
+        这一条正是 `jobdup` / `jddelete` / `jdid` 那三处的病根（它们把**旧快照**整份写回）。
+        """
+        store.save_jobs([{"id": "A"}])
+        stale = store.load_jobs()                     # 调用方手里的快照（马上就会过期）
+        store.upsert_job({"id": "B"})                 # 另一个写者插进来
+
+        seen = {}
+
+        def look(jobs):
+            seen["ids"] = [j.get("id") for j in jobs]
+            return None, None
+
+        store.update_jobs(look)
+        self.assertEqual(sorted(seen["ids"]), ["A", "B"],
+                         "fn 看到的是旧快照（%r），不是盘上最新的那份" % (stale,))
+
+    def test_a_gbk_ledger_refuses_the_transaction_and_keeps_every_byte(self):
+        """坏台账（有内容却读不出来）⇒ 拒绝整次事务，逐字节不变、连 `.bak-` 都不多。"""
+        path = store.jobs_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        raw = json.dumps([{"id": "字节跳动", "score": 60.0}],
+                         ensure_ascii=False).encode("gbk")
+        with open(path, "wb") as f:
+            f.write(raw)
+        folder = os.path.dirname(path)
+        before = sorted(os.listdir(folder))
+
+        with self.assertRaises(RuntimeError) as cm:
+            store.update_jobs(lambda jobs: ([{"id": "整份顶掉"}], 1))
+        self.assertIn("jobs.json", str(cm.exception))
+
+        with open(path, "rb") as f:
+            self.assertEqual(f.read(), raw, "拒绝写盘时台账必须逐字节未变")
+        self.assertEqual(sorted(os.listdir(folder)), before, "守卫先于留档")
+
+    def test_store_never_takes_an_outer_lock(self):
+        """锁序的**反向证据**（AST）：store 绝不引用上层那几把锁。
+
+        为什么这条是本节最关键的证据：`update_jobs` 会在**持 `_JD_LOCK` / `_MERGE_LOCK` /
+        `_KB_LOCK` 的调用方内部**被调用（`jdid.rename_jd` / `jobdup` / `jddelete`）——
+        那与它们**现在**在同一行调 `store.load_jobs` / `store.save_jobs` 取的是**同一把**
+        `_JOBS_LOCK`，所以锁图**逐边不变**、不可能成环。
+
+        这个结论的支柱只有一条：store 是**叶子模块**（只 import 标准库，从不回手去抢上层锁）。
+        它要是哪天 import 了 `jdid`/`kb`/`jobdup` 或直接引用那几把锁，"上层 → store"的
+        单向性就断了，环就有了 —— 所以必须用 AST 钉住（说明文字里提到那些锁名是应该的，
+        注释/文档字符串不算代码，AST 看不见它们）。
+        """
+        src = store.read_text(os.path.join(store.ROOT, "store.py"))
+        self.assertTrue(src)
+        tree = ast.parse(src)
+
+        used = {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)}
+        used |= {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
+        for name in ("_JD_LOCK", "_KB_LOCK", "_MERGE_LOCK", "_STORE_PATCH_LOCK",
+                     "_VIEW_LOCAL", "_LOCK"):
+            self.assertNotIn(name, used,
+                             "store.py 里真的去拿/碰了 `%s`：叶子模块的单向性断了" % name)
+
+        names = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                names |= {a.name.split(".")[0] for a in node.names}
+            elif isinstance(node, ast.ImportFrom):
+                names.add((node.module or "").split(".")[0])
+        self.assertTrue(names, "一个 import 都没找到？解析方式不对")
+        self.assertEqual(names - {"io", "json", "os", "re", "tempfile", "threading",
+                                 "datetime"}, set(),
+                         "store 只能 import 标准库（多一个项目模块就多一条回抢上层锁的通道）")
 
 
 if __name__ == "__main__":

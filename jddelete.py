@@ -688,6 +688,20 @@ def _tick():
             raise OSError("注入的删除失败（测试用）")
 
 
+def _drop_jd_records(jobs, jd_id):
+    """`store.update_jobs` 用的 `fn`：把挂在这个 JD 下面的分析记录摘掉。
+
+    返回 `(要写回的列表, 删除的条数)`。**总是返回列表**（而不是 `None`）：本模块这一处历来是
+    "无条件写回"（`save_jobs` 顺带负责留档 + 轮转），改成就地跳过会改变留档节奏 = 改对外行为。
+
+    判据与 `_analyses_of` 同一口径（`_jd_id_of_record`：`jd_id` 优先、退回 `id`）。
+    ⚠️ 只改内存：它是在 `_JOBS_LOCK` 里跑的，而调用方还持着 `_JD_LOCK` + `_KB_LOCK`
+    （与原来在同一行调 `save_jobs` 取的是**同一把**锁，锁序逐边不变）。
+    """
+    kept = [j for j in jobs if _jd_id_of_record(j) != jd_id]
+    return kept, len(jobs) - len(kept)
+
+
 def _interview_updates(planned_interviews):
     """在内存里把面试记录的 `job_id` 清空，返回 `[(path, 新状态), ...]`。
 
@@ -772,7 +786,9 @@ def _purge_locked(jd_id, plan):
     # **读不出来就拒绝执行**：后面那两步 `save_jobs` / `save_jds` 会把这两个文件**整份覆盖**，
     # 而 `store.load_jobs()` / `jdid.load_jds()` 都把"读不出来"报成**空** —— 那会把
     # 所有岗位的分析记录 / 所有 JD 记录一次抹掉（见两个 `_readable_*_or_raise`）。
-    jobs_before = _readable_jobs_or_raise()
+    # ⚠️ 这道闸门只**判**（读得出来吗），它读到的那份**不再**直接被写回：那正是
+    # "旧快照整份覆盖"的病根（见下面 2c 的 `store.update_jobs`）。
+    _readable_jobs_or_raise()
     jds_before = _readable_jds_or_raise()
     # 知识库坏掉**不阻止删除**（不会被覆盖，坏着也不丢数据），只如实说明
     # （那句话在 `_plan` 的 advisories 里说）。**这里不再自己读它**：引用清理那一整段
@@ -836,8 +852,13 @@ def _purge_locked(jd_id, plan):
         # `target_ids` 里就混进一个空串，于是"id 不在集合里"会把**所有**没有 id 的记录
         # 一起删掉（别的 JD 的、以及根本不属于任何 JD 的）。身份是"这是谁的记录"，
         # 就该用身份来判，别用"id 有没有出现在某个集合里"来代理它。
-        kept_jobs = [j for j in jobs_before if _jd_id_of_record(j) != jd_id]
-        store.save_jobs(kept_jobs)
+        #
+        # ⚠️ 读-改-写必须收进 `store.update_jobs`（计划 2.4）：老写法把上面闸门读到的
+        # `jobs_before` 筛完直接 `save_jobs`，中间挤进来的一次分析落盘（`upsert_job`）
+        # 会被整份顶掉。现在判据挪进临界区、作用在**刚读出来**的那份上。
+        # ⚠️ 无条件写回（哪怕这次一条都没删）：刻意保留老行为 —— `save_jobs` 同时负责
+        # 判据 + `.bak-` 留档 + 轮转，改成就地跳过会改变留档节奏（那是对外行为）。
+        store.update_jobs(lambda jobs: _drop_jd_records(jobs, jd_id))
         _tick()
         # 2d) 引用：知识库只清 `from_jds` 条目、面试记录只清 `job_id`
         # 知识库那一段走 kb 的窄接口：它自己持 `_KB_LOCK` 把整段读-改-写做完（坏库时
