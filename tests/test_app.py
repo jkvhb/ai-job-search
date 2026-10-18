@@ -6256,6 +6256,76 @@ class LogsRouteUnreadableTest(IsolatedCase):
         self.assertEqual(body["recent"], [])
 
 
+class LogsClearRouteTest(IsolatedCase):
+    """`POST /api/logs/clear`：清当前文件 **+ 所有存档段**，响应里带**实际删了几段**（6.5）。
+
+    改前：路由只 `open(LOG_FILE, "w")` 截断当前文件 ⇒ 之后 `GET /api/logs` 仍从存档里
+    把旧记录读回来（界面回「已清空」是假话）。这条用例在改前红在两处：
+    `body["archives_removed"]` 这个计数（旧响应没有这个字段）与
+    `GET /api/logs` 的 `total == 0`（旧行为仍有旧记录）。
+    """
+
+    def _write_segment(self, path, events):
+        folder = os.path.dirname(path)
+        if folder:
+            os.makedirs(folder, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            for e in events:
+                f.write(json.dumps({"event": e}, ensure_ascii=False) + "\n")
+        return path
+
+    def test_clearing_reports_the_count_and_leaves_no_records(self):
+        d = os.path.dirname(log.LOG_FILE)
+        base = os.path.basename(log.LOG_FILE)
+        self._write_segment(os.path.join(d, base + ".20261018_100000_000001"), ["old-1"])
+        self._write_segment(os.path.join(d, base + ".20261018_101000_000002"), ["mid-1"])
+        log.log_event("now-1")
+        self.assertEqual(len(log.archive_paths()), 2, "夹具前提：两个存档段")
+
+        h = _sandbox_handler("POST", "/api/logs/clear", b"", {"Content-Length": "0"})
+
+        body = h._body
+        self.assertEqual(h._status, 200)
+        self.assertTrue(body.get("ok"), "正常的清空回失败了：%r" % (body,))
+        self.assertEqual(body.get("archives_removed"), 2,
+                         "响应里没带「实际删了几段」：%r" % (body,))
+        self.assertIn("2 个存档段", str(body.get("message")),
+                      "给用户的那句话必须如实说删了几段：%r" % (body,))
+        self.assertEqual(log.archive_paths(), [], "存档段必须一个不剩")
+
+        page = _get("/api/logs").json_body()
+        self.assertEqual(page["total"], 0,
+                         "清空后 GET /api/logs 仍能读出旧记录（存档里的）—— 「已清空」是假话")
+        self.assertEqual(page["recent"], [])
+
+
+class FrontendClearLogsCountTest(IsolatedCase):
+    """前端「已清空」必须带上**实际删了几段**（6.5 的界面出口）。
+
+    ⚠️ 这条在改动前红：旧 toast 是硬编码的「日志已清空」，既没有计数、也没读响应里的
+    `message` —— 用户无从知道存档段有没有一起删掉。
+    """
+
+    def test_the_clear_toast_carries_the_archive_count(self):
+        _need_node()
+        out = web_probe.run_index(
+            "fetch = function(url){\n"
+            "  if(String(url).indexOf('/api/logs/clear') >= 0){\n"
+            "    return Promise.resolve({ok:true, json:function(){ return Promise.resolve(\n"
+            "      {ok:true, archives_removed:3, cleared_current:true,\n"
+            "       message:'已清空：当前日志 + 3 个存档段'}); }});\n"
+            "  }\n"
+            "  return Promise.resolve({ok:true, json:function(){ return Promise.resolve(\n"
+            "    {ok:true, total:0, recent:[], size:0}); }});\n"
+            "};\n"
+            "confirm = function(){ return true; };\n"
+            "await clearLogs();\n"
+            "out.toast = String($('#toast').textContent);\n")
+
+        self.assertIn("3", out["toast"], "「已清空」没带上实际删了几段：%r" % (out["toast"],))
+        self.assertIn("存档段", out["toast"], "没说清存档段也被删了：%r" % (out["toast"],))
+
+
 class GetOuterTryTest(IsolatedCase):
     """`do_GET` 外层兜底：路由里没人接住的意外 → **500 + 一句人话 + 一条日志**。
 

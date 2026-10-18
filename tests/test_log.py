@@ -575,5 +575,120 @@ class LogRotationTest(IsolatedCase):
             self.assertIn(a, names, "存档必须一起进反馈包")
 
 
+# ---------------------------------------------------------------- 6.5 清空日志的语义冲突
+class ClearAllLogsTest(IsolatedCase):
+    """「清空日志」= 清当前文件 **+ 删所有存档段**（6.5 的语义冲突）。
+
+    现状（改前）：`/api/logs/clear` 只 `open(LOG_FILE, "w")` 截断当前文件，而 `read_logs`
+    读的是"所有存档升序 + 当前文件" ⇒ 用户点「清空日志」、界面回「已清空」，
+    可旧记录仍从存档里被读回来 —— **那句「已清空」是假话**。
+
+    判定：**「一条记录都不许丢」约束的是自动轮转**（`log.py` 的轮转绝不删段），
+    **不约束用户显式点「清空」** —— 用户明确要求删掉却因为存档还在而仍然看得见，
+    那是说假话，比删掉更糟。所以删完必须**如实报告删了哪些段**、失败必须**如实回失败**。
+
+    这里的存档段**手工造**（名字按 `<日志名>.<YYYYmmdd_HHMMSS_微秒>` 的真实形状）：
+    比压小阈值真轮转更快、更稳，并且能顺带造一个"用户手工拷的 `.bak-…`"当反例。
+    """
+
+    def _write_segment(self, path, events):
+        folder = os.path.dirname(path)
+        if folder:
+            os.makedirs(folder, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            for e in events:
+                f.write(json.dumps({"event": e}, ensure_ascii=False) + "\n")
+        return path
+
+    def _two_archives_plus_current(self):
+        """当前文件 + 2 个存档段 + 1 个**不是**轮转产物（`.bak-…`）的诱饵。"""
+        d = os.path.dirname(log.LOG_FILE)
+        base = os.path.basename(log.LOG_FILE)
+        old = self._write_segment(os.path.join(d, base + ".20261018_100000_000001"),
+                                  ["old-1", "old-2"])
+        mid = self._write_segment(os.path.join(d, base + ".20261018_101000_000002"), ["mid-1"])
+        decoy = self._write_segment(os.path.join(d, base + ".bak-手动拷的"), ["decoy"])
+        log.log_event("now-1")
+        log.log_event("now-2")
+        self.assertEqual(log.archive_paths(), [old, mid], "夹具前提：正好两段、老的在前")
+        self.assertGreater(log.read_logs(10 ** 9).total, 0, "夹具前提：改前真的读得到旧记录")
+        return old, mid, decoy
+
+    def test_clearing_removes_the_current_file_and_every_archive(self):
+        """主判据：清完 `read_logs()` 回 0 条、`archive_paths()` 为空。
+
+        改前红在这里：`log.clear_all_logs` 还不存在（AttributeError）；即使存在，
+        "只截断当前文件"那版会让 `read_logs(...).total == 0` 这条断言红（存档里的
+        old-1/old-2/mid-1 仍被读回来）。
+        """
+        old, mid, _decoy = self._two_archives_plus_current()
+
+        res = log.clear_all_logs()
+
+        self.assertTrue(res["ok"], "正常的清空却报了失败：%r" % (res,))
+        self.assertEqual(res["archives_removed"], [old, mid], "删了哪几段必须如实回报（老的在前）")
+        self.assertTrue(res["cleared_current"], "当前文件没被清掉")
+        self.assertEqual(log.archive_paths(), [], "存档段必须一个不剩")
+        page = log.read_logs(10 ** 9)
+        self.assertEqual(page.total, 0,
+                         "清空后仍能从存档读出旧记录 —— 那句「已清空」是假话")
+        self.assertEqual(page.records, [])
+        self.assertEqual(os.path.getsize(log.LOG_FILE), 0, "当前文件应当被截成 0 字节")
+
+    def test_the_user_copied_backup_is_not_deleted(self):
+        """只删**轮转产物**：用户手工拷的 `.bak-…` 不归本进程管，不许被当成日志段删掉。"""
+        _old, _mid, decoy = self._two_archives_plus_current()
+        log.clear_all_logs()
+        self.assertTrue(os.path.exists(decoy), "用户手工拷的 .bak-… 被一并删了（那是他的东西）")
+
+    def test_clearing_twice_is_idempotent(self):
+        """幂等：清完再清一次 / 本来就没有日志 ⇒ 正常返回（`archives_removed` 为空）、不抛。"""
+        self._two_archives_plus_current()
+        self.assertTrue(log.clear_all_logs()["ok"])
+
+        again = log.clear_all_logs()
+        self.assertTrue(again["ok"], "第二次清空（已经没有存档）报失败了：%r" % (again,))
+        self.assertEqual(again["archives_removed"], [])
+        self.assertTrue(again["cleared_current"])
+        self.assertEqual(log.read_logs(10 ** 9).total, 0)
+
+        # 还没有任何日志文件的目录（`logs/` 存在、当前文件还没写第一条）
+        d = os.path.join(self.tmp, "空目录", "logs")
+        os.makedirs(d)
+        real = log.LOG_FILE
+        self.addCleanup(setattr, log, "LOG_FILE", real)
+        log.LOG_FILE = os.path.join(d, "events.jsonl")
+        res = log.clear_all_logs()
+        self.assertTrue(res["ok"], "没有日志时清空却报失败：%r" % (res,))
+        self.assertEqual(res["archives_removed"], [])
+
+    def test_a_locked_archive_is_reported_not_silently_ignored(self):
+        """失败必须如实带出来（删不掉却说"已清空"比没删更糟）。"""
+        old, mid, _decoy = self._two_archives_plus_current()
+
+        with mock.patch("os.remove", side_effect=PermissionError(13, "另一个程序占着")):
+            res = log.clear_all_logs()
+
+        self.assertFalse(res["ok"], "删不掉却回成功：%r" % (res,))
+        self.assertIn("另一个程序占着", res["error"])
+        self.assertIn(os.path.basename(old), res["error"], "哪一段失败了要说清")
+        self.assertIn(os.path.basename(mid), res["error"])
+        self.assertEqual(len(res["errors"]), 2)
+        self.assertEqual(res["archives_removed"], [], "没删掉的不许算进「已删」")
+        self.assertTrue(log.archive_paths(), "存档还在盘上（失败就是失败）")
+
+    def test_a_missing_log_directory_is_reported_not_raised(self):
+        """路径连目录都没有 ⇒ **不抛**、回 `ok:false` + 人话（调用方据此回 ok:false）。"""
+        real = log.LOG_FILE
+        self.addCleanup(setattr, log, "LOG_FILE", real)
+        log.LOG_FILE = os.path.join(self.tmp, "还没有的目录", "events.jsonl")
+
+        res = log.clear_all_logs()
+
+        self.assertFalse(res["ok"])
+        self.assertTrue(res["error"], "失败了却连一句原因都没有")
+        self.assertIn("events.jsonl", res["error"])
+
+
 if __name__ == "__main__":
     unittest.main()

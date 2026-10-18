@@ -3338,7 +3338,9 @@ $('#demoBtn').addEventListener('click', async ()=>{
 /* ---------------- 日志面板 ---------------- */
 /* 清空日志。抽成**具名函数**是为了能被探针直接调用（原来只挂在按钮的匿名监听器里，
    前端测试根本碰不到它 —— 而 P1-16 正是"失败了也 toast 成功"这句假话）。
-   ⚠️ 判 `r.ok`：服务端失败时回 `ok:false`，这里绝不许再说「日志已清空」。 */
+   ⚠️ 判 `r.ok`：服务端失败时回 `ok:false`，这里绝不许再说「日志已清空」。
+   ⚠️ 6.5：清空 = 当前文件 **+ 所有存档段** —— toast 要带上**实际删了几段**
+   （服务端把计数放在 `archives_removed`，人话在 `message`；只说「已清空」等于没说清存档去哪了）。 */
 async function clearLogs(){
   const el = $('#logSt');
   try{
@@ -3352,7 +3354,10 @@ async function clearLogs(){
       toast('清空日志失败：' + why);                 // 绝不 toast「日志已清空」
       return false;
     }
-    loadLogs(); toast('日志已清空');
+    const n = (r && typeof r.archives_removed === 'number') ? r.archives_removed : 0;
+    const msg = (r && r.message) ? String(r.message)
+              : (n > 0 ? ('已清空：当前日志 + ' + n + ' 个存档段') : '已清空：当前日志');
+    loadLogs(); toast(msg);                          // 带上实际删了几段
     return true;
   }catch(e){
     const why = (e && e.message) || String(e);

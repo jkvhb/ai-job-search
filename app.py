@@ -2743,15 +2743,26 @@ class Handler(BaseHTTPRequestHandler):
         if p == "/api/logs/clear":
             # P1-11：清空失败**不许**回 ok:true（前端只看 ok，会 toast「日志已清空」，
             # 而取证线索其实还在/或压根没清掉 —— 两种情况都必须如实说）。
-            try:
-                open(log.LOG_FILE, "w", encoding="utf-8").close()
-            except Exception as e:
-                log.log_event("logs.clear_failed", level="error", error=str(e), file=log.LOG_FILE)
-                return self._send(200, {"ok": False,
-                                        "error": "清空日志失败：%s（日志文件：%s）—— 日志没有被清空，"
-                                                 "请检查这个文件是否被占用或没有写权限" % (e, log.LOG_FILE)})
-            log.log_event("logs.cleared")
-            return self._send(200, {"ok": True})
+            # 6.5：清空 = 当前文件 **+ 所有存档段**。只截断当前文件的话，`read_logs`
+            # 仍会把存档里的旧记录读回来，「已清空」就是一句假话。
+            # ⚠️ 成功时**不再**写 `logs.cleared`：那会立刻在刚清空的日志里留下一行，
+            # 界面（`GET /api/logs`）随即显示「共 1 条」—— 删了什么由响应里的计数如实带回。
+            res = log.clear_all_logs()
+            if not res["ok"]:
+                log.log_event("logs.clear_failed", level="error", error=res["error"],
+                              archives_removed=len(res["archives_removed"]), file=log.LOG_FILE)
+                return self._send(200, {
+                    "ok": False,
+                    "archives_removed": len(res["archives_removed"]),
+                    "cleared_current": res["cleared_current"],
+                    "error": "清空日志失败：%s —— 日志没有被完整清空，请检查这些文件是否被占用"
+                             "或没有写权限（日志文件：%s）" % (res["error"], log.LOG_FILE)})
+            removed = len(res["archives_removed"])
+            return self._send(200, {
+                "ok": True,
+                "archives_removed": removed,
+                "cleared_current": res["cleared_current"],
+                "message": "已清空：当前日志 + %d 个存档段" % removed})
 
         if p == "/api/config":
             # ⚠️ **字段类型错不许静默忽略**（P1-13 的兄弟）：旧写法 `if isinstance(body.get(k), dict)`

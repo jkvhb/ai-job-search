@@ -352,6 +352,72 @@ def read_logs(limit=200):
                    lines=total_lines, blank_lines=blank, bad_lines=bad)
 
 
+def clear_all_logs():
+    """用户**显式**点「清空日志」：截断当前文件 **+ 删掉每一个轮转存档段**。
+
+    为什么要删存档（6.5 的语义冲突）：`read_logs` 读的是"所有存档升序 + 当前文件"。
+    只截断当前文件的话，用户点「清空日志」、界面回「已清空」，可旧记录**仍从存档里
+    被读回来** —— 那句「已清空」是假话。
+
+    判定：**"一条记录都不许丢"约束的是自动轮转**（`archive_paths` 里的段是 `log_event`
+    自动轮转出来的，轮转绝不删段），**不约束用户显式点「清空」** —— 用户明确要求删掉，
+    却因为存档还在而仍然看得见，那是说假话，比删掉更糟。
+
+    返回一个**形状固定**的 dict（调用方据此如实回话，前端据此带上计数）：
+
+        ok               全部成功？（有任何一处没清掉 ⇒ False）
+        file             当前日志文件路径
+        cleared_current  当前文件是否已经干净（截断成功；文件本来就不存在也算干净）
+        archives_removed 真的删掉的存档段路径（老的在前）
+        errors           [{"path": …, "error": …}, …]；`ok` 为 False 时非空
+        error            一句人话（`ok` 为 True 时是空串）
+
+    ⚠️ **本函数不抛异常，也绝不吞**：每一处失败都把**路径 + 原因**放进 `errors`，
+    调用方必须据此回 `ok:false`（"清空了一半却说清空成功"比没清更糟）。
+    ⚠️ **幂等**：没有当前文件 / 没有存档段时照常返回（`archives_removed` 为空、`ok` 为 True）。
+    ⚠️ **只删轮转产物**（`archive_paths()`）—— 用户手工拷的 `events.jsonl.bak-…` 不是日志段，
+    不归本进程管，绝不碰。
+    """
+    result = {"ok": True, "file": LOG_FILE, "cleared_current": False,
+              "archives_removed": [], "errors": [], "error": ""}
+    if not LOG_FILE:
+        # 档名文件读不出来时 LOG_FILE 是空串占位（见 `_initial_log_file`）：
+        # 没有"可清空的日志"这件事必须如实说，绝不静默当成功。
+        result["ok"] = False
+        result["error"] = "日志路径为空（档名文件读不出来），没有可清空的日志"
+        result["errors"].append({"path": "", "error": "日志路径为空"})
+        return result
+
+    for path in archive_paths():
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            # 列出来之后被别处删掉了：目标状态已经达成，不算失败、也不算"本函数删的"。
+            pass
+        except Exception as e:
+            result["errors"].append({"path": path, "error": "%s: %s" % (type(e).__name__, e)})
+        else:
+            result["archives_removed"].append(path)
+
+    try:
+        # 与旧实现同一个动作（"w" = 清空 + 文件不存在时建一个空文件），只是现在
+        # 存档段也一起删了，并且失败原因会带出去。
+        with open(LOG_FILE, "w", encoding="utf-8"):
+            pass
+        result["cleared_current"] = True
+    except Exception as e:
+        result["errors"].append({"path": LOG_FILE, "error": "%s: %s" % (type(e).__name__, e)})
+
+    if result["errors"]:
+        result["ok"] = False
+        parts = []
+        for item in result["errors"]:
+            name = os.path.basename(item.get("path") or "") or "（日志路径）"
+            parts.append("%s：%s" % (name, item.get("error") or ""))
+        result["error"] = "有 %d 处没能清掉 —— %s" % (len(result["errors"]), "；".join(parts))
+    return result
+
+
 LOG_GUIDE = """# 反馈日志包说明
 
 这个压缩包用来把「使用过程 + 报错信息」反馈给 AI，让它优化这个工具。
