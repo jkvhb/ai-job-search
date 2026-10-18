@@ -40,7 +40,7 @@ FILES = [
     "app.py", "store.py", "log.py", "llm.py", "search.py", "knowledge.py", "migrate_to_profiles.py",
     "interview.py", "jdfacts.py", "jddelete.py", "jdid.py", "jdrefs.py", "jobdup.py",
     "kb.py", "kbreuse.py", "outcome.py", "resumelib.py",
-    "备份体检.py",
+    "备份体检.py", "报告体检.py", "岗位去重.py",
     "启动.bat", "README.md", "EXAMPLES.md",
     "00-求职SOP总纲.md", "01-资产库构建.md", "02-预筛与打分.md",
     "03-JD拆解.md", "04-简历大纲.md", "05-面试准备.md", "06-投递追踪.md",

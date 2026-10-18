@@ -425,7 +425,9 @@ def _fill_from_card(node, card, matched_by=""):
             node[k] = clean(v)              # 形状类：kb 自己的尺子 + 全新对象
         else:
             node[k] = str(v or "").strip()  # 文本类：奇形值（5 / [1] / None）收口成字符串
-    # `layer` 走 `kb._as_int` 兜底（I-1）：`knowledge.json` 是用户可手改的，
+    # `layer` 走 `store.as_int(..., bool_ok=True)` 兜底（I-1，原来写的是本模块与 `kb` 各自的
+    # `_as_int` 副本；批 5 收归 store 之后口径由调用点显式传 —— 这里传的是 kb 那把尺子）：
+    # `knowledge.json` 是用户可手改的，
     # 一张 `layer: "abc"` / `[1]` 的卡会让 `int(...)` 抛出去 —— 那不是"悄悄认错"，
     # 而是**整步崩**：Task 5 接上后整次分析的知识地图退化成 `knowledge_error`，
     # 其余几十个节点的复用机会一起丢。下界夹 0 与 `kb._new_card` / `kb._merge_into` 同一口径

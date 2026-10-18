@@ -83,13 +83,6 @@ _VERSION_KEYS = ("id", "name", "root_id", "parent_id", "rev", "at", "size", "sha
                  "mother_file", "chosen", "ai_diff", "ai_diff_error", "note", resumelib.REMOVED)
 
 
-def _as_int(value, default=0):
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
-
-
 def _name_of_file(filename):
     """文件名去扩展名（与 `resumelib` 记录里的 `name`、`app` 的 `unregistered` 同一口径）"""
     return os.path.splitext(store.safe_name(filename))[0]
@@ -156,7 +149,9 @@ def _doc_state():
     if not isinstance(raw, dict):
         return 1, [], os.path.exists(path)
     items = raw.get("resumes")
-    return (_as_int(raw.get("version"), 1) or 1,
+    # 口径：本模块历史上用的是裸 `int()`（即 `bool_ok=True`）。取值实现只剩 store 这一份
+    # （结构钉子 `tests/test_store.py::SingleImplementationTest`），所以口径在调用点显式传。
+    return (store.as_int(raw.get("version"), 1, bool_ok=True) or 1,
             list(items) if isinstance(items, list) else [], True)
 
 

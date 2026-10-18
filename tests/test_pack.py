@@ -209,6 +209,23 @@ class RealRepoTest(unittest.TestCase):
                          "现在是 importers=%s、脚手架在 FILES 里=%s"
                          % (importers, "迁移脚手架.py" in listed))
 
+    def test_data_maintenance_clis_are_packaged(self):
+        """**反复可用**的数据维护入口随包发出：三个都「无参数严格只读 + 显式参数才写 + 写前备份」。
+
+        为什么这条要有（第四轮裁的）：`备份体检.py` 入包而 `报告体检.py` 不入包，是同一类脚本
+        两种待遇；而 README **随包发出去**，里面多处直接让用户 `python 报告体检.py --刷新模板`、
+        模块表里也把 `岗位去重.py` 当维护入口介绍 —— 不在包里就是 README 说假话
+        （朋友照着跑 = `FileNotFoundError`）。
+        与它相对的是**一次性**老数据迁移脚本（`简历迁移.py` / `身份迁移.py` /
+        `迁移脚手架.py`），那些只在"迁移前的数据"上有意义，仍不入包
+        （见 `test_scaffold_ships_iff_its_importers_ship`）。
+        判据不是"它会改数据"（这三个都会），而是「无参严格只读 + 显式参数才写 + 写前必备份」。
+        """
+        rels = {rel for rel, _ in PACK.collect()}
+        for name in ("备份体检.py", "报告体检.py", "岗位去重.py"):
+            with self.subTest(script=name):
+                self.assertIn(name, rels, "数据维护入口 %s 不在分享包里" % name)
+
     def test_app_local_imports_are_all_packaged(self):
         """动态版：不写死清单，直接从真 app.py 的 import 推导。"""
         rels = {rel for rel, _ in PACK.collect()}
@@ -254,6 +271,48 @@ class RealRepoTest(unittest.TestCase):
         # verify() 整条路径也要跑通（PII 那几条不算本测试的事）
         dep_text = [i for i in PACK.verify(zpath, root=REPO) if "缺少依赖文件" in i]
         self.assertEqual([], dep_text)
+
+
+class ReadmeCommandsTest(unittest.TestCase):
+    """**随包发出的 README 不许让用户去跑包里没有的脚本**（第四轮加的钉子）。
+
+    为什么这是真问题（不是洁癖）：`README.md` 在 `FILES` 里、会原样发给朋友，而它在好几处
+    直接写 `python 报告体检.py --刷新模板`。脚本不在包里 ⇒ 朋友照着 README 做就是
+    `No such file or directory` ——「文档说假话」的同类（本项目把它当缺陷，不当文案）。
+    判据是**扫 README 里的 `python X.py` 命令**，不是维护一份"我觉得该入包"的清单：
+    以后谁在 README 里加一条让人跑的脚本，忘了打包，这条会红。
+    """
+
+    #: README 给了 `python X.py` 命令、但**故意不随包发出**的脚本。
+    #: 每一条都要有理由；而且必须「README 真的这么用」「FILES 里真的没有」——
+    #: 哪天它入包了，`test_allowlist_is_not_rotten` 会要求把豁免删掉（豁免不许变成死字）。
+    NOT_SHIPPED = {
+        "简历迁移.py": "一次性老数据登记：只对『版本库出现之前』的数据有意义，朋友拿到的是新数据",
+        "身份迁移.py": "一次性老数据迁移：岗位身份从报告文件名换成结构化 id，同上",
+    }
+
+    def _readme_commands(self):
+        """README 里所有 `python X.py` 的 `X.py`（`python -m unittest …` 不算）。"""
+        with open(os.path.join(REPO, "README.md"), encoding="utf-8") as f:
+            src = f.read()
+        return sorted(set(re.findall(r"python\s+([^\s`]+\.py)", src)))
+
+    def test_readme_python_commands_are_packaged(self):
+        cmds = self._readme_commands()
+        self.assertIn("app.py", cmds, "README 的 python 命令一条都没扫出来？解析方式不对")
+        self.assertIn("报告体检.py", cmds, "README 已经不教用户跑报告体检了？解析方式不对")
+        missing = [c for c in cmds if c not in PACK.FILES and c not in self.NOT_SHIPPED]
+        self.assertEqual([], missing,
+                         "随包发出的 README 让用户跑这些脚本，但包里没有：%s" % missing)
+
+    def test_allowlist_is_not_rotten(self):
+        """豁免必须两条都成立：README 真的这么用、FILES 里真的没有。"""
+        cmds = set(self._readme_commands())
+        for name, why in sorted(self.NOT_SHIPPED.items()):
+            with self.subTest(script=name):
+                self.assertIn(name, cmds, "README 已经不这么用了，把 %s 从豁免里删掉" % name)
+                self.assertNotIn(name, PACK.FILES,
+                                 "%s 已经入包了，豁免该删（理由原来是：%s）" % (name, why))
 
 
 # ---- P0-15：泄漏扫描必须自动吃「当前 profile 自己的 PII」----

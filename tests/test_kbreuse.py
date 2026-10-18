@@ -791,8 +791,11 @@ class BrokenShapeTest(IsolatedCase):
 
     崩的代价不是"悄悄认错"，而是**整步崩**：Task 5 接上后，一张 `layer: "abc"` 的卡会让
     `plan_nodes` 抛出去、整次分析退化成 `knowledge_error`，**其余几十个节点的复用机会一起丢**。
-    项目自己就把这个形状当真：`kb._as_int`（`kb.py:83-88`）就是为它写的，
-    `tests/test_kb.py:300-309` 明确把 `"layer": "abc"` 当"不许抛"的形状。
+    项目自己就把这个形状当真：`store.as_int(..., bool_ok=True)`（kb 那把尺子，`kb.py:289` / `:301`）
+    就是为它写的，`tests/test_kb.py:306-314` 明确把 `"layer": "abc"` 当"不许抛"的形状。
+    （批 5 之前这里写的是 `kb._as_int`（`kb.py:83-88`）—— 那份副本已收归 store，注释跟着改；
+     第四轮又把 `interview.py` / `简历迁移.py` 两份漏网的副本也收了，见
+     `tests/test_store.py::SingleImplementationTest`。）
     """
 
     def _node(self, term="语音识别", **kw):
@@ -812,14 +815,14 @@ class BrokenShapeTest(IsolatedCase):
         return c
 
     def test_a_broken_layer_never_throws_and_is_floored_at_zero(self):
-        """`layer` 走 `kb._as_int` 兜底 —— `int("abc")` / `int([1])` 都会把整步炸掉。"""
+        """`layer` 走 `store.as_int(..., bool_ok=True)` 兜底 —— `int("abc")` / `int([1])` 都会把整步炸掉。"""
         for bad in ("abc", [1], None, {}, "3.7", float("nan"), -9):
             node = self._node()
             card = self._card(layer=bad)
             stats = kbreuse.plan_nodes([node], kbreuse.Index([card]))     # 不许抛
             self.assertEqual(stats["reusable"], 1)
             self.assertEqual(node["layer"], 0,
-                             "坏 layer 按 kb._as_int 兜底成 0（下界也夹 0）：%r" % (bad,))
+                             "坏 layer 按 store.as_int(bool_ok=True) 兜底成 0（下界也夹 0）：%r" % (bad,))
 
     def test_a_missing_layer_behaves_like_zero(self):
         node = self._node()
@@ -848,10 +851,10 @@ class BrokenShapeTest(IsolatedCase):
                              "节点 layer=%r、卡 layer=%r 时该是 %r"
                              % (node_layer, card_layer, want))
 
-    def test_a_float_layer_is_truncated_like_kb_as_int(self):
+    def test_a_float_layer_is_truncated_like_store_as_int(self):
         node = self._node(layer=5)
         kbreuse.plan_nodes([node], kbreuse.Index([self._card(layer=3.7)]))
-        self.assertEqual(node["layer"], 3, "`kb._as_int(3.7)` == 3（截断，不四舍五入）")
+        self.assertEqual(node["layer"], 3, "`store.as_int(3.7, bool_ok=True)` == 3（截断，不四舍五入）")
 
 
 class CopyContractTest(IsolatedCase):
@@ -1843,9 +1846,9 @@ class WriteBackSafetyTest(_WriteBackCase):
         self.assertEqual((added, merged), (0, 1), "库里已有这张卡 → 并进去")
         after = store.load_knowledge()["nodes"][0]
         self.assertEqual(after["state"], "待学习", "节点自称「已掌握」也不许覆盖库里的状态")
-        self.assertEqual(after["last_outcome"], "未面试", "同理（kb.py:303 的 or 只补空）")
-        self.assertEqual(after["asked_count"], 0, "同理（kb.py:304 只做 _as_int 归一，不取值）")
-        self.assertEqual(after["definition"], "库里的定义", "更短的定义不许顶掉库里的（kb.py:283-286）")
+        self.assertEqual(after["last_outcome"], "未面试", "同理（kb.py:300 的 or 只补空）")
+        self.assertEqual(after["asked_count"], 0, "同理（kb.py:301 只做 store.as_int 归一，不取值）")
+        self.assertEqual(after["definition"], "库里的定义", "更短的定义不许顶掉库里的（kb.py:279-283）")
 
     def test_an_incomplete_hit_is_completed_in_place_and_never_duplicated(self):
         """不变量 3：命中但**不够格**（缺来源）时写回是"就地补全"，逐条对照 `kb._merge_into`。

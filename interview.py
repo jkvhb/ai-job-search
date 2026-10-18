@@ -497,13 +497,6 @@ def _as_str(v):
     return ""
 
 
-def _as_int(v, default=0):
-    try:
-        return int(v)
-    except (TypeError, ValueError):
-        return default
-
-
 def _as_dict(v):
     return v if isinstance(v, dict) else {}
 
@@ -542,6 +535,11 @@ def _normalise_analysis(data):
 
     模型是不可信的输入源（会被截断、会少给字段、会把列表写成字符串），
     而复盘报告模板直接吃这份结构 —— 少一段就是前端一片空白或者直接崩。
+
+    取值小工具的实现只剩 `store` 那一份（批 5 收口，结构钉子见
+    `tests/test_store.py::SingleImplementationTest`）；本模块历史上的口径是**裸 `int()`**
+    （即 `bool_ok=True`：`true` 当成 1 —— 复盘报告里的占比/评分本来就允许写 `true` 这种
+    手滑值，当 1 比当"没给"更贴近模型的原意），所以两处调用都显式传这一把尺子。
     """
     data = data if isinstance(data, dict) else {}
     focus = []
@@ -549,7 +547,7 @@ def _normalise_analysis(data):
         if not isinstance(f, dict):
             continue
         area = _as_str(f.get("area"))
-        share = _as_int(f.get("share"), -1)
+        share = store.as_int(f.get("share"), -1, bool_ok=True)
         if not area or share < 0:
             continue
         focus.append({"area": area, "share": share})
@@ -564,7 +562,8 @@ def _normalise_analysis(data):
         "questions": _clean_dicts(data.get("questions"), ("q",)),
         "focus_areas": focus,
         "new_terms": _clean_dicts(data.get("new_terms"), ("term",)),
-        "interviewer_quality": {"score": _as_int(iq.get("score")), "comment": _as_str(iq.get("comment"))},
+        "interviewer_quality": {"score": store.as_int(iq.get("score"), bool_ok=True),
+                                "comment": _as_str(iq.get("comment"))},
         "answer_review": _clean_dicts(data.get("answer_review"), ("topic",)),
         "weak_concepts": _clean_dicts(data.get("weak_concepts"), ("term",)),
         "next_round_prep": {
