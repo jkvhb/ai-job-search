@@ -155,7 +155,16 @@ class FakeRepoTest(unittest.TestCase):
 
 
 class RealRepoTest(unittest.TestCase):
-    """真仓库上的防回归钉子：清单必须覆盖 app.py 的全部本地依赖（只读 data/）。"""
+    """真仓库上的防回归钉子：清单必须覆盖**包内每个 .py** 的本地依赖（只读 data/）。
+
+    ⚠️ 自检的覆盖边界（实话，别把它当成「包一定完整」的证明）：`_scan_py_sources()` 的起点是
+    **`FILES` 里列出的 .py + app.py**，`resolve_dependencies()` 再顺着这些文件里的
+    `import` / 静态引用往下走。于是：
+      - 包内模块新增了依赖、清单却没跟（`jddelete` 新 import 的 `jdrefs` 不在 FILES）⇒ **抓得到** ✓；
+      - 「本该入包、却压根没写进 FILES」的模块 ⇒ **永远抓不到** ✗（起点就是清单本身）；
+      - 只在**未入包**脚本里被 import 的模块（`迁移脚手架.py` ← 简历迁移 / 身份迁移）⇒
+        自检按设计不管它们，同进同出由 `test_scaffold_ships_iff_its_importers_ship` 钉住。
+    """
 
     def test_files_listed_all_exist_on_disk(self):
         """FILES 里不该挂盘上不存在的名字。
@@ -173,6 +182,32 @@ class RealRepoTest(unittest.TestCase):
         rels = {rel for rel, _ in PACK.collect()}
         missing = [n for n in P0_10_MODULES if n not in rels]
         self.assertEqual([], missing, "P0-10：这些模块 app.py 会 import，但分享包里没有：%s" % missing)
+
+    def test_jdrefs_module_is_packaged(self):
+        """P0-10 同款事故再犯一次：批 7.1 把 `jddelete` / `jdid` / `jobdup` 接到 `jdrefs`，
+
+        而 `FILES` 里当时**没有** `jdrefs.py` ⇒ 打出来的分享包缺这个模块，朋友解压双击
+        `启动.bat` 就是 `ModuleNotFoundError`。这条把「被 import 就必须在清单里」钉在
+        `jdrefs.py` 这个具体名字上（动态判据见下面的 `test_resolve_dependencies_all_packaged`）。
+        """
+        rels = {rel for rel, _ in PACK.collect()}
+        self.assertIn("jdrefs.py", rels, "jddelete/jdid/jobdup 都 import 了 jdrefs，包里却没有它")
+
+    def test_scaffold_ships_iff_its_importers_ship(self):
+        """`迁移脚手架.py` 只有 `简历迁移.py` / `身份迁移.py` 两个 import 方 ⇒ 两边必须同进同出。
+
+        现状（本用例在钉的就是这个）：**三个都不入包** —— 它们是会改用户数据的独立维护脚本，
+        分享给朋友的是能用起来的应用，不是这些一次性工具 ⇒ `迁移脚手架.py` 不在 `FILES` 里
+        **不是缺项**（把只有"没入包的脚本"才 import 的模块单独打进包，是给朋友塞一段死代码）。
+        哪天要把迁移脚本也发给朋友，就必须**同时**把脚手架加进 `FILES`，否则那两份脚本一跑
+        就 `ModuleNotFoundError`；只加脚手架不加脚本，本用例同样会红。
+        """
+        listed = set(PACK.FILES)
+        importers = [n for n in ("简历迁移.py", "身份迁移.py") if n in listed]
+        self.assertEqual(bool(importers), "迁移脚手架.py" in listed,
+                         "`迁移脚手架.py` 与它的两个 import 方必须同进同出；"
+                         "现在是 importers=%s、脚手架在 FILES 里=%s"
+                         % (importers, "迁移脚手架.py" in listed))
 
     def test_app_local_imports_are_all_packaged(self):
         """动态版：不写死清单，直接从真 app.py 的 import 推导。"""

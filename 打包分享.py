@@ -38,7 +38,7 @@ PKG = "AI求职助手-分享版-%s" % STAMP
 #    分享包解压后双击 启动.bat 直接 ImportError）。漏了会在 verify() 的依赖自检里被点名。
 FILES = [
     "app.py", "store.py", "log.py", "llm.py", "search.py", "knowledge.py", "migrate_to_profiles.py",
-    "interview.py", "jdfacts.py", "jddelete.py", "jdid.py", "jobdup.py",
+    "interview.py", "jdfacts.py", "jddelete.py", "jdid.py", "jdrefs.py", "jobdup.py",
     "kb.py", "kbreuse.py", "outcome.py", "resumelib.py",
     "备份体检.py",
     "启动.bat", "README.md", "EXAMPLES.md",
