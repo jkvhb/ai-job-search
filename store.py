@@ -437,10 +437,11 @@ def first_non_object_index(items):
 
     ⚠️ 这是与 `read_*_strict` 分开的另一把尺子：`read_*_strict` 只查**容器**形状。
     `jds` / `knowledge` 的写判据（`jds_safe_to_write` / `knowledge_safe_to_write`）**仍然只用**
-    浅读 —— 它们的写路径是整份覆盖，没有"逐元素取字段"，在那里收紧只会凭空把"能写"翻成
-    "拒绝写"，语义一个字都不许动。
-    `jobs_safe_to_write` 是**唯一的例外**（台账写路径 `upsert_job` 会 `j.get("id")`，
-    元素坏时是 AttributeError 而不是如实拒绝），它改问 `read_jobs_strict_deep`。
+    浅读。⚠️ 它们的写路径里同样有"逐元素取字段"的地方（`jdid.upsert_jd` 的 `r.get("id")`、
+    `kb._upsert_check_in` 的 `n.get("id")`）—— **已知未修**：收紧它们要连带改 `save_*` 的
+    拒绝话术、既有守卫用例，以及 `kb._with_kb_write` 的"留档后写"语义，是另一件事。
+    本次只收紧 `jobs`（台账写路径 `upsert_job` 会 `j.get("id")`，元素坏时是 AttributeError
+    而不是如实拒绝），它改问 `read_jobs_strict_deep`。
 
     而**读**的时候元素不是对象会被上层静默丢掉（`app._ledger_rows()` 的 `continue` /
     `kb.list_nodes()` 的过滤）：`[1, 2, 3]` 于是变成「共 0 个岗位」、
@@ -531,14 +532,18 @@ def jobs_safe_to_write(path=None):
     杀毒软件短暂锁文件、磁盘/IO 错误。
 
     ⚠️ **判据是深读（`read_jobs_strict_deep`：容器 + 每一项都得是对象）**，比
-    `jds` / `knowledge` 的写判据更严 —— 因为**只有台账的写路径会逐元素取字段**：
+    `jds` / `knowledge` 的写判据更严 —— 因为台账的写路径会**逐元素取字段**：
     `upsert_job` 的 `for j in jobs: if j.get("id") == …` 在非对象元素上直接
     `AttributeError: 'int' object has no attribute 'get'`。那是**未捕获异常**，不是
     "如实的前置条件拒绝"（盘上文件没坏 —— 写盘之前就炸了 —— 但用户看到的是 traceback）。
     收紧到这里之后，元素坏走的是 `upsert_job` **原有的**前置条件分支：
     `RuntimeError` + "拒绝写入" + "第 N 条不是对象"。
-    `jds` / `knowledge` 的写路径是整份覆盖、没有这种逐元素读-改-写，所以它们的判据
-    **一个字都不许跟着改**（见 `first_non_object_index` 的说明）。
+
+    ⚠️ **本次只收紧 jobs**（`jds` / `knowledge` 的判据一个字都没动）。它们**也有同形的
+    "逐元素取字段"路径**（`jdid.upsert_jd` 的 `r.get("id")`、`kb._upsert_check_in` 的
+    `n.get("id")`）—— **已知未修**，不是"它们不需要"：收紧它们要连带改 `save_*` 的拒绝话术、
+    既有守卫用例，以及 `kb._with_kb_write` 的"留档后写"语义，是独立的一件事。
+    在那之前它们的写判据**别跟着改**（见 `first_non_object_index` 的说明）。
 
     ⚠️ 判据必须问**严格读**，**不能**看 `load_jobs()` 的返回值 ——
     那正是把"读不出来"和"空台账"混成同一个信号的根源。

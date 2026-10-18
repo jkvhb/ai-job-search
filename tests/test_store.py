@@ -1533,12 +1533,13 @@ class ElementShapeStrictDeepTest(IsolatedCase):
     def test_only_the_jobs_write_path_ruler_was_tightened(self):
         """⚠️ 守卫：元素坏**只**让 `jobs_safe_to_write` 说不可写；jds / knowledge 照旧回可写。
 
-        **为什么 jobs 要更严、另两个不用**：只有台账的写路径会**按元素取字段**
-        —— `upsert_job` 的 `for j in jobs: j.get("id")` 在非对象元素上直接
-        `AttributeError: 'int' object has no attribute 'get'`（未捕获异常，不是"如实拒绝"）。
-        `jds` / `knowledge` 的写路径（`jdid.save_jds` / `kb.save_knowledge`）都是**整份覆盖**，
-        没有这种"逐元素取字段"的读-改-写；在那里收紧只会凭空把"能写"翻成"拒绝写"，
-        所以它们的判据一个字都不许动。
+        **为什么这次只收紧 jobs**：调度边界就是"只改 jobs 那一条"，`jds` / `knowledge` 的
+        写判据**故意一个字不动**（它们的守卫由本轮之外的另一件事负责）。
+
+        ⚠️ 但**别把这条读成"另两个没有同款问题"**：它们的写路径里同样有"逐元素取字段"的地方
+        （`jdid.upsert_jd` 的 `r.get("id")`、`kb._upsert_check_in` 的 `n.get("id")`），
+        元素坏时同样会 `AttributeError`。**已知未修**，已在汇报里点明 —— 收紧它们要连带改
+        `save_*` 的拒绝话术、各自用例，以及 `kb._with_kb_write` 的"留档后写"语义。
 
         ⚠️ 浅读那一半（`test_the_shallow_strict_reads_were_not_tightened`）**故意不动**：
         `read_*_strict` 仍然只查容器 —— 收紧落在 `jobs_safe_to_write` 自己身上（它改问深读），
