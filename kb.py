@@ -521,12 +521,16 @@ def _card_index(data):
 # 锁序铁律（见文件头）：这三个接口**只**取内层锁 `_KB_LOCK`，绝不回头去取
 # `_JD_LOCK` / `_MERGE_LOCK` —— 那些是调用方已经持着的**外层**锁，回头去要就是死锁形状。
 
-def _ref_id(x, strip):
+def ref_id(x, strip):
     """一条 `from_jds` 项指向的岗位 id（非 dict / 缺 id / id 不是字符串 → 空串）。
 
-    `strip` 不是洁癖而是**口径**：三处调用方历史上用的判据不同 ——
-    `jddelete` 去首尾空白（`_text()`），`jdid` / `jobdup` **逐字比**。收口时只搬家，
-    不顺手把两种判据统一成一种（那会改变用户手改出来的 `" jd1 "` 算不算同一条引用）。
+    `strip` 不是洁癖而是**口径**，而且它是**参数**（不是"这里忘了统一"）：三处调用方历史上
+    用的判据不同 —— `jddelete` / `jdrefs` 去首尾空白（它们必须先列清单、再按同一把尺子改，
+    否则手改出的 `" jd1 "` 会"预演列出、真改不动"），`jdid` / `jobdup` 的窄接口**逐字比**
+    （既有用例 `tests/test_kb.py:2996` 钉着这一点）。收口只搬家、不顺手把两种判据统一成
+    一种 —— 那会改变用户手改出来的 `" jd1 "` 算不算同一条引用。
+
+    本函数是**唯一一份**条目 id 取值实现（批 7.1：`jdrefs` 原来也有一份一模一样的副本）。
     """
     if not isinstance(x, dict):
         return ""
@@ -549,20 +553,38 @@ def _purge_refs_in(data, jd_id):
         frm = node.get("from_jds")
         if not isinstance(frm, list):
             continue
-        kept = [x for x in frm if _ref_id(x, True) != jd_id]
+        kept = [x for x in frm if ref_id(x, True) != jd_id]
         if len(kept) != len(frm):
             node["from_jds"] = kept
             touched += 1
     return touched
 
 
-def _repoint_refs_in(data, old_id, new_id):
+def repoint_refs_in(data, old_id, new_id, strip=False):
     """原地把每张卡 `from_jds` 里指向 old 的条目重指到 new。返回
     `(被改动的卡片数, 原位重指的条目数, 去掉的重复条目数)`（不落盘）。
 
     语义与 `jdid._repoint_kb` / `jobdup._repoint_kb` **逐字同一套**：卡上本来就有 new 项时
     保留它、去掉 old 那一条（否则同一个 JD 会被数两次）；否则把 old 项**原位改 id**
-    （保留它自己的 job_title / company / date）。判据是**逐字比较**（不去空白），与那两份一致。
+    （保留它自己的 job_title / company / date）。
+
+    ## ⚠️ 这是**唯一一份**"重指"变换的实现（批 7.1）
+
+    `jdrefs._repoint_kb_in` 原来是与本函数**逐行相同**的第二份副本（体检 §8.1 点名的
+    "同一套变换两份实现"）。现在它被删掉，`jdrefs` 直接调本函数 —— 变换只可能在这里漂移一次。
+
+    ## 判据是**参数**（`strip`），不是"这里统一成一种"
+
+    两边历史上的尺子不同，而且**各自都被既有用例钉着**（对向钉死，谁赢都会红一条）：
+      * `strip=True` —— **去首尾空白比**。`jdrefs`（预演 + 改写）与 `jddelete` 用这把尺子：
+        手改出来的 `" jd1 "` 也算同一条引用。`jdrefs` **必须**用它：它的 detect 与 rewrite
+        是同一把尺子，否则会"预演列出 3 条、真改 2 条"，而改名/合并之后那个
+        `" 旧 id "` 就成了一条永远指不到的悬空引用（`tests/test_jdrefs.py:400` 钉着）。
+      * `strip=False`（默认）—— **逐字比**。`repoint_jd_refs` / `merge_jd_refs` 用这把尺子，
+        与它们收口之前的 `jdid._repoint_kb` / `jobdup._repoint_kb` 逐字一致
+        （`tests/test_kb.py:2996` 钉着）。
+    换句话说：**实现统一了，口径按调用方传** —— 这是刻意的，别把它"顺手统一"掉：
+    改任何一边都会改变"用户手改出的 `" jd1 "` 算不算同一条引用"这个对外行为。
 
     旧实现里 `jobdup` 对每个有 `from_jds` 列表的卡都无条件回写 `node["from_jds"] = out`，
     `jdid` 只在真的改了才回写 —— 落盘内容完全相同（没命中的卡 `out` 与旧列表逐项一致），
@@ -575,10 +597,10 @@ def _repoint_refs_in(data, old_id, new_id):
         frm = node.get("from_jds")
         if not isinstance(frm, list):
             continue
-        has_new = any(_ref_id(x, False) == new_id for x in frm)
+        has_new = any(ref_id(x, strip) == new_id for x in frm)
         out, changed = [], False
         for x in frm:
-            if _ref_id(x, False) == old_id:
+            if ref_id(x, strip) == old_id:
                 if has_new:
                     changed = True          # 已经有 new 项 → 去掉这个重复项
                     deduped += 1
@@ -639,7 +661,7 @@ def repoint_jd_refs(old_id, new_id, key=None):
         return 0, ""
 
     def _fn(data):
-        touched, _repointed, _deduped = _repoint_refs_in(data, old, new)
+        touched, _repointed, _deduped = repoint_refs_in(data, old, new)
         if touched:
             store.save_knowledge(data, key)
         return touched
@@ -665,7 +687,7 @@ def merge_jd_refs(drop_id, keep_id, key=None):
         return 0, 0, ""                    # 同上：无事可做
 
     def _fn(data):
-        _touched, repointed, deduped = _repoint_refs_in(data, drop, keep)
+        _touched, repointed, deduped = repoint_refs_in(data, drop, keep)
         if repointed or deduped:
             store.save_knowledge(data, key)
         return repointed, deduped

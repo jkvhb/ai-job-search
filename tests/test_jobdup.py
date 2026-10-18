@@ -17,6 +17,7 @@ import unittest
 from unittest import mock
 
 import jobdup
+import jdrefs
 import kb
 import store
 
@@ -250,6 +251,121 @@ class MergeTest(IsolatedCase):
                          "合并没有走 `store.update_jobs`：台账又变成跨多次调用的读-改-写了")
         self.assertEqual({j["id"]: j.get("merged_into") for j in store.load_jobs()},
                          {"drop": "keep", "keep": None})
+
+
+class MergeUsesJdRefsTest(IsolatedCase):
+    """批 7.1 第 4 步：`merge_jobs` 的引用重指改走 `jdrefs.refs_of_jd` + `rewrite_jd_refs`。
+
+    合并原先只重指**知识库那一半**（`kb.merge_jd_refs`）+ 面试 `status.json` + 台账标记，
+    于是漏了 `interviews/*/feedback.json`（反哺幂等标记，键就是被并掉的 id）与
+    `report_state/<报告id>.json`（按报告 id 命名）—— 前者漏了会让"下一次反哺重试"
+    把同一次面试重复计进复习队列，而且预演/`refs_of_jd` 里还留着 `drop`。
+
+    这一组钉三件事：
+      ① **外部引用**（知识库 / 面试 `status.json` / `feedback.json`）合并后一条都不剩，
+         keep 那边覆盖全部（`merged_into` 那条是另一回事，归批 7.2）；
+      ② **既有合并语义逐字不变**：记录还在、标 `merged_into`、报告与 JD 原文一个都不删，
+         而且**已合并记录不加 `jd_id`**（`身份迁移.py` 的策略 A 钉着这一点）；
+      ③ 坏知识库照旧**整次拒绝**且一个字节都不动（闸门在 `jdrefs` 的预检里）。
+    """
+
+    def _fixture(self):
+        store.upsert_job({"id": "keep", "job_title": "语音/文本评测", "created_at": "2026-10-03 00:30",
+                          "jd_text_file": "keep.txt", "report": "keep.html", "score": 75.0})
+        store.upsert_job({"id": "drop", "job_title": "语音/文本评测", "created_at": "2026-10-08 16:40",
+                          "jd_text_file": "drop.txt", "report": "drop.html", "score": 72.0})
+        for i in ("keep", "drop"):
+            store.write_text(store.p_path("jd", i + ".txt"),
+                             FindDuplicatesTest.LONG if i == "keep" else FindDuplicatesTest.SHORT)
+            store.write_text(os.path.join(store.p_path("reports"), i + ".html"), "<html>" + i)
+        for jid in ("keep", "drop"):
+            kb.absorb([{"term": "语音识别", "layer": 0, "sources": [], "timeline": [],
+                        "related": [], "interview_questions": []}], {"id": jid})
+        store.save_interview_json("iv1", "status.json", {"state": "done", "job_id": "drop"})
+        store.save_interview_json("iv1", "feedback.json",
+                                  {"drop": {"applied": True, "jd_id": "drop"}})
+        store.save_report_state("drop", {"要会 ASR": True})
+        store.save_report_state("keep", {"要会 ASR": True})
+
+    def test_every_external_reference_is_repointed_to_the_kept_id(self):
+        self._fixture()
+        self.assertEqual(sorted(r.kind for r in jdrefs.refs_of_jd("drop")),
+                         sorted(["jobs", "kb", "iv_status", "report_state", "iv_feedback"]),
+                         "夹具前提：五类引用要齐（否则这条断言恒真）")
+        res = jobdup.merge_jobs("keep", "drop")
+        self.assertTrue(res["ok"], res["reason"])
+        # ① 外部引用（知识库 / 面试 status / 面试 feedback）**一条都不剩**
+        left = sorted(r.kind for r in jdrefs.refs_of_jd("drop"))
+        self.assertEqual(left, ["jobs", "report_state"],
+                         "合并后还有外部引用指着 drop：%r" % (jdrefs.refs_of_jd("drop"),))
+        # 剩下的两处是 **本体记录自己**（`id == drop` 的那条已合并记录，以及按它的报告 id
+        # 定位的报告勾选文件）—— 策略 A：已合并记录保留原样（不加 `jd_id`）、台账里不显示。
+        # 给它补 `jd_id` 会与 `身份迁移.py` 的既有决定冲突（`MergedRecordTest` 钉着），见
+        # `jdrefs.repoint_jobs_in(include_legacy=False)` 的说明。
+        jobs_ref = [r for r in jdrefs.refs_of_jd("drop") if r.kind == "jobs"][0]
+        self.assertEqual(jobs_ref.count, 1, "剩下的必须只有那条已合并记录自己")
+        # ② keep 那边覆盖全部引用点（`merged_into` 那条是 drop 打上去的标记，归批 7.2）
+        self.assertEqual(sorted(r.kind for r in jdrefs.refs_of_jd("keep")),
+                         sorted(["jobs", "kb", "iv_status", "report_state", "iv_feedback",
+                                 "merged_into"]))
+        # ③ 既有合并语义：记录**还在**、带着 `merged_into`；知识库去重；面试两条都跟过去
+        jobs = {j["id"]: j for j in store.load_jobs()}
+        self.assertIn("drop", jobs)
+        self.assertEqual(jobs["drop"]["merged_into"], "keep")
+        self.assertEqual(jobs["drop"]["report"], "drop.html")   # 报告文件名不改（策略上不重写）
+        self.assertNotIn("jd_id", jobs["drop"],
+                         "已合并记录被挂上了 jd_id（与 身份迁移 的策略 A 冲突）")
+        card = store.load_knowledge()["nodes"][0]
+        self.assertEqual([j["id"] for j in card["from_jds"]], ["keep"])
+        self.assertEqual(store.load_interview_json("iv1", "status.json")["job_id"], "keep")
+        fb = store.load_interview_json("iv1", "feedback.json")
+        self.assertEqual(list(fb), ["keep"], "feedback.json 的键还停着 drop")
+        self.assertEqual(fb["keep"]["jd_id"], "keep")
+        self.assertTrue(fb["keep"]["applied"], "反哺的幂等标记丢了（会重复计进复习队列）")
+        # ④ 报告 / JD 原文 / 报告勾选**一个都不删、也不改名**（策略上不重写）
+        self.assertTrue(os.path.exists(os.path.join(store.p_path("reports"), "drop.html")))
+        self.assertTrue(os.path.exists(os.path.join(store.p_path("reports"), "keep.html")))
+        self.assertTrue(os.path.exists(store.p_path("jd", "drop.txt")))
+        self.assertTrue(os.path.isfile(store.report_state_path("drop")),
+                        "报告勾选文件按报告 id 命名，合并不该动它")
+
+    def test_records_that_name_the_drop_id_in_jd_id_follow_in_the_same_transaction(self):
+        """迁移后形态：**显式**写着 `jd_id == drop` 的记录也要改指 keep（同一次台账事务）。"""
+        store.save_jobs([
+            {"id": "x", "jd_id": "drop", "report": "x.html", "created_at": "2026-10-02 09:00"},
+            {"id": "keep", "jd_id": "keep", "report": "keep.html", "created_at": "2026-10-03 09:00"},
+            {"id": "drop", "report": "drop.html", "created_at": "2026-10-08 09:00"},
+        ])
+        jobdup.merge_jobs("keep", "drop")
+        jobs = {j["id"]: j for j in store.load_jobs()}
+        self.assertEqual(jobs["x"]["jd_id"], "keep")
+        self.assertEqual(jobs["drop"]["merged_into"], "keep")
+
+    def test_the_returned_counters_and_log_fields_are_still_populated(self):
+        """`kb_repointed` / `kb_deduplicated` / `interview_files` 是 CLI 与日志的对外形状。"""
+        self._fixture()
+        res = jobdup.merge_jobs("keep", "drop")
+        self.assertTrue(res["ok"], res["reason"])
+        self.assertEqual(res["kb_repointed"], 0,
+                         "这张卡上本来就有 keep 项 ⇒ 那条 drop 引用是被**去重**掉的")
+        self.assertEqual(res["kb_deduplicated"], 1)
+        self.assertEqual(res["interview_files"], 1)
+        self.assertIsNotNone(res["multi_jd_before"])
+        self.assertIsNotNone(res["multi_jd_after"])
+
+    def test_a_corrupt_knowledge_base_still_aborts_the_whole_merge(self):
+        """坏知识库 ⇒ **整次拒绝**（`jdrefs` 的预检），台账与面试记录一个字节都不动。"""
+        self._fixture()
+        broken = "{\"nodes\": [{\"id\": \"x\"}  <<< 半截"
+        store.write_text(store.knowledge_path(), broken)
+        jobs_before = store.read_bytes(store.jobs_path())
+        iv_before = store.read_bytes(store.interview_file("iv1", "status.json"))
+        res = jobdup.merge_jobs("keep", "drop")
+        self.assertFalse(res["ok"])
+        self.assertEqual(store.read_text(store.knowledge_path()), broken)
+        self.assertEqual(store.read_bytes(store.jobs_path()), jobs_before)
+        self.assertEqual(store.read_bytes(store.interview_file("iv1", "status.json")), iv_before)
+        self.assertIsNone({j["id"]: j for j in store.load_jobs()}["drop"].get("merged_into"))
 
 
 class MergeIdempotenceTest(IsolatedCase):

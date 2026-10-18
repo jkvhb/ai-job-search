@@ -43,9 +43,13 @@
 
 * `jobs` 的"属于哪个 JD"用 **`jd_id or id`**（与 `jddelete._jd_id_of_record` / `app._jd_id_of_row`
   同一把尺子）：只认 `jd_id` 的话，**迁移前**形态的记录会"一条都列不出来"（少列最贵）。
-* `kb` 的 `from_jds[].id` 用**去空白比**（与 `jddelete` 的预演/清理同一把尺子）。⚠️ `kb` 的
-  重指核心 `kb._repoint_refs_in` 是**逐字比** —— 本模块**刻意**用同一把尺子做 detect 与
-  rewrite（否则「预演列出 3 条、真改 2 条」）。两种口径的收口是第 3/4 步接线时的事。
+* `kb` 的 `from_jds[].id` 用**去空白比**（与 `jddelete` 的预演/清理同一把尺子）。
+  ⚠️ 重指变换**只有一份实现**（批 7.1）：`kb.repoint_refs_in(data, old, new, strip=...)`。
+  本模块传 `strip=True`（**去空白比**，与 `_detect_kb` 同一把尺子 —— detect 与 rewrite 用
+  两把尺子就会"预演列出 3 条、真改 2 条"）；`kb` 的三个窄接口传各自的**历史口径**
+  （`purge_jd_refs` 去空白比；`repoint_jd_refs` / `merge_jd_refs` 逐字比）。判据由调用方
+  传入是**刻意的**：两边各被既有用例钉着，顺手统一任何一边都会改变"手改出的 `" jd1 "`
+  算不算同一条引用"这个对外行为。
 * `jds` / `iv_status` 用**逐字比**（与 `jdid` / `jobdup` 的既有实现逐字一致）。
 * `report_state` 只按**文件是否存在**判（它的"引用"是**文件名**=报告 id，不是内容）⇒ 这一处
   **不存在**"读不出来 ⇒ 当成没有引用"的洞：文件坏不坏都不影响"它在不在、属不属于这个岗位"。
@@ -117,31 +121,25 @@ def _jds_path(key=None):
     return store.p_path("jds.json", key=key)
 
 
-def _jd_of_record(rec):
+def jd_of_record(rec):
     """一条台账记录挂在哪个 JD 下：`jd_id` 优先，迁移前的记录退回 `id`。
 
     判据与 `jddelete._jd_id_of_record` / `app._jd_id_of_row` **同一口径**（本项目最容易写错的
     一处）：只认 `jd_id` 的话，迁移前的数据会"一条分析都列不出来" —— 那正是"少列"最贵的形态
     （用户对着"只有 0 条引用"的清单按了确认）。
+
+    **公开**：合并（`jobdup`）要在**同一次台账事务**里既重指 `jd_id`、又标 `merged_into`，
+    它调 `repoint_jobs_in`（下面），判据仍然只有这一份。
     """
     if not isinstance(rec, dict):
         return ""
     return _text(rec.get("jd_id")) or _text(rec.get("id"))
 
 
-def _ref_id_str(x, strip):
-    """一条 `from_jds` 项指向的岗位 id（非 dict / 缺 id / id 不是字符串 → 空串）。
-
-    `strip` 不是洁癖而是**口径**：本模块对 detect 与 rewrite 都用**去空白比**
-    （`strip=True`），与 `jddelete` 的预演/清理同一把尺子；`kb._repoint_refs_in` 用的是逐字比。
-    两把尺子并存会让「预演列出 3 条、真改 2 条」（手改出的 `" jd1 "` 只被前者认）。
-    """
-    if not isinstance(x, dict):
-        return ""
-    v = x.get("id")
-    if not isinstance(v, str):
-        return ""
-    return v.strip() if strip else v
+# 一条 `from_jds` 项指向的岗位 id：**实现只有一份** —— `kb.ref_id(x, strip)`（批 7.1 把两份
+# 逐行相同的副本收成了一份，本模块**不再**留同名同义的小包装：留一个"转发壳子"会让人以为
+# 这里可以独立演化，而那正是"两份实现迟早漂移"的开头）。`strip` 的来历见 `kb.ref_id`
+# 与模块文档的「口径」一节（本模块用去空白比，与 `_detect_kb` 的 detect 同一把尺子）。
 
 
 def _strict(reader, path):
@@ -208,7 +206,7 @@ def _report_ids_of(rows, jd_id):
     """
     out, seen = [], set()
     for rec in rows:
-        if _jd_of_record(rec) != jd_id:
+        if jd_of_record(rec) != jd_id:
             continue
         name = store.safe_name(rec.get("report"))
         if not name:
@@ -239,7 +237,7 @@ def _detect_jobs(jd_id, scan):
     path = store.jobs_path(scan.key)
     if scan.jobs_err:
         return [_unreadable("jobs", path, scan.jobs_err)]
-    n = len([r for r in scan.jobs if _jd_of_record(r) == jd_id])
+    n = len([r for r in scan.jobs if jd_of_record(r) == jd_id])
     return [Ref("jobs", path, n, KINDS["jobs"].how)] if n else []
 
 
@@ -253,7 +251,7 @@ def _detect_kb(jd_id, scan):
     for node in data.get("nodes") or []:
         if not isinstance(node, dict):
             continue
-        if any(_ref_id_str(x, True) == jd_id for x in (node.get("from_jds") or [])):
+        if any(kb.ref_id(x, True) == jd_id for x in (node.get("from_jds") or [])):
             n += 1
     return [Ref("kb", path, n, KINDS["kb"].how)] if n else []
 
@@ -374,69 +372,71 @@ def _rewrite_jds(old, new, refs, key):
     return 0, ""
 
 
-def _rewrite_jobs(old, new, refs, key):
-    """#2 `jobs.json` 的 `jd_id`（口径 `jd_id or id` ⇒ 迁移前的记录也会被指过去）。
+def repoint_jobs_in(rows, old, new, include_legacy=True):
+    """原地把 `rows` 里挂在 `old` 名下的记录的 `jd_id` 改指 `new`，返回改了几条（**不落盘**）。
 
-    `merged_into` 字段**原样留着**：它是 #7 那一处（悬空引用），处理属批 7.2 ——
-    本函数只把记录"挂在哪个 JD"改对，绝不替 7.2 做决定。
+    "判断一条记录挂在哪个 JD 下"只有一份实现（`jd_of_record`：`jd_id or id`）—— 本函数是它的
+    唯一一处"改"的落点：
+      * `_rewrite_jobs`（改名那条路）在 `store.update_jobs` 的临界区里调它（`include_legacy=True`：
+        改名要把**所有**指向旧 id 的地方改干净，迁移前形态的记录靠 `id` 当身份，也得跟过去，
+        否则改完 `refs_of_jd(旧)` 仍然非空 —— 旧 id 悬着）；
+      * `jobdup._mark_drop_merged`（合并）在**它自己的**那一次台账事务里调它
+        （`include_legacy=False`：合并只改**显式写着 `jd_id == old`** 的那些记录）。
+        ⚠️ 为什么合并**不**退回 `id`：`merged_into` 那条记录（`id == drop`）按
+        `身份迁移.py` 的策略 A **保留原样**（不加 `jd_id`）—— 它是历史标记、台账里不显示；
+        给它补一个 `jd_id` 会与"已合并记录不挂到新 JD 上"这条既有决定冲突
+        （`tests/test_migration.py::MergedRecordTest` 钉着）。而真·引用（知识库 / 面试
+        `status.json` / `feedback.json`）由本模块其余 kind 覆盖，一条都不会漏。
+
+    `merged_into` 字段**不在这里碰**：那是 #7（悬空引用），处理属批 7.2。
     """
-    rows, err = store.read_jobs_strict(store.jobs_path(key))
-    if err:
-        return 0, "台账 `jobs.json` 在动手前变得读不出来了：%s" % err
     changed = 0
     for rec in rows:
-        if _jd_of_record(rec) != old:
+        if not isinstance(rec, dict):
+            continue
+        if include_legacy:
+            if jd_of_record(rec) != old:
+                continue
+        elif rec.get("jd_id") != old:
             continue
         if rec.get("jd_id") != new:
             rec["jd_id"] = new
             changed += 1
-    if changed:
-        store.save_jobs(rows, key)      # 内部持 `_JOBS_LOCK` + 判据 + 留档
-    return changed, ""
+    return changed
 
 
-def _repoint_kb_in(data, old, new):
-    """原地重指 `from_jds[].id`，返回 `(改动的卡片数, 原位重指条目数, 去掉的重复条目数)`。
+def _rewrite_jobs(old, new, refs, key):
+    """#2 `jobs.json` 的 `jd_id`（口径 `jd_id or id` ⇒ 迁移前的记录也会被指过去）。
 
-    语义与 `kb._repoint_refs_in` **同一套**（卡上本来就有 new 项 → 去掉 old 那一条，否则把
-    old 项**原位改 id**，保留它自己的 `job_title` / `company` / `date`）。
-    **判据不同且是刻意的**：kb 那份是逐字比，本模块用**去空白比** —— 与 `_detect_kb` 同一把
-    尺子（否则手改出的 `" jd1 "` 会被"预演列出、真改不动"）。
+    **读-改-写整段收进 `store.update_jobs`**（与 `jdid.rename_jd` / `jobdup` 原来的做法一致，
+    计划 2.4）：判据作用在**刚读出来**的那份台账上；一条都没改 → 传 `None` 回去
+    （**一个字节都不写**，也不多留一份 `.bak-`）。写盘前的严格读只用来把"读不出来"如实
+    报成原因（`update_jobs` 内部用的是宽容的 `load_jobs`，读不出来会给空台账 —— 那正是
+    "当成没有引用"的形态，所以必须先问严格读）。
+
+    `merged_into` 字段**原样留着**：它是 #7 那一处（悬空引用），处理属批 7.2 ——
+    本函数只把记录"挂在哪个 JD"改对，绝不替 7.2 做决定。
     """
-    touched = repointed = deduped = 0
-    for node in data.get("nodes") or []:
-        if not isinstance(node, dict):
-            continue
-        frm = node.get("from_jds")
-        if not isinstance(frm, list):
-            continue
-        has_new = any(_ref_id_str(x, True) == new for x in frm)
-        out, changed = [], False
-        for x in frm:
-            if _ref_id_str(x, True) == old:
-                if has_new:
-                    changed = True          # 已经有 new 项 ⇒ 去掉这个重复条目（否则同一个 JD 数两次）
-                    deduped += 1
-                    continue
-                x = dict(x)               # 只改一份副本，不动传进来的那些 dict
-                x["id"] = new
-                has_new = True
-                changed = True
-                repointed += 1
-            out.append(x)
-        if changed:
-            node["from_jds"] = out
-            touched += 1
-    return touched, repointed, deduped
+    _rows, err = store.read_jobs_strict(store.jobs_path(key))
+    if err:
+        return 0, "台账 `jobs.json` 在动手前变得读不出来了：%s" % err
+
+    def _fn(rows):
+        changed = repoint_jobs_in(rows, old, new)
+        return (rows if changed else None), changed
+
+    return store.update_jobs(_fn, key), ""
 
 
 def _rewrite_kb(old, new, refs, key):
     """#3 知识库引用：**只走** `kb._with_kb_write`（内部持 `_KB_LOCK`，坏库哨兵也只有那一份）。
 
     本模块自己**绝不**取 `_KB_LOCK`（硬约束 3：锁序恒为"调用方的上层锁 → kb 的锁"）。
+    ⚠️ 重指变换只有**一份实现**（批 7.1）：`kb.repoint_refs_in(..., strip=True)` ——
+    本模块用去空白比，与 `_detect_kb` 同一把尺子（否则"预演列出 3 条、真改 2 条"）。
     """
     def _fn(data):
-        touched, _repointed, _deduped = _repoint_kb_in(data, old, new)
+        touched, _repointed, _deduped = kb.repoint_refs_in(data, old, new, strip=True)
         if touched:
             store.save_knowledge(data, key)
         return touched

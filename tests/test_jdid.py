@@ -18,6 +18,7 @@ import unittest
 from unittest import mock
 
 import jdid
+import jdrefs
 import kb
 import store
 
@@ -785,6 +786,88 @@ class RenameJdTest(IsolatedCase):
 
         with open(path, "rb") as f:
             self.assertEqual(f.read(), raw, "中止时台账必须逐字节不变")
+
+
+class RenameUsesJdRefsTest(IsolatedCase):
+    """批 7.1 第 3 步：`rename_jd` 的引用重指改走 `jdrefs.refs_of_jd` + `rewrite_jd_refs`。
+
+    改名原先自己 repoint 三处（`jds.json` / 知识库 `from_jds` / 面试 `status.json` / 台账），
+    于是**漏了两处**：`report_state/<报告id>.json`（按报告 id 命名，改名不需要动它，但**必须
+    列出来**）与 `interviews/<面试id>/feedback.json`（反哺幂等标记，**键就是旧 JD id**）——
+    后者不改的话，改完名之后那个键就指向一个不存在的岗位，下一次反哺重试会把同一次面试
+    重复计进复习队列。
+
+    这一组钉三件事：
+      ① 改名后 `refs_of_jd(旧)` **为空**（悬空 0 条）、`refs_of_jd(新)` 覆盖全部六类；
+      ② `feedback.json` 的键与条目里的 `jd_id` 副本都跟过去；
+      ③ 读不出来的那处引用（`feedback.json` 坏掉）⇒ **拒绝整次改名**、一个字节都不动。
+    """
+
+    OLD = RenameJdTest.OLD
+    NEW = RenameJdTest.NEW
+    SIX = ["jds", "jobs", "kb", "iv_status", "report_state", "iv_feedback"]
+
+    def _fixture(self):
+        """在 `RenameJdTest` 的夹具上补齐**此前漏掉的两处**（报告勾选 / 反哺标记）。"""
+        RenameJdTest._fixture(self)
+        store.save_report_state("a1", {"要会 ASR": True})       # 报告 id = `a1.html` 去掉后缀
+        store.save_interview_json("iv1", "feedback.json",
+                                  {self.OLD: {"applied": True, "jd_id": self.OLD}})
+
+    def _kinds(self, jd_id):
+        return sorted(r.kind for r in jdrefs.refs_of_jd(jd_id))
+
+    def test_after_the_rename_nothing_points_at_the_old_id(self):
+        self._fixture()
+        self.assertEqual(self._kinds(self.OLD), sorted(self.SIX),
+                         "夹具前提：六类引用要齐（否则这条断言恒真）")
+        jdid.rename_jd(self.OLD, self.NEW)
+        self.assertEqual(jdrefs.refs_of_jd(self.OLD), [],
+                         "改完还有东西指着旧 id（悬空引用）")
+        self.assertEqual(self._kinds(self.NEW), sorted(self.SIX),
+                         "新 id 没有覆盖全部引用点")
+        # 逐项的真实内容：不是"扫出来对"而是"盘上那份对"
+        fb = store.load_interview_json("iv1", "feedback.json")
+        self.assertEqual(list(fb), [self.NEW], "feedback.json 的键还停着旧 id")
+        self.assertEqual(fb[self.NEW]["jd_id"], self.NEW, "条目里那份 `jd_id` 副本没跟过去")
+        self.assertTrue(fb[self.NEW]["applied"], "反哺的幂等标记丢了（会重复计进复习队列）")
+        # 报告勾选文件按**报告 id** 命名 ⇒ 改名不需要动它，但它在清单里（上面六类已断言）
+        self.assertTrue(os.path.isfile(store.report_state_path("a1")),
+                        "报告勾选文件被顺手删/改名了")
+        self.assertEqual(store.load_jobs()[0]["jd_id"], self.NEW)
+
+    def test_an_unreadable_feedback_file_refuses_the_rename_and_changes_nothing(self):
+        """**读不出来 ≠ 没有引用**：坏掉的 `feedback.json` ⇒ 拒绝整次改名（一个字节都不动）。"""
+        self._fixture()
+        path = store.interview_file("iv1", "feedback.json")
+        with open(path, "wb") as f:                  # 真实的非 UTF-8 字节（不是 mock）
+            f.write(json.dumps({"jd": "中文"}, ensure_ascii=False).encode("gbk"))
+        raw = store.read_bytes(path)
+        jds_before = store.read_bytes(store.p_path("jds.json"))
+        jobs_before = store.read_bytes(store.jobs_path())
+        with self.assertRaises(RuntimeError) as cm:
+            jdid.rename_jd(self.OLD, self.NEW)
+        self.assertIn("读不出来", str(cm.exception))
+        self.assertIn("拒绝", str(cm.exception))
+        self.assertEqual(store.read_bytes(path), raw, "坏的那份原样留着")
+        self.assertEqual(store.read_bytes(store.p_path("jds.json")), jds_before)
+        self.assertEqual(store.read_bytes(store.jobs_path()), jobs_before)
+        self.assertEqual(store.load_jobs()[0]["jd_id"], self.OLD)
+
+    def test_a_legacy_record_identified_by_its_own_id_follows_the_rename_too(self):
+        """**迁移前形态**的记录（身份 = `id`，没有 `jd_id`）也跟到新 id。
+
+        判据是 `jdrefs` 的 `jd_id or id`（与删除预演同一把尺子）：只认 `jd_id` 的话，
+        改完名之后这条记录的 `_jd_of_record` 仍等于旧 id ⇒ `refs_of_jd(旧)` 非空（悬空 1 条）。
+        """
+        jdid.upsert_jd({"id": self.OLD, "seq": 1, "company": ""})
+        store.save_jobs([{"id": self.OLD, "report": "legacy.html", "score": 60.0,
+                          "created_at": "2026-10-01 09:00"}])
+        self.assertNotIn("jd_id", store.load_jobs()[0])
+        jdid.rename_jd(self.OLD, self.NEW)
+        self.assertEqual(store.load_jobs()[0]["jd_id"], self.NEW)
+        self.assertEqual([r.kind for r in jdrefs.refs_of_jd(self.OLD)], [],
+                         "迁移前形态的记录没跟上改名（旧 id 还悬着）")
 
 
 class JdsStoreTest(IsolatedCase):

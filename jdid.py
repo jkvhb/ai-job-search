@@ -31,6 +31,8 @@ import kb
 import log
 import store
 
+import jdrefs
+
 # ---------- 常量（来自规格 §3/§4，别拍） ----------
 SEP = "_"                       # 分隔符用 _，因为薪资里本身有 -（13-26K）
 UNKNOWN = "【未知%s】"           # 【未知单位】/【未知学历】/【未知职责】/【未知城市】/【未知薪资】/【未知领域】
@@ -666,38 +668,27 @@ def _bad(msg, **kw):
     return ValueError(msg)
 
 
-def _jd_id_mover(old, new):
-    """造一个给 `store.update_jobs` 用的 `fn`：把 `jd_id == old` 的分析记录改指 `new`。
-
-    返回 `fn(jobs) -> (要写回的列表 或 None, 改了几条)`；一条都没改 → 回 `None`
-    （**一个字节都不写**，与老写法 `if jobs_moved:` 的语义一致）。
-    ⚠️ `fn` 只改内存：它是在 `_JOBS_LOCK` 里跑的，而调用方还持着 `_JD_LOCK` + `_KB_LOCK`
-    （与原来在同一行调 `store.save_jobs` 取的是**同一把**锁，锁序逐边不变）。
-    ⚠️ 判据必须只认 `jd_id`（**不退回 `id`**）：迁移前的老记录靠 `id` 当身份，但 `rename_jd`
-    历来只改 `jd_id` 那些，改成"退回 id"会顺手改掉别的记录（既有用例钉着这一条）。
-    """
-    def move(jobs):
-        moved = 0
-        for j in jobs:
-            if isinstance(j, dict) and j.get("jd_id") == old:
-                j["jd_id"] = new
-                moved += 1
-        return (jobs if moved else None), moved
-    return move
-
-
 def rename_jd(old_id, new_id, key=None):
     """改一个 JD 的 ID，并把**所有引用**同步改过去。成功返回新 id 字符串。
 
-    改哪些地方（规格 §4「改 ID 的影响」）：
-      1. `jds.json` 的 `id`，旧值推进 `id_history`
-      2. 知识库 `from_jds[].id`
-      3. 面试记录 `status.json.job_id`
-      4. `jobs.json` 里挂在它下面的分析 `jd_id`
+    改哪些地方（规格 §4「改 ID 的影响」）：**清单只有一份**（批 7.1）——
+    `jdrefs.refs_of_jd(old)` 说了算（`jdrefs.KINDS`：`jds.json` 本体 / 台账 `jd_id` /
+    知识库 `from_jds` / 面试 `status.json` / 报告勾选 `report_state` / 反哺 `feedback.json`），
+    逐项重写交给 `jdrefs.rewrite_jd_refs`。本模块**不再自己列清单**（原先自己列三处 ⇒
+    漏了 `report_state/<报告id>.json` 与 `interviews/*/feedback.json`，后者一旦漏，改完名它
+    的键就指向一个不存在的岗位，下一次反哺重试会把同一次面试重复计进复习队列）。
     **已有的报告文件不重命名**（它们只是产物；台账通过 `jobs.json.report` 找到它们）。
 
-    先在内存里算完全部改动、校验通过后**逐文件落盘**；中途任一步抛错就用内存里的原像
-    把已写的文件回滚（先 jds.json 后知识库），绝不留「jds 改了、引用没改」的半改状态。
+    **台账那一段的判据是 `jd_id or id`**（`jdrefs` 的口径，与删除预演同一把尺子）：迁移前
+    形态的记录（身份就是 `id`、没有 `jd_id`）也会跟上改名 —— 只认 `jd_id` 的话它们改完还是
+    `refs_of_jd(旧)` 的命中（旧 id 悬着）。这是本步唯一一处判据变化，属于"清单与改写同一把
+    尺子"的必然结果。
+
+    **失败语义全部在 `jdrefs`**：它写之前重新过每一处的 `*_safe_to_write`，任何一处读不出来/
+    结构不对就**整次拒绝**（一个字节都不写）；落盘中途失败则用**原始字节**原像逐字节回滚
+    ——绝不留「jds.json 改了、引用没改」。本模块保留的是**前面的闸门**（JD 库读不出来、
+    知识库读不出来、任何一份面试 `status.json` 读不出来、以及 `refs_of_jd` 自己报出来的
+    "读不出来" ⇒ 一律 `RuntimeError` 拒绝、一个字节都不动），那句话是给用户看的。
 
     **知识库读不出来时拒绝整次改名**（`RuntimeError`）：判据是 `store.knowledge_safe_to_write()`
     —— 与 `kb.repoint_jd_refs` 用的是**同一份**（"读不出来 ≠ 空"只有一个实现）。为什么必须拒绝：
@@ -781,12 +772,11 @@ def rename_jd(old_id, new_id, key=None):
                        % (kb_reason, old))
                 log.log_event("jdid.rename_rejected", level="warn", reason=msg, old=old, new=new)
                 raise RuntimeError(msg)
-            jobs = store.load_jobs(key)
 
             # ---- 需求二②：有面试 status.json 读不出来 → 拒绝整次改名（"读不出来"就是"不知道"）----
             # 面试记录是**每个面试目录一个文件**，漏掉一份不会有任何集中信号：老实现把它当成
             # "这份没引用我"跳过，改完 ID 后那份的 `job_id` 静默留着旧 ID（同一个岗位两种身份）。
-            paths, iv_err = _interview_status_paths(old)
+            _paths, iv_err = _interview_status_paths(old)
             if iv_err:
                 msg = ("%s。**已拒绝这次改 ID**：读不出来就无法确认哪些面试记录挂在 %s 下面，"
                        "改完会有一条面试记录的 `job_id` 静默留着旧 ID（同一个岗位两种身份）。"
@@ -795,83 +785,52 @@ def rename_jd(old_id, new_id, key=None):
                 log.log_event("jdid.rename_rejected", level="warn", reason=msg, old=old, new=new)
                 raise RuntimeError(msg)
 
-            # ---- 6) 先在内存里把全部改动算完（此时一个字节都还没落盘）----
-            new_target = dict(target)
-            new_target["id"] = new
-            hist = [h for h in (target.get("id_history") or []) if h != old]
-            new_target["id_history"] = hist + [old]
-            updated_jds = dict(data)
-            updated_jds["jds"] = [new_target if r is target else r for r in data["jds"]]
+            # ---- 6) 引用清单只有一份（`jdrefs.KINDS`）：**纯读**，先把"读不出来"拒掉 ----
+            # 批 7.1 第 3 步：改名原先自己 repoint 三处 ⇒ 漏了 `report_state/<报告id>.json`
+            # 与 `interviews/*/feedback.json`（后者**键就是旧 JD id**，不改就会指向一个不存在的
+            # 岗位，下一次反哺重试会把同一次面试重复计进复习队列）。现在只问 `jdrefs`。
+            # ⚠️ 它自己**不取**任何外层锁（本线程正持着 `_JD_LOCK` + `_KB_LOCK`），
+            # 写 knowledge.json 时只重入 `kb._with_kb_write` 的 `_KB_LOCK` ⇒ 锁序逐边不变。
+            refs = jdrefs.refs_of_jd(old, key)
+            bad_refs = jdrefs.unreadable_refs(refs)
+            if bad_refs:
+                # **"读不出来"就是"不知道它指向谁"** ⇒ 拒绝整次改名（与上面两道闸门同一规格）。
+                # 老实现只拦 `status.json`；`feedback.json` 坏掉时它会照改并报成功 ——
+                # 改完那个坏文件里的旧键还指着已经不存在的岗位（同岗位两种身份，全程静默）。
+                msg = ("%s。**已拒绝这次改 ID**：读不出来就无法确认还有哪些引用挂在 %s 下面，"
+                       "改完会留下「jds.json 指向新 ID、那些引用还指着旧 ID」的两种身份。"
+                       "这次改名一个字节都没动 —— 请先把它修好（或从别处恢复、把它移开）再改。"
+                       % ("；".join(r.err for r in bad_refs), old))
+                log.log_event("jdid.rename_rejected", level="warn", reason=msg, old=old, new=new)
+                raise RuntimeError(msg)
 
-            # 知识库那一段**不在这里算**：它的读-改-写整段收归 `kb.repoint_jd_refs`
-            # （P3-3），在下面第 7 步按"落盘顺序"（jds → 知识库 → 面试 → 台账）真正执行。
-            iv_new = []
-            for path in paths:
-                st = store.read_json(path, None)
-                if isinstance(st, dict):
-                    st = dict(st)
-                    st["job_id"] = new
-                    iv_new.append((path, st))
-            # 台账那一段：这里**只做预检**（有几条记录要跟着改指新 ID）—— 真正落盘时
-            # 由 `store.update_jobs` 在 `_JOBS_LOCK` 里重新读一份最新的、再改（计划 2.4）。
-            # ⚠️ 老写法在这一步把第 764 行那份**快照**改好、到第 7 步整份写回：改名窗口里
-            # 挤进来的一次分析落盘（`upsert_job`）会被整份顶掉（丢更新，报告还在盘上）。
-            jobs_moved = 0
-            for j in jobs:
-                if isinstance(j, dict) and j.get("jd_id") == old:
-                    jobs_moved += 1
-
-            # ---- 7) 落盘（逐文件；失败用内存原像回滚已写的文件）----
-            # 原像一律按**原始字节**读（`read_bytes`，读不出来返回 None 表示"本来不存在"）。
-            # 这里真正的风险不是"非 UTF-8 的 jds.json"（那条静态路径到不了这里：读不出来时
-            # 上面那道 `store.jds_safe_to_write` 闸门已经**拒绝整次改名**，一个字节都没写），
-            # 而是**取原像这一步本身读失败**（文件被锁 / 权限）。
-            # 用 `read_text(..., None)` 会把"读失败"静默兜成 `None`，而 `None` 在下面的
-            # 回滚里表示"这个文件本来不存在" → 回滚把 285 字节的台账写成 `{}`（2 字节），
-            # 用户的 JD 库被清空、连备份里也没有原文。回归测试：
-            # `tests/test_jdid.py::RenameJdTest::test_a_read_failure_at_snapshot_time_leaves_the_bytes_untouched`。
-            written = []      # [(path, 原始字节 或 None)]
-            kb_touched = 0
+            # ---- 7) 落盘：逐项重写 + 原像逐字节回滚**都由 `jdrefs` 负责** ----
+            # 它写之前会重新过一遍每一处的 `*_safe_to_write`，任何一处写不得就**整次拒绝**
+            # （一个字节都不写）；落盘中途失败则用原像逐字节还原，绝不留「jds 改了、引用没改」。
+            # 原像必须按**原始字节**取（`read_bytes`）：文本模式会把 LF 换成 CRLF，那样"逐字节
+            # 还原"就是假的（回归：`test_a_read_failure_at_snapshot_time_leaves_the_bytes_untouched`
+            # 与 `RenameRollbackByteExactTest`）。
             try:
-                written.append((_jds_path(key), store.read_bytes(_jds_path(key))))
-                save_jds(updated_jds, key)
-                # 知识库引用：走 kb 的窄接口 —— 读-改-写整段在 `_KB_LOCK` 里完成
-                # （这里只是**重入**取它；外面那把 `_KB_LOCK` 是本函数从第 744 行起持着的）。
-                # 原像必须在接口**之前**取：此刻没有并发写者能挤进来，所以那份字节就是
-                # 「本次改动的原像」，失败回滚写回去 = 逐字节还原。
-                kb_path = store.knowledge_path(key)
-                kb_before = store.read_bytes(kb_path)
-                kb_touched, kb_ref_err = kb.repoint_jd_refs(old, new, key)
-                if kb_ref_err:
-                    # 外层这道闸门与这次调用之间库变成了读不出来（外部程序锁/改坏了它）：
-                    # 接口**一个字都没写**。这里**响亮失败**而不是静默跳过 —— 静默跳过
-                    # 正好就是 P0-8 要修的那件事（jds 改了、引用没改）。
-                    raise RuntimeError("知识库在改名过程中变得读不出来了：%s" % kb_ref_err)
-                if kb_touched:
-                    written.append((kb_path, kb_before))
-                for path, st in iv_new:
-                    written.append((path, store.read_bytes(path)))
-                    store.write_json(path, st)
-                if jobs_moved:
-                    written.append((store.jobs_path(key), store.read_bytes(store.jobs_path(key))))
-                    # 读-改-写整段收进 `store.update_jobs`（计划 2.4）：判据作用在**刚读出来**
-                    # 的那份台账上，而不是第 764 行的快照。原像在上面按字节取好（只读、无副作用），
-                    # 写成不成都由它自己收尾（原子写）⇒ 回滚前提与老写法一致。
-                    # ⚠️ 此刻本线程持着 `_JD_LOCK` + `_KB_LOCK`：这里取 store 的 `_JOBS_LOCK`
-                    # 与原来在同一行调 `store.save_jobs` 取的是**同一把**锁，锁序逐边不变。
-                    store.update_jobs(_jd_id_mover(old, new), key)
-            except BaseException as e:
-                for path, before in reversed(written):
-                    try:
-                        if before is None:
-                            store.write_json(path, {} if path.endswith("jds.json") else [])
-                        else:
-                            store.write_bytes(path, before)
-                    except Exception:
-                        pass
+                jdrefs.rewrite_jd_refs(old, new, refs=refs, key=key)
+            except (jdrefs.JdRefsRefused, jdrefs.JdRefsWriteFailed) as e:
+                # 拒绝（坏文件）与中途失败（已回滚）都是"这次改名没成"：原样给用户看 `jdrefs`
+                # 那句说清"哪个文件、为什么"的话 —— 重新包装一遍只会丢掉细节。
                 log.log_exc("jdid.rename_failed", e, old=old, new=new)
-                raise _bad("改 ID 失败：%s（已回滚本次改动）" % e, old=old, new=new)
+                raise _bad("改 ID 失败：%s" % e, old=old, new=new)
+            except Exception as e:
+                # 原像都取不出来（文件被锁 / 权限 / IO）：`jdrefs` 在**任何落盘之前**就抛了，
+                # 一个字节都没写。这里换成 `ValueError`（本模块对外的既有约定），
+                # 绝不把"读失败"兜成"这个文件本来不存在"再去写一份假的。
+                log.log_exc("jdid.rename_failed", e, old=old, new=new)
+                raise _bad("改 ID 失败：%s（本次改名一个字节都没动）" % e, old=old, new=new)
 
-        log.log_event("jdid.rename_done", old=old, new=new, kb_nodes=kb_touched,
-                      interviews=len(iv_new), analyses=jobs_moved)
+        # 计数只用于日志（口径由 `jdrefs` 的 `Ref.count` 给出：kb = 卡片数、jobs = 记录数、
+        # 面试 = 逐文件的条数），不再自己另算一遍。
+        per_kind = {}
+        for r in refs:
+            per_kind[r.kind] = per_kind.get(r.kind, 0) + max(r.count, 0)
+        log.log_event("jdid.rename_done", old=old, new=new,
+                      kb_nodes=per_kind.get("kb", 0),
+                      interviews=per_kind.get("iv_status", 0),
+                      analyses=per_kind.get("jobs", 0))
         return new

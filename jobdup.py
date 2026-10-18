@@ -23,6 +23,7 @@
      （轮转正是会删掉原像的那只手 —— 这条老雷就是这么变可达的）。
   5. `find_duplicate_jobs` **只读**（不写文件、不记日志），这样体检 CLI 无参数时能保证零写入。
 """
+import copy
 import glob
 import os
 import re
@@ -30,6 +31,7 @@ import threading
 import unicodedata
 from datetime import datetime
 
+import jdrefs
 import kb
 import log
 import store
@@ -348,18 +350,53 @@ def merge_jobs(keep_id, drop_id):
 
 
 def _mark_drop_merged(jobs, drop_id, keep_id):
-    """`store.update_jobs` 用的 `fn`：给 drop 那条打上 `merged_into`。
+    """`store.update_jobs` 用的 `fn`：给 drop 那条打上 `merged_into`，**并把显式写着
+    `jd_id == drop_id` 的记录改指 keep**（批 7.1，判据见 `jdrefs.repoint_jobs_in`）。
+
+    两件事**必须在同一次台账事务里**：分成两次写，中间那一瞬是「记录已并入 keep、却仍挂在
+    drop 下」的半成品状态（而且多一次跨调用的读-改-写）。判据仍只有一份
+    （`jdrefs.repoint_jobs_in` → `jd_of_record`）。
+    ⚠️ **不退回 `id`**（`include_legacy=False`）：`merged_into` 那条记录（`id == drop`）按
+    `身份迁移.py` 的策略 A **保留原样**（不加 `jd_id`）—— 它是历史标记、台账里不显示；
+    给它补一个 `jd_id` 会与"已合并记录不挂到新 JD 上"这条既有决定冲突
+    （`tests/test_migration.py::MergedRecordTest` 钉着）。真正的外部引用（知识库 / 面试
+    `status.json` / `feedback.json`）由 `jdrefs` 的其余 kind 覆盖，一条都不会漏。
 
     返回 `(要写回的列表, 标记成功了吗)`；临界区里找不到那条记录 → `(None, False)`
     （**一个字节都不写**，由调用方响亮失败）。
     ⚠️ 本函数**只改内存**：绝不许在这里取锁 / 读别的文件 —— 它是在 `_JOBS_LOCK` 里跑的，
     而调用方还持着 `_MERGE_LOCK`（`tests/test_store.py::UpdateJobsTransactionTest` 钉着这条约定）。
     """
+    jdrefs.repoint_jobs_in(jobs, drop_id, keep_id, include_legacy=False)
     for j in jobs:
         if isinstance(j, dict) and j.get("id") == drop_id:
             j["merged_into"] = keep_id
             return jobs, True
     return None, False
+
+
+# 合并时要重指哪几种引用（批 7.1）：**除了 `jds` 本体**——合并绝不改 JD 记录的 id
+# （那不是"合并"该动的东西，而且很可能撞上已有的那个 id）；`merged_into`（悬空引用）
+# 归批 7.2，本步不处理（`jdrefs` 会如实报 ok=False）。
+# ⚠️ 台账那一种（`jobs`）**不在这里**：它要和 `merged_into` 标记进**同一次** `update_jobs`
+# 事务（见 `_mark_drop_merged`），由本模块在一次事务里做完 —— 判据仍调 `jdrefs.repoint_jobs_in`。
+_MERGE_KINDS = ("kb", "iv_status", "report_state", "iv_feedback")
+
+
+def _kb_repoint_counts(data, drop_id, keep_id):
+    """**只读**算出这次合并在知识库上会"原位改指几条 / 去掉几条重复项"。
+
+    为什么不自己再遍历一遍：那正是"同一套变换两份实现"的老病（体检 §8.1）。这里把
+    `kb.ensure_kb` 的结果**复制一份**，交给**唯一一份**实现 `kb.repoint_refs_in`
+    （判据 `strip=True`，与 `jdrefs` 的重写同一把尺子），只取它的计数三元组。
+    副本上的改动不会落盘；真正落盘仍由 `jdrefs.rewrite_jd_refs` 在锁里做。
+    """
+    try:
+        scratch = copy.deepcopy(kb.ensure_kb(data if isinstance(data, dict) else {}))
+        _touched, repointed, deduped = kb.repoint_refs_in(scratch, drop_id, keep_id, strip=True)
+        return repointed, deduped
+    except Exception:                     # noqa: BLE001 —— 计数只是给日志/CLI 看的，绝不让它挡住合并
+        return 0, 0
 
 
 def _merge_jobs_locked(keep_id, drop_id):
@@ -396,46 +433,48 @@ def _merge_jobs_locked(keep_id, drop_id):
                       keep=keep_id, drop=drop_id)
         return _result(False, msg)
 
+    # ---- 批 7.1：引用清单只有一份（`jdrefs.KINDS`）----
+    # 原先这里只重指知识库那一半 + 面试 `status.json`，漏了 `interviews/*/feedback.json`
+    # （键就是 drop）与 `report_state/<报告id>.json`。
+    # ⚠️ 这一层**不自己判"读不出来"**：`rewrite_jd_refs` 自己在任何落盘之前就会因为
+    # `err` 非空 / 预检不过而 `JdRefsRefused`（一个字节都不写），下面那个 `except` 会回滚并
+    # 如实回报。那正是"读不出来 ≠ 没有引用"的**唯一一份**判据，本模块不另造一套。
+    refs = jdrefs.refs_of_jd(drop_id)
+    rewrite_refs = [r for r in refs if r.kind in _MERGE_KINDS]
+
     before = kb.stats(store.load_knowledge())["multi_jd"]
+    repointed, deduped = _kb_repoint_counts(store.load_knowledge(), drop_id, keep_id)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     backups = []
     try:
         _snapshot(store.jobs_path(), ts, backups)
-        # 知识库那一段的备份与读-改-写必须在同一把锁里：备份若在锁外取，中间挤进来一次
-        # absorb 就会让「备份」不再是本次改动的原像，回滚会把别人的更新抹掉。
-        # 读-改-写本身收归 `kb.merge_jd_refs`（P3-3）：这里持着 `_KB_LOCK` 只是**重入**
-        # （备份 → 改库 必须是一个临界区），真正保护它的锁在 kb 自己的模块里。
-        with kb._KB_LOCK:
-            _snapshot(store.knowledge_path(), ts, backups)
-            repointed, deduped, kb_ref_err = kb.merge_jd_refs(drop_id, keep_id)
-            if kb_ref_err:
-                # 坏库（有内容但读不出来）：**放弃本次合并，绝不写成空库**。
-                # 用 `RuntimeError`：全仓"前置条件不满足就中止"的既有类型，`_rollback` 只 catch
-                # `Exception`，与原来 `_repoint_kb` 那条路逐字同一形状。
-                raise RuntimeError("knowledge.json 读不出来（有内容但读不出来）："
-                                   "已放弃本次合并，绝不写成空库。原因：%s" % kb_ref_err)
-
-        # 面试记录的清单**不在这里重新扫**：上面那道闸门已经扫过一次（并据此拒绝读不出来的情况），
-        # 这里复用同一份清单 —— 否则"闸门扫的"与"写盘扫的"是两个时刻的输入（同源读取只改一半）。
+        # 面试记录先留档（**在任何重指之前**）：`jdrefs` 接下来会改写它们的 `job_id`，
+        # 回滚的原像必须是动手之前那份。清单复用上面那道闸门扫出来的同一份
+        # —— 否则"闸门扫的"与"写盘扫的"是两个时刻的输入（同源读取只改一半）。
         for path in iv_files:
             _snapshot(path, ts, backups)
-        for path in iv_files:
-            # 同源读取**不能只改一半**：闸门那次读得到，写盘这次再读也可能读不出来（文件被锁 /
-            # 被别的编辑器改坏 / 权限）。老实现 `if isinstance(st, dict)` 在这种时候**静默跳过**
-            # —— 闸门白装，那条面试记录仍指向 drop，而合并报成功。这里响亮失败 → 走下面的回滚
-            # （这些面试记录上面都留过档，回滚前提齐备）。
-            st = store.read_json(path, None)
-            if not isinstance(st, dict):
-                raise RuntimeError(
-                    "面试记录 `%s` 在写盘阶段读不出来（拿不到它的 `job_id`）：本次合并中止并回滚，"
-                    "绝不把它静默留在指向 %s 的旧身份上。" % (path, drop_id))
-            st["job_id"] = keep_id
-            store.write_json(path, st)
+        # 知识库那一段的备份与读-改-写必须在同一把锁里：备份若在锁外取，中间挤进来一次
+        # absorb 就会让「备份」不再是本次改动的原像，回滚会把别人的更新抹掉。
+        # 引用重指本身收归 `jdrefs.rewrite_jd_refs`（单一真源）：这里持着 `_KB_LOCK` 只是
+        # **重入**（备份 → 改库 必须是一个临界区），真正保护它的锁在 kb 自己的模块里。
+        with kb._KB_LOCK:
+            _snapshot(store.knowledge_path(), ts, backups)
+            # ---- 引用重指：`jdrefs` 的清单，漏一种就是盘上孤儿 ----
+            # 它写之前重新过一遍每一处的 `*_safe_to_write`：任何一处读不出来 ⇒ **整次拒绝**
+            # （一个字节都不写）；落盘中途失败 ⇒ 用原像逐字节回滚后再抛。
+            try:
+                jdrefs.rewrite_jd_refs(drop_id, keep_id, refs=rewrite_refs)
+            except (jdrefs.JdRefsRefused, jdrefs.JdRefsWriteFailed) as e:
+                # 坏库 / 坏文件 / 写盘失败：一律走下面的 `except`（回滚 + 如实回报），
+                # 但保留 `jdrefs` 那句说清"哪个文件、为什么"的原文。
+                raise RuntimeError(str(e))
 
         # 台账那一段（计划 2.4）：读-改-写收进 `store.update_jobs` —— 整段在 `_JOBS_LOCK` 里，
         # 而且用的必须是**刚读出来**的那份、不是第 352 行那份快照。老写法 `save_jobs(raw)`
         # 把旧快照整份写回：合并窗口里挤进来的一次分析落盘（`upsert_job`）会被整份顶掉
         # —— 报告文件还在盘上，台账里却再也看不到那次刚花过模型额度的分析。
+        # ⚠️ 这一笔**同时**做两件事（`_mark_drop_merged`）：把挂在 drop 下的记录改指 keep
+        # （否则 `refs_of_jd(drop)` 永远非空）与打 `merged_into` 标记。
         # ⚠️ `fn` 只改内存（此刻本线程持着 `_MERGE_LOCK`，去取 store 的 `_JOBS_LOCK` 是
         # "外层 → 内层"，与原来在同一行调 `save_jobs` 取的是同一把锁，锁序逐边不变）。
         marked = store.update_jobs(lambda jobs: _mark_drop_merged(jobs, drop_id, keep_id))

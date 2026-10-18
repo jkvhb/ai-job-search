@@ -45,8 +45,9 @@
 换来的是「不凭空造 JD、跑几次都一样」。
 
 **铁律**：
-  1. 只 import 本任务用到的模块（`jobdup` / `jdid` / `kb` / `store` / `log`），
-     **绝不 import `app.py`**（那是服务，脚本不能拖起 Web 依赖）。
+  1. 只 import 本任务用到的模块（`jobdup` / `jdid` / `jdrefs` / `kb` / `store` / `log`），
+     **绝不 import `app.py`**（那是服务，脚本不能拖起 Web 依赖）。`jdrefs` 是零依赖的
+     引用点登记表（批 7.1）：本脚本的 `REF_KINDS` 必须与它的 `KINDS` 对得上。
   2. 写 `knowledge.json` 必须持 `kb._KB_LOCK`（本项目真实丢过 97 张卡）；
      锁顺序恒为 `jdid._JD_LOCK` → `kb._KB_LOCK`（反向会死锁）。
   3. `knowledge.json` 「有内容但解析失败」→ **立刻中止**，绝不用空库顶掉
@@ -67,11 +68,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # 不再各抄一遍（抄漏一处就是体检 §2 P0-14）。
 import 迁移脚手架 as 脚手架  # noqa: E402
 
-import jdid    # noqa: E402
-import jobdup  # noqa: E402
-import kb      # noqa: E402
-import log     # noqa: E402
-import store   # noqa: E402
+import jdid     # noqa: E402
+import jdrefs   # noqa: E402
+import jobdup   # noqa: E402
+import kb       # noqa: E402
+import log      # noqa: E402
+import store    # noqa: E402
 
 # JD 级字段（只存 `jds.json`）——与 `app.JD_FIELDS` 同一口径（脚本不 import app，故各列一份）
 JD_FIELDS = ("job_title", "job_category", "location", "salary", "company", "hr_name", "phone",
@@ -99,6 +101,43 @@ USAGE = """用法：
 # 备份目录名前缀（`data/profiles/迁移备份_<时间戳>/`）。**唯一一份定义**：
 # 备份命名与「拷备份时跳过旧备份」两处都用它，绝不会写歪成两个说法。
 BACKUP_PREFIX = "迁移备份"
+
+# ---------------------------------------------------------------- 引用点口径（批 7.1）
+# 本脚本会重写的引用点：kind 名**必须**与 `jdrefs.KINDS`（「指向岗位的引用点」唯一登记表）
+# 的登记名一致，产物也必须对得上。那份登记表回答的是同一个问题
+# （"哪些产物里带着岗位身份"），只是它按**调用方**（改名 / 删除 / 合并）组织。
+#
+# 为什么一次性脚本也要对齐：它本机已执行过，但别人的机器上（或从备份恢复出来的数据上）
+# 还会再跑。哪天 `jdrefs.KINDS` 新增/改名一种引用点，这里必须知道 —— 否则脚本会以为
+# 自己已经处理干净了（漏一种引用点 = 迁移后在盘上留下孤儿记录）。
+# 对齐是**静态名单 + 闸门**（`_assert_ref_kinds_registered`），不重写任何一种引用点：
+# 本脚本是历史工具，改它的行为不在批 7.1 的范围里（CLI 与文案一个字都不动）。
+REF_KINDS = ("jds", "jobs", "kb", "iv_status")
+REF_PRODUCTS = ("jds.json", "jobs.json", "knowledge.json", "interviews/status.json")
+
+
+def _assert_ref_kinds_registered():
+    """口径闸门：本脚本的引用点名单必须与 `jdrefs.KINDS` 逐项对上（正常时**静默**通过）。
+
+    失败一律 `RuntimeError`（全仓"前置条件不满足就中止"的既有类型），并且**一个字节都不写**
+    —— 调用点在 `plan_migration()` 的最前面，任何读盘/算计划都还没开始。
+    文案只用 GBK 可编码的字符（cp936 控制台上 print 出去不会 `UnicodeEncodeError`）。
+    """
+
+    def _fail(msg):
+        raise RuntimeError(
+            "身份迁移：%s。引用点清单只准有一份（`jdrefs.KINDS`）—— 请把本脚本的 "
+            "REF_KINDS / REF_PRODUCTS 与那份登记表对齐后再跑。" % msg)
+
+    missing = [k for k in REF_KINDS if k not in jdrefs.KINDS]
+    if missing:
+        _fail("这些引用点没有在 jdrefs.KINDS 里登记：%s" % "、".join(missing))
+    products = set()
+    for kind in REF_KINDS:
+        products |= set(jdrefs.KINDS[kind].products)
+    if products != set(REF_PRODUCTS):
+        _fail("引用点产物与 jdrefs.KINDS 对不上：本脚本 %s，登记表 %s"
+              % (sorted(REF_PRODUCTS), sorted(products)))
 
 # 测试注入点（生产恒为空）：`--执行` 每写一个文件后把它的相对名 append 进来；
 # 测试往里面放一个「打开即抛错」的对象，就能在**事务中途**制造写盘失败，
@@ -344,6 +383,8 @@ def plan_migration():
       `skipped`     —— `(no_text, too_short)` 两类自成一组的原因计数
       `changed`     —— 这一轮会不会改动任何一个字节（`--执行` 据此决定要不要备份，P0-12）
     """
+    # 批 7.1：引用点名单必须与 `jdrefs.KINDS` 同一口径（静默通过；不一致就响亮报错且不写盘）。
+    _assert_ref_kinds_registered()
     with jdid._JD_LOCK:                        # noqa: SLF001 —— 锁顺序恒为 _JD_LOCK → _KB_LOCK
         jds_data = jdid.load_jds()
         existing = [r for r in jds_data.get("jds", []) if isinstance(r, dict)]

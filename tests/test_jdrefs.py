@@ -28,6 +28,7 @@ import unittest
 from unittest import mock
 
 import jdrefs
+import kb
 import store
 
 from tests.base import IsolatedCase
@@ -502,7 +503,59 @@ class GuardTest(_Case):
         self.assertGreaterEqual(tested, 5, "这条测试实际只变异了 %d 个 kind，太少了" % tested)
 
 
-# ---------------------------------------------------------------- ⑤ 模块卫生（铁律）
+# ---------------------------------------------------------------- ⑤ kb 重指变换：只剩一份实现
+class KbRepointUnificationTest(_Case):
+    """批 7.1：`from_jds` 重指变换**只有一份实现**（体检 §8.1 点名的"同一套变换两份"）。
+
+    原来 `jdrefs._repoint_kb_in` 与 `kb._repoint_refs_in` 是逐行相同、**判据不同**的两份副本
+    （前者去空白比、后者逐字比）。收口方案：实现搬到 `kb.repoint_refs_in`，**判据变成参数**
+    （`strip`）—— 因为两边的判据各被既有用例**对向钉着**，谁"胜出"都会让另一边红：
+      * `tests/test_jdrefs.py:400`（本文件）要求带空白的 `" jd1 "` 被**改到**（去空白比）；
+      * `tests/test_kb.py:2996` 要求 `kb.repoint_jd_refs` **不认** `" old "`（逐字比）。
+    所以这一组钉的是"**一份实现、两种判据、两条既有用例都还绿**"。
+    """
+
+    def _src(self):
+        src = store.read_text(os.path.join(store.ROOT, "jdrefs.py"))
+        self.assertTrue(src, "读不到 jdrefs.py")
+        return src
+
+    def test_jdrefs_no_longer_keeps_its_own_copy_of_the_transform(self):
+        self.assertFalse(hasattr(jdrefs, "_repoint_kb_in"),
+                         "jdrefs 里还留着一份 kb 重指变换的第二实现（它迟早会与 kb 漂移）")
+        self.assertIn("kb.repoint_refs_in(", self._src(),
+                      "jdrefs 没有走 kb 的唯一一份重指实现")
+        # 连"条目 id 取值"那半也不许留同名同义的包装（转发壳子会让人以为它能独立演化）
+        self.assertFalse(hasattr(jdrefs, "_ref_id_str"),
+                         "jdrefs 里还留着一份与 kb.ref_id 同名同义的条目 id 取值")
+        self.assertIn("kb.ref_id(", self._src())
+
+    def test_the_single_implementation_takes_the_criterion_as_a_parameter(self):
+        """判据是**参数**（不是"这里统一成一种"）：两边历史口径不同、各有既有用例钉着。"""
+        import inspect
+        sig = inspect.signature(kb.repoint_refs_in)
+        self.assertIn("strip", sig.parameters,
+                      "重指实现的判据必须参数化（去空白比 / 逐字比都要能表达）")
+
+    def test_both_callers_keep_their_own_historical_criterion(self):
+        """同一份盘上数据，两种判据各按各的口径处理（**都不是漏改**）。"""
+        self._fixture()
+        padded = " " + JD_A + " "
+        store.save_knowledge({"version": 1, "nodes": [
+            {"id": "n1", "term": "语音识别", "from_jds": [{"id": padded}]}]})
+        # ① jdrefs 这条（去空白比）：扫得到、也真的改它
+        refs = [r for r in self._refs_of(JD_A) if r.kind == "kb"]
+        self.assertEqual(len(refs), 1, "去空白比那条没扫到带空白的引用")
+        jdrefs.rewrite_jd_refs(JD_A, JD_B, refs=refs)
+        self.assertEqual(store.load_knowledge()["nodes"][0]["from_jds"][0]["id"], JD_B)
+        # ② kb 的窄接口（逐字比）：同一份数据**不该**被它当命中
+        store.save_knowledge({"version": 1, "nodes": [
+            {"id": "n1", "term": "语音识别", "from_jds": [{"id": padded}]}]})
+        self.assertEqual(kb.repoint_jd_refs(JD_A, JD_B), (0, ""))
+        self.assertEqual(store.load_knowledge()["nodes"][0]["from_jds"][0]["id"], padded)
+
+
+# ---------------------------------------------------------------- ⑥ 模块卫生（铁律）
 class ModuleHygieneTest(_Case):
     def _src(self):
         src = store.read_text(os.path.join(store.ROOT, "jdrefs.py"))

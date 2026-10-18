@@ -22,6 +22,7 @@ import unittest
 from unittest import mock
 
 import jdid
+import jdrefs
 import kb
 import store
 
@@ -1151,6 +1152,56 @@ class GbkSafetyTest(MigrationTestBase):
         self.assertEqual(_gbk_unsafe(err2.getvalue()), [], repr(err2.getvalue()))
         err2.getvalue().encode("gbk")
         self.assertIn("备份失败", err2.getvalue())
+
+
+class ReferenceKindsAlignedWithJdRefsTest(MigrationTestBase):
+    """批 7.1 第 5 步：`身份迁移.py` 的引用点名单必须与 `jdrefs.KINDS` **同一口径**。
+
+    它是**一次性脚本**（本机已执行过），但别人的机器上（或从备份恢复出来的数据上）还会再跑。
+    它自己列着"哪些产物里带岗位身份"（`jds.json` / `jobs.json` / 知识库 / 面试 `status.json`），
+    而 `jdrefs.KINDS` 是同一份清单的**唯一登记表** —— 两份名单一旦分叉，脚本就会以为自己
+    已经处理干净了（漏掉一种引用点 = 迁移后盘上孤儿）。
+
+    这一组钉三件事：
+      ① 脚本用的 kind 名与产物**逐项**对得上 `jdrefs.KINDS`；
+      ② 登记表少一种就**响亮报错**（不是静默跳过），且那句话 GBK 可编码（cp936 控制台）；
+      ③ 这道闸门在 `--试跑` 那条路上真的会跑（不写任何东西）。
+    """
+
+    def test_the_script_uses_the_same_registry_as_jdrefs(self):
+        self.assertTrue(hasattr(CLI, "REF_KINDS"), "身份迁移没有把引用点名单接到 jdrefs.KINDS")
+        self.assertTrue(hasattr(CLI, "REF_PRODUCTS"))
+        products = set()
+        for kind in CLI.REF_KINDS:
+            self.assertIn(kind, jdrefs.KINDS,
+                          "身份迁移用的 kind 名不在 jdrefs.KINDS 里：%s" % kind)
+            products |= set(jdrefs.KINDS[kind].products)
+        self.assertEqual(products, set(CLI.REF_PRODUCTS),
+                         "脚本列的引用点产物与登记表对不上")
+
+    def test_a_kind_missing_from_the_registry_is_a_loud_error(self):
+        with mock.patch.dict(jdrefs.KINDS):
+            del jdrefs.KINDS["iv_status"]
+            with self.assertRaises(RuntimeError) as cm:
+                CLI._assert_ref_kinds_registered()
+        self.assertIn("iv_status", str(cm.exception))
+        str(cm.exception).encode("gbk")            # cp936 控制台上也要说得出话
+
+    def test_the_guard_really_runs_on_the_dry_run_path(self):
+        before = fingerprint(store.DATA_ROOT)
+        with mock.patch.dict(jdrefs.KINDS):
+            del jdrefs.KINDS["kb"]
+            with self.assertRaises(RuntimeError) as cm:
+                CLI.plan_migration()
+        self.assertIn("kb", str(cm.exception))
+        self.assertEqual(fingerprint(store.DATA_ROOT), before, "报错路径也不许写盘")
+
+    def test_the_dry_run_still_prints_its_table(self):
+        """对照组：登记表正常时，闸门**静默**通过（试跑表一个字都不受影响）。"""
+        code, text = self.run_cli(["--试跑"])
+        self.assertEqual(code, 0)
+        self.assertIn("活跃分析 5 份 → 3 个 JD", text)
+        self.assertIn("以上只是试跑", text)
 
 
 # ---------------------------------------------------------------- 报告体检（P0-12）
