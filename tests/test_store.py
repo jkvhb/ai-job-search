@@ -1530,29 +1530,28 @@ class ElementShapeStrictDeepTest(IsolatedCase):
         self.assertEqual(store.read_jds_strict()[1], "")
         self.assertEqual(store.read_knowledge_strict(), ({"nodes": [1]}, ""))
 
-    def test_only_the_jobs_write_path_ruler_was_tightened(self):
-        """⚠️ 守卫：元素坏**只**让 `jobs_safe_to_write` 说不可写；jds / knowledge 照旧回可写。
+    def test_all_three_write_path_rulers_ask_element_shape(self):
+        """三个写判据（台账 / JD 库 / 知识库）都问**元素**形状：元素坏 ⇒ 不可写 + 说第几条。
 
-        **为什么这次只收紧 jobs**：调度边界就是"只改 jobs 那一条"，`jds` / `knowledge` 的
-        写判据**故意一个字不动**（它们的守卫由本轮之外的另一件事负责）。
-
-        ⚠️ 但**别把这条读成"另两个没有同款问题"**：它们的写路径里同样有"逐元素取字段"的地方
-        （`jdid.upsert_jd` 的 `r.get("id")`、`kb._upsert_check_in` 的 `n.get("id")`），
-        元素坏时同样会 `AttributeError`。**已知未修**，已在汇报里点明 —— 收紧它们要连带改
-        `save_*` 的拒绝话术、各自用例，以及 `kb._with_kb_write` 的"留档后写"语义。
+        沿革：第三轮只收紧 `jobs_safe_to_write`（当时 `jds` / `knowledge` 记成"已知未修"，
+        本用例当时的名字就是 `test_only_the_jobs_write_path_ruler_was_tightened`）；第四轮把
+        那两件做掉了 —— 所以这条现在钉的是**三个都收紧**这件事本身，防有人把它们改回浅读。
+        （顺序上先有 `JdsKnowledgeWritePathElementShapeTest` 的行为用例，这条只负责"三个一起"。）
 
         ⚠️ 浅读那一半（`test_the_shallow_strict_reads_were_not_tightened`）**故意不动**：
-        `read_*_strict` 仍然只查容器 —— 收紧落在 `jobs_safe_to_write` 自己身上（它改问深读），
-        不是把元素校验塞进浅读（那会把 jds / knowledge 的写判据一起带严）。
+        `read_*_strict` 仍然只查容器 —— 收紧落在各 `*_safe_to_write` 自己身上（它改问深读），
+        不是把元素校验塞进浅读（那会把"读得出来"这个信号本身改掉）。
         """
         self._write(store.jobs_path(), '[{"id": "a"}, 1]')
         self._write(store.p_path("jds.json"), '{"version": 1, "seq": 0, "jds": [1]}')
         self._write(store.knowledge_path(), '{"nodes": [1]}')
-        ok, err = store.jobs_safe_to_write()
-        self.assertFalse(ok, "jobs 的元素坏仍回「可写」—— 接着 upsert_job 就是 AttributeError")
-        self.assertIn("第 2 条不是对象", err)
-        self.assertEqual(store.jds_safe_to_write(), (True, ""))
-        self.assertEqual(store.knowledge_safe_to_write(), (True, ""))
+        for name, fn, pos in (("台账", store.jobs_safe_to_write, 2),
+                              ("JD 库", store.jds_safe_to_write, 1),
+                              ("知识库", store.knowledge_safe_to_write, 1)):
+            with self.subTest(file=name):
+                ok, err = fn()
+                self.assertFalse(ok, "%s的元素坏仍回「可写」" % name)
+                self.assertIn("第 %d 条不是对象" % pos, err)
 
 
 class JobsWritePathElementShapeTest(IsolatedCase):
@@ -1615,6 +1614,80 @@ class JobsWritePathElementShapeTest(IsolatedCase):
         self.assertEqual(store.jobs_safe_to_write(), (True, ""), "合法的空列表必须照旧可写")
         self._write(store.jobs_path(), b"")
         self.assertEqual(store.jobs_safe_to_write(), (True, ""), "0 字节 = 合法的「第一次」")
+
+
+class JdsKnowledgeWritePathElementShapeTest(IsolatedCase):
+    """第四轮：把 ③ 那把尺子同样落到 `jds.json` / `knowledge.json` 的**写**判据上。
+
+    病根与 `JobsWritePathElementShapeTest` 逐字相同：写判据只问**浅读**（只看容器）⇒
+    `[{"好"}, 1]` 回 `(True, "")`。但这里的**表现与台账不同、而且更坏**：
+    `jdid.load_jds()` / `kb.ensure_kb()` 在**读**的时候就把非对象元素过滤掉（这是它们"绝不抛"
+    的容错），于是写路径**不会炸** —— 它会**照常成功**，顺手把那条坏元素从盘上**静默抹掉**。
+    用户永远不知道自己那个文件被改过，也没有任何提示（台账那边至少是 AttributeError / 拒绝）。
+    体检报告 §7.3 曾把它记成"已知未修"（收紧要连带改拒绝话术与 `kb._with_kb_write` 的
+    "留档后写"语义）—— 第四轮把话术与那条新分支一起改了，判据本身只改这几行：
+    「读不干净的文件一个字节都不碰」。
+
+    ⚠️ 这里只钉**判据**；拒绝的**出口**在 `tests/test_jdid.py::UpsertElementShapeTest`
+    与 `tests/test_kb.py::ElementBrokenLibraryIsRefusedTest`（分开钉，否则这里绿了
+    也可能只是"多了个没人用的函数"）。
+    """
+
+    def _write(self, path, blob):
+        folder = os.path.dirname(path)
+        if folder:
+            os.makedirs(folder, exist_ok=True)
+        data = blob if isinstance(blob, bytes) else blob.encode("utf-8")
+        with open(path, "wb") as f:
+            f.write(data)
+        return path
+
+    def test_jds_write_criterion_asks_element_shape(self):
+        """`{"jds": [1,2,3]}` / `{"jds": [{好}, 1]}` ⇒ 不可写，原因点明**第几条**不是对象。
+
+        ⚠️ 顶部**不能**是裸列表：`{"jds": …}` 这一层由浅读管，裸列表报的是"结构不对"
+        （另一档，见对照组）。
+        """
+        for blob, pos in (('{"version": 1, "jds": [1, 2, 3]}', 1),
+                          ('{"version": 1, "jds": [{"id": "a"}, 1]}', 2)):
+            with self.subTest(blob=blob):
+                self._write(store.p_path("jds.json"), blob)
+                ok, err = store.jds_safe_to_write()
+                self.assertFalse(ok, "元素坏却仍回「可写」：%r" % ((ok, err),))
+                self.assertIn("第 %d 条不是对象" % pos, err)
+                self.assertIn("jds.json", err)
+
+    def test_knowledge_write_criterion_asks_element_shape(self):
+        for blob, pos in (('{"nodes": [1, 2]}', 1),
+                          ('{"version": 1, "nodes": [{"id": "a"}, 1]}', 2)):
+            with self.subTest(blob=blob):
+                self._write(store.knowledge_path(), blob)
+                ok, err = store.knowledge_safe_to_write()
+                self.assertFalse(ok, "元素坏却仍回「可写」：%r" % ((ok, err),))
+                self.assertIn("第 %d 条不是对象" % pos, err)
+                self.assertIn("knowledge.json", err)
+
+    def test_the_control_group_is_still_writable(self):
+        """对照组：不存在 / 正常 / 合法空容器 / 0 字节 ⇒ 照旧可写；**容器**坏 ⇒ 仍不可写。"""
+        self.assertEqual(store.jds_safe_to_write(), (True, ""), "文件不存在 = 合法的「第一次」")
+        self.assertEqual(store.knowledge_safe_to_write(), (True, ""))
+        store.write_json(store.p_path("jds.json"), {"version": 1, "seq": 0, "jds": [{"id": "a"}]})
+        store.write_json(store.knowledge_path(), {"nodes": [{"id": "a"}]})
+        self.assertEqual(store.jds_safe_to_write(), (True, ""), "正常 JD 库必须照旧可写")
+        self.assertEqual(store.knowledge_safe_to_write(), (True, ""), "正常知识库必须照旧可写")
+        self._write(store.p_path("jds.json"), '{"version": 1, "seq": 0, "jds": []}')
+        self._write(store.knowledge_path(), '{"nodes": []}')
+        self.assertEqual(store.jds_safe_to_write(), (True, ""), "合法的空容器必须照旧可写")
+        self.assertEqual(store.knowledge_safe_to_write(), (True, ""))
+        self._write(store.p_path("jds.json"), b"")
+        self._write(store.knowledge_path(), b"")
+        self.assertEqual(store.jds_safe_to_write(), (True, ""), "0 字节 = 合法的「第一次」")
+        self.assertEqual(store.knowledge_safe_to_write(), (True, ""))
+        # 反向对照：深读不许把**容器**坏的那一档放过去（别写成"只深不浅"）
+        self._write(store.p_path("jds.json"), '["不是对象"]')
+        self._write(store.knowledge_path(), '{"nodes": 1}')
+        self.assertFalse(store.jds_safe_to_write()[0], "容器坏仍必须不可写")
+        self.assertFalse(store.knowledge_safe_to_write()[0], "容器坏仍必须不可写")
 
 
 class UpdateJobsTransactionTest(IsolatedCase):
@@ -1953,8 +2026,11 @@ class SingleImplementationTest(unittest.TestCase):
     """
 
     # 各模块历史上的口径（跨模块引用也算在本模块头上：kbreuse 用 kb 的、身份迁移用 jdid 的）
+    # `interview.py` / `简历迁移.py` 是批 5 收口时**漏在外面**的两份（各自一份裸 `int()` 副本），
+    # 第四轮补进来 —— 口径同样由调用点显式传，所以也必须出现在这里，否则"再长一份副本"没人看得见。
     AS_INT_KIND = {"kb.py": True, "kbreuse.py": True, "resumelib.py": True,
-                   "jdid.py": False, "身份迁移.py": False}
+                   "jdid.py": False, "身份迁移.py": False,
+                   "interview.py": True, "简历迁移.py": True}
     AS_TEXT_EMPTY = {"jdid.py": None, "jdfacts.py": None,
                      "jddelete.py": "", "jdrefs.py": "", "resumelib.py": ""}
 

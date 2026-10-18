@@ -1055,6 +1055,76 @@ def _write_gbk_jds():
     return path, raw
 
 
+class UpsertElementShapeTest(IsolatedCase):
+    """第四轮：坏**元素**不许被写入口"静默写掉"（与台账 ③ 同一个出口：拒绝 + 文件不动）。
+
+    **病根（实测，改前）**：`store.jds_safe_to_write()` 只问浅读 ⇒ 对 `{"jds": [{好}, 1]}`
+    回 `(True, "")`；而 `load_jds()` 会**过滤掉**那条 `1`（它"绝不抛异常"的容错）。
+    于是三个写入口**都不炸、都成功**，只是盘上那条元素被**静默删掉**了：
+    `upsert_jd` / `next_seq` / `save_jds` 都走"读 → 过滤 → 整份覆盖"这条路，
+    用户永远不知道自己那个文件被改过。比台账 ③ 的 `AttributeError` 更隐蔽（那是当场炸，
+    这是**默默地改**）。判据口径与 ③ 完全一致：**读不干净的文件一个字节都不碰**。
+
+    `jds_safe_to_write()` 收紧到深读之后，这三个入口走的是它们**原有的**
+    "读不干净 ⇒ `RuntimeError` + 拒绝写入"分支 —— 类型与话术都是既有口径。
+    本轮顺带把那三句话术里**对元素坏不成立**的断言（"内存里是从空库兜出来的"）改成只陈述
+    能证明的部分：判据是「读不干净的文件一个字节都不碰」，而 `err` 自己会说清是第几条坏了。
+
+    ⚠️ 三种入口一起钉：只钉 `upsert_jd` 的话，`next_seq` / `save_jds` 里同样的洞没人看得见
+    （`next_seq` 的现状尤其糟：它"成功"地把坏元素连同新 `seq` 一起写掉）。
+    """
+
+    BLOB = '{"version": 1, "seq": 7, "jds": [{"id": "a"}, 1]}'
+
+    def _write(self):
+        path = store.p_path("jds.json")
+        with open(path, "wb") as f:
+            f.write(self.BLOB.encode("utf-8"))
+        return path
+
+    def _assert_untouched(self, path):
+        with open(path, "rb") as f:
+            self.assertEqual(f.read(), self.BLOB.encode("utf-8"),
+                             "拒绝时 JD 库必须逐字节不动")
+        folder = os.path.dirname(path)
+        leftovers = sorted(n for n in os.listdir(folder) if ".bak-" in n)
+        self.assertEqual(leftovers, [],
+                         "拒绝时不该多出 .bak- 副本（说明它走到了写盘那一步）")
+
+    def test_upsert_refuses_instead_of_silently_dropping_the_bad_element(self):
+        path = self._write()
+        with self.assertRaises(RuntimeError) as ctx:
+            jdid.upsert_jd({"id": "b"})
+        self.assertNotIsInstance(ctx.exception, AttributeError,
+                                 "退化成未捕获的 AttributeError 也不行（要的是如实的前置条件拒绝）")
+        msg = str(ctx.exception)
+        self.assertIn("拒绝写入", msg)              # 既有口径：与别的坏库同一个出口
+        self.assertIn("第 2 条不是对象", msg)       # 原因如实带出来
+        self._assert_untouched(path)
+
+    def test_next_seq_refuses_instead_of_silently_dropping_the_bad_element(self):
+        path = self._write()
+        with self.assertRaises(RuntimeError) as ctx:
+            jdid.next_seq()
+        self.assertIn("拒绝写入", str(ctx.exception))
+        self.assertIn("第 2 条不是对象", str(ctx.exception))
+        self._assert_untouched(path)
+
+    def test_save_jds_refuses_too(self):
+        path = self._write()
+        with self.assertRaises(RuntimeError) as ctx:
+            jdid.save_jds({"version": 1, "seq": 0, "jds": []})
+        self.assertIn("拒绝写入", str(ctx.exception))
+        self._assert_untouched(path)
+
+    def test_the_control_group_still_writes(self):
+        """对照组：不存在的库 / 正常库照旧能写（别把闸门做成"谁都写不了"）。"""
+        jdid.save_jds({"version": 1, "seq": 0, "jds": [{"id": "a"}]})
+        self.assertEqual([r["id"] for r in jdid.load_jds()["jds"]], ["a"])
+        self.assertEqual(jdid.upsert_jd({"id": "b"})["id"], "b")
+        self.assertEqual([r["id"] for r in jdid.load_jds()["jds"]], ["a", "b"])
+
+
 class JdsWriteRefusesUnreadableLibraryTest(IsolatedCase):
     """本轮实测的**两条丢数据路**：`jds.json` 有字节却读不出来时，三个写入口都必须拒绝。
 

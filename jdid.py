@@ -512,9 +512,11 @@ def save_jds(data, key=None):
         ok, err = store.jds_safe_to_write(p)
         if not ok:
             raise RuntimeError(
-                "%s。**拒绝写入**：`save_jds` 是**整份覆盖**，而现在内存里那份是从读不出来的文件"
-                "兜出来的空库（`load_jds()` 永不抛异常）—— 写下去就是整个 JD 库一次性没掉，"
-                "盘上没有任何副本。请先把 `jds.json` 修好（或从别处恢复、把它移开）再保存。" % err)
+                "%s。**拒绝写入**：`save_jds` 是**整份覆盖**，而这份 `jds.json` 读不干净 ——"
+                "判据是「读不干净的文件一个字节都不碰」。硬写下去只有两种结局：容器坏时"
+                "（`load_jds()` 永不抛异常 → 空库）整个 JD 库一次性没掉；元素坏时 `load_jds()`"
+                "会把那条元素过滤掉，写回等于把它**静默删掉**。"
+                "请先把 `jds.json` 修好（或从别处恢复、把它移开）再保存。" % err)
         if not isinstance(data, dict):
             data = {}
         raw = data.get("jds")
@@ -557,9 +559,11 @@ def upsert_jd(record, key=None):
         ok, err = store.jds_safe_to_write(p)
         if not ok:
             raise RuntimeError(
-                "%s。**拒绝写入**：这次 `upsert_jd` 会把整个 JD 库覆盖成「这一条 + 读出来的"
-                "空库」，旧记录会在盘上消失且没有副本。请先把 `jds.json` 修好"
-                "（或从别处恢复、把它移开）再抓这个岗位。" % err)
+                "%s。**拒绝写入**：`upsert_jd` 是「读库 → 改一条 → 整份覆盖」，而这份 `jds.json`"
+                "读不干净 —— 判据是「读不干净的文件一个字节都不碰」。硬写下去只有两种结局："
+                "容器坏时整个库被覆盖成「这一条 + 读出来的空库」（旧记录在盘上消失且没有副本）；"
+                "元素坏时 `load_jds()` 会把那条元素过滤掉，写回等于把它**静默删掉**。"
+                "请先把 `jds.json` 修好（或从别处恢复、把它移开）再抓这个岗位。" % err)
         data = load_jds(key)
         new = dict(record)
         new.setdefault("id_history", [])
@@ -593,10 +597,10 @@ def next_seq(key=None):
         ok, err = store.jds_safe_to_write(p)
         if not ok:
             raise RuntimeError(
-                "%s。**拒绝写入**：`next_seq` 要把 `seq` 写回盘上，而现在内存里那份是从读不出来"
-                "的文件兜出来的空库 —— 写下去就是整个 JD 库被清空（编号还会从 1 重新开始，"
-                "跟已有的 ID 撞车）。请先把 `jds.json` 修好（或从别处恢复、把它移开）再继续。"
-                % err)
+                "%s。**拒绝写入**：`next_seq` 要把 `seq` 写回盘上，而这份 `jds.json` 读不干净"
+                "—— 判据是「读不干净的文件一个字节都不碰」。硬写下去只有两种结局：容器坏时"
+                "整个 JD 库被清空（`seq` 从 1 重来，跟已有的 ID 撞车）；元素坏时那条元素会被"
+                "**静默删掉**。请先把 `jds.json` 修好（或从别处恢复、把它移开）再继续。" % err)
         data = load_jds(key)
         data["seq"] = max(0, store.as_int(data.get("seq"), 0, bool_ok=False)) + 1
         save_jds(data, key)

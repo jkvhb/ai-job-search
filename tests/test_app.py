@@ -3270,7 +3270,13 @@ class ReportStateWriteOkTest(IsolatedCase):
         self.assertEqual(body["saved"], 0)
         self.assertEqual(body["failed"], 1)
         self.assertIn("新概念", body["error"])
-        self.assertIn("留档", body["error"])
+        # 老断言钉的是「留档（改名成 .corrupt-*）也失败」那句话。第四轮加了第三档
+        # 「读得出来、但有元素不是对象」（拒绝、**不隔离**）之后，那句话对元素坏是**假话**
+        # （压根没去留档，用户会照着它去找一个不存在的 .corrupt-*）⇒ 路由改说"读不干净"，
+        # 这一条对**两种**原因都成立；具体是哪一种写在日志 kb.write_refused 里。
+        self.assertIn("读不干净", body["error"])
+        self.assertNotIn("也失败", body["error"],
+                         "不许再断言「留档也失败」：元素坏时我们根本没去留档")
         # 坏文件必须原地保留（留档失败就不许动它）—— 测试也不许把它删掉
         with open(store.knowledge_path(), "rb") as f:
             self.assertIn(b"CORRUPT", f.read())

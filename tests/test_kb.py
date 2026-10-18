@@ -3316,3 +3316,77 @@ class KbRefLockOrderAstTest(unittest.TestCase):
         for name in self.CALLERS:
             self.assertIn("kb._KB_LOCK", self._src(name),
                           "%s 已经不再持 `_KB_LOCK` 了？那这条 AST 断言就没验证到东西" % name)
+
+
+class ElementBrokenLibraryIsRefusedTest(IsolatedCase):
+    """第四轮：库**元素坏**时如实拒绝、**且绝不隔离** —— 这是第三条路，不是 (a) 也不是 (b)。
+
+    **病根（实测，改前）**：`ensure_kb()` 在读的时候就把非对象元素过滤掉 ⇒
+    `upsert_check` / `absorb` **不炸、也不报**：它们照常加卡、照常 save，
+    顺手把用户文件里那条坏元素**从盘上抹掉**。用户永远不知道自己那个文件被改过。
+    （所以这里既不是 (a) 的"拒绝"、也不是 (b) 的"留档后写"——它压根没意识到有问题。）
+
+    为什么修成**拒绝**、而不是沿用 (b)「留档后写」：`{"nodes": [{145 张好卡…}, 1]}` 是
+    **读得出来、只坏了一条元素**，那条是可修的（人打开文件删掉那个 `1` 就行）。照 (b) 走 =
+    把用户 145 张好卡从**活库**挪进一个 `.corrupt-*`、活库只剩"这一张卡" ——
+    用户看到的是「点一下勾，知识库没了」，比拒绝糟得多，而且完全没有必要。
+    所以第三类：**拒绝 + 文件逐字节不动 + 不留档**，原因如实点到"第几条不是对象"。
+
+    (a)/(b) 两类的既有语义**不许动**：GBK 坏文件照旧留档后写（对照组钉着）。
+
+    ⚠️ 判据（`store.knowledge_safe_to_write` 改问深读）与**出口**（这里的 `(False, …)`）
+    分开钉：判据绿了也可能只是"多了个没人用的函数"。
+    """
+
+    BLOB = '{"version": 1, "nodes": [{"id": "yuyinshibie", "term": "语音识别"}, 1]}'
+
+    def _write(self):
+        path = store.knowledge_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(self.BLOB.encode("utf-8"))
+        return path
+
+    def _quarantined(self):
+        folder = os.path.dirname(store.knowledge_path())
+        if not os.path.isdir(folder):
+            return []
+        return sorted(n for n in os.listdir(folder) if ".corrupt-" in n)
+
+    def test_upsert_check_refuses_without_moving_the_file(self):
+        path = self._write()
+        self.assertEqual(kb.upsert_check("新概念", "已掌握"), (False, False, None),
+                         "元素坏的库上不该声称「勾上了」")
+        self.assertEqual(self._quarantined(), [],
+                         "元素坏 ≠ 读不出来：不许把 145 张好卡改名挪进 .corrupt-*")
+        with open(path, "rb") as f:
+            self.assertEqual(f.read(), self.BLOB.encode("utf-8"),
+                             "拒绝时库文件必须逐字节不动")
+
+    def test_absorb_refuses_too(self):
+        path = self._write()
+        self.assertEqual(kb.absorb([{"term": "新概念", "definition": "d"}], {"id": "j1"}),
+                         (0, 0), "元素坏的库上不该声称「沉淀了」")
+        self.assertEqual(self._quarantined(), [], "同上：不许隔离")
+        with open(path, "rb") as f:
+            self.assertEqual(f.read(), self.BLOB.encode("utf-8"))
+
+    def test_the_control_group_still_takes_the_old_two_paths(self):
+        """对照组：**容器**坏（GBK 解析失败）照旧走原来的两条路，别把第三种路做成万能挡板。"""
+        # ⚠️ 夹具**必须含中文**：纯 ASCII 的 GBK 与 UTF-8 逐字节相同 ⇒ 那就不是坏文件，
+        # 这条用例会**假绿**（本项目 11+ 次假绿的常见形态，见 test_jdid 里同一句提醒）。
+        raw = json.dumps({"nodes": [{"id": "yuyinshibie", "term": "语音识别"}]},
+                         ensure_ascii=False).encode("gbk")
+        try:
+            raw.decode("utf-8")
+        except UnicodeDecodeError:
+            pass
+        else:
+            raise AssertionError("夹具没坏：这串字节居然能按 UTF-8 解出来")
+        path = store.knowledge_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(raw)
+        self.assertEqual(kb.upsert_check("新概念", "已掌握")[0], True,
+                         "(b) 类的入口在**读不出来**时照旧留档后写")
+        self.assertEqual(len(self._quarantined()), 1, "读不出来时仍必须留档")

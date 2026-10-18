@@ -3081,7 +3081,13 @@ class Handler(BaseHTTPRequestHandler):
                     elif not kb.normalize_id(term):
                         why = "术语 %r 归一化后是空的（它建不出卡，勾会丢）" % (term,)
                     else:
-                        why = "知识库 `knowledge.json` 读不出来且留档（改名成 .corrupt-*）也失败"
+                        # 第三轮加了"库读不出来"两档（拒绝 / 留档失败）；第四轮又加了第三档
+                        # 「读得出来、但有元素不是对象」（拒绝、**不隔离**）。所以这里不能
+                        # 再断言"留档也失败" —— 那句话对元素坏是假话（压根没去留档），
+                        # 而用户会照着它去找一个并不存在的 `.corrupt-*`。
+                        why = ("知识库这次没有写入：`knowledge.json` 读不干净"
+                               "（整个读不出来，或者里面有一条不是对象）。文件一个字节都没动"
+                               "—— 修好库之后再点一次这个勾（原因也记在日志 kb.write_refused）")
                     failed.append("知识点 `%s`（%s）没写进知识库：%s" % (term, state, why))
             log.log_event("report_state.write", report=rid, saved=saved, created=created,
                           failed=len(failed))
@@ -3149,7 +3155,13 @@ class Handler(BaseHTTPRequestHandler):
                 log.log_exc("kb.add_error", e)
                 return self._send(500, {"ok": False, "error": "入库失败：%s" % e})
             if not ok or not isinstance(card, dict):
-                return self._send(400, {"ok": False, "error": "术语不能为空（只有标点也算空）"})
+                # 术语在上一道闸门已经验过（空 / 只有标点都 400 了），所以走到这里的
+                # `ok=False` 只剩"库读不干净"这一档 —— 不许再说成"术语不能为空"（假话）。
+                return self._send(400, {
+                    "ok": False,
+                    "error": "知识库这次没有写入：`knowledge.json` 读不干净"
+                             "（整个读不出来，或者里面有一条不是对象）。文件一个字节都没动"
+                             "—— 修好库之后再点一次"})
             log.log_event("kb.add_manual", id=card.get("id"), term=term, created=created)
             return self._send(200, {"ok": True, "created": created,
                                     "id": card.get("id"), "node": card})

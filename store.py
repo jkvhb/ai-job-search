@@ -527,12 +527,11 @@ def first_non_object_index(items):
     """列表里**第一个不是对象**的元素是第几条（1 基，给人看的）？全是对象回 0。
 
     ⚠️ 这是与 `read_*_strict` 分开的另一把尺子：`read_*_strict` 只查**容器**形状。
-    `jds` / `knowledge` 的写判据（`jds_safe_to_write` / `knowledge_safe_to_write`）**仍然只用**
-    浅读。⚠️ 它们的写路径里同样有"逐元素取字段"的地方（`jdid.upsert_jd` 的 `r.get("id")`、
-    `kb._upsert_check_in` 的 `n.get("id")`）—— **已知未修**：收紧它们要连带改 `save_*` 的
-    拒绝话术、既有守卫用例，以及 `kb._with_kb_write` 的"留档后写"语义，是另一件事。
-    本次只收紧 `jobs`（台账写路径 `upsert_job` 会 `j.get("id")`，元素坏时是 AttributeError
-    而不是如实拒绝），它改问 `read_jobs_strict_deep`。
+    **写**判据也问这把尺子（`jobs` 在第三轮、`jds` / `knowledge` 在第四轮收紧）——
+    理由是**写**路径也"读进来 → 整份覆盖"，而 `load_*` 会在读的时候把非对象元素**静默过滤掉**：
+    元素坏时那些写入口不会炸，而是"成功"地把那条元素从盘上抹掉（`jdid.upsert_jd` /
+    `jdid.next_seq` / `jdid.save_jds` / `kb.upsert_check` / `kb.absorb` 实测都是这样）。
+    `kb._with_kb_write` 对"元素坏"另有一条专路（拒绝、**不隔离**），见该函数 docstring。
 
     而**读**的时候元素不是对象会被上层静默丢掉（`app._ledger_rows()` 的 `continue` /
     `kb.list_nodes()` 的过滤）：`[1, 2, 3]` 于是变成「共 0 个岗位」、
@@ -799,8 +798,8 @@ def read_jds_strict_deep(path=None):
 def jds_safe_to_write(path=None):
     """`jds.json` 当前是否可以**安全写盘**？返回 `(可写, 原因)`。
 
-    可写 = **读得出来**，**或者**文件里根本没有一个字节（不存在 / 真的是 0 字节）。
-    其余（有字节、却读不出来）→ 不可写：调用方必须**拒绝**这次写盘。
+    可写 = **读得出来**（容器**与元素**都合格），**或者**文件里根本没有一个字节
+    （不存在 / 真的是 0 字节）。其余（有字节、却读不出来）→ 不可写：调用方必须**拒绝**这次写盘。
 
     为什么必须有它（**实测，隔离探针，299 字节 / 2 条记录的 GBK `jds.json`**）：
       - `jdid.upsert_jd(一条新记录)` → 盘上 272 字节、**只剩新那一条**（旧 2 条被清）
@@ -810,9 +809,15 @@ def jds_safe_to_write(path=None):
 
     ⚠️ 判据必须问**严格读**，**不能**看 `jdid.load_jds()` 的返回值 ——
     那正是把"读不出来"和"空库"混成同一个信号的根源。
+
+    ⚠️ 第四轮：判据从**浅读**（只看容器）收紧成 `read_jds_strict_deep`（容器 + 元素）。
+    写路径同样是"读进来 → 过滤 → 整份覆盖"，而 `jdid.load_jds()` 会把非对象元素**过滤掉**：
+    实测 `{"jds": [{好}, 1]}` 上 `upsert_jd` / `next_seq` / `save_jds` 三个入口**都不抛异常、
+    都"成功"**，只是盘上那条 `1` 被**静默删掉**了（用户永远不知道文件被改过）。
+    口径与台账 ③ 一致：**读不干净的文件一个字节都不碰**，把"第几条坏了"如实交给用户去修。
     """
     p = path or p_path("jds.json")
-    _data, err = read_jds_strict(p)
+    _data, err = read_jds_strict_deep(p)
     if not err:
         return True, ""
     if not file_has_bytes_to_lose(p):
@@ -1005,9 +1010,10 @@ def snapshot_before_overwrite(path):
 def knowledge_safe_to_write(path=None):
     """知识库当前是否可以**安全写盘**？返回 `(可写, 原因)`。
 
-    可写 = **读得出来**，**或者**文件里根本没有一个字节（不存在 / 真的是 0 字节）。
-    其余（有字节、却读不出来，**含纯空白**）→ 不可写：调用方必须先备份或放弃本次写盘，
-    **绝不能**把内存里那份（`load_knowledge()` 给的 `{"nodes": []}`）写回去。
+    可写 = **读得出来**（容器**与元素**都合格），**或者**文件里根本没有一个字节
+    （不存在 / 真的是 0 字节）。其余（有字节、却读不出来，**含纯空白**）→ 不可写：
+    调用方必须先备份或放弃本次写盘，**绝不能**把内存里那份（`load_knowledge()` 给的
+    `{"nodes": []}`）写回去。
 
     这是「读不出来 ≠ 空」这条规则**唯一**的实现（`kb` / `jobdup` / `身份迁移` 都用它）。
     注意它与 `read_knowledge_strict` 的分工不同：那个回答"读得出来吗"，
@@ -1016,9 +1022,16 @@ def knowledge_safe_to_write(path=None):
     ⚠️ P0-6：判据从 `content_bytes_present()` 收紧成 `file_has_bytes_to_lose()`。
     老判据对 `b"\\r\\n   \\r\\n"` 这种"有字节但 strip 之后为空"的文件判"没有可丢的内容" ⇒ 可写，
     于是它会被内存里的空库顶掉（实测）。字节意义上它不是空的 —— 那就不能当成"没什么可丢"。
+
+    ⚠️ 第四轮：判据再从浅读收紧成 `read_knowledge_strict_deep`（容器 + 元素）。
+    `kb.ensure_kb()` 会把非对象节点**过滤掉**，所以 `{"nodes": [{好}, 1]}` 上
+    `upsert_check` / `absorb` 这两个写入口**不炸也不报**：它们照常加卡、照常 save，
+    顺手把用户文件里那条元素**从盘上抹掉**（实测，比 `AttributeError` 更隐蔽 —— 那是默默地改）。
+    收紧之后 `_with_kb_write` 对这一档走**第三条路**（拒绝 + 不留档），
+    为什么不是"留档后写"见 `_with_kb_write` 的 docstring。
     """
     p = path or knowledge_path()
-    _data, err = read_knowledge_strict(p)
+    _data, err = read_knowledge_strict_deep(p)
     if not err:
         return True, ""
     if not file_has_bytes_to_lose(p):

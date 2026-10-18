@@ -80,7 +80,8 @@ def normalize_id(term):
     return _PUNCT.sub("", unicodedata.normalize("NFKC", term)).lower()
 
 
-# `_as_int` 已收归 `store.as_int`（批 5：kb / jdid / resumelib / jddelete 四份副本统一成一份）。
+# `_as_int` 已收归 `store.as_int`（批 5：kb / jdid / resumelib / jddelete 四份副本统一成一份；
+# 第四轮又把漏在外面的 `interview` / `简历迁移` 两份补了进来，现在全仓库只剩这一份实现）。
 # 本模块的口径是 `bool_ok=True`（裸 `int(value)`，`True` 就是 1）—— 调用点**每一处都显式传**，
 # 与统一前的副本逐字节等价（等价夹具见 `tests/test_store.py::AsIntTest`）。
 
@@ -360,8 +361,17 @@ def _with_kb_write(fn, refuse_when=None, write_when_unreadable=True, key=None):
 
     返回 `(是否真的调用过 fn, fn 的返回值或守卫给的原因)`：
 
-      * `(False, 守卫给的原因 / _KB_WRITE_REFUSED / _KB_BACKUP_FAILED)` —— 没写。
+      * `(False, 守卫给的原因 / _KB_WRITE_REFUSED / _KB_BACKUP_FAILED / 元素坏的原因)` —— 没写。
       * `(True, result)` —— fn 跑过了；库读不出来时坏文件已先被改名留档（这次写入不丢用户的卡）。
+
+    **文件状态有三档，不是两档**（第四轮补的第三档）：
+      1. **可写**（读得出来、元素都是对象，或压根没有字节）→ 照常干活。
+      2. **读不出来**（解析失败 / 结构不对）→ 按入口语义分 (a) 拒绝 / (b) 留档后写，见下。
+      3. **读得出来、但有元素不是对象**（`{"nodes": [{好卡}, 1]}`）→ **一律拒绝，且不留档**。
+         这一档以前没人管：`ensure_kb()` 会把那条元素过滤掉，于是 `absorb` / `upsert_check`
+         **不炸也不报**，顺手把用户文件里那行**静默抹掉**（实测）。而 `store.knowledge_safe_to_write`
+         第四轮收紧到深读之后，这一档在这里被拦成"没写"——不是为了保住那条 `1`（它本来就没用），
+         是为了**不替用户改文件却不说**：坏元素是可修的，修好之后这次操作可以重来。
 
     **为什么必须抽出来（P0-1）**：`absorb` 早就接了哨兵，而另外五个写入口各写各的样板。
     `record_interview` 那条漏了哨兵 —— 实测把 GBK 写坏的库（300 字节、用户 145 张卡）换成
@@ -398,6 +408,26 @@ def _with_kb_write(fn, refuse_when=None, write_when_unreadable=True, key=None):
     with _KB_LOCK:
         kb_path = store.knowledge_path(key)
         read_ok = store.knowledge_safe_to_write(kb_path)[0]
+        if not read_ok:
+            # ---- 第三种文件状态（第四轮）：**读得出来、但有元素不是对象** ----
+            # 这一档既不是"可写"、也不是"文件坏了"，所以 (a)/(b) 都不适用：
+            #   * 不能走 (b)「留档后写」：`{"nodes": [{145 张好卡…}, 1]}` 里那些好卡是**活的**，
+            #     留档 = 把它们从活库挪进 `.corrupt-*`、活库只剩这次新写的那一张。
+            #     用户看到的是「点一下勾，知识库没了」—— 比拒绝糟得多，而且毫无必要：
+            #     那条坏元素是**可修**的（人打开文件删掉那个 `1` 就行），不是"文件解析不了"。
+            #   * 也不能只看 `write_when_unreadable`：(a) 那四个入口的理由是"目标卡在不在
+            #     无从判断"，而这里**判断得出来**（坏的是别处的元素）。拒绝的真实理由是另一条 ——
+            #     `ensure_kb()` 会把那条元素过滤掉，**真写下去就是把用户文件里的一行静默抹掉**。
+            # 所以：拒绝 + 文件逐字节不动 + **不留档**，原因如实点到"第几条不是对象"。
+            # （浅读一次 + 深读一次：只为让原因字符串只有一份实现 —— `read_knowledge_strict_deep`。
+            #   文件只有几十 KB，且这条支路只在"读不干净"时才会走到。）
+            _shallow, shallow_err = store.read_knowledge_strict(kb_path)
+            if not shallow_err:
+                _deep, deep_err = store.read_knowledge_strict_deep(kb_path)
+                if deep_err:
+                    log.log_event("kb.write_refused", level="warn",
+                                  reason="broken_element", detail=deep_err[:200])
+                    return False, deep_err
         if read_ok and refuse_when is not None:
             because = refuse_when(ensure_kb(store.load_knowledge(key)))
             if because:
