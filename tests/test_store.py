@@ -1530,18 +1530,90 @@ class ElementShapeStrictDeepTest(IsolatedCase):
         self.assertEqual(store.read_jds_strict()[1], "")
         self.assertEqual(store.read_knowledge_strict(), ({"nodes": [1]}, ""))
 
-    def test_the_write_path_rulers_still_say_writable(self):
-        """⚠️ 守卫：元素坏**不是**写盘判据的事 —— 三个 `*_safe_to_write` 仍回可写。
+    def test_only_the_jobs_write_path_ruler_was_tightened(self):
+        """⚠️ 守卫：元素坏**只**让 `jobs_safe_to_write` 说不可写；jds / knowledge 照旧回可写。
 
-        谁把元素校验塞进 `read_*_strict`（或 `*_safe_to_write`），这两条就红 ——
-        "写路径的既有行为一字不变"就是这么钉住的。
+        **为什么 jobs 要更严、另两个不用**：只有台账的写路径会**按元素取字段**
+        —— `upsert_job` 的 `for j in jobs: j.get("id")` 在非对象元素上直接
+        `AttributeError: 'int' object has no attribute 'get'`（未捕获异常，不是"如实拒绝"）。
+        `jds` / `knowledge` 的写路径（`jdid.save_jds` / `kb.save_knowledge`）都是**整份覆盖**，
+        没有这种"逐元素取字段"的读-改-写；在那里收紧只会凭空把"能写"翻成"拒绝写"，
+        所以它们的判据一个字都不许动。
+
+        ⚠️ 浅读那一半（`test_the_shallow_strict_reads_were_not_tightened`）**故意不动**：
+        `read_*_strict` 仍然只查容器 —— 收紧落在 `jobs_safe_to_write` 自己身上（它改问深读），
+        不是把元素校验塞进浅读（那会把 jds / knowledge 的写判据一起带严）。
         """
         self._write(store.jobs_path(), '[{"id": "a"}, 1]')
         self._write(store.p_path("jds.json"), '{"version": 1, "seq": 0, "jds": [1]}')
         self._write(store.knowledge_path(), '{"nodes": [1]}')
-        self.assertEqual(store.jobs_safe_to_write(), (True, ""))
+        ok, err = store.jobs_safe_to_write()
+        self.assertFalse(ok, "jobs 的元素坏仍回「可写」—— 接着 upsert_job 就是 AttributeError")
+        self.assertIn("第 2 条不是对象", err)
         self.assertEqual(store.jds_safe_to_write(), (True, ""))
         self.assertEqual(store.knowledge_safe_to_write(), (True, ""))
+
+
+class JobsWritePathElementShapeTest(IsolatedCase):
+    """③ 写路径判据也认元素形状：元素坏 ⇒ `(False, 人话)`，`upsert_job` 如实拒绝而不是炸。
+
+    病根（既有行为）：读路径 `read_jobs_strict_deep` 早就会报"第 N 条不是对象"，
+    而写路径判据 `jobs_safe_to_write` 只问**浅读**（只看容器）⇒ 对同一份坏库回 `(True, "")`
+    ⇒ 谁接着 `upsert_job(...)` 就在坏元素上 `AttributeError: 'int' object has no attribute 'get'`。
+    盘上文件确实没受损（写盘之前就炸了），但那是**未捕获异常**，不是"如实的前置条件拒绝"。
+
+    修法只落在 `jobs_safe_to_write`（改问 `read_jobs_strict_deep`）⇒ `upsert_job` 走它
+    **原有的**前置条件分支（`RuntimeError` + "拒绝写入" + 原因），类型与文案都是既有口径。
+    """
+
+    def _write(self, path, blob):
+        folder = os.path.dirname(path)
+        if folder:
+            os.makedirs(folder, exist_ok=True)
+        data = blob if isinstance(blob, bytes) else blob.encode("utf-8")
+        with open(path, "wb") as f:
+            f.write(data)
+        return path
+
+    def test_a_non_object_element_makes_the_ledger_not_safe_to_write(self):
+        """`[1,2,3]` / `[{好},1]` ⇒ 不可写，原因要说清是**第几条**不是对象。"""
+        for blob, pos in (("[1, 2, 3]", 1), ('[{"id": "a"}, 1]', 2)):
+            with self.subTest(blob=blob):
+                self._write(store.jobs_path(), blob)
+                ok, err = store.jobs_safe_to_write()
+                self.assertFalse(ok, "元素坏却仍回「可写」：%r" % ((ok, err),))
+                self.assertIn("第 %d 条不是对象" % pos, err)
+                self.assertIn("jobs.json", err)
+
+    def test_upsert_refuses_with_the_existing_precondition_error(self):
+        """同一份坏库上 `upsert_job` ⇒ 既有的前置条件异常，且盘上逐字节不变、不留副本。"""
+        blob = b'[{"id": "a"}, 1]'
+        path = self._write(store.jobs_path(), blob)
+        folder = os.path.dirname(path)
+        before = sorted(os.listdir(folder))
+
+        with self.assertRaises(RuntimeError) as ctx:
+            store.upsert_job({"id": "刚跑完的分析", "score": 88.0})
+
+        self.assertNotIsInstance(ctx.exception, AttributeError,
+                                 "还是那个未捕获的 AttributeError（不是如实的前置条件拒绝）")
+        msg = str(ctx.exception)
+        self.assertIn("拒绝写入", msg)              # 既有口径：与别的坏库同一个出口
+        self.assertIn("第 2 条不是对象", msg)       # 原因如实带出来
+        with open(path, "rb") as f:
+            self.assertEqual(f.read(), blob, "盘上台账被动了：写盘之前就该拒绝")
+        self.assertEqual(sorted(os.listdir(folder)), before,
+                         "拒绝时不该多出 .bak- 副本（说明它走到了写盘那一步）")
+
+    def test_the_control_group_is_still_writable(self):
+        """对照组：不存在 / 正常台账 / 合法空列表 `[]` / 0 字节 ⇒ 照旧 `(True, "")`。"""
+        self.assertEqual(store.jobs_safe_to_write(), (True, ""), "文件不存在 = 合法的「第一次」")
+        store.save_jobs([{"id": "a", "score": 80}])
+        self.assertEqual(store.jobs_safe_to_write(), (True, ""), "正常台账必须照旧可写")
+        self._write(store.jobs_path(), "[]")
+        self.assertEqual(store.jobs_safe_to_write(), (True, ""), "合法的空列表必须照旧可写")
+        self._write(store.jobs_path(), b"")
+        self.assertEqual(store.jobs_safe_to_write(), (True, ""), "0 字节 = 合法的「第一次」")
 
 
 class UpdateJobsTransactionTest(IsolatedCase):

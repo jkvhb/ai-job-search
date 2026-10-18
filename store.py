@@ -435,9 +435,13 @@ def config_safe_to_write(path=None):
 def first_non_object_index(items):
     """列表里**第一个不是对象**的元素是第几条（1 基，给人看的）？全是对象回 0。
 
-    ⚠️ 这是**读路径**的另一把尺子，刻意与 `read_*_strict` 分开：
-    `read_*_strict` 只查**容器**形状，而它们同时是 `*_safe_to_write` 的判据 ——
-    在那里收紧"元素"，写路径的既有语义就变了（"能写"会翻成"拒绝写"）。
+    ⚠️ 这是与 `read_*_strict` 分开的另一把尺子：`read_*_strict` 只查**容器**形状。
+    `jds` / `knowledge` 的写判据（`jds_safe_to_write` / `knowledge_safe_to_write`）**仍然只用**
+    浅读 —— 它们的写路径是整份覆盖，没有"逐元素取字段"，在那里收紧只会凭空把"能写"翻成
+    "拒绝写"，语义一个字都不许动。
+    `jobs_safe_to_write` 是**唯一的例外**（台账写路径 `upsert_job` 会 `j.get("id")`，
+    元素坏时是 AttributeError 而不是如实拒绝），它改问 `read_jobs_strict_deep`。
+
     而**读**的时候元素不是对象会被上层静默丢掉（`app._ledger_rows()` 的 `continue` /
     `kb.list_nodes()` 的过滤）：`[1, 2, 3]` 于是变成「共 0 个岗位」、
     `[{好记录}, 1]` 只显示 1 条 —— 坏的那部分**没人看得见**（又一个假话）。
@@ -489,11 +493,14 @@ def read_jobs_strict(path=None):
 def read_jobs_strict_deep(path=None):
     """`read_jobs_strict` + **元素级**校验：列表里每一项都必须是对象。
 
-    **为什么另起一个函数**（而不是把校验塞进 `read_jobs_strict`）：那个同时是
-    `jobs_safe_to_write` 的判据（写路径）—— 在它里面收紧会让"能写"翻成"拒绝写"，
-    写路径的既有语义**一个字都不许动**。而元素坏这件事**读侧必须报**：
+    **为什么另起一个函数**（而不是把校验塞进 `read_jobs_strict`）：那个函数本身是
+    "只查容器"的既有尺子，`upsert_job` 之外还有别的调用方在读它；把元素校验塞进去会让
+    "读得出来吗"的语义变宽。而元素坏这件事**读侧必须报**：
     `app._ledger_rows()` 对不是对象的记录是 `continue` ⇒ `[1, 2, 3]` 回「共 0 个岗位」、
     `[{好记录}, 1]` 只显示 1 条（坏的那条**静默消失**，比整份读不出来更难发现）。
+
+    ⚠️ 写路径里**只有 `jobs_safe_to_write` 用这个深读**（台账的写路径会逐元素取字段，
+    元素坏是 AttributeError）；`jds` / `knowledge` 的写判据仍问各自的浅读，别跟着改。
 
     出口与"容器坏"**同一把尺子**：原因非空、点明**哪个文件**与**第几条**不是对象。
     对照组照旧：不存在 / 真 0 字节 / 合法的空列表 `[]` ⇒ `([], "")`。
@@ -513,8 +520,8 @@ def read_jobs_strict_deep(path=None):
 def jobs_safe_to_write(path=None):
     """`jobs.json` 当前是否可以**安全写盘**？返回 `(可写, 原因)`。
 
-    可写 = **读得出来**，**或者**文件里根本没有一个字节（不存在 / 真的是 0 字节）。
-    其余（有字节、却读不出来）→ 不可写。
+    可写 = **读得出来（容器 + 元素都合格）**，**或者**文件里根本没有一个字节
+    （不存在 / 真的是 0 字节）。其余（有字节、却读不出来）→ 不可写。
 
     为什么必须有它：`upsert_job` 是分析记录写盘的**唯一真出口**（`app.py` 的 `/api/analyze`
     与结果面板、`outcome.py` 都走它），而它的第一步 `load_jobs()` 在读/解析失败时回 `[]`
@@ -523,11 +530,23 @@ def jobs_safe_to_write(path=None):
     触发条件是现实的：用户手改 JSON、非 UTF-8 保存（本项目已栽过一次 GBK）、
     杀毒软件短暂锁文件、磁盘/IO 错误。
 
+    ⚠️ **判据是深读（`read_jobs_strict_deep`：容器 + 每一项都得是对象）**，比
+    `jds` / `knowledge` 的写判据更严 —— 因为**只有台账的写路径会逐元素取字段**：
+    `upsert_job` 的 `for j in jobs: if j.get("id") == …` 在非对象元素上直接
+    `AttributeError: 'int' object has no attribute 'get'`。那是**未捕获异常**，不是
+    "如实的前置条件拒绝"（盘上文件没坏 —— 写盘之前就炸了 —— 但用户看到的是 traceback）。
+    收紧到这里之后，元素坏走的是 `upsert_job` **原有的**前置条件分支：
+    `RuntimeError` + "拒绝写入" + "第 N 条不是对象"。
+    `jds` / `knowledge` 的写路径是整份覆盖、没有这种逐元素读-改-写，所以它们的判据
+    **一个字都不许跟着改**（见 `first_non_object_index` 的说明）。
+
     ⚠️ 判据必须问**严格读**，**不能**看 `load_jobs()` 的返回值 ——
     那正是把"读不出来"和"空台账"混成同一个信号的根源。
     """
     p = path or jobs_path()
-    _data, err = read_jobs_strict(p)
+    # 问**深读**（容器 + 元素）：元素不是对象时 `upsert_job` 会 AttributeError，
+    # 而这里必须先在**写盘的门口**如实拒绝（既有口径：RuntimeError + 原因）。
+    _data, err = read_jobs_strict_deep(p)
     if not err:
         return True, ""
     if not file_has_bytes_to_lose(p):
