@@ -42,6 +42,7 @@ import shutil
 from datetime import datetime
 
 import jdid
+import jdrefs
 import kb
 import log
 import store
@@ -354,6 +355,57 @@ def _interview_hits(jd_id):
     return out
 
 
+def _refs_all_of(jd_id):
+    """预演里的**全量引用清单**：`jdrefs.refs_of_jd(jd_id)` 的投影 + 如实上报的 advisories。
+
+    返回 `(records, advisories)`：
+      * `records` = `[{"kind","path","count","how","err"}]`（顺序 = `jdrefs.KINDS` 的登记顺序，
+        输出稳定；逐文件的 kind 一个文件一条）；
+      * `advisories` = 每一处**读不出来**的引用点各一句 —— **「读不出来」绝不是「没有引用」**
+        （`jdrefs` 用 `count = -1` 表达"未知"）；`jdrefs.unreadable_refs` 就是那把尺子，
+        本模块不另造一套判据。
+
+    **为什么预演要用它、而不是自己再列一遍清单**（批 7.1 §8.1）：预演原先自己列三份
+    （知识库 / 面试 `status.json` / 悬空合并引用），实测**漏了** `report_state/<报告id>.json`
+    与 `interviews/*/feedback.json` —— 删完岗位之后它们变成盘上孤儿，而预演里一个字都不提。
+    清单从此**只有 `jdrefs.KINDS` 一份**：以后再新增一个"指向岗位"的产物，守卫测试
+    （`tests/test_jdrefs.py::GuardTest`）会先红，预演自动跟着列出来。
+
+    ⚠️ **只读**：`jdrefs.refs_of_jd` 一个字节都不落盘（预演的铁律）；它自己**不取**任何业务锁，
+    所以这里（`_plan` 可能在 `_JD_LOCK` / `_KB_LOCK` 里被调用）不会引入新的锁序边。
+    """
+    if not jd_id:
+        # 空 id 不猜（`jdrefs.refs_of_jd` 对空 id 是 `ValueError`）：没有 id 就没有"它的引用"。
+        return [], []
+    refs = jdrefs.refs_of_jd(jd_id)
+    records = [{"kind": r.kind, "path": r.path, "count": r.count,
+                "how": r.how, "err": r.err} for r in refs]
+    bad = jdrefs.unreadable_refs(refs)
+    advisories = []
+    if bad:
+        advisories.append({"kind": "unreadable_refs", "message":
+                           "有 %d 处引用点**读不出来**（文件里有字节、拿不到内容）—— 这**不是**"
+                           "「没有引用」：下面那份清单里它们的条数是**未知**，不是 0。"
+                           "按这份清单动手会漏掉它们（删完就成盘上孤儿），请先修好"
+                           "（或从别处恢复、把它们移开）：%s"
+                           % (len(bad), "；".join(r.err for r in bad))})
+    return records, advisories
+
+
+def _refs_all_view(records):
+    """把 `_refs_all_of` 的 records 包成预演对外的 `refs.all`（**只搬运，不重算**）。
+
+    `hits` 就是 `records` 的条数（不是另算一遍的第二个计数：`hits` 与 `records` 不一致是
+    「预演说一套、别处做另一套」的原料）；`unreadable` = 带 `err` 的那几处，**它们不是 0 条**，
+    而是"未知"（`count = -1`）。
+    """
+    bad = [r for r in records if r["err"]]
+    return {"hits": len(records), "records": records, "unreadable": len(bad),
+            "note": "**单一真源**（`jdrefs.KINDS` / `refs_of_jd`）：指向这个岗位的**每一处**引用，"
+                    "逐文件的 kind 一个文件一条。以前这里自己列三份清单，漏了 "
+                    "`report_state/<报告id>.json` 与 `interviews/*/feedback.json` 两类。"}
+
+
 def _file_entry(where, name, kind, note=""):
     path = os.path.join(store.p_path(where), name)
     return {"where": where, "name": name, "kind": kind, "note": note,
@@ -376,6 +428,8 @@ def _plan(jd_id):
     rows, jobs_err = _jobs_or_error()
     _jds_data, jds_err = _jds_or_error()
     _kb_data, kb_err = _knowledge_or_error()
+    # 批 7.1 第 2 步：引用清单**只有一份**（`jdrefs.KINDS`），预演直接列它的结果。
+    refs_all, ref_advisories = _refs_all_of(jd_id)
     # 两个"会被覆盖"的文件的读失败合并成一个 `unreadable`（对外只暴露一个字段）。
     unreadable = "；".join(x for x in (jobs_err, jds_err) if x)
     analyses = _analyses_of(jd_id, rows) if jd_id else []
@@ -387,9 +441,12 @@ def _plan(jd_id):
             return {"id": jd_id, "jd": None, "found": True, "unreadable": unreadable,
                     "knowledge_err": kb_err,
                     "analyses": [], "files": [], "kb_cards": [], "interviews": [],
-                    "advisories": [{"kind": "unreadable_jobs", "message": unreadable}]}
+                    "refs_all": refs_all,
+                    "advisories": ([{"kind": "unreadable_jobs", "message": unreadable}]
+                                   + ref_advisories)}
         return {"id": jd_id, "jd": None, "found": False, "analyses": [], "files": [],
-                "kb_cards": [], "interviews": []}
+                "kb_cards": [], "interviews": [], "refs_all": refs_all,
+                "advisories": list(ref_advisories)}
 
     files, seen, advisories = [], set(), []
     if unreadable:
@@ -492,7 +549,8 @@ def _plan(jd_id):
             "analyses": analyses, "files": files,
             "kb_cards": _kb_hits(jd_id, _kb_data), "interviews": _interview_hits(jd_id),
             "merged_refs": merged_refs,
-            "advisories": advisories}
+            "refs_all": refs_all,
+            "advisories": advisories + ref_advisories}
 
 
 def _jd_file_names_of(jd, analyses, key):
@@ -563,9 +621,10 @@ def preview_purge(jd_id):
                 "jd_record": None, "analyses": [], "files": [],
                 "refs": {"knowledge": {"hits": 0, "cards": [], "cards_kept": 0, "note": ""},
                          "interviews": {"hits": 0, "records": []},
-                         "merged": {"hits": 0, "records": [], "note": ""}},
+                         "merged": {"hits": 0, "records": [], "note": ""},
+                         "all": _refs_all_view([])},
                 "summary": {"analyses": 0, "files": 0, "reports": 0, "kb_hits": 0,
-                            "interviews": 0, "merged_hits": 0},
+                            "interviews": 0, "merged_hits": 0, "ref_hits": 0},
                 "advisories": []}
     advisories = list(plan["advisories"])
     if plan["jd"] is None:
@@ -587,6 +646,8 @@ def preview_purge(jd_id):
     kb_cards = plan["kb_cards"]
     interviews = plan["interviews"]
     merged_refs = plan["merged_refs"]
+    # 批 7.1 第 2 步：**全量引用清单**（`jdrefs` 的投影）—— 今天漏的那两类会当场出现在这里。
+    refs_all = plan.get("refs_all") or []
     unreadable = str(plan.get("unreadable") or "")
     return {
         "ok": True, "id": jd_id, "found": True, "jd_exists": plan["jd"] is not None,
@@ -611,13 +672,15 @@ def preview_purge(jd_id):
                      "hits": len(merged_refs), "records": merged_refs,
                      "note": "这次会顺带清理的**悬空合并引用**：只去掉 `merged_into` 那个标记"
                              "（记录本身保留），清完它们**重新出现在台账里**（合并目标已经没了，"
-                             "再把它们过滤掉就是永久看不见、也删不掉）"}},
+                             "再把它们过滤掉就是永久看不见、也删不掉）"},
+                 "all": _refs_all_view(refs_all)},
         "summary": {"analyses": len(analyses),
                     "files": len(files),
                     "reports": len([f for f in files if f["kind"] == "analysis_report"]),
                     "kb_hits": sum(c["hits"] for c in kb_cards),
                     "interviews": len(interviews),
-                    "merged_hits": len(merged_refs)},
+                    "merged_hits": len(merged_refs),
+                    "ref_hits": len(refs_all)},
         "advisories": advisories,
         # ---- 内部键（带下划线）：`purge_jd` 的指纹与删除都只读它们，绝不读摊平后的那份 ----
         "_analyses": plan["analyses"],

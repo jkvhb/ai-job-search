@@ -800,6 +800,86 @@ class JdPurgeFileScopeTest(_PurgeCase):
         self.assertEqual([j.get("id") for j in left if j.get("id")], [B1])
 
 
+class PreviewRefsSingleSourceTest(_PurgeCase):
+    """批 7.1 第 2 步：预演的引用清单改用 `jdrefs.refs_of_jd`（**单一真源**）。
+
+    预演原先自己列三份清单（知识库 / 面试 `status.json` / 悬空合并引用），于是**漏了两处**：
+    `report_state/<报告id>.json` 与 `interviews/<面试id>/feedback.json` —— 删完岗位之后它们
+    变成盘上孤儿，而预演里**一个字都不提**（"少列"最贵的形态：用户对着"只有 N 条引用"的
+    清单按了确认）。
+
+    这一组钉四件事：
+      ① 今天漏的那两类**在预演里当场出现**（旧实现必红）；
+      ② 条数 / 路径 / 说明都说得出来（不是只多一个 kind 名字）；
+      ③ 对照组：**真的**没有引用时如实说 0（"0 条"与"读不出来"必须能分开）；
+      ④ **读不出来 ≠ 没有引用**：那一处要带 `err` 进预演，`count = -1`（未知），
+         并在 `advisories` 里如实说出来 —— 绝不是"看起来只有 0 条"。
+    """
+
+    def _all(self, preview):
+        """预演里的**全量引用清单**（`jdrefs` 的投影）。"""
+        return preview["refs"]["all"]
+
+    def _feedback_path(self):
+        return store.interview_file("iv_0001", "feedback.json")
+
+    def test_the_two_reference_kinds_missed_before_now_show_up_in_the_preview(self):
+        store.save_report_state(A1, {"要会 ASR": True})
+        store.save_interview_json("iv_0001", "feedback.json",
+                                  {JD_A: {"applied": True, "jd_id": JD_A}})
+        p = jddelete.preview_purge(JD_A)
+        records = self._all(p)["records"]
+        kinds = [r["kind"] for r in records]
+        self.assertIn("report_state", kinds, "此前漏掉的第一处没出现在预演里：%r" % (records,))
+        self.assertIn("iv_feedback", kinds, "此前漏掉的第二处没出现在预演里：%r" % (records,))
+        by_kind = {r["kind"]: r for r in records}
+        self.assertEqual(by_kind["report_state"]["count"], 1)
+        self.assertEqual(by_kind["report_state"]["path"], store.report_state_path(A1),
+                         "报告勾选文件那一处没指向**具体文件**")
+        self.assertEqual(by_kind["iv_feedback"]["path"], self._feedback_path())
+        self.assertTrue(by_kind["iv_feedback"]["how"], "每一处都要说清「这是哪一处引用」")
+        self.assertEqual(by_kind["iv_feedback"]["err"], "")
+
+    def test_it_lists_every_reference_kind_and_the_hits_match_the_records(self):
+        """六种引用齐备时一处不少（`hits` 与 `records` **同一份**，不许两套计数）。"""
+        store.save_report_state(A1, {"要会 ASR": True})
+        store.save_interview_json("iv_0001", "feedback.json", {JD_A: {"applied": True}})
+        p = jddelete.preview_purge(JD_A)
+        allrefs = self._all(p)
+        self.assertEqual(sorted(r["kind"] for r in allrefs["records"]),
+                         sorted(["jds", "jobs", "kb", "iv_status",
+                                 "report_state", "iv_feedback"]))
+        self.assertEqual(allrefs["hits"], len(allrefs["records"]))
+        self.assertEqual(allrefs["unreadable"], 0)
+        # 既有的三份清单**原样保留**（前端与既有用例都按那些键读）
+        self.assertEqual(p["refs"]["knowledge"]["hits"], 2)
+        self.assertEqual([r["id"] for r in p["refs"]["interviews"]["records"]], ["iv_0001"])
+
+    def test_no_references_at_all_is_reported_as_zero_not_as_unknown(self):
+        """对照组：找不到这个岗位 ⇒ 引用 0 条、**不是**"读不出来"（两件相反的事）。"""
+        p = jddelete.preview_purge("根本没有这个 ID_0001")
+        self.assertFalse(p["found"])
+        self.assertEqual(self._all(p)["hits"], 0)
+        self.assertEqual(self._all(p)["records"], [])
+        self.assertEqual(self._all(p)["unreadable"], 0)
+        self.assertEqual(json.dumps(p["advisories"], ensure_ascii=False).count("读不出来"), 0)
+
+    def test_an_unreadable_reference_is_reported_instead_of_counted_as_none(self):
+        """**读不出来 ≠ 没有引用**：那一处要带 `err` 进预演（`count = -1`）并进 advisories。"""
+        store.save_interview_json("iv_0001", "feedback.json", {JD_A: {"applied": True}})
+        path = self._feedback_path()
+        with open(path, "wb") as f:                    # 真实的非 UTF-8 字节（不是 mock）
+            f.write(json.dumps({"x": "中文"}, ensure_ascii=False).encode("gbk"))
+        p = jddelete.preview_purge(JD_A)
+        bad = [r for r in self._all(p)["records"] if r["err"]]
+        self.assertTrue(bad, "读不出来的那一处没进预演：%r" % (self._all(p),))
+        self.assertIn(path, [r["path"] for r in bad])
+        self.assertEqual([r["count"] for r in bad], [-1],
+                         "读不出来时 count 必须是 -1（未知），0 的含意是「确认没有引用」")
+        self.assertEqual(self._all(p)["unreadable"], len(bad))
+        self.assertIn("读不出来", json.dumps(p["advisories"], ensure_ascii=False))
+
+
 class JdPurgePreviewPinningTest(_PurgeCase):
     """把审查者**实证过是假绿**的几处钉死（变异能过 = 那条断言其实没在测东西）。"""
 
