@@ -434,7 +434,7 @@ def plan_migration():
             "before_kb": kb_out["before_kb"], "after_kb": kb_out["after_kb"],
             "before_multi": kb_out["before_multi"], "after_multi": kb_out["after_multi"],
             "seq": max([r["seq"] or 0 for r in records]
-                       + [jdid._as_int(jds_data.get("seq"), 0)] + [0]),   # noqa: SLF001
+                       + [store.as_int(jds_data.get("seq"), 0, bool_ok=False)] + [0]),   # noqa: SLF001
         }
 
 
@@ -448,7 +448,7 @@ def _plan_groups(jds_data, existing, active):
     bundle = [(g, "指纹") for g in groups]
     bundle += [([r], "缺 JD 原文") for r in no_text]           # 缺原文 → 各自一组，不猜
     bundle += [([r], "原文过短（无法指纹判定）") for r in too_short]
-    seq = max(0, jdid._as_int(jds_data.get("seq"), 0))         # noqa: SLF001
+    seq = max(0, store.as_int(jds_data.get("seq"), 0, bool_ok=False))         # noqa: SLF001
     records, new_ids = [], {}
     for members, why in bundle:
         record = {
@@ -489,7 +489,7 @@ def _plan_groups(jds_data, existing, active):
 
 def _seq_of_jd(jd_rec):
     """已有 JD 记录的编号（`seq` 字段优先，没有就从 id 末段解出来）；解不出 → None"""
-    seq = jdid._as_int(jd_rec.get("seq"), 0)                   # noqa: SLF001
+    seq = store.as_int(jd_rec.get("seq"), 0, bool_ok=False)                   # noqa: SLF001
     if seq:
         return seq
     try:
@@ -510,15 +510,15 @@ def _build_jds(jds_data, records):
             claimed.add(record["existing"]["id"])
     out, seq_max = [], 0
     for jds_rec in jds_data.get("jds", []):
-        if not isinstance(jds_rec, dict) or not jdid._text(jds_rec.get("id")):   # noqa: SLF001
+        if not isinstance(jds_rec, dict) or not store.as_text(jds_rec.get("id"), empty=None):   # noqa: SLF001
             continue
-        seq_max = max(seq_max, jdid._as_int(jds_rec.get("seq"), 0))          # noqa: SLF001
+        seq_max = max(seq_max, store.as_int(jds_rec.get("seq"), 0, bool_ok=False))          # noqa: SLF001
         if jds_rec.get("id") not in claimed:
             out.append(jds_rec)
     for record in records:
         seq_max = max(seq_max, record["seq"] or 0)
         out.append(_order_jd_record(_merge_jd_record(record)))
-    return {"version": jdid._as_int(jds_data.get("version"), 1) or 1,   # noqa: SLF001
+    return {"version": store.as_int(jds_data.get("version"), 1, bool_ok=False) or 1,   # noqa: SLF001
             "seq": seq_max, "jds": out}
 
 
@@ -574,7 +574,7 @@ def _merge_jd_record(record):
         new_rec.setdefault("id_history", [])
         new_rec.setdefault("jd_facts", {})
         new_rec["id"] = str(existing.get("id") or record["jd_id"])
-        new_rec["seq"] = jdid._as_int(existing.get("seq"), record["seq"] or 0)   # noqa: SLF001
+        new_rec["seq"] = store.as_int(existing.get("seq"), record["seq"] or 0, bool_ok=False)   # noqa: SLF001
         new_rec["created_at"] = created
         new_rec["updated_at"] = str(existing.get("updated_at") or _now())
         return new_rec

@@ -1713,8 +1713,13 @@ class LedgerFilterTest(_AnalyzeRouteCase):
         # ② 真删合并目标
         code, body = self._post_json("/api/jd/purge", {"id": "k"})
         self.assertEqual(code, 200, body)
-        # ③ 悬空引用被清掉 ⇒ `d` 重新成为台账里的一行（这就是「重新可见」）
-        self.assertEqual([j["id"] for j in body["jobs"]], ["d"],
+        # ③ 悬空引用被清掉 ⇒ `d` 重新成为台账里的一行（这就是「重新可见」）。
+        #    台账**现读**一遍（purge 的响应里不再捎带那份"算完就扔"的台账，见
+        #    `test_purge_does_not_recompute_a_ledger_it_would_only_throw_away`）；
+        #    前端同一步也是自己重新 `loadJobs()`。
+        code, fresh = self._get("/api/jobs")
+        self.assertEqual(code, 200, fresh)
+        self.assertEqual([j["id"] for j in fresh["jobs"]], ["d"],
                          "被合并的记录没有重新出现在台账里：它在界面上永久消失、也删不掉")
         rec = [j for j in store.load_jobs() if j.get("id") == "d"][0]
         self.assertNotIn("merged_into", rec,
@@ -4874,8 +4879,44 @@ class JdPurgeRouteTest(LedgerWithReportsCase):
         self.assertIsNone(jdid.find_jd(self.JD_ID))
         for name in ("a1.html", "a2.html", self.JD_ID + ".txt"):
             self.assertFalse(os.path.exists(os.path.join(store.p_path("reports"), name)))
-        # 返回的台账里已经没有这一行了
-        self.assertEqual(body["jobs"], [])
+        # 台账里已经没有这一行了（**现读**盘上的来说，不是响应体里捎回来的那份 ——
+        # 响应里不再有 `jobs` 这个字段，理由见那条"不许白算"的用例）
+        self.assertEqual([r["id"] for r in app._ledger_rows()], [])
+
+    def test_purge_does_not_recompute_a_ledger_it_would_only_throw_away(self):
+        """⑤（体检 §6）：purge 成功后**不再**算一遍"带报告的台账"。
+
+        判据是**可数量**：那份台账要把该 JD 每条分析的**报告 HTML 打开并解析**
+        （`_ledger_rows` → `_jd_row` → `_analysis_scores` → `kb.read_report_data`）。
+        改前这里每条分析各读一次（本夹具 2 条 ⇒ 2 次）；改后必须**0 次** —— 因为
+        响应里的 `jobs` 字段前端**从不读**，前端在成功分支上自己 `loadJobs()`
+        （`web/index.html` 的 `jdDelete` 成功那条路径）。
+
+        为什么钉在 `kb.read_report_data` 上而不是 `_ledger_rows`：删掉一次函数调用很容易
+        被"顺手把台账算在别处"绕过；而"删完之后把**还活着的**岗位的报告再解析一遍"这件事，
+        唯一的入口就是报告解析本身。
+
+        ⚠️ 夹具里**必须留一个不被删的岗位**（`survivor`）：只留一个即将被删的岗位的话，
+        改前那份台账去读的是**刚被删掉的**报告名，`os.path.isfile` 先假的 ⇒ 一次解析都不发生，
+        这条用例就变成恒真的假绿了（实测过：改前的实现也叫 0 次）。
+        """
+        self._two_analyses()
+        # 另一个岗位不参与这次删除 —— 它的报告**还在盘上**，才是"白算"真会去解析的那一份
+        self._old_job("survivor")
+        self._report_file("survivor.html", [{"dimension": "经验匹配", "weight": 10, "score": 8}])
+        with mock.patch.object(kb, "read_report_data", wraps=kb.read_report_data) as spy:
+            code, body = self._post_json("/api/jd/purge", {"id": self.JD_ID})
+        self.assertEqual(code, 200, body)
+        self.assertTrue(body["ok"], body)
+        self.assertEqual(spy.call_count, 0,
+                         "删除成功后仍去解析报告（白算）、次数=%d：%r"
+                         % (spy.call_count, [c[0][0] for c in spy.call_args_list]))
+        # 那个字段一并去掉（前端不读它；留着它就还会有人去填它）
+        self.assertNotIn("jobs", body, "响应里还在端一份没人读的台账：%r" % (sorted(body),))
+        # 对照：其余字段一个不少（逐键钉住，删的是**字段**不是语义）
+        self.assertEqual(sorted(body), ["analyses", "backup", "backup_note", "id", "interviews",
+                                        "kb_nodes", "merged_refs", "ok", "removed_files",
+                                        "skipped_files"])
 
     def test_purge_without_a_fingerprint_still_works(self):
         """老前端 / curl 不传指纹时照常执行（指纹是**额外**的一道闸门，不是必填）。"""

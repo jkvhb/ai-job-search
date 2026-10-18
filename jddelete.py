@@ -82,23 +82,16 @@ class JdPurgeError(Exception):
         self.code = code
 
 
-def _text(value):
-    """非空字符串才算内容（用户可手改 JSON，5 / [] / None 一律当没有）。"""
-    return value.strip() if isinstance(value, str) else ""
-
-
-def _as_int(value):
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return 0
-
-
+# `_text` / `_as_int` 已收归 store（批 5：五个模块的 _text 两种契约、四个模块的 _as_int 一份实现）。
+# 本模块的口径是「空 → ""」（`store.as_text(..., empty="")` —— 这些 id 要直接拼进 `==` 比较与
+# 字符串模板，`None` 会在 `str()` 里变成 "None"），调用点**每一处都显式传**。
+# （本模块原先那份 `_as_int` 一个调用点都没有 —— 是死副本，随统一一并删掉；
+# 本模块里没有任何地方要把一个值容错取成整数。）
 def _jd_id_of_record(rec):
     """一条分析记录的 JD 身份：`jd_id` 优先，迁移前退回 `id`（与 `app._jd_id_of_row` 同口径）。"""
     if not isinstance(rec, dict):
         return ""
-    return _text(rec.get("jd_id")) or _text(rec.get("id"))
+    return store.as_text(rec.get("jd_id"), empty="") or store.as_text(rec.get("id"), empty="")
 
 
 def _jobs_or_error():
@@ -248,7 +241,7 @@ def _purge_identities(jd_id, rows):
     gone = {jd_id} if jd_id else set()
     for rec in rows:
         if _jd_id_of_record(rec) == jd_id:
-            rid = _text(rec.get("id"))
+            rid = store.as_text(rec.get("id"), empty="")
             if rid:
                 gone.add(rid)
     return gone
@@ -268,7 +261,7 @@ def _dangling_merged_refs(jd_id, rows):
     for rec in rows:
         if not isinstance(rec, dict) or _jd_id_of_record(rec) == jd_id:
             continue
-        target = _text(rec.get("merged_into"))
+        target = store.as_text(rec.get("merged_into"), empty="")
         if target and target in gone:
             out.append({"id": str(rec.get("id") or ""), "merged_into": target,
                         "jd_id": _jd_id_of_record(rec), "report": _report_name(rec)})
@@ -333,13 +326,13 @@ def _kb_hits(jd_id, data=None):
         if not isinstance(node, dict):
             continue
         hits = [x for x in (node.get("from_jds") or [])
-                if isinstance(x, dict) and _text(x.get("id")) == jd_id]
+                if isinstance(x, dict) and store.as_text(x.get("id"), empty="") == jd_id]
         if hits:
             out.append({"id": str(node.get("id") or ""), "term": str(node.get("term") or ""),
                         "hits": len(hits),
                         "other_sources": len([x for x in (node.get("from_jds") or [])
                                               if isinstance(x, dict)
-                                              and _text(x.get("id")) != jd_id])})
+                                              and store.as_text(x.get("id"), empty="") != jd_id])})
     return out
 
 
@@ -348,7 +341,7 @@ def _interview_hits(jd_id):
     out = []
     for path in sorted(glob.glob(store.interview_file("*", "status.json"))):
         st = store.read_json(path, None)
-        if isinstance(st, dict) and _text(st.get("job_id")) == jd_id:
+        if isinstance(st, dict) and store.as_text(st.get("job_id"), empty="") == jd_id:
             out.append({"id": os.path.basename(os.path.dirname(path)),
                         "path": path,
                         "title": str(st.get("title") or st.get("job_title") or "")})
@@ -423,7 +416,7 @@ def _plan(jd_id):
     `knowledge_err` 非空**不阻止**删除（那个文件不会被覆盖，坏着也不会丢数据），
     但它要作为 advisory 说出来：否则用户以为引用清干净了，其实还指着已删的岗位。
     """
-    jd_id = _text(jd_id)
+    jd_id = store.as_text(jd_id, empty="")
     jd = jdid.find_jd(jd_id) if jd_id else None
     rows, jobs_err = _jobs_or_error()
     _jds_data, jds_err = _jds_or_error()
@@ -637,7 +630,7 @@ def preview_purge(jd_id):
                  "score": r.get("score"),
                  "report": _report_name(r),
                  "created_at": str(r.get("created_at") or ""),
-                 "merged": bool(_text(r.get("merged_into")))}
+                 "merged": bool(store.as_text(r.get("merged_into"), empty=""))}
                 for r in plan["analyses"]]
     files = [{"name": f["name"], "where": f["where"], "kind": f["kind"],
               "exists": f["exists"], "kept": bool(f.get("kept")),
@@ -849,7 +842,7 @@ def _drop_jd_records(jobs, jd_id):
     gone = _purge_identities(jd_id, jobs)
     cleared = []
     for j in kept:
-        target = _text(j.get("merged_into")) if isinstance(j, dict) else ""
+        target = store.as_text(j.get("merged_into"), empty="") if isinstance(j, dict) else ""
         if target and target in gone:
             j.pop("merged_into", None)
             cleared.append({"id": str(j.get("id") or ""), "merged_into": target,

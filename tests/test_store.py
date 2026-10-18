@@ -1841,5 +1841,229 @@ class UpdateJobsTransactionTest(IsolatedCase):
                          "store 只能 import 标准库（多一个项目模块就多一条回抢上层锁的通道）")
 
 
+class AsIntTest(unittest.TestCase):
+    """批 5：`store.as_int` 是**唯一**一份容错取整数，**口径**由调用方显式传。
+
+    这张表就是「逐字节等价」的判据：每一格都对着**统一前**每个模块那份副本的行为
+    （`kb` / `resumelib` / `jddelete` 是裸 `int(value)` ⇒ 头两列；`jdid` 先拒收 bool ⇒ 第三列）。
+    改任何一格都说明某处的口径被动过 —— 那正是这批"行为不变"的整理**唯一**能出的错。
+    """
+
+    # (入参, bool_ok=True, bool_ok=False)  —— 后两列 = 统一前两种副本各自的返回值
+    CASES = [
+        (None, 0, 0),
+        ("", 0, 0),
+        (" ", 0, 0),
+        (True, 1, 0),                    # ← 这里就是两种口径**唯一**分岔的地方
+        (False, 0, 0),                   # 两种口径在 False 上恰好一致（都是 0）
+        (0, 0, 0),
+        (-1, -1, -1),
+        ("3", 3, 3),
+        (" 3 ", 3, 3),
+        ("3.7", 0, 0),                   # int("3.7") 抛 ValueError ⇒ default（不是 3！）
+        ("abc", 0, 0),
+        (3.7, 3, 3),                     # float 截断，不四舍五入
+        (-3.7, -3, -3),
+        ([], 0, 0),
+        ([1], 0, 0),
+        ({}, 0, 0),
+        ({"a": 1}, 0, 0),
+        ("0x10", 0, 0),
+    ]
+
+    def test_the_table_is_identical_under_both_historical_kinds(self):
+        for raw, yes, no in self.CASES:
+            with self.subTest(raw=raw):
+                self.assertEqual(store.as_int(raw, 0, bool_ok=True), yes,
+                                 "bool_ok=True 口径（老 kb/resumelib/jddelete）变了：%r" % (raw,))
+                self.assertEqual(store.as_int(raw, 0, bool_ok=False), no,
+                                 "bool_ok=False 口径（老 jdid）变了：%r" % (raw,))
+
+    def test_the_default_is_returned_as_is(self):
+        """`default` 原样返回（老副本是裸 `return default`，不做二次转换）。"""
+        self.assertEqual(store.as_int("abc", -1), -1)
+        self.assertEqual(store.as_int(None, 7), 7)
+        self.assertIsNone(store.as_int([], None))
+        self.assertEqual(store.as_int("3", -1), 3, "取得到就不许拿 default 顶")
+
+    def test_only_type_and_value_errors_are_swallowed(self):
+        """只兜 `TypeError` / `ValueError` —— `OverflowError` 照旧漏出去（老副本如此）。
+
+        吞掉它等于把"数据离谱到没法解释"改成一堆 0，那比晚一点炸更糟。
+        """
+        self.assertRaises(OverflowError, store.as_int, float("inf"))
+        self.assertRaises(OverflowError, store.as_int, float("-inf"))
+        # 对照：这两类被兜住（不抛）
+        self.assertEqual(store.as_int([1]), 0)          # int([]) 是 TypeError
+        self.assertEqual(store.as_int("abc"), 0)        # int("abc") 是 ValueError
+
+
+class AsTextTest(unittest.TestCase):
+    """批 5：`store.as_text` 是**唯一**一份容错取字符串，两种契约用 `empty=` 表达。
+
+    两种契约都是**真的**，谁也不是另一个的"顺手版本"：
+    `empty=None`（老 jdid / jdfacts：调用方 `or` 兜底）与
+    `empty=""`（老 jddelete / jdrefs / resumelib：值要直接进 `==` 与字符串模板，
+    `None` 在 `str()` 里会变成 `"None"` —— 那是句假话）。
+    """
+
+    # (入参, empty=None, empty="")
+    CASES = [
+        (None, None, ""),
+        ("", None, ""),
+        (" ", None, ""),
+        ("\t\r\n", None, ""),
+        ("\u3000", None, ""),            # 全角空格也只算空白
+        ("abc", "abc", "abc"),
+        (" abc ", "abc", "abc"),
+        (" abc\n第二行 ", "abc\n第二行", "abc\n第二行"),   # 只去首尾，不动中间
+        ("\u3000 甲 ", "甲", "甲"),
+        (5, None, ""),
+        (0, None, ""),
+        (True, None, ""),
+        ([], None, ""),
+        (["a"], None, ""),
+        ({}, None, ""),
+        (b"abc", None, ""),              # bytes 不是 str
+    ]
+
+    def test_the_table_is_identical_under_both_contracts(self):
+        for raw, none_like, empty_like in self.CASES:
+            with self.subTest(raw=raw):
+                self.assertEqual(store.as_text(raw, empty=None), none_like,
+                                 "empty=None 契约（老 jdid/jdfacts）变了：%r" % (raw,))
+                self.assertEqual(store.as_text(raw, empty=""), empty_like,
+                                 "empty=\"\" 契约（老 jddelete/jdrefs/resumelib）变了：%r" % (raw,))
+
+    def test_the_two_contracts_only_differ_in_the_missing_cases(self):
+        """契约不同**只**在"缺失"那一类上 —— 有内容时两列必须完全相同。"""
+        for raw, none_like, empty_like in self.CASES:
+            if none_like is None and empty_like == "":
+                continue
+            self.assertEqual(none_like, empty_like, "有内容的入参两种契约却不同：%r" % (raw,))
+
+
+class SingleImplementationTest(unittest.TestCase):
+    """批 5 的**结构钉子**：取值小工具实现只剩 store 这一份，口径在调用点显式传。
+
+    为什么必须有这条（而不是只钉行为）：行为用例挡不住"在某个模块里又长出一份副本"
+    —— 副本刚长出来时行为一模一样，等它漂移了才发现。这里用 AST 钉两件事：
+    ① 模块里**没有**自己的 `_as_int` / `_text`；② 每一处 `store.as_int` / `store.as_text`
+    调用都**显式**带口径关键字，且带的是**这个模块历史上那一把尺子**。
+    """
+
+    # 各模块历史上的口径（跨模块引用也算在本模块头上：kbreuse 用 kb 的、身份迁移用 jdid 的）
+    AS_INT_KIND = {"kb.py": True, "kbreuse.py": True, "resumelib.py": True,
+                   "jdid.py": False, "身份迁移.py": False}
+    AS_TEXT_EMPTY = {"jdid.py": None, "jdfacts.py": None,
+                     "jddelete.py": "", "jdrefs.py": "", "resumelib.py": ""}
+
+    @staticmethod
+    def _tree(name):
+        return ast.parse(store.read_text(os.path.join(store.ROOT, name)))
+
+    def test_no_module_keeps_its_own_copy(self):
+        for name in sorted(set(self.AS_INT_KIND) | set(self.AS_TEXT_EMPTY)):
+            with self.subTest(module=name):
+                defs = {n.name for n in ast.walk(self._tree(name))
+                        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+                self.assertNotIn("_as_int", defs, "%s 里又长出了一份 _as_int 副本" % name)
+                self.assertNotIn("_text", defs, "%s 里又长出了一份 _text 副本" % name)
+
+    def _calls(self, name, attr):
+        for node in ast.walk(self._tree(name)):
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == attr and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "store"):
+                yield node
+
+    def test_every_call_site_passes_its_own_kind_explicitly(self):
+        for name, want in sorted(self.AS_INT_KIND.items()):
+            calls = list(self._calls(name, "as_int"))
+            with self.subTest(module=name):
+                self.assertTrue(calls, "%s 里一个 store.as_int 都没有？解析方式不对" % name)
+            for call in calls:
+                kw = {k.arg: k.value for k in call.keywords}
+                self.assertIn("bool_ok", kw, "%s:%d 调 store.as_int 没显式传口径"
+                              % (name, call.lineno))
+                self.assertIsInstance(kw["bool_ok"], ast.Constant)
+                self.assertIs(kw["bool_ok"].value, want,
+                              "%s:%d 的 bool_ok 口径不是它历史上那把尺子"
+                              % (name, call.lineno))
+        for name, want in sorted(self.AS_TEXT_EMPTY.items()):
+            calls = list(self._calls(name, "as_text"))
+            with self.subTest(module=name):
+                self.assertTrue(calls, "%s 里一个 store.as_text 都没有？解析方式不对" % name)
+            for call in calls:
+                kw = {k.arg: k.value for k in call.keywords}
+                self.assertIn("empty", kw, "%s:%d 调 store.as_text 没显式传契约"
+                              % (name, call.lineno))
+                self.assertIsInstance(kw["empty"], ast.Constant)
+                self.assertEqual(kw["empty"].value, want,
+                                 "%s:%d 的 empty 契约不是它历史上那一份"
+                                 % (name, call.lineno))
+
+
+class AtomicWriteStreamTest(IsolatedCase):
+    """④c：`save_stream` 里那套"流式 mkstemp + os.replace"抽成 `_atomic_write_stream`。
+
+    入口只有一份，对外契约（返回字节数 / `ValueError` / `OSError` / 超限那块不写 /
+    失败不删旧文件）**一字不变** —— 那几条既有行为由 `SaveStreamAtomicTest` 钉着，
+    这里补的是"抽出来的这个入口自己"的契约。
+    """
+
+    def _leftover_temps(self, room):
+        return sorted(n for n in os.listdir(room) if n.startswith(".tmp-"))
+
+    def _path(self, name="blob.bin"):
+        return os.path.join(self.tmp, "stream", name)
+
+    def test_it_returns_the_byte_count_and_leaves_no_temp_behind(self):
+        path = self._path()
+        payload = "内容".encode("utf-8") + b"\x00\xff"
+        n = store._atomic_write_stream(path, io.BytesIO(payload), 10 * 1024)
+        self.assertEqual(n, len(payload))
+        self.assertEqual(store.read_bytes(path), payload)
+        self.assertEqual(self._leftover_temps(os.path.dirname(path)), [])
+
+    def test_the_older_file_survives_an_oversize_failure(self):
+        """超限 ⇒ `ValueError`，**旧文件一个字节没动**，超限那一块与 `.tmp-` 都不留。"""
+        path = self._path()
+        store.write_bytes(path, b"OLD")
+        with self.assertRaises(ValueError) as cm:
+            store._atomic_write_stream(path, io.BytesIO(b"x" * 5000), 1000)
+        self.assertIn("文件超过上限 %d MB" % (1000 // 1024 // 1024), str(cm.exception))
+        self.assertEqual(store.read_bytes(path), b"OLD")
+        self.assertEqual(self._leftover_temps(os.path.dirname(path)), [])
+
+    def test_a_read_error_keeps_the_older_file_and_leaves_no_temp(self):
+        """读源失败（`OSError`）照旧漏出去：目标不动、临时文件删掉（不多一种失败形态）。"""
+
+        class Boom(object):
+            def read(self, n):
+                raise OSError("读源失败（注入）")
+
+        path = self._path()
+        store.write_bytes(path, b"OLD")
+        with self.assertRaises(OSError):
+            store._atomic_write_stream(path, Boom(), None)
+        self.assertEqual(store.read_bytes(path), b"OLD")
+        self.assertEqual(self._leftover_temps(os.path.dirname(path)), [])
+
+    def test_no_limit_means_write_everything(self):
+        path = self._path()
+        n = store._atomic_write_stream(path, io.BytesIO(b"y" * 700000), None)
+        self.assertEqual(n, 700000)
+        self.assertEqual(os.path.getsize(path), 700000)
+
+    def test_save_stream_really_goes_through_that_one_entry(self):
+        """`save_stream` 自己**不再**有第二套 mkstemp —— 它必须调这条入口。"""
+        with mock.patch.object(store, "_atomic_write_stream",
+                               wraps=store._atomic_write_stream) as spy:
+            n = store.save_stream("iv1", "audio.wav", io.BytesIO(b"x" * 10), max_bytes=1000)
+        self.assertEqual(n, 10)
+        self.assertEqual(spy.call_count, 1, "save_stream 没走 _atomic_write_stream")
+
+
 if __name__ == "__main__":
     unittest.main()

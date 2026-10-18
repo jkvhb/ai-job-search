@@ -419,20 +419,12 @@ def _undo_failed_ledger_write(file_path, prev, fresh_snapshot):
 
 
 # ---------- 路径 / 取值小工具 ----------
-def _text(value):
-    return value.strip() if isinstance(value, str) else ""
-
-
-def _as_int(value, default=0):
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
-
-
+# `_text` / `_as_int` 已收归 store（批 5）：本模块的口径是「空 → ""」（`store.as_text(..., empty="")`，
+# 这里要直接拼进 `==` 比较与字符串模板）与「bool 就是 1/0」（`store.as_int(..., bool_ok=True)`），
+# 调用点**每一处都显式传**，与统一前的副本逐字节等价（`tests/test_store.py::AsIntTest`/`AsTextTest`）。
 def _clean_id(value):
     """版本 id 只能是**单个**文件名段 —— 它会被拼进快照路径，不许带路径分隔符。"""
-    v = _text(value)
+    v = store.as_text(value, empty="")
     if not v or v in (".", "..") or os.path.basename(v) != v:
         return ""
     return v
@@ -510,7 +502,7 @@ def _kind_on_disk(text, rec, ok_kind):
       调用方（`_read_in` 的两条出口）必须先用 `store.content_bytes_present` 拦一道，
       再调本函数。"读不出来"永远不等于"文件是空的"（Task 1.10 第 1 条）。
     """
-    expected = _text(rec.get("sha256"))
+    expected = store.as_text(rec.get("sha256"), empty="")
     if expected and sha256_of(text) != expected:
         return "mismatch"
     return ok_kind
@@ -526,7 +518,7 @@ def _root_of(rec):
 
 
 def _rev_of(rec):
-    return _as_int(rec.get("rev"), 1)
+    return store.as_int(rec.get("rev"), 1, bool_ok=True)
 
 
 def _is_removed(rec):
@@ -631,7 +623,7 @@ def _read_in(recs, version_id):
         if not text and store.content_bytes_present(snap):
             # ⚠️ 这里也**必须**过"没有 sha256 就不认盘上那份"这道闸：否则没有指纹时会把
             # `<名字>.md` 里**别人的内容**当成这一版的"最新版原文"报给用户（实测过）。
-            if not _text(rec.get("sha256")):
+            if not store.as_text(rec.get("sha256"), empty=""):
                 return "", snap, "mismatch"      # 没有依据 → 快照优先，宁可报不符
             stale_snap = ("", snap, "mismatch")
         else:
@@ -679,7 +671,7 @@ def load_resumes():
         version = 1
         items = []
         if isinstance(raw, dict):
-            version = _as_int(raw.get("version"), 1)
+            version = store.as_int(raw.get("version"), 1, bool_ok=True)
             if isinstance(raw.get("resumes"), list):
                 items = raw["resumes"]
         recs = []
@@ -699,7 +691,7 @@ def save_resumes(doc):
     d = doc if isinstance(doc, dict) else {}
     items = d.get("resumes")
     items = items if isinstance(items, list) else []
-    out = {"version": _as_int(d.get("version"), 1) or 1,
+    out = {"version": store.as_int(d.get("version"), 1, bool_ok=True) or 1,
            "resumes": [r for r in items if isinstance(r, dict)]}
     with _LOCK:
         store.write_json(_doc_path(), out)
@@ -825,7 +817,7 @@ def create_version(name, content, parent_id=None, note=""):
                 # ⚠️ 证明力**全在记录里**：记录被改坏（比如把 sha 改成盘上那份）时这个"过时"判断
                 # 本身就可能是错的 —— 所以下面覆盖前**必须先把旧快照改名留档**（Task 1.10 第 2 条）。
                 # ⚠️ 记录**没有** sha256 时**不修** —— 没有依据，宁可不动（那个 `bool(expected)` 就是这道闸）。
-                expected = _text(mother.get("sha256"))
+                expected = store.as_text(mother.get("sha256"), empty="")
                 snap_existed_before = os.path.exists(snap_path)
                 stale = (bool(expected) and snap_existed_before
                          and m_kind in ("latest", "mother")

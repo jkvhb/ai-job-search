@@ -430,8 +430,8 @@ def _fill_from_card(node, card, matched_by=""):
     # 而是**整步崩**：Task 5 接上后整次分析的知识地图退化成 `knowledge_error`，
     # 其余几十个节点的复用机会一起丢。下界夹 0 与 `kb._new_card` / `kb._merge_into` 同一口径
     # （min 是单调的：一旦让 -3 落盘，之后再来合法值也永远回不来）。
-    node["layer"] = min(max(0, kb._as_int(node.get("layer"))),
-                        max(0, kb._as_int(card.get("layer"))))
+    node["layer"] = min(max(0, store.as_int(node.get("layer"), bool_ok=True)),
+                        max(0, store.as_int(card.get("layer"), bool_ok=True)))
     # `"ai-generated"` 那条支路**不可达**：本函数只在够格时被调用，而"够格"的定义里
     # 就要求「至少一条带 url 的 dict 来源」（`_card_completeness`）—— 直接写死 `verified`。
     # 刻意不写 `"verified" if card.get("sources") else ...`：那是死分支，而且它用的是

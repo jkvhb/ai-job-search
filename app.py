@@ -2951,14 +2951,12 @@ class Handler(BaseHTTPRequestHandler):
             log.log_event("jd.purge_done", jd=jd_id, backup=os.path.basename(res["backup"]),
                           files=len(res["removed_files"]), analyses=len(res["analyses"]),
                           skipped=len(res["skipped_files"]))
-            # 顺手把刷新后的台账端回去（前端 loadJobs() 之外少一次往返）。
-            # ⚠️ 它**必须**在自己的 try 里：删除**已经成功**，一次台账渲染失败绝不能
-            # 让前端收到 5xx —— 那会让用户以为没删掉，从而再删一次（那时已经找不到了）。
-            try:
-                rows = _ledger_rows()
-            except Exception as e:
-                log.log_exc("jd.purge_ledger_error", e, jd=jd_id)
-                rows = []
+            # ⚠️ 这里**刻意不算**「刷新后的台账」（体检 §6 的"白算"）：`_ledger_rows()` 的每一行
+            # 都要把该 JD 的**每条分析**的报告打开、解析出逐维分数（`_analysis_scores` →
+            # `kb.read_report_data`）—— 一次删除成功之后，对着一批**刚被删掉**的报告名去读盘。
+            # 而它在响应里唯一的去处是 `jobs`，前端**一个字节都不读**（`web/index.html:1180`
+            # 在成功分支上直接 `loadJobs()` 重新拉 `/api/jobs`）。所以这份台账算完就被丢掉：
+            # 白读 N 份 HTML、白解析 N 次。删除语义本身一个字节都没动，只是**少做无用功**。
             return self._send(200, {"ok": True, "id": jd_id, "backup": res["backup"],
                                     "backup_note": res["backup_note"],
                                     "removed_files": res["removed_files"],
@@ -2967,9 +2965,8 @@ class Handler(BaseHTTPRequestHandler):
                                     "kb_nodes": res["kb_nodes"],
                                     "interviews": res["interviews"],
                                     # 批 7.2：这次顺带清掉了几条悬空合并引用（预演里已列过）。
-                                    # 它们清完之后重新成为台账里的一行 —— `jobs` 里就能看见。
-                                    "merged_refs": res["merged_refs"],
-                                    "jobs": rows})
+                                    # 它们清完之后重新成为台账里的一行 —— 刷一次 `loadJobs()` 就能看见。
+                                    "merged_refs": res["merged_refs"]})
 
         if p == "/api/job/result":
             # 记录结果：用户的字一个不改地存下来（转义是模板的事）。status 非法 → 400。

@@ -164,14 +164,8 @@ def _now():
     return datetime.now().strftime(NOW_FMT)
 
 
-def _text(value):
-    """取非空字符串；其它（None / 数字 / 列表）一律当缺失 → None。"""
-    if not isinstance(value, str):
-        return None
-    v = value.strip()
-    return v or None
-
-
+# `_text` 已收归 store（批 5）：本模块的口径是「空 → None」
+# （`store.as_text(..., empty=None)` —— 调用方拿它 `or` 兜底），调用点**每一处都显式传**。
 def _as_nodes(value):
     """知识地图的「节点列表」形态：`list` 直接用；`{"nodes": [...]}` 取 `nodes`；其它 → None。
 
@@ -221,7 +215,7 @@ def _store(jd_id, nodes, source, at=None, seeded_at=None, only_if_no_cache=False
     got = _as_nodes(nodes)
     if got is None:
         raise ValueError("知识地图必须是节点列表（或 {\"nodes\": [...]}）：%r" % (nodes,))
-    src = _text(source)
+    src = store.as_text(source, empty=None)
     if src is None:
         raise ValueError("knowledge_source 必须是非空字符串：%r" % (source,))
     with jdid._JD_LOCK:
@@ -234,10 +228,10 @@ def _store(jd_id, nodes, source, at=None, seeded_at=None, only_if_no_cache=False
             return None                              # 此刻已经有可用缓存了：放弃这次写入
         facts["knowledge"] = got
         facts["knowledge_source"] = src
-        if _text(at):
-            facts["knowledge_at"] = _text(at)
+        if store.as_text(at, empty=None):
+            facts["knowledge_at"] = store.as_text(at, empty=None)
         elif old:
-            facts["knowledge_at"] = _text(facts.get("knowledge_at")) or _now()
+            facts["knowledge_at"] = store.as_text(facts.get("knowledge_at"), empty=None) or _now()
         else:
             facts["knowledge_at"] = _now()
         if seeded_at:
@@ -255,9 +249,9 @@ def _report_of(analysis):
     记录里没有 `report` 时退回 `<分析id>.html`（迁移前的约定就是「分析 id == 报告文件名」）——
     这是定位**它自己的**报告，不是猜别人的。
     """
-    name = _text(analysis.get("report")) or ""
+    name = store.as_text(analysis.get("report"), empty=None) or ""
     if not name:
-        aid = _text(analysis.get("id"))
+        aid = store.as_text(analysis.get("id"), empty=None)
         name = (aid + ".html") if aid else ""
     name = store.safe_name(name)          # 取 basename：`../evil.html` 出不了 reports 目录
     if not name:
@@ -273,7 +267,7 @@ def _seed(jd_id):
     而写成功时节点列表**必然非空**（下面 `if not nodes: continue` 保证了这一点）。
     回一份调用方随即丢掉的节点列表，只会让人以为"外面还要用这份节点"。
     """
-    want = _text(jd_id)
+    want = store.as_text(jd_id, empty=None)
     if not want or jdid.find_jd(want) is None:
         return None
     # created_at 升序；坏报告**跳过继续找**，不能因为最新那份没知识就放弃播种
@@ -292,7 +286,7 @@ def _seed(jd_id):
                        # `knowledge_at` 是这份地图**真正生成**的时间 = 那份分析记录的
                        # `created_at`；`seeded_at` 才是「这次播种发生在何时」。写成同一个时间
                        # 的话，报告里的小字会显示一个**晚于报告本身**的生成日期。
-                       at=_text(analysis.get("created_at")), seeded_at=_now(),
+                       at=store.as_text(analysis.get("created_at"), empty=None), seeded_at=_now(),
                        only_if_no_cache=True)
         if facts is None:
             # 临界区里发现已经有可用缓存（窄窗口：另一个线程刚把真算落盘）→ 放弃这次播种写。
@@ -324,13 +318,13 @@ def seed_from_reports(jd_id):
 def _reuse(jd_id, cached):
     """① 缓存命中（或等待者拿到了刚落盘的那份）：记事件、返回 `(节点, "cache")`。"""
     log.log_event("analyze.knowledge_reused", jd=jd_id, nodes=len(cached),
-                  at=_text(get(jd_id).get("knowledge_at")) or "")
+                  at=store.as_text(get(jd_id).get("knowledge_at"), empty=None) or "")
     return cached, SOURCE_CACHE
 
 
 def _compute(jd_id, jd_text, cfg, builder, refresh):
     """③ 真算一次并落盘。**单飞登记由调用方负责**（同一个 JD 同一时刻只走一个）。"""
-    replaced_at = (_text(get(jd_id).get("knowledge_at")) or "") if refresh else ""
+    replaced_at = (store.as_text(get(jd_id).get("knowledge_at"), empty=None) or "") if refresh else ""
     # ⚠️ `builder(...)` 是**实参**：它在 `_store` 取 `_JD_LOCK` 之前就求值完了。
     # 真算要 206 秒，抱着 `_JD_LOCK` 去算就等于让**所有 JD 的写入**一起停 206 秒。
     computed = builder(jd_text, cfg)

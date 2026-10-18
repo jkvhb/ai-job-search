@@ -266,6 +266,50 @@ def _atomic_write_bytes(path, raw, sync=False):
         raise
 
 
+STREAM_CHUNK = 256 * 1024     # 流式写的分块大小（几十 MB 的录音不吃内存）
+
+
+def _atomic_write_stream(path, src, max_bytes=None):
+    """把可读对象 `src` **流式**地原子写到 `path`（同目录临时文件 + `os.replace`），返回写入字节数。
+
+    与 `_atomic_write_bytes` 是同一条骨架（mkstemp → 写 → `os.replace` → 失败删临时文件再抛），
+    区别只有一个：**字节不进内存**——`_atomic_write_bytes` 要一份完整的 `bytes` 才能写，
+    而录音 / 上传文件有几十 MB，攒在内存里不值当。
+
+    ⚠️ 为什么 store 里要**两条**原子写（而不是把 `_atomic_write_bytes` 改成也吃流）：那条的
+    契约是"先有完整字节、再落盘"，它还要 `sync=` 与编码校验；把流塞进去会让它长出分支，
+    而 `write_text` / `write_json` / `write_bytes` 三个调用点都不需要流式。分开 + 都写在这里，
+    好过在调用方（`save_stream`）里另写一套 mkstemp —— **"临时文件 + replace" 这套只准在
+    store 里出现这两次，而且两份都用同一个前缀/后缀/失败清理口径**。
+
+    `max_bytes`：累计写出的字节数**一超限就抛 `ValueError`**（超限那一块**不写**），
+    `None` = 不设上限。调用方的 `ValueError` / `OSError` 契约与返回的字节数一字不变。
+    """
+    room = os.path.dirname(path)
+    os.makedirs(room, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".tmp-", suffix=".part", dir=room)
+    os.close(fd)
+    total = 0
+    try:
+        with open(tmp, "wb") as f:
+            while True:
+                chunk = src.read(STREAM_CHUNK)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if max_bytes is not None and total > max_bytes:
+                    raise ValueError("文件超过上限 %d MB" % (max_bytes // 1024 // 1024))
+                f.write(chunk)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+    return total
+
+
 def write_text(path, content):
     """文本写盘：**UTF-8**，换行按平台翻译（与老写法**逐字节**相同），走 `_atomic_write_bytes`。"""
     _atomic_write_bytes(path, _encode_text(content))
@@ -331,6 +375,53 @@ def write_json(path, obj):
     buf = io.StringIO()
     json.dump(obj, buf, ensure_ascii=False, indent=2)
     _atomic_write_bytes(path, _encode_text(buf.getvalue()), sync=True)
+
+
+# ---------- 取值小工具：**一个实现，口径由调用方显式传** ----------
+# 为什么收在 store：`_as_int` / `_text` 原先在 kb / jdid / resumelib / jddelete / jdrefs / jdfacts
+# 各有一份逐行相同（或只差一行）的副本，而它们**口径并不一致**（bool 收不收 / 空值回 None 还是 ""）。
+# 副本一多，"这个模块到底按哪把尺子取值"就得靠读实现才知道 —— 于是迟早有一处按别人的尺子取值。
+# 现在实现只剩这一份，各模块把**自己的**口径当参数传进来（`bool_ok=` / `empty=`），
+# 与旧副本逐字节等价（`tests/test_store.py::AsIntTest` / `AsTextTest` 拿旧实现当夹具钉着）。
+def as_int(value, default=0, bool_ok=False):
+    """容错取整数：`'3'` → 3，`3.7` → 3（截断）……取不到就回 `default`（**绝不抛异常**）。
+
+    `bool_ok` 是**口径**（不是便利开关），由调用方按自己那份数据的历史语义显式传：
+
+    - `bool_ok=True`：`True` / `False` 当 1 / 0 —— 老 `kb._as_int` / `resumelib._as_int` /
+      `jddelete._as_int` 的口径（它们都是裸 `int(value)`）。
+    - `bool_ok=False`（默认）：`True` / `False` 一律当"取不到"→ `default` —— 老 `jdid._as_int`
+      的口径。理由在 `jdid`：那里的布尔值来自用户可手改的 JSON，`True` 落成 `1` 会是**编**一个
+      序号出来（`seq` / `version` 都是有意义的编号），当缺失比猜一个好。
+
+    ⚠️ 只兜 `TypeError` / `ValueError`（与旧副本**一字不差**）：`int(float('inf'))` 的
+    `OverflowError` 照旧漏出去 —— 那是"数据离谱到没法解释"，吞掉它只会更晚更隐蔽地炸。
+    """
+    if not bool_ok and isinstance(value, bool):
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def as_text(value, empty=None):
+    """容错取字符串：非 `str`（含 `None` / 数字 / 列表）一律当缺失；是 `str` 就去首尾空白。
+
+    `empty` 是**口径**（两种契约都真实存在，**不能合成一种**），由调用方显式传：
+
+    - `empty=None`：缺失 / 空串 / 全是空白 → `None`（老 `jdid._text` / `jdfacts._text` 的口径：
+      调用方拿它 `or` 兜底，"没有值"与"值是空串"在本项目里不是一回事）。
+    - `empty=""`：同样三种情况 → `""`（老 `jddelete._text` / `jdrefs._text` / `resumelib._text`
+      的口径：这些地方要直接拼进 `==` 比较与字符串模板，`None` 会在 `str()` 里变成 `"None"`）。
+
+    ⚠️ 别把两种口径混着传：同一个模块里"有的地方要 `None`、有的地方要 `""`"只在**看着像**的
+    那两个函数之间成立；逐调用点核对过（见 `tests/test_store.py::AsTextTest` 与批 5 的汇报）。
+    """
+    if not isinstance(value, str):
+        return empty
+    v = value.strip()
+    return v or empty
 
 
 def safe_name(name):
@@ -1025,8 +1116,9 @@ def interview_file(interview_id, filename, key=None):
 def save_stream(interview_id, filename, src, max_bytes):
     """把可读对象分块写到面试目录。超限或出错时**只删掉临时文件**并抛异常。返回写入字节数。
 
-    分块（256KB）是为了几十 MB 的录音不吃内存；所以这里不能像 `_atomic_write_bytes` 那样
-    先把整份字节攒在内存里，而是**流式**写进同目录临时文件，成功后再 `os.replace`。
+    分块（`STREAM_CHUNK` = 256KB）是为了几十 MB 的录音不吃内存；所以这里不能像
+    `_atomic_write_bytes` 那样先把整份字节攒在内存里 —— 落盘走的是**流式**的那条原子写
+    `_atomic_write_stream`（同目录临时文件 → 成功后才 `os.replace`）。
 
     ⚠️ 为什么必须"先写临时文件"（体检 P3-7）：老写法直接 `open(path, "wb")` —— 那会**先把
     同名的旧文件截断成 0 字节**，失败时那句 `os.remove(path)` 又把**旧文件也删了**。
@@ -1035,36 +1127,14 @@ def save_stream(interview_id, filename, src, max_bytes):
     且会被删掉（否则下次会被当成有效录音）。
 
     `max_bytes` 上限的语义**一字不变**：还是"读到的累计字节数一超限就抛 `ValueError`"
-    （超限那一块**不写**），还是 `max_bytes // 1024 // 1024` 那个提示文案。
-    契约（返回写入字节数 / 抛 `ValueError` / 抛 `OSError`）也照旧 —— `app.py` 的上传路由
-    不用改。
+    （超限那一块**不写**），还是 `max_bytes // 1024 // 1024` 那个提示文案 —— 它现在写在
+    `_atomic_write_stream` 里（唯一实现）。契约（返回写入字节数 / 抛 `ValueError` /
+    抛 `OSError`）也照旧 —— `app.py` 的上传路由不用改。
     """
     path = interview_file(interview_id, filename)
     if not path:
         raise ValueError("非法的面试 id 或文件名")
-    room = os.path.dirname(path)
-    os.makedirs(room, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(prefix=".tmp-", suffix=".part", dir=room)
-    os.close(fd)
-    total = 0
-    try:
-        with open(tmp, "wb") as f:
-            while True:
-                chunk = src.read(256 * 1024)
-                if not chunk:
-                    break
-                total += len(chunk)
-                if total > max_bytes:
-                    raise ValueError("文件超过上限 %d MB" % (max_bytes // 1024 // 1024))
-                f.write(chunk)
-        os.replace(tmp, path)
-    except BaseException:
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
-        raise
-    return total
+    return _atomic_write_stream(path, src, max_bytes)
 
 
 def save_interview_json(interview_id, filename, obj, key=None):

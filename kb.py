@@ -80,12 +80,9 @@ def normalize_id(term):
     return _PUNCT.sub("", unicodedata.normalize("NFKC", term)).lower()
 
 
-def _as_int(v, default=0):
-    """容错取整数：'1' → 1；'abc'/None/[] → default（绝不抛异常）"""
-    try:
-        return int(v)
-    except (TypeError, ValueError):
-        return default
+# `_as_int` 已收归 `store.as_int`（批 5：kb / jdid / resumelib / jddelete 四份副本统一成一份）。
+# 本模块的口径是 `bool_ok=True`（裸 `int(value)`，`True` 就是 1）—— 调用点**每一处都显式传**，
+# 与统一前的副本逐字节等价（等价夹具见 `tests/test_store.py::AsIntTest`）。
 
 
 def _today():
@@ -99,7 +96,7 @@ def _normalise_review_fields(card):
     缺字段的卡片一进 review_queue / record_review 就会 KeyError 或把 "+1" 算成字符串拼接。
     和 from_jds 清洗同一个理由 —— 所有查询与序列化都经过这里，只改一处就全口径归位。
     """
-    card["review_count"] = _as_int(card.get("review_count"))
+    card["review_count"] = store.as_int(card.get("review_count"), bool_ok=True)
     dt = card.get("last_reviewed_at")
     card["last_reviewed_at"] = dt.strip() if isinstance(dt, str) else ""
     r = card.get("last_result")
@@ -244,7 +241,7 @@ def _new_card(node, jd):
         "definition": str(node.get("definition") or "").strip(),
         "plain_explanation": str(node.get("plain_explanation") or "").strip(),
         "category": str(node.get("category") or "").strip(),
-        "layer": max(0, _as_int(node.get("layer"))),
+        "layer": max(0, store.as_int(node.get("layer"), bool_ok=True)),
         "sources": clean_sources(node.get("sources")),
         "timeline": clean_timeline(node.get("timeline")),
         "related": clean_related(node.get("related")),
@@ -289,7 +286,7 @@ def _merge_into(card, node):
         card["category"] = str(node.get("category") or "").strip()
 
     # 下界夹 0：min 是单调的，一旦让 -3 落盘，之后再来合法值也永远回不来
-    card["layer"] = min(max(0, _as_int(card.get("layer"))), max(0, _as_int(node.get("layer"))))
+    card["layer"] = min(max(0, store.as_int(card.get("layer"), bool_ok=True)), max(0, store.as_int(node.get("layer"), bool_ok=True)))
 
     card["related"] = clean_related(_as_list(card.get("related")) + _as_list(node.get("related")))
     card["interview_questions"] = clean_questions(
@@ -301,7 +298,7 @@ def _merge_into(card, node):
     # _as_int 顺带修掉 "3" 这类字符串写法。
     card["state"] = card.get("state") or DEFAULT_STATE
     card["last_outcome"] = card.get("last_outcome") or DEFAULT_OUTCOME
-    card["asked_count"] = _as_int(card.get("asked_count"))
+    card["asked_count"] = store.as_int(card.get("asked_count"), bool_ok=True)
     card.setdefault("first_seen", _today())
     card["last_seen"] = _today()
 
@@ -795,7 +792,7 @@ def _review_score(card):
     weight = _REVIEW_WEIGHT.get(state, 1)
     jd_n = len(_valid_jds(card))
     age = min(_days_since(card.get("last_reviewed_at")), _REVIEW_AGE_CAP)
-    asked = _as_int(card.get("asked_count"))
+    asked = store.as_int(card.get("asked_count"), bool_ok=True)
     # 被真实面试问过 → 优先复习（asked=0 时因子为 1，与旧行为一致）
     return weight * (1 + jd_n) * (1 + age / 7.0) * (1 + asked)
 
@@ -860,12 +857,12 @@ def _review_reason(card):
     jd_n = len(_valid_jds(card))
     if jd_n > 1:
         parts.append("被 %d 个岗位提到" % jd_n)
-    asked = _as_int(card.get("asked_count"))
+    asked = store.as_int(card.get("asked_count"), bool_ok=True)
     if asked > 0:
         parts.append("面试被问过 %d 次" % asked)
     raw = card.get("last_reviewed_at")
     raw = raw.strip() if isinstance(raw, str) else ""
-    parts.append(_review_age_text(raw, _as_int(card.get("review_count"))))
+    parts.append(_review_age_text(raw, store.as_int(card.get("review_count"), bool_ok=True)))
     return " · ".join(parts)
 
 
@@ -926,7 +923,7 @@ def _record_review_in(data, nid, result):
     else:
         rank = _STATE_RANK.get(str(card.get("state")), 0)
         card["state"] = STATE_VALUES[max(0, rank - 1)]
-    card["review_count"] = _as_int(card.get("review_count")) + 1
+    card["review_count"] = store.as_int(card.get("review_count"), bool_ok=True) + 1
     card["last_reviewed_at"] = _today()
     card["last_result"] = result
     store.save_knowledge(data)
@@ -1012,7 +1009,7 @@ def _record_interview_in(data, jd_id, asked, weak, good):
         card = index.get(normalize_id(term))
         if card is None:
             continue
-        card["asked_count"] = _as_int(card.get("asked_count")) + 1
+        card["asked_count"] = store.as_int(card.get("asked_count"), bool_ok=True) + 1
         hits += 1
     for term, outcome in [(t, "没答上") for t in _as_list(weak)] + \
                          [(t, "答上了") for t in _as_list(good)]:
@@ -1312,7 +1309,7 @@ def _merge_nodes_locked(kb, keep_id, drop_id):
     _merge_into(keep, drop)
 
     # 手动合并两张「用户卡」时进度要取并集：否则误选合并方向就会静默丢掉复习进度
-    keep["asked_count"] = max(_as_int(keep.get("asked_count")), _as_int(drop.get("asked_count")))
+    keep["asked_count"] = max(store.as_int(keep.get("asked_count"), bool_ok=True), store.as_int(drop.get("asked_count"), bool_ok=True))
     if _STATE_RANK.get(str(drop.get("state")), 0) > _STATE_RANK.get(str(keep.get("state")), 0):
         keep["state"] = drop["state"]
     # last_outcome 取值也要归一：knowledge.json 是用户可手改的，`"last_outcome": 5` 这类非法值

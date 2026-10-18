@@ -110,31 +110,16 @@ def _clean(value):
     return _BAD_RE.sub("", text).strip()
 
 
-def _text(value):
-    """取一个字段的字符串值：非字符串（含 None / 数字 / 列表）一律当缺失 → None。"""
-    if not isinstance(value, str):
-        return None
-    v = value.strip()
-    return v or None
-
-
+# `_text` / `_as_int` 已收归 store（批 5：五个模块的 _text 两种契约、四个模块的 _as_int 一份实现）：
+# 本模块的口径是「空 → None」（`store.as_text(..., empty=None)`）与「bool 当缺失」
+# （`store.as_int(..., bool_ok=False)`），调用点**每一处都显式传**。
 def _first_text(*values):
     """第一个「非空字符串」的值。"""
     for v in values:
-        t = _text(v)
+        t = store.as_text(v, empty=None)
         if t:
             return t
     return None
-
-
-def _as_int(value, default=0):
-    """容错取整数：'3' → 3；None / 'abc' / bool → default（绝不抛异常）。"""
-    if isinstance(value, bool):
-        return default
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
 
 
 def _bad_chars_in(text):
@@ -149,7 +134,7 @@ def _bad_chars_in(text):
 # ---------- 字段派生 ----------
 def _education_of(data):
     """学历：`education`，空则看 `hard_gates` 里 `name=学历` 那条的 `jd`。"""
-    edu = _text(data.get("education"))
+    edu = store.as_text(data.get("education"), empty=None)
     if edu:
         return edu
     gates = data.get("hard_gates")
@@ -157,7 +142,7 @@ def _education_of(data):
         for g in gates:
             if not isinstance(g, dict):
                 continue
-            if _text(g.get("name")) == "学历":
+            if store.as_text(g.get("name"), empty=None) == "学历":
                 got = _first_text(g.get("jd"), g.get("value"), g.get("requirement"))
                 if got:
                     return got
@@ -247,7 +232,7 @@ def _normalize_education(value):
     取**出现的最高档**（`_EDU_TIERS` 已是高→低序）：`本科及以上` 是本科；
     `大专及以上` 是大专；提不出任何档位 → None（绝不把整句话塞进 ID）。
     """
-    text = _text(value)
+    text = store.as_text(value, empty=None)
     if not text:
         return None
     for tier in _EDU_TIERS:
@@ -263,7 +248,7 @@ def _normalize_salary(value):
     变成两个不同的身份 —— 正是本模块要根除的那类「同一件事两处不同写法」）。
     提不出区间 → None（由 `build_id` 填 `【未知薪资】`）。
     """
-    text = _text(value)
+    text = store.as_text(value, empty=None)
     if not text:
         return None
     m = _SALARY_RE.search(text)
@@ -336,7 +321,7 @@ def _normalize_company(value):
 
     截断时按 `_BRACKET_OPEN_RE` 砍掉半个括号（不能留 `（` 半截）。空 → None（`【未知单位】`）。
     """
-    text = _text(value)
+    text = store.as_text(value, empty=None)
     if not text:
         return None
     m = _BRACKET_RE.search(text)
@@ -382,11 +367,11 @@ def derive_fields(report_data):
     或者直接调下面的 `normalize_fields` 之前那份原始 dict。
     """
     data = report_data if isinstance(report_data, dict) else {}
-    company = _text(data.get("company"))
-    duty = _text(data.get("job_category")) or _text(data.get("duty"))
-    city = _text(data.get("location"))
+    company = store.as_text(data.get("company"), empty=None)
+    duty = store.as_text(data.get("job_category"), empty=None) or store.as_text(data.get("duty"), empty=None)
+    city = store.as_text(data.get("location"), empty=None)
     if not city:
-        addr = _text(data.get("address"))
+        addr = store.as_text(data.get("address"), empty=None)
         if addr:
             city = _city_from_address(addr)
     return normalize_fields({
@@ -395,7 +380,7 @@ def derive_fields(report_data):
         "duty": duty,
         "domain": _domain_of(data),
         "city": city,
-        "salary": _text(data.get("salary")),
+        "salary": store.as_text(data.get("salary"), empty=None),
     })
 
 
@@ -412,7 +397,7 @@ def build_id(fields, seq):
     for name in SEGMENTS[:-1]:
         value = _clean(data.get(name))
         out.append(value or (UNKNOWN % _UNKNOWN_WORD[name]))
-    out.append("%04d" % max(0, _as_int(seq)))
+    out.append("%04d" % max(0, store.as_int(seq, bool_ok=False)))
     return SEP.join(out)
 
 
@@ -467,13 +452,13 @@ def validate_id(text, jds, exclude_id=None):
     except ValueError as e:
         return str(e)
     uid = _clean(raw)
-    ex = _text(exclude_id)
+    ex = store.as_text(exclude_id, empty=None)
     if isinstance(jds, dict):            # 容错：误传整份 {"jds": [...]} 也认
         jds = jds.get("jds")
     for j in (jds if isinstance(jds, list) else []):
         if not isinstance(j, dict):
             continue
-        other = _text(j.get("id"))
+        other = store.as_text(j.get("id"), empty=None)
         if not other or other == ex:
             continue
         if _clean(other) == uid:
@@ -498,10 +483,10 @@ def load_jds(key=None):
     raw = d.get("jds")
     out = []
     for r in (raw if isinstance(raw, list) else []):
-        if isinstance(r, dict) and _text(r.get("id")):
+        if isinstance(r, dict) and store.as_text(r.get("id"), empty=None):
             out.append(r)
-    return {"version": _as_int(d.get("version"), 1) or 1,
-            "seq": max(0, _as_int(d.get("seq"), 0)),
+    return {"version": store.as_int(d.get("version"), 1, bool_ok=False) or 1,
+            "seq": max(0, store.as_int(d.get("seq"), 0, bool_ok=False)),
             "jds": out}
 
 
@@ -533,10 +518,10 @@ def save_jds(data, key=None):
         if not isinstance(data, dict):
             data = {}
         raw = data.get("jds")
-        out = {"version": _as_int(data.get("version"), 1) or 1,
-               "seq": max(0, _as_int(data.get("seq"), 0)),
+        out = {"version": store.as_int(data.get("version"), 1, bool_ok=False) or 1,
+               "seq": max(0, store.as_int(data.get("seq"), 0, bool_ok=False)),
                "jds": [r for r in (raw if isinstance(raw, list) else [])
-                       if isinstance(r, dict) and _text(r.get("id"))]}
+                       if isinstance(r, dict) and store.as_text(r.get("id"), empty=None)]}
         store.snapshot_before_overwrite(p)      # 覆盖前留档（自带 `.bak-` 轮转，只留最新 3 份）
         store.write_json(p, out)
         return out
@@ -544,7 +529,7 @@ def save_jds(data, key=None):
 
 def find_jd(jd_id, key=None):
     """按 id 找一条 JD 记录。找不到（或 id 空）→ None。"""
-    want = _text(jd_id)
+    want = store.as_text(jd_id, empty=None)
     if not want:
         return None
     for r in load_jds(key)["jds"]:
@@ -562,7 +547,7 @@ def upsert_jd(record, key=None):
     `load_jds()` 读失败时给的是空库，拿它去 upsert 就是把整个 JD 库换成这一条
     （**实测**：2 条记录 → 只剩新那一条，`.bak-` 0 份）。
     """
-    if not isinstance(record, dict) or not _text(record.get("id")):
+    if not isinstance(record, dict) or not store.as_text(record.get("id"), empty=None):
         raise ValueError("JD 记录必须有非空的 id")
     from datetime import datetime
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -578,7 +563,7 @@ def upsert_jd(record, key=None):
         data = load_jds(key)
         new = dict(record)
         new.setdefault("id_history", [])
-        if not _text(new.get("created_at")):
+        if not store.as_text(new.get("created_at"), empty=None):
             new["created_at"] = now
         new["updated_at"] = now
         for i, r in enumerate(data["jds"]):
@@ -613,7 +598,7 @@ def next_seq(key=None):
                 "跟已有的 ID 撞车）。请先把 `jds.json` 修好（或从别处恢复、把它移开）再继续。"
                 % err)
         data = load_jds(key)
-        data["seq"] = max(0, _as_int(data.get("seq"), 0)) + 1
+        data["seq"] = max(0, store.as_int(data.get("seq"), 0, bool_ok=False)) + 1
         save_jds(data, key)
         return data["seq"]
 
@@ -623,16 +608,16 @@ def jd_id_of_analysis(analysis):
     """从 `jobs.json` 的一条分析记录取它挂在哪个 JD 下。没有 → 空串。"""
     if not isinstance(analysis, dict):
         return ""
-    return _text(analysis.get("jd_id")) or ""
+    return store.as_text(analysis.get("jd_id"), empty=None) or ""
 
 
 def analyses_of(jd_id, key=None):
     """该 JD 下的全部分析记录，按 `created_at` 升序（没有 created_at 的排最前）。"""
-    want = _text(jd_id)
+    want = store.as_text(jd_id, empty=None)
     if not want:
         return []
     out = [j for j in store.load_jobs(key)
-           if isinstance(j, dict) and _text(j.get("jd_id")) == want]
+           if isinstance(j, dict) and store.as_text(j.get("jd_id"), empty=None) == want]
     return sorted(out, key=lambda j: (str(j.get("created_at") or ""), str(j.get("id") or "")))
 
 
@@ -711,8 +696,8 @@ def rename_jd(old_id, new_id, key=None):
     `tests/test_jdid.py::RenameJdTest::test_a_read_failure_at_snapshot_time_leaves_the_bytes_untouched`）；
     换行也不许被文本模式换掉 —— 回滚的语义是"和动手之前一模一样"。
     """
-    old = _text(old_id)
-    new = _text(new_id)
+    old = store.as_text(old_id, empty=None)
+    new = store.as_text(new_id, empty=None)
     if not old or not new:
         raise _bad("旧 ID 与新 ID 都要给", old=old or "", new=new or "")
     if old == new:

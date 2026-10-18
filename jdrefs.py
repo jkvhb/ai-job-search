@@ -110,11 +110,9 @@ class JdRefsWriteFailed(RuntimeError):
 
 
 # ---------------------------------------------------------------- 小工具
-def _text(value):
-    """非空字符串才算内容（用户可手改 JSON：`5` / `[]` / `None` 一律当没有）。"""
-    return value.strip() if isinstance(value, str) else ""
-
-
+# `_text` 已收归 store（批 5）：本模块的口径是「空 → ""」（`store.as_text(..., empty="")` ——
+# 这些值要直接拼进 `==` 比较与字符串模板，`None` 会在 `str()` 里变成 "None"），
+# 调用点**每一处都显式传**，与统一前的副本逐字节等价（`tests/test_store.py::AsTextTest`）。
 def _jds_path(key=None):
     """`jds.json` 的路径。**不 import `jdid`**（第 3 步它会 import 本模块）：与
     `jdid._jds_path` 是同一份解析（都是 `store.p_path("jds.json", key=key)`）。"""
@@ -133,7 +131,7 @@ def jd_of_record(rec):
     """
     if not isinstance(rec, dict):
         return ""
-    return _text(rec.get("jd_id")) or _text(rec.get("id"))
+    return store.as_text(rec.get("jd_id"), empty="") or store.as_text(rec.get("id"), empty="")
 
 
 # 一条 `from_jds` 项指向的岗位 id：**实现只有一份** —— `kb.ref_id(x, strip)`（批 7.1 把两份
@@ -210,7 +208,7 @@ def _report_ids_of(rows, jd_id):
             continue
         name = store.safe_name(rec.get("report"))
         if not name:
-            aid = _text(rec.get("id"))
+            aid = store.as_text(rec.get("id"), empty="")
             name = (aid + ".html") if aid else ""
         rid = name[:-5] if name.endswith(".html") else name
         if rid and rid not in seen:
@@ -313,7 +311,7 @@ def _detect_merged_into(jd_id, scan):
     if scan.jobs_err:
         return [_unreadable("merged_into", path, scan.jobs_err)]
     n = len([r for r in scan.jobs
-             if isinstance(r, dict) and _text(r.get("merged_into")) == jd_id])
+             if isinstance(r, dict) and store.as_text(r.get("merged_into"), empty="") == jd_id])
     return [Ref("merged_into", path, n, KINDS["merged_into"].how)] if n else []
 
 
@@ -559,7 +557,7 @@ def refs_of_jd(jd_id, key=None):
 
     ⚠️ 空 id 直接 `ValueError`：返回空列表会被读成"没有引用"，而空 id 的真相是"不知道在问谁"。
     """
-    want = _text(jd_id)
+    want = store.as_text(jd_id, empty="")
     if not want:
         raise ValueError("JD id 不能为空（空 id 不猜：返回空列表会被读成「没有引用」）")
     scan = _Scan(key)
@@ -583,7 +581,7 @@ def refs_of_jd_or_raise(jd_id, key=None):
     refs = refs_of_jd(jd_id, key)
     bad = unreadable_refs(refs)
     if bad:
-        raise JdRefsUnreadable(_refused_message(_text(jd_id), bad))
+        raise JdRefsUnreadable(_refused_message(store.as_text(jd_id, empty=""), bad))
     return refs
 
 
@@ -646,8 +644,8 @@ def rewrite_jd_refs(old_id, new_id, refs=None, key=None):
       * `ok=False` + `err=理由` —— 这一项本步**刻意不处理**（`merged_into`，批 7.2）。
     改了几条走 `jdrefs.rewrite_done` 日志（`changed`），调用方也能重扫一遍 `refs_of_jd` 自己核。
     """
-    old = _text(old_id)
-    new = _text(new_id)
+    old = store.as_text(old_id, empty="")
+    new = store.as_text(new_id, empty="")
     if not old or not new:
         raise ValueError("旧 id 与新 id 都要给（空 id 不猜）")
     if old == new:
