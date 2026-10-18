@@ -423,10 +423,16 @@ def render_table(plan, executing=False):
 # ---------------------------------------------------------------- 备份 / 恢复
 # 批 5 §7.2：这一段原先在本脚本与 `身份迁移.py` 里**各抄一遍**（`_dir_stats` / `_human_size`
 # / `_backup_note` / `_profile_files` / `_ignore_previous_backups` / `_backup_profile` /
-# `_restore_profile`）。两边唯一的差别是 `_restore_profile` 收尾那圈多一句
-# `if dirpath == root: continue` —— 而那句正是体检 §2 P0-14 的真缺陷（回滚时把 profile 根目录
-# `rmdir` 掉，用户下一步就是重试，等于「失败路径上再丢一次」）。抄两遍的真正代价是
-# **下一次改一处、漏一处**，所以现在**唯一一份实现**在 `迁移脚手架.py`，这里只剩绑定：
+# `_restore_profile`）。
+# 【订正】此处原先还写着「两边唯一的差别是 `_restore_profile` 收尾那圈多一句
+# `if dirpath == root: continue`（本脚本有、`身份迁移.py` 没有）」—— **这是假的**：
+# 重构前两份脚本**都已有** `if dirpath == root: continue` 与 `.bak-` 那道闸门，两份
+# `_restore_profile` **代码逐行一致**（AST 归一化后只差 docstring / 注释）。体检 §2 P0-14
+# 那颗雷（回滚时把 profile 根目录 `rmdir` 掉，用户下一步就是重试，等于「失败路径上再丢一次」）
+# 是**更早的一次修复**里拆掉的，不是这次重构补上的差值 —— 换句话说，**两道保护此前双方就都有**。
+# 这次重构统一的是**实现**（订正口径与 `迁移脚手架.py` 顶部那段一致，以那份为准）。
+# 抄两遍的真正代价不是「代码丑」，而是**下一次改一处、漏一处**；所以现在**唯一一份实现**在
+# `迁移脚手架.py`，这里只剩绑定：
 # `functools.partial` 把本脚本的备份前缀绑成第一个位置参数，于是调用形状一个字没变
 # （`_backup_profile()` / `_restore_profile(backup, had_files)`，以及 `copytree(ignore=...)`
 # 按 `(dirpath, names)` 两参调用）—— `execute_migration` 与既有测试都照原名调用。
