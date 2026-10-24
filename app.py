@@ -33,6 +33,7 @@ import interview
 import llm
 import log
 import outcome
+import pdftext
 import resumelib
 import search as search_mod
 import store
@@ -126,6 +127,10 @@ SOP_FILES = ["00-求职SOP总纲.md", "02-预筛与打分.md", "03-JD拆解.md",
 # 8 MiB 的依据：4 MB 的截图 base64 后 ≈5.4 MB，8 MiB 留出 ≈1.5× 余量；
 # 再大就该压缩了（对恶意请求而言 8 MiB 也仍然是个硬上限：超限**一个字节都不读**）。
 MAX_JSON_BODY_BYTES = 8 * 1024 * 1024
+
+#: 简历 PDF 的大小上限。base64 之后要 ×4/3：5 MB 的 PDF ≈ 6.7 MB 请求体，仍在上面那条 8 MiB 之内。
+#: 前端也会在本地先挡一次（省一次上传），但**判据不能只在前端**（前端可以被绕过）。
+PDF_MAX_BYTES = 5 * 1024 * 1024
 
 
 def _size_text(n):
@@ -2845,6 +2850,49 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"ok": True, "name": rec.get("name"), "resume": rec,
                                     "id": rec.get("id"), "rev": rec.get("rev"),
                                     "parent_id": rec.get("parent_id")})
+
+        if p == "/api/resumes/pdf":
+            # 电子版 PDF → 文字（**只读**：不写盘、不留副本、不改任何记录）。
+            # 保存仍然走 `POST /api/resumes`（用户先看见、可改，点「保存」才登记版本）——
+            # 这条路由只回答"这份 PDF 里写着什么"，绝不替用户决定"那就存了吧"。
+            name = str(body.get("name") or "").strip()
+            if not name.lower().endswith(".pdf"):
+                return self._send(400, {"ok": False, "error":
+                                        "只接 PDF：%r 不是 .pdf 文件（Word 文档请先另存为 PDF，"
+                                        "或直接另存为 .md / .txt）" % (name or "（没有名字）")})
+            b64 = body.get("b64")
+            if not isinstance(b64, str) or not b64.strip():
+                return self._send(400, {"ok": False, "error":
+                                        "没有收到 PDF 内容（b64 为空）—— 请重新选择文件"})
+            try:
+                raw = base64.b64decode("".join(b64.split()), validate=False)
+            except (ValueError, TypeError):
+                return self._send(400, {"ok": False, "error":
+                                        "上传内容不是合法的 base64（文件可能在上传时被截断）"})
+            if not raw:
+                return self._send(400, {"ok": False, "error":
+                                        "没有收到 PDF 内容（解出来是 0 字节）—— 请重新选择文件"})
+            if len(raw) > PDF_MAX_BYTES:
+                return self._send(400, {"ok": False, "error":
+                                        "PDF 太大（本次 %s，上限 %s）：简历不需要这么大，"
+                                        "请先压缩或只导出简历那几页再传"
+                                        % (_size_text(len(raw)), _size_text(PDF_MAX_BYTES))})
+            try:
+                got = pdftext.extract_text(raw)
+            except pdftext.PdfError as e:
+                # 读不出来 = **用户能修的问题**（扫描件/加密/坏文件）⇒ 400 + 原话
+                log.log_event("resume.pdf_rejected", level="warn", name=name,
+                              error=str(e)[:300])
+                return self._send(400, {"ok": False, "error": str(e)})
+            except Exception as e:                      # 解析器自己的 bug：500，绝不假装是文件问题
+                log.log_exc("resume.pdf_extract_error", e)
+                return self._send(500, {"ok": False, "error": "解析 PDF 时出错：%s" % e})
+            stem = os.path.splitext(store.safe_name(name))[0].strip()
+            log.log_event("resume.pdf_loaded", name=stem, pages=got.pages,
+                          chars=got.chars, warnings=len(got.warnings))
+            return self._send(200, {"ok": True, "name": stem, "text": got.text,
+                                    "pages": got.pages, "chars": got.chars,
+                                    "warnings": list(got.warnings)})
 
         if p in ("/api/resumes/choose", "/api/resumes/restore", "/api/resumes/purge"):
             # 三个「改一条版本记录」的动作。它们**只动 `resumes.json`**（purge 只删自己那份快照）：

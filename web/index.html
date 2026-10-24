@@ -297,8 +297,8 @@
     <div class="card">
       <h2>编辑简历 <span class="pill" id="editingName">未选择</span></h2>
       <div class="row">
-        <input type="file" id="resumeFile" accept=".md,.txt">
-        <span class="hintline" style="margin:0">「选择文件」只读 .md / .txt 文本（前端 FileReader，不引第三方依赖）；读进来后点「保存」才登记版本。</span>
+        <input type="file" id="resumeFile" accept=".md,.txt,.pdf">
+        <span class="hintline" style="margin:0">「选择文件」收 .md / .txt 文本与**电子版** PDF（文字可选中复制那种）；读进来后点「保存」才登记版本。</span>
       </div>
       <div class="hintline" id="editingHint"></div>
       <textarea id="resumeContent" style="min-height:340px" placeholder="先在上方点「编辑」，或新建一份……"></textarea>
@@ -2695,24 +2695,51 @@ $('#clearResumeBtn').addEventListener('click', ()=>{
 });
 
 /* 「选择文件」：.md / .txt 由 FileReader 读成文本，再按**原 JSON 提交**（不引第三方依赖、不做 multipart）。
+   电子版 PDF 走第三分支：`readAsArrayBuffer` → 纯 JS base64 → `POST /api/resumes/pdf` 抽文字
+   （PDF 里抽的是**文字流**，分栏/表格可能串行；扫描件抽不出 ⇒ 服务端明确拒绝）。
 
-   ⚠️ `accept=".md,.txt"` 只是给文件对话框的**建议** —— 用户强选 `.docx` 照样能选进来。
+   ⚠️ `accept=` 只是给文件对话框的**建议** —— 用户强选 `.docx` 照样能选进来。
    不判扩展名就会把二进制按文本读进来（乱码）再以 `.md` 存下，用户在报告里拿到一堆问号。
-   所以这里**按扩展名显式判断**：只收 `.md` / `.txt`（大小写不敏感），其它**明确拒绝**并说清
-   该怎么办（另存为 .md/.txt）——本工具不做 .docx/.pdf/.doc 转换，也绝不静默存乱码。 */
+   所以这里**按扩展名显式判断**：只收 `.md` / `.txt` / `.pdf`（大小写不敏感），其它**明确拒绝**
+   并说清该怎么办（另存为 .md/.txt 或导出 PDF）——本工具不做 .docx/.doc 转换，也绝不静默存乱码。 */
 const RS_TEXT_EXT = ['.md', '.txt'];
+const RS_PDF_MAX = 5 * 1024 * 1024;          // 5 MB：与服务端 `app.PDF_MAX_BYTES` 同一条线
 function rsIsTextFile(fileName){
   const n = String(fileName == null ? '' : fileName).trim().toLowerCase();
   return RS_TEXT_EXT.some(x=>n.length > x.length && n.slice(-x.length) === x);
 }
+function rsIsPdf(fileName){
+  const n = String(fileName == null ? '' : fileName).trim().toLowerCase();
+  return n.length > 4 && n.slice(-4) === '.pdf';
+}
+/* 纯 JS 的 base64（**故意不用 btoa**）：① Node 探针的 vm 里没有 btoa；
+   ② `String.fromCharCode.apply(null, hugeArray)` 在几 MB 上会爆调用栈。 */
+function rsB64FromBytes(bytes){
+  const T = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+  let out = '', i = 0;
+  for(; i + 2 < bytes.length; i += 3){
+    const n = (bytes[i] << 16) | (bytes[i+1] << 8) | bytes[i+2];
+    out += T[(n >> 18) & 63] + T[(n >> 12) & 63] + T[(n >> 6) & 63] + T[n & 63];
+  }
+  const rest = bytes.length - i;
+  if(rest === 1){
+    const n = bytes[i] << 16;
+    out += T[(n >> 18) & 63] + T[(n >> 12) & 63] + '==';
+  } else if(rest === 2){
+    const n = (bytes[i] << 16) | (bytes[i+1] << 8);
+    out += T[(n >> 18) & 63] + T[(n >> 12) & 63] + T[(n >> 6) & 63] + '=';
+  }
+  return out;
+}
 function rsFileChosen(f){
   if(!f) return false;
+  if(rsIsPdf(f.name)) return rsPdfChosen(f);
   if(!rsIsTextFile(f.name)){
     // 明确拒绝：**不读**这个文件、**不动**编辑区里已有的内容（免得把用户正在写的东西冲掉）
-    const msg = '只支持 .md / .txt 文本文件：「' + String(f.name || '') +
-      '」不是文本文件（本工具不转换 .docx/.doc/.pdf）—— 请先另存为 .md 或 .txt 再上传。';
+    const msg = '只支持 .md / .txt 文本文件或电子版 PDF：「' + String(f.name || '') +
+      '」不是这些格式（本工具不转换 .docx/.doc）—— 请先另存为 .md / .txt，或用 Word/WPS 导出 PDF 再上传。';
     alert(msg);
-    logUI('resume.file_rejected', {name: String(f.name || ''), reason: '非 .md/.txt 文本文件'}, 'warn');
+    logUI('resume.file_rejected', {name: String(f.name || ''), reason: '非 .md/.txt/.pdf'}, 'warn');
     return false;
   }
   const reader = new FileReader();
@@ -2735,6 +2762,66 @@ function rsFileChosen(f){
   };
   reader.readAsText(f);
   return true;
+}
+/* 电子版 PDF：只读本地字节 → base64 → 服务端抽文字 → 填进编辑区（**保存仍然由用户点**）。
+   失败一律"只说原因、不动编辑区"：与 .docx 被拒时同一条纪律（别把正在写的内容冲掉）。 */
+function rsPdfChosen(f){
+  const size = Number(f.size || 0);
+  if(size > RS_PDF_MAX){
+    alert('PDF 太大（' + (size / 1048576).toFixed(1) + ' MB，上限 5 MB）：请压缩一下，或只导出简历那几页再传。');
+    logUI('resume.pdf_rejected', {name: String(f.name || ''), reason: 'too_large', bytes: size}, 'warn');
+    return false;
+  }
+  const reader = new FileReader();
+  reader.onload = async ()=>{
+    const bytes = new Uint8Array(reader.result);
+    let r = null;
+    try{
+      const resp = await fetch('/api/resumes/pdf', {method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({name: f.name, b64: rsB64FromBytes(bytes)})});
+      r = await resp.json();
+    }catch(e){
+      alert('读取 PDF 失败：' + e.message);
+      logUI('resume.pdf_read_failed', {name: String(f.name || ''), error: e.message}, 'error');
+      return;
+    }
+    if(!r || !r.ok){
+      // 服务端已明确拒绝（扫描件 / 加密 / 太大 / 不是 PDF）—— 原话转达，编辑区一个字不动
+      const msg = (r && r.error) || '未知错误';
+      alert(msg);
+      logUI('resume.pdf_rejected', {name: String(f.name || ''), error: msg}, 'warn');
+      return;
+    }
+    rsApplyPdfText(f, r);
+  };
+  reader.onerror = ()=>{
+    toast('文件读取失败：' + f.name);
+    logUI('resume.pdf_read_failed', {name: String(f.name || '')}, 'error');
+  };
+  reader.readAsArrayBuffer(f);
+  return true;
+}
+function rsApplyPdfText(f, r){
+  const text = String(r.text == null ? '' : r.text);
+  // 落盘名 = 去扩展名 + `.md`（`save_resume_version` 也是 `splitext` 之后再登记）——
+  // 让编辑区显示"将会保存成哪个文件"，而不是一个根本不会存在的 `.pdf`。
+  const target = String(r.name || rsStem(f.name)) + '.md';
+  $('#resumeContent').value = text;
+  const pill = $('#editingName');
+  pill.textContent = target; pill.dataset.name = target; delete pill.dataset.version;
+  RS_EDIT = {name: target, version: '', content: ''};
+  const mother = rsMotherOf(rsStem(target));
+  const warns = (r.warnings || []).join('；');
+  rsHint('已从 PDF「' + f.name + '」抽出 ' + (Number(r.pages) || 0) + ' 页 / ' + text.length +
+    ' 字符，保存时按「' + target + '」登记' + (mother
+      ? '：这一族谱已选定母版 → 保存时会让你选「延续 / 新开一份独立的」。'
+      : '（第 1 次修改）。') +
+    ' 抽的是文字流，分栏 / 表格可能串行 —— 保存前请自己过一眼。' +
+    (warns ? ' ⚠️ ' + warns : ''));
+  logUI('resume.pdf_loaded', {name: f.name, pages: Number(r.pages) || 0,
+    chars: text.length, warnings: (r.warnings || []).length});
+  toast('已读出 PDF 文字 ✓');
 }
 $('#resumeFile').addEventListener('change', e=>{
   const f = e.target.files && e.target.files[0];

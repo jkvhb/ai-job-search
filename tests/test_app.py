@@ -20,6 +20,7 @@ import subprocess
 import sys
 import threading
 import unittest
+import base64
 from unittest import mock
 from urllib.parse import quote
 
@@ -38,6 +39,7 @@ import store
 
 from tests import web_probe
 from tests.base import IsolatedCase
+from tests.test_pdftext import _content, _simple
 
 
 # 「路径穿越没泄漏」这条断言的金丝雀：它躺在 reports/ 的**上一级**（profile 根）的 config.json 里，
@@ -4746,6 +4748,230 @@ class ResumeMissingBranchScoreTest(LedgerWithReportsCase):
         self.assertEqual([x["score"] for x in out["same"]], [71.5])
         self.assertEqual([x["score"] for x in out["other"]], [90.0])
         self.assertEqual(out["unknown"], [])           # 没有版本 id 就不查（不猜）
+
+
+class ResumePdfPickTest(IsolatedCase):
+    """「选择文件」的 **PDF 分支**（真跑页面 JS）：发什么请求、填不填编辑区、失败动不动它。
+
+    这里必须真跑页面脚本：`.pdf` 分支的关键行为（`readAsArrayBuffer`、base64 编码、请求体、
+    "失败不改编辑区"）**全在前端**，后端测试一条都覆盖不到。
+    """
+
+    def _run(self, files, *, resp=None, bytes_=None):
+        _need_node()
+        return web_probe.run_index(
+            _DIM_PARSE_JS +
+            "function __bufOf(a){ var u = new Uint8Array(a.length);"
+            " for (var i = 0; i < a.length; i++) u[i] = a[i]; return u.buffer; }\n"
+            "out.calls = [];\n"
+            "window.fetch = fetch = function(url, opts){\n"
+            "  out.calls.push({url: String(url), body: String((opts || {}).body || '')});\n"
+            "  return Promise.resolve({ok: true, json: function(){"
+            " return Promise.resolve(__fixture.resp || {ok: true}); }});\n"
+            "};\n"
+            "FileReader = function(){\n"
+            "  var self = this;\n"
+            "  this.readAsText = function(f){ self.result = String(f.__text || '');"
+            " if(self.onload) self.onload(); };\n"
+            "  this.readAsArrayBuffer = function(f){ self.result = __bufOf(__fixture.bytes || []);"
+            " if(self.onload) self.onload(); };\n"
+            "};\n"
+            "out.results = [];\n"
+            "for (var i = 0; i < __fixture.files.length; i++){\n"
+            "  var f = __fixture.files[i];\n"
+            "  __alerts.length = 0;\n"
+            "  $('#resumeContent').value = '原有内容';\n"
+            "  $('#editingName').dataset.name = '原有.md';\n"
+            "  out.calls.length = 0;\n"
+            "  var ret = rsFileChosen(f);\n"
+            "  await new Promise(function(r){ setTimeout(r, 20); });\n"
+            "  out.results.push({name: String(f.name), ret: ret, alerts: __alerts.slice(),\n"
+            "    content: String($('#resumeContent').value),\n"
+            "    picked: String($('#editingName').dataset.name || ''),\n"
+            "    hint: String($('#editingHint').textContent || ''),\n"
+            "    calls: out.calls.slice()});\n"
+            "}\n"
+            "out.b64 = rsB64FromBytes(new Uint8Array([0, 1, 2, 250, 251, 255]));\n"
+            "out.isPdf = ['a.pdf', 'A.PDF', 'a.pdf.exe', 'pdf', '简历.pdf', 'a.md']"
+            ".map(function(n){ return rsIsPdf(n); });\n",
+            {"files": files, "bytes": list(bytes_ or []), "resp": resp})
+
+    @staticmethod
+    def _pdf_calls(got):
+        """只数发往 `/api/resumes/pdf` 的请求（`logUI` 也会 fetch 一条 `/api/log`，别混进来）。"""
+        return [c for c in got["calls"] if c["url"] == "/api/resumes/pdf"]
+
+    def test_a_pdf_is_sent_as_base64_and_fills_the_editor(self):
+        blob = b"%PDF-1.4\nhello"
+        out = self._run([{"name": "简历.pdf", "size": len(blob)}],
+                        bytes_=blob,
+                        resp={"ok": True, "name": "简历", "text": "张三\nPython",
+                              "pages": 2, "chars": 7,
+                              "warnings": ["第 2 页有字体无法映射（跳过了 1 个字符）"]})
+        self.assertEqual(out["unexpected"], [])
+        got = out["results"][0]
+        self.assertTrue(got["ret"])
+        calls = self._pdf_calls(got)
+        self.assertEqual(len(calls), 1, "PDF 必须只发一次抽取请求：%r" % (got["calls"],))
+        self.assertEqual(calls[0]["url"], "/api/resumes/pdf")
+        sent = json.loads(calls[0]["body"])
+        self.assertEqual(sent["name"], "简历.pdf")
+        self.assertEqual(sent["b64"], base64.b64encode(blob).decode("ascii"),
+                         "前端 base64 与标准实现不一致（服务端会解不出文件）")
+        self.assertEqual(got["content"], "张三\nPython")
+        self.assertEqual(got["picked"], "简历.md", "编辑区要显示**将要落盘**的名字，不是根本不存在的 .pdf")
+        self.assertIn("2 页", got["hint"])
+        self.assertIn("字体无法映射", got["hint"], "服务端的 warning 必须如实转达给用户")
+        self.assertEqual(got["alerts"], [])
+
+    def test_a_rejected_pdf_never_touches_the_editor(self):
+        out = self._run([{"name": "扫描件.pdf", "size": 100}],
+                        bytes_=b"%PDF-1.4",
+                        resp={"ok": False, "error": "这份 PDF 里抽不出文字（扫描件）……"})
+        got = out["results"][0]
+        self.assertEqual(out["unexpected"], [])
+        self.assertEqual(len(self._pdf_calls(got)), 1)
+        self.assertEqual(got["content"], "原有内容", "失败了却把编辑区冲掉了")
+        self.assertEqual(got["picked"], "原有.md")
+        self.assertEqual(len(got["alerts"]), 1, got["alerts"])
+        self.assertIn("扫描件", got["alerts"][0])
+
+    def test_a_docx_is_still_rejected_without_any_request(self):
+        out = self._run([{"name": "我的简历.docx", "__text": "PK\x03\x04binary"}])
+        got = out["results"][0]
+        self.assertFalse(got["ret"])
+        self.assertEqual(self._pdf_calls(got), [], "被拒的文件不该发抽取请求")
+        self.assertEqual(got["content"], "原有内容")
+        self.assertIn("只支持 .md / .txt", got["alerts"][0])
+        self.assertIn("我的简历.docx", got["alerts"][0])
+
+    def test_an_oversize_pdf_is_refused_locally(self):
+        out = self._run([{"name": "大.pdf", "size": 5 * 1024 * 1024 + 1}])
+        got = out["results"][0]
+        self.assertFalse(got["ret"])
+        self.assertEqual(self._pdf_calls(got), [], "超大的文件连读都不该读（更不该上传）")
+        self.assertIn("太大", got["alerts"][0])
+        self.assertEqual(got["content"], "原有内容")
+
+    def test_extension_matching_is_exact(self):
+        out = self._run([])
+        self.assertEqual(out["isPdf"], [True, True, False, False, True, False],
+                         "`a.pdf.exe` / 裸 `pdf` 都不许当成 PDF")
+
+    def test_the_js_base64_encoder_matches_python(self):
+        out = self._run([])
+        raw = bytes([0, 1, 2, 250, 251, 255])
+        self.assertEqual(out["b64"], base64.b64encode(raw).decode("ascii"),
+                         "纯 JS base64 与 Python 不一致（0x00/0xFF 这类边界最容易错）")
+
+
+class ResumePdfRouteTest(IsolatedCase):
+    """`POST /api/resumes/pdf`：电子版 PDF → 文字。**只读**：不写盘、不留副本、不登记版本。
+
+    为什么路由层也要测：`pdftext` 的单元测试只证明"字节进、文字出"，这三件事它管不到 ——
+      ① 名字 / 大小的闸门（**不能被前端绕过**）；
+      ② 失败时**盘上什么都不许多**（连一份 PDF 副本都不许留）；
+      ③ 分级：用户能修的问题（扫描件 / 加密 / 改名）必须 400 + 人话；
+         **解析器自己的 bug 必须 500**，绝不许伪装成"你的文件不是 PDF"。
+    """
+
+    def _post(self, body):
+        raw = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        headers = {"Content-Length": str(len(raw)),
+                   "Content-Type": "application/json; charset=utf-8"}
+        h = _sandbox_handler("POST", "/api/resumes/pdf", raw, headers)
+        return h._status, h._body
+
+    @staticmethod
+    def _b64(blob):
+        return base64.b64encode(blob).decode("ascii")
+
+    @staticmethod
+    def _simple_pdf(text="Zhang San - Python Engineer", **kw):
+        return _simple(_content(b"(" + text.encode("ascii") + b") Tj"), **kw)
+
+    def _files(self):
+        """profile 里除日志以外的文件（日志本来就会记一条 `resume.pdf_loaded`）。"""
+        root = store.profile_dir()
+        out = []
+        for dirpath, _dirs, names in os.walk(root):
+            if os.sep + "logs" in dirpath:
+                continue
+            for n in names:
+                out.append(os.path.relpath(os.path.join(dirpath, n), root))
+        return sorted(out)
+
+    def test_a_digital_pdf_is_extracted_and_nothing_is_written(self):
+        before = self._files()
+        code, body = self._post({"name": "张三.pdf", "b64": self._b64(self._simple_pdf())})
+        self.assertEqual(code, 200, body)
+        self.assertIs(body["ok"], True, body)
+        self.assertEqual(body["text"], "Zhang San - Python Engineer")
+        self.assertEqual(body["pages"], 1)
+        self.assertEqual(body["chars"], len("Zhang San - Python Engineer"))
+        self.assertEqual(body["warnings"], [])
+        self.assertEqual(body["name"], "张三", "回给前端的是**将要落盘的名字**（不含 .pdf）")
+        self.assertEqual(self._files(), before, "这条路由必须只读：盘上不许多任何文件（含 PDF 副本）")
+
+    def test_a_non_pdf_name_is_rejected(self):
+        before = self._files()
+        code, body = self._post({"name": "简历.docx", "b64": self._b64(b"whatever")})
+        self.assertEqual(code, 400, body)
+        self.assertIs(body["ok"], False)
+        self.assertIn("只接 PDF", body["error"])
+        self.assertEqual(self._files(), before)
+
+    def test_bad_base64_is_rejected(self):
+        # `AAAA====` 会被 Python 宽松地解成 3 个字节（不是"坏 base64"）；真正解不开的是**长度不对**的串。
+        for bad in ("abc", "AAAAA"):
+            with self.subTest(b64=bad):
+                code, body = self._post({"name": "a.pdf", "b64": bad})
+                self.assertEqual(code, 400, body)
+                self.assertIn("base64", body["error"])
+
+    def test_an_empty_upload_is_rejected(self):
+        for value in ("", "   ", None):
+            with self.subTest(b64=value):
+                code, body = self._post({"name": "a.pdf", "b64": value})
+                self.assertEqual(code, 400, body)
+                self.assertIn("没有收到", body["error"])
+
+    def test_an_oversize_pdf_is_rejected_before_parsing(self):
+        blob = b"%PDF-1.4" + b"\x00" * (app.PDF_MAX_BYTES + 16)
+        code, body = self._post({"name": "big.pdf", "b64": self._b64(blob)})
+        self.assertEqual(code, 400, body)
+        self.assertIn("太大", body["error"])
+
+    def test_a_file_that_is_not_a_pdf_is_rejected_with_the_magic_hint(self):
+        code, body = self._post({"name": "改了后缀.pdf",
+                                 "b64": self._b64(b"PK\x03\x04" + b"x" * 100)})
+        self.assertEqual(code, 400, body)
+        self.assertIn("PDF", body["error"])
+
+    def test_an_image_only_pdf_says_it_cannot_extract(self):
+        before = self._files()
+        code, body = self._post({"name": "扫描件.pdf",
+                                 "b64": self._b64(_simple(_content(b"() Tj")))})
+        self.assertEqual(code, 400, body)
+        self.assertIn("抽不出文字", body["error"])
+        self.assertEqual(self._files(), before)
+
+    def test_an_encrypted_pdf_is_rejected(self):
+        code, body = self._post({"name": "加密.pdf",
+                                 "b64": self._b64(self._simple_pdf(trailer_extra=b" /Encrypt 9 0 R"))})
+        self.assertEqual(code, 400, body)
+        self.assertIn("加密", body["error"])
+
+    def test_a_parser_bug_is_a_500_not_a_fake_file_problem(self):
+        """解析器崩了 = 我们的 bug ⇒ 500。绝不许报成"你的文件不是 PDF"（那是甩锅给用户）。"""
+        before = self._files()
+        with mock.patch.object(app.pdftext, "extract_text",
+                               side_effect=RuntimeError("boom")):
+            code, body = self._post({"name": "a.pdf", "b64": self._b64(self._simple_pdf())})
+        self.assertEqual(code, 500, body)
+        self.assertIs(body["ok"], False)
+        self.assertIn("解析 PDF 时出错", body["error"])
+        self.assertEqual(self._files(), before)
 
 
 class ResumeFilePickRejectTest(IsolatedCase):
