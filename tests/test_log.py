@@ -85,7 +85,7 @@ class LogFilePathTest(IsolatedCase):
         """复现真实形态：记事本按 ANSI/GBK 存了中文档名。"""
         fp = store.current_profile_file()
         with open(fp, "w", encoding="gbk") as f:
-            f.write("周汉钦")
+            f.write("示例姓名")
         with open(fp, "rb") as f:
             raw = f.read()
         # 反证：这份文件确实**不是**合法的 UTF-8（否则「读不出来」这条用例本身是假的）

@@ -536,8 +536,8 @@ class UpsertJobRefusesUnreadableLedgerTest(IsolatedCase):
         path = store.jobs_path()
         os.makedirs(os.path.dirname(path), exist_ok=True)
         raw = json.dumps(
-            [{"id": "20261008_语音文本评测_72分", "score": 72.0, "resume": "周汉钦-母版"},
-             {"id": "20261003_语音文本评测_75分", "score": 75.0, "resume": "周汉钦-母版"}],
+            [{"id": "20261008_语音文本评测_72分", "score": 72.0, "resume": "示例姓名-母版"},
+             {"id": "20261003_语音文本评测_75分", "score": 75.0, "resume": "示例姓名-母版"}],
             ensure_ascii=False).encode("gbk")
         with open(path, "wb") as f:
             f.write(raw)
@@ -1407,7 +1407,7 @@ class ElementShapeStrictDeepTest(IsolatedCase):
     元素不是对象时上层会**静默丢掉**它 —— `[{好记录}, 1]` 只显示 1 条、`[1,2,3]` 显示 0 条，
     坏的那部分**没人看得见**（又是一句"共 0 个岗位"级别的假话）。
 
-    人话与"容器坏"同一把尺子：`<文件> \`x.json\` 读不出来：第 N 条不是对象`。
+    人话与"容器坏"同一把尺子：`<文件> x.json 读不出来：第 N 条不是对象`。
     """
 
     def _write(self, path, blob):

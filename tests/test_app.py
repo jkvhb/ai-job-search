@@ -2738,11 +2738,11 @@ class ResumeVersionRouteTest(IsolatedCase):
     def test_unregistered_files_on_disk_are_reported_not_hidden(self):
         """迁移之前（Task 5 之前）盘上就有简历文件、`resumes.json` 还没有 —— 界面必须看得见它们。"""
         store.ensure_profile()
-        store.write_text(os.path.join(store.p_path("resumes"), "周汉钦-母版.md"), "老简历正文")
+        store.write_text(os.path.join(store.p_path("resumes"), "示例姓名-母版.md"), "老简历正文")
         code, body = self._get("/api/resumes")
         self.assertEqual(code, 200)
-        self.assertEqual(body["files"], ["周汉钦-母版.md"])
-        self.assertEqual(body["unregistered"], ["周汉钦-母版.md"])   # 没有版本记录 → 如实标出
+        self.assertEqual(body["files"], ["示例姓名-母版.md"])
+        self.assertEqual(body["unregistered"], ["示例姓名-母版.md"])   # 没有版本记录 → 如实标出
         self.assertEqual(body["resumes"], [])
 
     def test_a_removed_version_still_counts_as_registered(self):
@@ -3396,7 +3396,7 @@ class ResumeSelectWiringTest(IsolatedCase):
     """简历下拉的数据来源必须与 `/api/resumes` 的**真实形状**对齐。
 
     用户真实数据的形状（Task 5 迁移之前）：`resumes/` 里有文件、`resumes.json` **不存在**
-    → 接口回 `{"resumes": [], "files": ["周汉钦-母版.md"], "unregistered": ["周汉钦-母版.md"], …}`。
+    → 接口回 `{"resumes": [], "files": ["示例姓名-母版.md"], "unregistered": ["示例姓名-母版.md"], …}`。
     `resumes` 是**版本记录对象数组**（`app.py` 的 `versions`），`files` 是**文件名数组**，
     `unregistered` 才是"盘上有文件但**还没有**版本记录"那一份（用户现在的全部简历）。
 
@@ -3440,15 +3440,15 @@ class ResumeSelectWiringTest(IsolatedCase):
 
     def test_disk_only_shape_shows_the_file_and_submits_the_file_name(self):
         store.ensure_profile()
-        store.write_text(os.path.join(store.p_path("resumes"), "周汉钦-母版.md"), "老简历正文")
+        store.write_text(os.path.join(store.p_path("resumes"), "示例姓名-母版.md"), "老简历正文")
         self.assertFalse(os.path.exists(store.p_path("resumes.json")))     # 用户真实数据的形状
         code, body = self._get("/api/resumes")
         self.assertEqual(code, 200)
         self.assertEqual(body["resumes"], [])                             # 版本库还是空的
-        self.assertEqual(body["files"], ["周汉钦-母版.md"])                # 盘上的真话在这儿
-        self.assertEqual(body["unregistered"], ["周汉钦-母版.md"])          # 还没登记版本的就是它
+        self.assertEqual(body["files"], ["示例姓名-母版.md"])                # 盘上的真话在这儿
+        self.assertEqual(body["unregistered"], ["示例姓名-母版.md"])          # 还没登记版本的就是它
         sent = self._sent(body)
-        self.assertEqual(sent, {"resume_name": "周汉钦-母版.md", "resume_id": ""},
+        self.assertEqual(sent, {"resume_name": "示例姓名-母版.md", "resume_id": ""},
                          "盘上那份简历没有出现在下拉里：字段读错了（body=%r）" % (body,))
         self.assertNotEqual(sent["resume_name"], "[object Object]")        # ← 修 1 之前的实测症状
         self.assertTrue(os.path.exists(os.path.join(store.p_path("resumes"), sent["resume_name"])),
@@ -3456,14 +3456,14 @@ class ResumeSelectWiringTest(IsolatedCase):
         self.assertEqual(sent["resume_id"], "")                            # 没有版本可钉 → 如实不传
 
     def test_a_registered_version_is_picked_by_version_id(self):
-        v1 = resumelib.create_version("周汉钦-母版", "登记过的正文")
+        v1 = resumelib.create_version("示例姓名-母版", "登记过的正文")
         code, body = self._get("/api/resumes")
         self.assertEqual(code, 200)
         self.assertEqual([r["id"] for r in body["resumes"]], [v1["id"]])   # 记录是**对象**数组
-        self.assertEqual(body["files"], ["周汉钦-母版.md"])
+        self.assertEqual(body["files"], ["示例姓名-母版.md"])
         self.assertEqual(body["unregistered"], [])                         # 有版本记录 → 不重复出现
         sent = self._sent(body)
-        self.assertEqual(sent, {"resume_name": "周汉钦-母版.md", "resume_id": v1["id"]},
+        self.assertEqual(sent, {"resume_name": "示例姓名-母版.md", "resume_id": v1["id"]},
                          "下拉没有把**版本 id** 当 value → 分析请求不会带 resume_id")
 
 
@@ -3481,13 +3481,13 @@ class ResumePickerOneOptionPerLineageTest(IsolatedCase):
     """
 
     def test_three_versions_give_exactly_one_option_holding_the_current_id(self):
-        v1 = resumelib.create_version("周汉钦-母版", "第 1 版正文")
-        v2 = resumelib.create_version("周汉钦-母版", "第 2 版正文", parent_id=v1["id"])
-        v3 = resumelib.create_version("周汉钦-母版", "第 3 版正文", parent_id=v2["id"])
+        v1 = resumelib.create_version("示例姓名-母版", "第 1 版正文")
+        v2 = resumelib.create_version("示例姓名-母版", "第 2 版正文", parent_id=v1["id"])
+        v3 = resumelib.create_version("示例姓名-母版", "第 3 版正文", parent_id=v2["id"])
         code, view = _resumes_view()
         self.assertEqual(code, 200, view)
         opts = _picker_probe(view)["options"]
-        mine = [o for o in opts if o["text"] == "周汉钦-母版.md"]
+        mine = [o for o in opts if o["text"] == "示例姓名-母版.md"]
         self.assertEqual(len(mine), 1, "同一族谱给了不止一个选项：%r" % (opts,))
         self.assertEqual(mine[0]["value"], v3["id"])            # ← 逐字等于当前版 id
         values = [o["value"] for o in opts]
@@ -3497,8 +3497,8 @@ class ResumePickerOneOptionPerLineageTest(IsolatedCase):
 
     def test_the_current_version_is_what_the_same_lineage_reports_as_current(self):
         """两边**同一个口径**：下拉给的那条 == `resumelib.current_of(root)`。"""
-        v1 = resumelib.create_version("周汉钦-母版", "第 1 版正文")
-        v2 = resumelib.create_version("周汉钦-母版", "第 2 版正文", parent_id=v1["id"])
+        v1 = resumelib.create_version("示例姓名-母版", "第 1 版正文")
+        v2 = resumelib.create_version("示例姓名-母版", "第 2 版正文", parent_id=v1["id"])
         code, view = _resumes_view()
         self.assertEqual(code, 200, view)
         picked = _picker_probe(view)["selected"]
@@ -5800,7 +5800,7 @@ print("MAIN_RETURNED")
 _BREAK_AFTER_IMPORT = '''
 import io as _io
 with _io.open(store.current_profile_file(), "wb") as _f:
-    _f.write("周汉钦".encode("gbk"))
+    _f.write("示例姓名".encode("gbk"))
 print("PROFILE_BROKEN")
 '''
 
@@ -5837,7 +5837,7 @@ class StartupProfilePreconditionTest(IsolatedCase):
     def _gbk_profile_file(self):
         fp = store.current_profile_file()
         with open(fp, "w", encoding="gbk") as f:
-            f.write("周汉钦")
+            f.write("示例姓名")
         with open(fp, "rb") as f:
             self.assertRaises(UnicodeDecodeError, f.read().decode, "utf-8")
         return fp
@@ -5898,14 +5898,14 @@ class StartupProfilePreconditionTest(IsolatedCase):
 
     def test_a_valid_profile_file_still_starts_and_is_honored(self):
         """反向的钉子：修法绝不能变成「档名文件存在就拒绝启动」。"""
-        store.set_current_profile("周汉钦")
+        store.set_current_profile("示例姓名")
 
         p = self._run_probe()
 
         out = self._text(p.stdout)
         self.assertEqual(p.returncode, 0, self._text(p.stderr))
         self.assertIn("APP_IMPORTED_OK", out)
-        self.assertIn(os.path.join(store.profiles_root(), "周汉钦", "logs"), out)
+        self.assertIn(os.path.join(store.profiles_root(), "示例姓名", "logs"), out)
 
     # ---- 单元层：可单测的校验函数本身
     def test_precondition_returns_none_when_the_file_is_fine(self):

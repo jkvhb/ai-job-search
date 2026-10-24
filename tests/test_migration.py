@@ -80,7 +80,7 @@ def write_report(path, data):
 def _report_data(title, salary, category, location, education, score, company=""):
     return {"job_title": title, "company": company, "job_category": category,
             "location": location, "salary": salary, "education": education,
-            "score": score, "verdict": "建议投递", "resume": "周汉钦-母版",
+            "score": score, "verdict": "建议投递", "resume": "示例姓名-母版",
             "source": "粘贴文本", "application": {"status": "未投递", "outcome_reason": "",
                                               "outcome_at": ""}}
 
@@ -120,7 +120,7 @@ class MigrationTestBase(CliTestMixin, IsolatedCase):
                               "job_category": "数据标注/质检", "location": "北京",
                               "salary": "13-26K", "score": 70.0, "verdict": "建议投递",
                               "source_type": "粘贴文本", "jd_text_file": jid + ".txt",
-                              "resume": "周汉钦-母版", "status": "未投递"})
+                              "resume": "示例姓名-母版", "status": "未投递"})
             store.write_text(os.path.join(jd_dir, jid + ".txt"), text)
             write_report(os.path.join(reports, jid + ".html"),
                          _report_data("语音/文本评测", "13-26K", "数据标注/质检", "北京",
@@ -130,7 +130,7 @@ class MigrationTestBase(CliTestMixin, IsolatedCase):
         store.upsert_job({"id": "分析D", "report": "分析D.html", "created_at": "2026-09-04 10:00",
                           "job_title": "电商直播运营", "company": "某电商公司",
                           "job_category": "AI数据运营", "location": "上海", "salary": "10-15K",
-                          "score": 55.0, "jd_text_file": "分析D.txt", "resume": "周汉钦-母版",
+                          "score": 55.0, "jd_text_file": "分析D.txt", "resume": "示例姓名-母版",
                           "status": "未投递"})
         store.write_text(os.path.join(jd_dir, "分析D.txt"), OTHER_JD)
         write_report(os.path.join(reports, "分析D.html"),
@@ -141,7 +141,7 @@ class MigrationTestBase(CliTestMixin, IsolatedCase):
         store.upsert_job({"id": "分析E", "report": "分析E.html", "created_at": "2026-09-05 10:00",
                           "job_title": "语音/文本评测（示例）", "company": "某 AI 科技公司（示例）",
                           "job_category": "数据标注/质检", "location": "北京", "salary": "13–26K",
-                          "score": 80.4, "jd_text_file": "", "resume": "周汉钦-母版",
+                          "score": 80.4, "jd_text_file": "", "resume": "示例姓名-母版",
                           "status": "未投递"})
         write_report(os.path.join(reports, "分析E.html"),
                      _report_data("语音/文本评测（示例）", "13–26K", "数据标注/质检", "北京",
@@ -698,7 +698,7 @@ class IdempotenceTest(MigrationTestBase):
         store.upsert_job({"id": "分析F", "report": "分析F.html", "created_at": "2026-10-01 10:00",
                           "job_title": "图像标注质检", "company": "某图像公司",
                           "job_category": "数据标注/质检", "location": "深圳", "salary": "12-18K",
-                          "score": 66.0, "jd_text_file": "分析F.txt", "resume": "周汉钦-母版",
+                          "score": 66.0, "jd_text_file": "分析F.txt", "resume": "示例姓名-母版",
                           "status": "未投递"})
         store.write_text(store.p_path("jd", "分析F.txt"), NEW_JD)
         write_report(os.path.join(store.p_path("reports"), "分析F.html"),
@@ -804,7 +804,7 @@ class ExistingJdIdClaimTest(CliTestMixin, IsolatedCase):
         # job 记录就是「迁移后」的形状：只有分析级字段 + jd_id（真实数据里就是这样）
         store.upsert_job({"id": self.JOB, "jd_id": self.JD_ID, "report": self.JOB + ".html",
                           "created_at": "2026-10-14 15:03", "score": 75.0,
-                          "resume": "周汉钦-母版", "resume_id": "rv_0001"})
+                          "resume": "示例姓名-母版", "resume_id": "rv_0001"})
         # 报告里的写法与 JD 记录**不同**（JD 记录才是身份：报告那份不许反过来覆盖它）
         write_report(os.path.join(store.p_path("reports"), self.JOB + ".html"),
                      _report_data("大模型标注（报告侧写法）", "12-20K（含绩效）", "标注管理",
@@ -896,7 +896,7 @@ class RestoreKeepsProfileRootTest(IsolatedCase):
         照样会自成 1 个 JD、照样要写 jds.json）。
         """
         store.upsert_job({"id": "分析X", "report": "分析X.html", "created_at": "2026-09-01 10:00",
-                          "job_title": "语音/文本评测", "score": 70.0, "resume": "周汉钦-母版"})
+                          "job_title": "语音/文本评测", "score": 70.0, "resume": "示例姓名-母版"})
         with mock.patch.object(store, "write_json", side_effect=OSError("disk full (注入)")), \
                 mock.patch.object(sys, "argv", ["身份迁移.py", "--执行"]), \
                 contextlib.redirect_stdout(io.StringIO()), \

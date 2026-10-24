@@ -2,7 +2,7 @@
 """`简历迁移.py`（把盘上已有的简历文件登记成 `rv_0001`、把老分析指向它）的测试。
 
 夹具与**用户真实数据的形状同构**（规格 §7 的实测形状）：
-  - 简历文件 `resumes/周汉钦-母版.md`，mtime = **2026-09-18 23:06:24**（早于全部 6 次分析）
+  - 简历文件 `resumes/示例姓名-母版.md`，mtime = **2026-09-18 23:06:24**（早于全部 6 次分析）
   - 6 条分析（真实的 id / created_at / `resume` 值，其中 1 条是 `merged_into` 死记录）
   - 外加 2 条**对不上**的：`resume="别的简历"`（盘上没有这份文件）、`resume=""`
   - 外加 1 条**已经有 `resume_id`** 的：绝不能被覆盖（幂等 + 不覆盖别人的账）
@@ -34,8 +34,8 @@ CLI = importlib.import_module("简历迁移")
 IDENTITY_CLI = importlib.import_module("身份迁移")
 MIGRATION_SCAFFOLD = importlib.import_module("迁移脚手架")
 
-RESUME_NAME = "周汉钦-母版"
-RESUME_TEXT = ("周汉钦 · 简历（夹具）\n\n## 技能\n数据标注质检 / ASR 评测 / Bad Case 归因\n\n"
+RESUME_NAME = "示例姓名-母版"
+RESUME_TEXT = ("示例姓名 · 简历（夹具）\n\n## 技能\n数据标注质检 / ASR 评测 / Bad Case 归因\n\n"
                "## 项目经历\n语音通话 Agent 质检，返修率降低 40%\n")
 RESUME_MTIME = "2026-09-18 23:06:24"          # 规格 §7 实测的文件修改时间
 RESUME_AT = "2026-09-18 23:06"                # 版本记录的 `at`（与 resumelib._AT_FMT 同口径）
@@ -659,8 +659,8 @@ class NonUtf8ResumesDocTest(MigrationCase):
 # ================================================================ 差分测试（体检批 5 §7.2）
 # 两个脚本的「备份 / 恢复」四件套现在是**同一份实现**（`迁移脚手架.py`）。下面这个夹具与这个
 # 用例类就是"不再抄两遍"的**牙**：谁把实现抄回两份、或只改一边、或改动命名规则，这里就红。
-FIXTURE_RESUME = "周汉钦-母版"
-FIXTURE_RESUME_TEXT = "周汉钦 · 简历（差分夹具）\n\n## 技能\n数据标注质检 / ASR 评测\n"
+FIXTURE_RESUME = "示例姓名-母版"
+FIXTURE_RESUME_TEXT = "示例姓名 · 简历（差分夹具）\n\n## 技能\n数据标注质检 / ASR 评测\n"
 FIXTURE_MTIME_TS = datetime.strptime("2026-09-18 23:06:24", "%Y-%m-%d %H:%M:%S").timestamp()
 FIXTURE_BAK = "jobs.json" + store.BACKUP_SUFFIX + "20200101_000000"
 FIXTURE_OLD_BACKUPS = ("迁移备份_20200101_000000", "简历迁移备份_20200101_000000")

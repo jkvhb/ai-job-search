@@ -583,7 +583,7 @@ class MotherSnapshotPrecedenceTest(IsolatedCase):
         self.assertEqual(path, self._snap_path(v1["id"]))
 
 
-PART_NAME = "周汉钦-A"
+PART_NAME = "示例姓名-A"
 MOTHER_TEXT = ("候选人简历正文（母版）\n"
                "项目经历：语音质检平台\n"
                "技能：Python / 数据标注")
