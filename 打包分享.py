@@ -41,7 +41,7 @@ FILES = [
     "interview.py", "jdfacts.py", "jddelete.py", "jdid.py", "jdrefs.py", "jobdup.py",
     "kb.py", "kbreuse.py", "outcome.py", "pdftext.py", "resumelib.py",
     "备份体检.py", "报告体检.py", "岗位去重.py",
-    "启动.bat", "README.md", "EXAMPLES.md",
+    "启动.bat", "新手引导.md", "README.md", "EXAMPLES.md",
     "00-求职SOP总纲.md", "01-资产库构建.md", "02-预筛与打分.md",
     "03-JD拆解.md", "04-简历大纲.md", "05-面试准备.md", "06-投递追踪.md",
 ]
@@ -54,6 +54,10 @@ DIRS = ["web", "assets", "templates"]
 # 旧路径一并拦住；.leak-keywords.txt 里是真实姓名/手机号，绝不允许进包。
 BLOCK_FILES = {"config.json", "jobs.json", "events.jsonl", ".leak-keywords.txt"}
 BLOCK_DIRS = {"data", "reports", "resumes", "dist", "__pycache__", "docs", ".git"}
+
+#: 分享包里**必须有**的文件（少了朋友就不知道从哪开始）。
+#: ⚠️ 它们**不是依赖**（少了不会 ImportError），所以依赖自检抓不到 —— 必须单独列出来。
+REQUIRED_IN_PACKAGE = ("新手引导.md", "启动.bat", "README.md")
 
 
 def _blocked(rel):
@@ -120,6 +124,8 @@ SHORTCUT_BAT = (
 )
 
 SHARE_NOTE = """# AI 求职助手 · 测试版
+
+> **第一次用？先看同目录的 `新手引导.md`（30 秒版）** —— 这一页是更详细的说明。
 
 欢迎试用！这是一个**跑在你自己电脑上**的 AI 求职工具。
 
@@ -578,13 +584,28 @@ def dependency_issues(root=None, packaged=None):
     return [rel for rel in resolve_dependencies(root) if rel not in have]
 
 
-def verify(zpath, root=None):
-    """反向扫描 zip，确认没有泄漏、而且**真的跑得起来**"""
+def _rel_in_package(name):
+    """zip 内的 `包名/相对路径` → `相对路径`（包名取什么都行）。"""
+    n = str(name).replace("\\", "/").lstrip("/")
+    return n.split("/", 1)[1] if "/" in n else n
+
+
+def verify(zpath, root=None, allow_fake_keys_in=(), notes=None, required=()):
+    """反向扫描 zip，确认没有泄漏、而且**真的跑得起来**。
+
+    `allow_fake_keys_in`：**显式豁免**的路径前缀（只给交接包用 —— 它的 `tests/` 里有两条
+    故意写成 `sk-...` 的**测试夹具**，不豁免的话"每次打包都被自己删掉"）。豁免**必须点名路径**，
+    而且每一处都记进 `notes`（调用方要打印出来），绝不静默放过；`tests/` 以外的 `sk-` 串照样报。
+
+    `required`：这个包里"必须存在"的相对路径（`main()` 传 `REQUIRED_IN_PACKAGE`）。
+    默认空 —— 假仓库的测试用例本来就没有这些文件，不该被它们拖红。
+    """
     root = root or ROOT
     issues = []
     kws = leak_keywords(root)
     with zipfile.ZipFile(zpath) as z:
-        for n in z.namelist():
+        names = z.namelist()
+        for n in names:
             info = z.getinfo(n)
             if info.file_size > 3_000_000:
                 issues.append("文件过大：%s (%.1f MB)" % (n, info.file_size / 1e6))
@@ -593,23 +614,36 @@ def verify(zpath, root=None):
                     txt = z.read(n).decode("utf-8", "ignore")
                 except Exception:
                     continue
-                if re.search(r"sk-[A-Za-z0-9_\-]{20,}", txt):
-                    issues.append("疑似明文 API Key：%s" % n)
+                keys = re.findall(r"sk-[A-Za-z0-9_\-]{20,}", txt)
+                if keys:
+                    rel = _rel_in_package(n)
+                    if any(rel.startswith(p) for p in allow_fake_keys_in):
+                        if notes is not None:
+                            notes.append("已豁免 %d 处 sk- 串：%s（测试夹具，不是真 Key）"
+                                         % (len(keys), rel))
+                    else:
+                        issues.append("疑似明文 API Key：%s" % n)
                 for kw in kws:
                     if kw in txt:
                         issues.append("个人信息 '%s' 出现在：%s" % (kw, n))
         # ---- 依赖自检：以前只查"有没有泄密"，不查"能不能跑"，于是印出假绿灯 ----
         # 基准来自**真实仓库**（app.py 等源码在盘上写了什么 import、引用了哪些 web 资源），
         # 绝不来自 zip 自己的 namelist —— 拿包内已列文件当基准是自证循环，永远通过。
-        for rel in dependency_issues(root, z.namelist()):
+        for rel in dependency_issues(root, names):
             issues.append("缺少依赖文件：%s（解压后双击 启动.bat 会 ImportError / 报告缺模板）" % rel)
+        # ---- 新用户入门文件：少了它**不会报错**（不是依赖），但朋友会不知道从哪开始 ----
+        have = _strip_pkg_prefix(names)
+        for rel in required:
+            if rel not in have:
+                issues.append("缺少必需文件：%s（包里少了它，新用户不知道从哪开始）" % rel)
     return issues
 
 
-def main():
-    os.makedirs(DIST, exist_ok=True)
+def main(dest=None):
+    dest = dest or DIST
+    os.makedirs(dest, exist_ok=True)
     items = collect()
-    zpath = os.path.join(DIST, PKG + ".zip")
+    zpath = os.path.join(dest, PKG + ".zip")
 
     print("=" * 58)
     print("  打包分享版")
@@ -631,7 +665,7 @@ def main():
         z.writestr(PKG + "/分享说明.md", SHARE_NOTE)
 
     print("\n  反向安全检查中……")
-    issues = verify(zpath)
+    issues = verify(zpath, required=REQUIRED_IN_PACKAGE)
     if issues:
         print("  ✘ 发现 %d 个问题，已删除该包：" % len(issues))
         for i in issues:

@@ -16,6 +16,7 @@
 ⚠️ 那台机器**没有 `data/`**（干净检出）时真名推不出来 ⇒ 相关用例**显式 skip + 给理由**
 （见 `_assert_no_real_pii`），绝不退化成"看起来在断言、其实什么都没断言"的空循环。
 """
+import hashlib
 import importlib
 import os
 import re
@@ -26,6 +27,7 @@ import zipfile
 from unittest import mock
 
 PACK = importlib.import_module("打包分享")
+HAND = importlib.import_module("打包交接")
 
 # 真实仓库根目录（测试只读它，不写）
 REPO = os.path.dirname(os.path.abspath(PACK.__file__))
@@ -271,6 +273,105 @@ class RealRepoTest(unittest.TestCase):
         # verify() 整条路径也要跑通（PII 那几条不算本测试的事）
         dep_text = [i for i in PACK.verify(zpath, root=REPO) if "缺少依赖文件" in i]
         self.assertEqual([], dep_text)
+
+
+class HandoffPackTest(unittest.TestCase):
+    """**交接包**（`打包交接.py`）：自包含、不带个人数据、manifest 能对账。
+
+    这个包和分享包的目标不同（它给"对方的 AI"看源码 + 测试 + 项目纪律），所以必须钉三件事：
+      ① 该有的都有（交接文档 / manifest / 源码 / tests / docs）；
+      ② 不该有的一律没有（`data/`、`config.json`、泄漏关键词表）；
+      ③ manifest 里的指纹与包里**真实字节**一致 —— 否则"对账"这件事本身就是假话。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="pack-handoff-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def _build(self):
+        zpath, man = HAND.build(dest=self.tmp)
+        return zpath, man
+
+    @staticmethod
+    def _rels(zpath):
+        with zipfile.ZipFile(zpath) as z:
+            names = z.namelist()
+        return names, {n.split("/", 1)[1] for n in names if "/" in n}
+
+    def test_the_share_package_ships_the_newcomer_guide(self):
+        self.assertIn("新手引导.md", PACK.FILES)
+        self.assertIn("新手引导.md", {rel for rel, _ in PACK.collect()})
+        self.assertIn("新手引导.md", PACK.REQUIRED_IN_PACKAGE,
+                      "入门文件必须列进「缺少就报错」的清单，否则哪天被删了没人发现")
+
+    def test_verify_flags_a_package_without_the_newcomer_guide(self):
+        """反向：**缺**新手引导的包必须被点名（不然上面那条只是"清单里有"）。"""
+        root = os.path.join(self.tmp, "fake")
+        os.makedirs(os.path.join(root, "web"))
+        for rel, text in (("app.py", FAKE_APP), ("aaa.py", "# aaa\n"),
+                          ("bbb.py", "# bbb\n"), ("web/x.html", "<html></html>\n"),
+                          ("web/demo.json", "{}\n")):
+            _write(os.path.join(root, rel), text)
+        zpath = os.path.join(self.tmp, "fake.zip")
+        with zipfile.ZipFile(zpath, "w") as z:
+            for rel, full in PACK.collect(root=root, files=FAKE_FILES, dirs=["web"]):
+                z.write(full, "pkg/" + rel)
+        issues = PACK.verify(zpath, root=root, required=PACK.REQUIRED_IN_PACKAGE)
+        self.assertTrue([i for i in issues if "新手引导.md" in i],
+                        "缺新手引导却没被点名：%r" % (issues,))
+
+    def test_launcher_checks_the_python_version(self):
+        """`启动.bat` 必须真的**检查版本**：只 `where python` 时，老 Python 会抛用户看不懂的语法错。"""
+        with open(os.path.join(REPO, "启动.bat"), encoding="utf-8") as f:
+            txt = f.read()
+        self.assertIn("version_info", txt)
+        self.assertIn("3, 9", txt)
+
+    def test_handoff_package_is_self_contained_and_clean(self):
+        zpath, man = self._build()
+        names, rels = self._rels(zpath)
+        for rel in ("给AI的交接文档.md", "manifest.json", "app.py", "pdftext.py",
+                    "tests/test_pdftext.py", "docs/批2-7-验收报告.md",
+                    "web/index.html", "新手引导.md", "启动.bat"):
+            self.assertIn(rel, rels, "交接包缺少 %s" % rel)
+        for bad in ("config.json", ".leak-keywords.txt", "manifest.json.bak"):
+            self.assertNotIn(bad, rels, "交接包不许带 %s" % bad)
+        self.assertEqual([], [r for r in rels if r.startswith("data/")],
+                         "交接包不许带用户数据：%r" % [r for r in rels if r.startswith("data/")])
+        self.assertEqual(man["counts"]["files"] + 1, len(names),      # +manifest.json 自己
+                         "manifest 的文件数与 zip 里的条目数对不上")
+
+    def test_manifest_fingerprints_match_the_packaged_bytes(self):
+        zpath, man = self._build()
+        pkg = os.path.basename(zpath)[:-4]
+        with zipfile.ZipFile(zpath) as z:
+            for entry in man["files"]:
+                data = z.read(pkg + "/" + entry["path"])
+                self.assertEqual(len(data), entry["bytes"], entry["path"])
+                self.assertEqual(hashlib.sha256(data).hexdigest()[:16], entry["sha256"],
+                                 entry["path"])
+
+    def test_fake_key_exemption_is_named_and_narrow(self):
+        """`tests/` 里的假 Key 被**点名豁免**；`tests/` 以外的 sk- 串照样报（不许整包豁免）。"""
+        zpath, _man = self._build()
+        notes = []
+        issues = PACK.verify(zpath, root=REPO, allow_fake_keys_in=("tests/",), notes=notes)
+        self.assertEqual([], [i for i in issues if "API Key" in i], issues)
+        self.assertTrue([n for n in notes if "已豁免" in n], "豁免必须被如实说出来：%r" % (notes,))
+
+        root = os.path.join(self.tmp, "fakekey")
+        os.makedirs(os.path.join(root, "web"))
+        for rel, text in (("app.py", FAKE_APP), ("aaa.py", 'KEY = "sk-' + "a" * 30 + '"\n'),
+                          ("bbb.py", "# bbb\n"), ("web/x.html", "<html></html>\n"),
+                          ("web/demo.json", "{}\n")):
+            _write(os.path.join(root, rel), text)
+        z2 = os.path.join(self.tmp, "fakekey.zip")
+        with zipfile.ZipFile(z2, "w") as z:
+            for rel, full in PACK.collect(root=root, files=FAKE_FILES, dirs=["web"]):
+                z.write(full, "pkg/" + rel)
+        issues2 = PACK.verify(z2, root=root, allow_fake_keys_in=("tests/",))
+        self.assertTrue([i for i in issues2 if "aaa.py" in i],
+                        "`tests/` 以外的明文 Key 被漏掉了：%r" % (issues2,))
 
 
 class ReadmeCommandsTest(unittest.TestCase):
